@@ -12,7 +12,7 @@ use dpf_pir::{Database, UtxoChunkDatabase};
 use std::env;
 
 const DATA_PATH: &str = "/Volumes/Bitcoin/pir/utxo_chunks.bin";
-const NUM_ENTRIES: usize = 33_032;
+const NUM_ENTRIES: usize = 33_038; // Total number of 32KB chunks in the database
 const ENTRY_SIZE: usize = 32768;
 
 fn main() {
@@ -24,7 +24,7 @@ fn main() {
         eprintln!();
         eprintln!("Examples:");
         eprintln!("  {} 0        # First entry", args[0]);
-        eprintln!("  {} 33031    # Last entry", args[0]);
+        eprintln!("  {} 33037    # Last entry", args[0]);
         eprintln!("  {} 9999     # Entry at index 9999", args[0]);
         std::process::exit(1);
     }

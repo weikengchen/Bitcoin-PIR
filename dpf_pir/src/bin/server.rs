@@ -5,8 +5,14 @@
 //!
 //! ## Usage
 //!
+//! Plain WebSocket (ws://):
 //! ```bash
-//! cargo run --bin server_ws -- --port 8091
+//! cargo run --bin server -- --port 8091
+//! ```
+//!
+//! Secure WebSocket (wss://) with TLS:
+//! ```bash
+//! cargo run --bin server -- --port 8091 --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem
 //! ```
 //!
 //! The server accepts WebSocket connections and processes PIR queries
@@ -14,23 +20,32 @@
 
 use dpf_pir::load_configuration;
 use dpf_pir::websocket::{DataStore, DataStoreManager};
-use log::{error, info, warn};
+use log::{error, info};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::fs::File;
+use std::io::BufReader;
 use tokio::net::TcpListener;
 use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 
-#[tokio::main]
-async fn main() {
-    // Initialize logger
-    env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
-        .init();
+// TLS support
+use tokio_rustls::TlsAcceptor;
+use rustls_pemfile::{certs, private_key};
+use tokio_rustls::rustls::{self, ServerConfig};
 
-    // Parse command line arguments
+/// Command line arguments
+struct ServerArgs {
+    port: u16,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+}
+
+fn parse_args() -> ServerArgs {
     let args: Vec<String> = std::env::args().collect();
-    let mut port = 8091; // Default WebSocket port
+    let mut port = 8091;
+    let mut tls_cert: Option<String> = None;
+    let mut tls_key: Option<String> = None;
     
     let mut i = 1;
     while i < args.len() {
@@ -41,27 +56,113 @@ async fn main() {
                     i += 1;
                 }
             }
+            "--tls-cert" => {
+                if i + 1 < args.len() {
+                    tls_cert = Some(args[i + 1].clone());
+                    i += 1;
+                }
+            }
+            "--tls-key" => {
+                if i + 1 < args.len() {
+                    tls_key = Some(args[i + 1].clone());
+                    i += 1;
+                }
+            }
             "--help" | "-h" => {
                 println!("DPF-PIR WebSocket Server");
                 println!("Usage: {} [OPTIONS]", args[0]);
                 println!();
                 println!("Options:");
-                println!("  --port, -p <PORT>  Port to listen on (default: 8091)");
-                println!("  --help, -h         Show this help message");
+                println!("  --port, -p <PORT>     Port to listen on (default: 8091)");
+                println!("  --tls-cert <FILE>     TLS certificate file (PEM format)");
+                println!("  --tls-key <FILE>      TLS private key file (PEM format)");
+                println!("  --help, -h            Show this help message");
                 println!();
-                println!("This server accepts WebSocket connections from browser clients.");
-                println!("The protocol uses binary messages with bincode serialization.");
-                return;
+                println!("Examples:");
+                println!("  # Plain WebSocket (ws://)");
+                println!("  {} --port 8091", args[0]);
+                println!();
+                println!("  # Secure WebSocket (wss://)");
+                println!("  {} --port 8091 --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem", args[0]);
+                println!();
+                println!("To generate self-signed certificates for testing:");
+                println!("  openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes");
+                std::process::exit(0);
             }
             _ => {}
         }
         i += 1;
     }
 
+    // Validate TLS arguments
+    if tls_cert.is_some() != tls_key.is_some() {
+        error!("Both --tls-cert and --tls-key must be provided together");
+        std::process::exit(1);
+    }
+
+    ServerArgs { port, tls_cert, tls_key }
+}
+
+/// Load TLS configuration from certificate and key files
+fn load_tls_config(cert_path: &str, key_path: &str) -> Result<TlsAcceptor, Box<dyn std::error::Error>> {
+    // Load certificate
+    let cert_file = File::open(cert_path)?;
+    let mut cert_reader = BufReader::new(cert_file);
+    let cert_chain: Vec<rustls::pki_types::CertificateDer> = certs(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Load private key
+    let key_file = File::open(key_path)?;
+    let mut key_reader = BufReader::new(key_file);
+    let key_der = private_key(&mut key_reader)?
+        .ok_or("No private key found in file")?;
+
+    // Build TLS configuration
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, key_der)?;
+
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+#[tokio::main]
+async fn main() {
+    // Initialize logger
+    env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Info)
+        .init();
+
+    // Parse command line arguments
+    let args = parse_args();
+    let port = args.port;
+
+    // Load TLS configuration if provided
+    let tls_acceptor = match (&args.tls_cert, &args.tls_key) {
+        (Some(cert_path), Some(key_path)) => {
+            info!("Loading TLS certificate from: {}", cert_path);
+            info!("Loading TLS private key from: {}", key_path);
+            match load_tls_config(cert_path, key_path) {
+                Ok(acceptor) => {
+                    info!("TLS configuration loaded successfully");
+                    Some(acceptor)
+                }
+                Err(e) => {
+                    error!("Failed to load TLS configuration: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        _ => {
+            info!("Running in plain WebSocket mode (no TLS)");
+            None
+        }
+    };
+
     // Load configuration (databases are registered in server_config.rs)
     let server_config = load_configuration();
 
-    info!("Starting DPF-PIR WebSocket server on port {}", port);
+    let protocol = if tls_acceptor.is_some() { "wss" } else { "ws" };
+    info!("Starting DPF-PIR WebSocket server on port {} ({})", port, protocol);
     info!("Load to memory: {}", server_config.load_to_memory);
 
     // Create data store manager
@@ -112,12 +213,18 @@ async fn main() {
         }
     };
 
-    info!("WebSocket server listening on ws://{}", addr);
-    info!("Connect from browser using: ws://localhost:{}", port);
+    if tls_acceptor.is_some() {
+        info!("Secure WebSocket server listening on wss://{}", addr);
+        info!("Connect from browser using: wss://your-domain:{}", port);
+    } else {
+        info!("WebSocket server listening on ws://{}", addr);
+        info!("Connect from browser using: ws://localhost:{}", port);
+    }
 
     // Wrap in Arc for sharing across tasks
     let store_manager = Arc::new(store_manager);
     let registry = Arc::new(server_config.registry);
+    let tls_acceptor = Arc::new(tls_acceptor);
 
     // Accept connections loop
     loop {
@@ -136,48 +243,82 @@ async fn main() {
         info!("[SERVER] Step 2: Spawning task to handle connection from {}", peer_addr);
         let store_manager = Arc::clone(&store_manager);
         let registry = Arc::clone(&registry);
+        let tls_acceptor = Arc::clone(&tls_acceptor);
         
         tokio::spawn(async move {
-            info!("[SERVER] Step 3: Starting WebSocket handshake for {}", peer_addr);
-            // Use accept_hdr_async to handle CORS and allow connections from any origin
-            let callback = |req: &Request, mut response: Response| {
-                let origin = req.headers().get("origin").map(|v| v.to_str().unwrap_or("*")).unwrap_or("*");
-                info!("[SERVER] Step 4: WebSocket handshake request from origin: {}", origin);
-                info!("[SERVER] Request headers: {:?}", req.headers());
-                
-                // Add CORS headers to the response
-                let headers = response.headers_mut();
-                headers.insert(
-                    tokio_tungstenite::tungstenite::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
-                    tokio_tungstenite::tungstenite::http::HeaderValue::from_static("*"),
-                );
-                headers.insert(
-                    tokio_tungstenite::tungstenite::http::header::ACCESS_CONTROL_ALLOW_METHODS,
-                    tokio_tungstenite::tungstenite::http::HeaderValue::from_static("GET, POST, OPTIONS"),
-                );
-                headers.insert(
-                    tokio_tungstenite::tungstenite::http::header::ACCESS_CONTROL_ALLOW_HEADERS,
-                    tokio_tungstenite::tungstenite::http::HeaderValue::from_static("Content-Type, Authorization"),
-                );
-                info!("[SERVER] Step 5: CORS headers added to response");
-                Ok(response)
-            };
+            info!("[SERVER] Step 3: Starting connection handling for {}", peer_addr);
             
-            info!("[SERVER] Step 6: Calling accept_hdr_async to complete WebSocket handshake...");
-            match accept_hdr_async(stream, callback).await {
-                Ok(ws_stream) => {
-                    info!("[SERVER] Step 7: WebSocket handshake SUCCESS for {}", peer_addr);
-                    info!("[SERVER] Step 8: Starting WebSocket message handler for {}", peer_addr);
-                    dpf_pir::websocket::handle_websocket_connection(
-                        ws_stream, store_manager, registry
-                    ).await;
-                    info!("[SERVER] Step 9: WebSocket handler completed for {}", peer_addr);
-                }
-                Err(e) => {
-                    error!("[SERVER] Step ERROR: WebSocket handshake FAILED for {}: {}", peer_addr, e);
-                    error!("[SERVER] Error details: {:?}", e);
-                }
+            // Handle TLS if configured
+            if let Some(acceptor) = tls_acceptor.as_ref() {
+                info!("[SERVER] Step 3a: Performing TLS handshake for {}", peer_addr);
+                let tls_stream = match acceptor.accept(stream).await {
+                    Ok(s) => {
+                        info!("[SERVER] TLS handshake successful for {}", peer_addr);
+                        s
+                    }
+                    Err(e) => {
+                        error!("[SERVER] TLS handshake failed for {}: {}", peer_addr, e);
+                        return;
+                    }
+                };
+                
+                // WebSocket handshake over TLS stream
+                handle_websocket_connection(tls_stream, peer_addr, store_manager, registry).await;
+            } else {
+                // Plain WebSocket (no TLS)
+                handle_websocket_connection(stream, peer_addr, store_manager, registry).await;
             }
         });
+    }
+}
+
+/// Handle WebSocket connection (works for both plain and TLS streams)
+async fn handle_websocket_connection<S>(
+    stream: S,
+    peer_addr: SocketAddr,
+    store_manager: Arc<DataStoreManager>,
+    registry: Arc<dpf_pir::DatabaseRegistry>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    info!("[SERVER] Step 4: Starting WebSocket handshake for {}", peer_addr);
+    
+    // Use accept_hdr_async to handle CORS and allow connections from any origin
+    let callback = |req: &Request, mut response: Response| {
+        let origin = req.headers().get("origin").map(|v| v.to_str().unwrap_or("*")).unwrap_or("*");
+        info!("[SERVER] Step 5: WebSocket handshake request from origin: {}", origin);
+        
+        // Add CORS headers to the response
+        let headers = response.headers_mut();
+        headers.insert(
+            tokio_tungstenite::tungstenite::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            tokio_tungstenite::tungstenite::http::HeaderValue::from_static("*"),
+        );
+        headers.insert(
+            tokio_tungstenite::tungstenite::http::header::ACCESS_CONTROL_ALLOW_METHODS,
+            tokio_tungstenite::tungstenite::http::HeaderValue::from_static("GET, POST, OPTIONS"),
+        );
+        headers.insert(
+            tokio_tungstenite::tungstenite::http::header::ACCESS_CONTROL_ALLOW_HEADERS,
+            tokio_tungstenite::tungstenite::http::HeaderValue::from_static("Content-Type, Authorization"),
+        );
+        info!("[SERVER] Step 6: CORS headers added to response");
+        Ok(response)
+    };
+    
+    info!("[SERVER] Step 7: Calling accept_hdr_async to complete WebSocket handshake...");
+    match accept_hdr_async(stream, callback).await {
+        Ok(ws_stream) => {
+            info!("[SERVER] Step 8: WebSocket handshake SUCCESS for {}", peer_addr);
+            info!("[SERVER] Step 9: Starting WebSocket message handler for {}", peer_addr);
+            dpf_pir::websocket::handle_websocket_connection(
+                ws_stream, store_manager, registry
+            ).await;
+            info!("[SERVER] Step 10: WebSocket handler completed for {}", peer_addr);
+        }
+        Err(e) => {
+            error!("[SERVER] Step ERROR: WebSocket handshake FAILED for {}: {}", peer_addr, e);
+            error!("[SERVER] Error details: {:?}", e);
+        }
     }
 }

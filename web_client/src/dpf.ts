@@ -38,14 +38,6 @@ export class DpfWrapper {
   }
 
   /**
-   * Generate a single DPF key (for single-server queries) (async)
-   */
-  async genSingleKey(index: number, n: number = 24): Promise<Uint8Array> {
-    const keys = await this.genKeys(index, n);
-    return keys.key1;
-  }
-
-  /**
    * Evaluate DPF key to get the result bitmap
    * Note: This is typically done on the server side
    */

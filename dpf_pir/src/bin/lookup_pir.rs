@@ -37,7 +37,7 @@ const CHUNKS_DB_ID: &str = "utxo_chunks_data";
 const CUCKOO_NUM_BUCKETS: usize = 15_385_139;
 
 /// Number of entries in the chunks database
-const CHUNKS_NUM_ENTRIES: usize = 33_032;
+const CHUNKS_NUM_ENTRIES: usize = 33_038;
 
 /// Chunk size in bytes (32KB)
 const CHUNK_SIZE: usize = 32 * 1024;

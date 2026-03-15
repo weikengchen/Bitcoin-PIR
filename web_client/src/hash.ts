@@ -69,43 +69,47 @@ export function cuckooLocations(key: Uint8Array, numBuckets: number): [number, n
 /**
  * Custom hash function for TXID mapping (hash 1)
  * murmurhash3-style finalizer
+ * 
+ * Matches Rust implementation exactly:
+ * - Uses wrapping multiplication
+ * - Converts to u64 before modulo to ensure unsigned behavior
  */
 export function txidMappingHash1(key: Uint8Array, numBuckets: number): number {
-  // Interpret key as u32 (little-endian)
-  let keyU32 = 0;
-  for (let i = 0; i < 4 && i < key.length; i++) {
-    keyU32 |= key[i] << (8 * i);
-  }
+  // Interpret key as u32 (little-endian) - matches Rust's u32::from_le_bytes
+  let h = (key[0] | (key[1] << 8) | (key[2] << 16) | (key[3] << 24)) >>> 0;
   
-  // murmurhash3-style finalizer
-  let h = keyU32;
+  // murmurhash3-style finalizer (matches Rust exactly)
   h ^= h >>> 16;
-  h = (h * 0x45d9f3b) >>> 0;
+  h = (Math.imul(h, 0x45d9f3b) >>> 0);  // wrapping_mul as u32
   h ^= h >>> 16;
   
-  return h % numBuckets;
+  // Use BigInt for the modulo to match Rust's "as u64 as usize % num_buckets"
+  // This ensures we get the correct positive result
+  return Number(BigInt(h >>> 0) % BigInt(numBuckets));
 }
 
 /**
  * Custom hash function for TXID mapping (hash 2)
  * Different mixing constants
+ * 
+ * Matches Rust implementation exactly:
+ * - Uses wrapping multiplication
+ * - Converts to u64 before modulo to ensure unsigned behavior
  */
 export function txidMappingHash2(key: Uint8Array, numBuckets: number): number {
-  // Interpret key as u32 (little-endian)
-  let keyU32 = 0;
-  for (let i = 0; i < 4 && i < key.length; i++) {
-    keyU32 |= key[i] << (8 * i);
-  }
+  // Interpret key as u32 (little-endian) - matches Rust's u32::from_le_bytes
+  let h = (key[0] | (key[1] << 8) | (key[2] << 16) | (key[3] << 24)) >>> 0;
   
-  // Different mixing constants
-  let h = keyU32;
+  // Different mixing constants (matches Rust exactly)
   h ^= h >>> 15;
-  h = (h * 0x735a2d97) >>> 0;
+  h = (Math.imul(h, 0x735a2d97) >>> 0);  // wrapping_mul as u32
   h ^= h >>> 15;
-  h = (h * 0x0bef6c35) >>> 0;
+  h = (Math.imul(h, 0x0bef6c35) >>> 0);  // wrapping_mul as u32
   h ^= h >>> 16;
   
-  return h % numBuckets;
+  // Use BigInt for the modulo to match Rust's "as u64 as usize % num_buckets"
+  // This ensures we get the correct positive result
+  return Number(BigInt(h >>> 0) % BigInt(numBuckets));
 }
 
 /**

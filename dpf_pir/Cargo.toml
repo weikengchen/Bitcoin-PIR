@@ -21,3 +21,7 @@ rand = "0.8"
 tokio-tungstenite = "0.21"
 futures-util = "0.3"
 
+# TLS support for secure WebSocket (wss://)
+tokio-rustls = "0.25"
+rustls-pemfile = "2.0"
+

@@ -12,7 +12,7 @@ export const CUCKOO_NUM_BUCKETS = 15_385_139;
 export const CUCKOO_BUCKET_SIZE = 1; // 1 entry per bucket
 export const CUCKOO_ENTRY_SIZE = 20 + 32; // 20-byte key + 32-byte value
 
-export const CHUNKS_NUM_ENTRIES = 33_032;
+export const CHUNKS_NUM_ENTRIES = 33_038;
 export const CHUNK_SIZE = 32 * 1024; // 32 KB
 
 export const TXID_MAPPING_NUM_BUCKETS = 30_097_234;

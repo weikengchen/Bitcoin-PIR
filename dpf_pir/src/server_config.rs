@@ -139,7 +139,7 @@ pub fn load_configuration() -> ServerConfiguration {
         "/Volumes/Bitcoin/pir/utxo_chunks.bin", // data_path
         32768,  // entry_size (32KB per chunk)
         1,     // bucket_size
-        33_032, // num_buckets (33,032 chunks)
+        33_038, // num_buckets (33,038 chunks)
         1,     // num_locations (direct index)
     );
 
