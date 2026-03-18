@@ -94,8 +94,7 @@ export class PirClient {
   private config: PirClientConfig;
   private reconnectConfig: ReconnectConfig;
   private dpf = createDpf();
-  private pendingRequests: Map<number, (response: Response) => void> =
-    new Map();
+  private pendingResponses: Map<1 | 2, Array<(response: Response) => void>> = new Map();
   private requestCounter = 0;
 
   // Reconnection state
@@ -112,6 +111,46 @@ export class PirClient {
   constructor(config: PirClientConfig) {
     this.config = config;
     this.reconnectConfig = { ...DEFAULT_RECONNECT_CONFIG, ...config.reconnect };
+    this.pendingResponses.set(1, []);
+    this.pendingResponses.set(2, []);
+  }
+
+  /**
+   * Central message handler for a server's WebSocket.
+   * Routes responses to pending request callbacks in FIFO order.
+   * Pong responses from heartbeats are handled inline without consuming a pending callback.
+   */
+  private handleMessage(serverNum: 1 | 2, event: MessageEvent): void {
+    try {
+      const response = decodeResponse(new Uint8Array(event.data));
+
+      // Handle heartbeat pongs without consuming a pending request callback
+      if ('Pong' in response) {
+        clearTimeout(this.heartbeatTimeoutTimers.get(serverNum));
+        this.heartbeatTimeoutTimers.delete(serverNum);
+        this.lastPongTime.set(serverNum, Date.now());
+        console.log(`[HEARTBEAT] Server ${serverNum} pong received`);
+        return;
+      }
+
+      // Route to the next pending request callback (FIFO)
+      const queue = this.pendingResponses.get(serverNum)!;
+      const callback = queue.shift();
+      if (callback) {
+        callback(response);
+      } else {
+        console.warn(`[PIR] Received unexpected response from server ${serverNum} with no pending request`);
+      }
+    } catch (error) {
+      console.error(`[PIR] Failed to decode response from server ${serverNum}:`, error);
+      // Reject the oldest pending request
+      const queue = this.pendingResponses.get(serverNum)!;
+      const callback = queue.shift();
+      if (callback) {
+        // Can't reject a resolve callback, but at least clear it
+        // The timeout will handle rejection
+      }
+    }
   }
 
   /**
@@ -190,6 +229,10 @@ export class PirClient {
           } else {
             this.ws2 = ws;
           }
+          // Install permanent central message handler
+          ws.onmessage = (event) => this.handleMessage(serverNum, event);
+          // Reset the pending response queue for this server
+          this.pendingResponses.set(serverNum, []);
           // Record the time of last pong (connection established)
           this.lastPongTime.set(serverNum, Date.now());
           console.log(`[DEBUG] [SERVER ${serverNum}] Step 6: Resolving connection promise`);
@@ -335,32 +378,8 @@ export class PirClient {
 
         this.heartbeatTimeoutTimers.set(serverNum, timeoutTimer);
 
-        // Send ping
+        // Send ping — pong response is handled by the central handleMessage()
         ws.send(encoded);
-
-        // Set up one-time message handler for pong
-        const originalOnMessage = ws.onmessage;
-        ws.onmessage = (event) => {
-          try {
-            const response = decodeResponse(new Uint8Array(event.data));
-            // Check if it's a Pong response
-            if ('Pong' in response) {
-              clearTimeout(this.heartbeatTimeoutTimers.get(serverNum));
-              this.heartbeatTimeoutTimers.delete(serverNum);
-              this.lastPongTime.set(serverNum, Date.now());
-              console.log(`[HEARTBEAT] Server ${serverNum} pong received`);
-            }
-            // Call original handler if exists
-            if (originalOnMessage) {
-              originalOnMessage.call(ws, event);
-            }
-          } catch (error) {
-            console.error(`[HEARTBEAT] Error processing response:`, error);
-            if (originalOnMessage) {
-              originalOnMessage.call(ws, event);
-            }
-          }
-        };
       } catch (error) {
         console.error(`[HEARTBEAT] Error sending ping to server ${serverNum}:`, error);
       }
@@ -438,34 +457,23 @@ export class PirClient {
       throw new Error(`Not connected to server ${serverNum}`);
     }
 
-    const requestId = this.requestCounter++;
     const encoded = encodeRequest(request);
+    const queue = this.pendingResponses.get(serverNum)!;
 
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
-        this.pendingRequests.delete(requestId);
+        // Remove this callback from the queue on timeout
+        const idx = queue.indexOf(callback);
+        if (idx !== -1) queue.splice(idx, 1);
         reject(new Error(`Request to server ${serverNum} timed out`));
       }, 30000); // 30 second timeout
 
-      this.pendingRequests.set(requestId, (response: Response) => {
+      const callback = (response: Response) => {
         clearTimeout(timeout);
         resolve(response);
-      });
-
-      ws.onmessage = (event) => {
-        try {
-          const response = decodeResponse(new Uint8Array(event.data));
-          const callback = this.pendingRequests.get(requestId);
-          if (callback) {
-            this.pendingRequests.delete(requestId);
-            callback(response);
-          }
-        } catch (error) {
-          console.error('Failed to decode response:', error);
-          reject(error);
-        }
       };
 
+      queue.push(callback);
       ws.send(encoded);
     });
   }
