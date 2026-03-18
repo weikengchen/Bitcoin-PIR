@@ -1,0 +1,631 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bitcoin PIR Web Client Demo (Gen2)</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        h1 {
+            color: #333;
+            border-bottom: 3px solid #f7931a;
+            padding-bottom: 10px;
+        }
+        h2 {
+            color: #666;
+            margin-top: 30px;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+        .status.connected {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        .status.disconnected {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        .status.connecting {
+            background-color: #fff3cd;
+            color: #856404;
+        }
+        .status.reconnecting {
+            background-color: #ffeaa7;
+            color: #856404;
+            animation: pulse 1.5s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+        button {
+            background-color: #f7931a;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            margin: 5px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        button:hover {
+            background-color: #e0820e;
+        }
+        button:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
+        }
+        button.secondary {
+            background-color: #6c757d;
+        }
+        button.secondary:hover {
+            background-color: #5a6268;
+        }
+        input[type="text"] {
+            padding: 8px;
+            margin: 5px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            width: 300px;
+        }
+        input[type="text"].small {
+            width: 200px;
+        }
+        label {
+            display: block;
+            margin: 10px 0 5px 0;
+            font-weight: bold;
+        }
+        .result {
+            background-color: #f8f9fa;
+            padding: 15px;
+            border-radius: 4px;
+            margin: 10px 0;
+            font-family: 'Courier New', Consolas, 'SF Mono', 'Monaco', monospace;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        .step {
+            margin: 20px 0;
+            padding: 15px;
+            border-left: 4px solid #f7931a;
+            background-color: #fff8f0;
+        }
+        .step-number {
+            font-weight: bold;
+            color: #f7931a;
+        }
+        .log {
+            background-color: #1e1e1e;
+            color: #d4d4d4;
+            padding: 15px;
+            border-radius: 4px;
+            max-height: 300px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+        }
+        .log-entry {
+            margin: 5px 0;
+        }
+        .log-entry.error {
+            color: #f48771;
+        }
+        .log-entry.success {
+            color: #89d185;
+        }
+        .log-entry.info {
+            color: #4fc1ff;
+        }
+        /* UTXO pagination styles */
+        .utxo-section {
+            margin-top: 20px;
+            border-top: 2px solid #f7931a;
+            padding-top: 20px;
+        }
+        .utxo-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        .utxo-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-family: monospace;
+            font-size: 13px;
+        }
+        .utxo-table th {
+            background-color: #f7931a;
+            color: white;
+            padding: 10px;
+            text-align: left;
+        }
+        .utxo-table td {
+            padding: 8px 10px;
+            border-bottom: 1px solid #ddd;
+        }
+        .utxo-table tr:nth-child(even) {
+            background-color: #f9f9f9;
+        }
+        .utxo-table tr:hover {
+            background-color: #fff3e0;
+        }
+        .pagination-controls {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            margin: 20px 0;
+            gap: 10px;
+        }
+        .pagination-info {
+            font-size: 14px;
+            color: #666;
+            margin: 0 15px;
+        }
+        .utxo-loading {
+            text-align: center;
+            padding: 20px;
+            color: #666;
+        }
+        .hidden {
+            display: none;
+        }
+        .amount-btc {
+            color: #28a745;
+            font-weight: bold;
+        }
+        .txid-link {
+            color: #0066cc;
+            font-size: 11px;
+            word-break: break-all;
+            text-decoration: none;
+        }
+        .txid-link:hover {
+            text-decoration: underline;
+            color: #004499;
+        }
+        .server-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin: 5px 0;
+        }
+        .server-label {
+            width: 80px;
+            font-weight: normal;
+        }
+        .whale-banner {
+            background-color: #fff3cd;
+            border: 2px solid #f7931a;
+            border-radius: 8px;
+            padding: 20px;
+            text-align: center;
+            margin: 20px 0;
+        }
+        .whale-banner h3 {
+            color: #856404;
+            margin: 0 0 10px 0;
+            font-size: 20px;
+        }
+        .whale-banner p {
+            color: #856404;
+            margin: 0;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Bitcoin PIR Web Client Demo (Gen2)</h1>
+        <p>
+            This demo shows how to query the Bitcoin UTXO set using Private Information Retrieval (PIR).
+            Your queries are private - the server learns nothing about which address you're looking up.
+        </p>
+
+        <div id="status" class="status disconnected">
+            Status: Disconnected
+        </div>
+
+        <div class="step">
+            <span class="step-number">Step 1:</span> Configure & Connect to PIR Servers
+            <br><br>
+            <div class="server-row">
+                <span class="server-label">Server 1:</span>
+                <input type="text" id="server1Url" class="small" value="wss://dpf1.chenweikeng.com">
+            </div>
+            <div class="server-row">
+                <span class="server-label">Server 2:</span>
+                <input type="text" id="server2Url" class="small" value="wss://dpf2.chenweikeng.com">
+            </div>
+            <br>
+            <button id="connectBtn">Connect</button>
+            <button id="reconnectBtn" class="secondary hidden">Reconnect</button>
+            <button id="disconnectBtn" disabled>Disconnect</button>
+        </div>
+
+        <div class="step">
+            <span class="step-number">Step 2:</span> Query by Script Pubkey
+            <br><br>
+            <label for="scriptPubkey">Script Pubkey (hex):</label>
+            <input type="text" id="scriptPubkey" placeholder="e.g., 76a914b64513c1f1b889a556463243cca9c26ee626b9a088ac" value="76a914b64513c1f1b889a556463243cca9c26ee626b9a088ac">
+            <br>
+            <button id="queryCuckooBtn">Query UTXOs</button>
+        </div>
+
+        <h2>Query Results</h2>
+        <div id="result" class="result">
+            No results yet. Configure servers and run a query.
+        </div>
+
+        <!-- Whale Banner (hidden by default) -->
+        <div id="whaleBanner" class="whale-banner hidden">
+            <h3>Whale Address Detected</h3>
+            <p>This address has UTXOs but is excluded from the lightweight database.</p>
+        </div>
+
+        <!-- UTXO Pagination Section -->
+        <div id="utxoSection" class="utxo-section hidden">
+            <div class="utxo-header">
+                <h2>UTXO Entries</h2>
+                <span id="utxoCountInfo" class="pagination-info"></span>
+            </div>
+
+            <div id="utxoLoading" class="utxo-loading hidden">
+                Loading entries...
+            </div>
+
+            <table class="utxo-table" id="utxoTable">
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        <th style="min-width: 280px;">TXID</th>
+                        <th>Vout</th>
+                        <th>Amount (satoshis)</th>
+                        <th>Amount (BTC)</th>
+                    </tr>
+                </thead>
+                <tbody id="utxoTableBody">
+                </tbody>
+            </table>
+
+            <div class="pagination-controls">
+                <button id="prevPageBtn" disabled>&#9664; PREV PAGE</button>
+                <span id="pageInfo" class="pagination-info">Page 1 of 1</span>
+                <button id="nextPageBtn" disabled>NEXT PAGE &#9654;</button>
+            </div>
+        </div>
+
+        <h2>Log</h2>
+        <div id="log" class="log">
+            <div class="log-entry info">Waiting for connection...</div>
+        </div>
+    </div>
+
+    <script type="module">
+        import { createPirClient, hexToBytes, bytesToHex, cuckooHash1, cuckooHash2, CUCKOO_NUM_BUCKETS, scriptHash } from './src/index.js';
+
+        let client = null;
+        let paginationState = null;
+        let currentPage = 0;
+        const PAGE_SIZE = 20;
+        let lastConnectedUrls = { server1: '', server2: '' };
+
+        function log(message, type = 'info') {
+            const logDiv = document.getElementById('log');
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${type}`;
+            entry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+            logDiv.appendChild(entry);
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+
+        function setStatus(message, isConnected) {
+            const statusDiv = document.getElementById('status');
+            statusDiv.textContent = `Status: ${message}`;
+            statusDiv.className = `status ${isConnected ? 'connected' : 'disconnected'}`;
+        }
+
+        function setButtons(connected) {
+            document.getElementById('connectBtn').disabled = connected;
+            document.getElementById('disconnectBtn').disabled = !connected;
+            updateReconnectButton();
+        }
+
+        function updateReconnectButton() {
+            const server1 = document.getElementById('server1Url').value.trim();
+            const server2 = document.getElementById('server2Url').value.trim();
+            const reconnectBtn = document.getElementById('reconnectBtn');
+
+            // Show reconnect button if URLs have changed since last connection
+            if (client && (server1 !== lastConnectedUrls.server1 || server2 !== lastConnectedUrls.server2)) {
+                reconnectBtn.classList.remove('hidden');
+            } else {
+                reconnectBtn.classList.add('hidden');
+            }
+        }
+
+        function setResult(message) {
+            document.getElementById('result').textContent = message;
+        }
+
+        function formatSatoshisToBtc(satoshis) {
+            const btc = Number(satoshis) / 100_000_000;
+            return btc.toFixed(8);
+        }
+
+        /**
+         * Convert a 32-byte TXID Uint8Array to reversed hex string (Bitcoin display format)
+         */
+        function txidToReversedHex(txid) {
+            const reversed = Array.from(txid).reverse();
+            return reversed.map(b => b.toString(16).padStart(2, '0')).join('');
+        }
+
+        function updateUtxoTable(entries, startIndex) {
+            const tbody = document.getElementById('utxoTableBody');
+            tbody.innerHTML = '';
+
+            entries.forEach((entry, i) => {
+                const row = document.createElement('tr');
+                const rowIndex = startIndex + i + 1;
+                const txidHex = txidToReversedHex(entry.txid);
+                const txidShort = txidHex.substring(0, 16);
+
+                row.innerHTML = `
+                    <td>${rowIndex}</td>
+                    <td>
+                        <a href="https://mempool.space/tx/${txidHex}" target="_blank" class="txid-link">${txidShort}...</a>
+                    </td>
+                    <td>${entry.vout}</td>
+                    <td>${entry.amount.toString()}</td>
+                    <td class="amount-btc">${formatSatoshisToBtc(entry.amount)} BTC</td>
+                `;
+                tbody.appendChild(row);
+            });
+        }
+
+        function updatePaginationControls() {
+            if (!paginationState) return;
+
+            const totalPages = Math.ceil(Number(paginationState.totalEntries) / PAGE_SIZE);
+            document.getElementById('pageInfo').textContent = `Page ${currentPage + 1} of ${totalPages}`;
+            document.getElementById('utxoCountInfo').textContent =
+                `${paginationState.totalEntries} total UTXOs | ${paginationState.entries.length} cached`;
+
+            document.getElementById('prevPageBtn').disabled = currentPage === 0;
+            document.getElementById('nextPageBtn').disabled = currentPage >= totalPages - 1;
+        }
+
+        async function loadPage(page) {
+            if (!paginationState || !client) return;
+
+            const loadingDiv = document.getElementById('utxoLoading');
+            loadingDiv.classList.remove('hidden');
+
+            try {
+                const entries = await client.getUtxoPage(paginationState, page, PAGE_SIZE);
+                const startIndex = page * PAGE_SIZE;
+                updateUtxoTable(entries, startIndex);
+                currentPage = page;
+                updatePaginationControls();
+            } catch (error) {
+                log(`Error loading page: ${error.message}`, 'error');
+            } finally {
+                loadingDiv.classList.add('hidden');
+            }
+        }
+
+        async function connect() {
+            const server1Url = document.getElementById('server1Url').value.trim();
+            const server2Url = document.getElementById('server2Url').value.trim();
+
+            if (!server1Url || !server2Url) {
+                log('Please enter both server URLs', 'error');
+                return;
+            }
+
+            try {
+                log(`Connecting to servers...`);
+                log(`  Server 1: ${server1Url}`);
+                log(`  Server 2: ${server2Url}`);
+
+                // Create client with connection state callback for auto-reconnection
+                client = createPirClient(server1Url, server2Url);
+                client = new (await import('./src/index.js')).PirClient({
+                    server1Url,
+                    server2Url,
+                    reconnect: {
+                        enabled: true,
+                        maxAttempts: 0,  // Infinite retries
+                        initialDelay: 1000,
+                        maxDelay: 30000,
+                        backoffFactor: 2,
+                        heartbeatInterval: 30000,  // 30 second heartbeat
+                        heartbeatTimeout: 10000,   // 10 second pong timeout
+                    },
+                    onConnectionStateChange: (state, message) => {
+                        log(`Connection state: ${state}${message ? ' - ' + message : ''}`,
+                            state === 'connected' ? 'success' :
+                            state === 'disconnected' ? 'error' : 'info');
+
+                        // Update UI based on connection state
+                        const statusDiv = document.getElementById('status');
+                        statusDiv.textContent = `Status: ${state.charAt(0).toUpperCase() + state.slice(1)}${message ? ' - ' + message : ''}`;
+                        statusDiv.className = `status ${state}`;
+
+                        // Update buttons based on state
+                        if (state === 'connected') {
+                            setButtons(true);
+                            lastConnectedUrls = { server1: server1Url, server2: server2Url };
+                        } else if (state === 'disconnected') {
+                            setButtons(false);
+                        } else if (state === 'connecting' || state === 'reconnecting') {
+                            document.getElementById('connectBtn').disabled = true;
+                            document.getElementById('disconnectBtn').disabled = false;
+                        }
+                    }
+                });
+
+                await client.connect();
+
+                log('Successfully connected to both servers!', 'success');
+            } catch (error) {
+                log(`Connection failed: ${error.message}`, 'error');
+                client = null;
+            }
+        }
+
+        function disconnect() {
+            if (client) {
+                client.disconnect();
+                client = null;
+                log('Disconnected from servers', 'info');
+                setStatus('Disconnected', false);
+                setButtons(false);
+            }
+            // Reset pagination state
+            paginationState = null;
+            currentPage = 0;
+            document.getElementById('utxoSection').classList.add('hidden');
+            document.getElementById('whaleBanner').classList.add('hidden');
+        }
+
+        async function queryUtxos() {
+            // Auto-connect if not connected
+            if (!client || !client.isConnected()) {
+                log('Not connected. Connecting first...', 'info');
+                await connect();
+                if (!client) return; // Connection failed
+            }
+
+            const scriptPubkeyHex = document.getElementById('scriptPubkey').value.trim();
+            if (!scriptPubkeyHex) {
+                log('Please enter a script pubkey', 'error');
+                return;
+            }
+
+            // Reset pagination state
+            paginationState = null;
+            currentPage = 0;
+            document.getElementById('utxoSection').classList.add('hidden');
+            document.getElementById('whaleBanner').classList.add('hidden');
+
+            try {
+                // Convert script pubkey hex to bytes
+                const scriptPubkey = hexToBytes(scriptPubkeyHex);
+                log(`Script Pubkey: ${scriptPubkeyHex}`, 'info');
+                log(`Script Pubkey length: ${scriptPubkey.length} bytes`, 'info');
+
+                // Compute HASH160 = RIPEMD160(SHA256(script))
+                const scriptHashBytes = await scriptHash(scriptPubkey);
+                const scriptHashHex = bytesToHex(scriptHashBytes);
+
+                log(`Computed HASH160: ${scriptHashHex}`, 'info');
+
+                // Initialize pagination state
+                log('Starting PIR query...', 'info');
+                paginationState = await client.initUtxoPagination(scriptHashBytes);
+
+                if (!paginationState) {
+                    log(`Script hash not found in database`, 'error');
+                    setResult(
+                        `Script Pubkey: ${scriptPubkeyHex}\n\n` +
+                        `HASH160: ${scriptHashHex}\n\n` +
+                        `Result: Script hash NOT FOUND\n\n` +
+                        `This address has no UTXOs in the database.`
+                    );
+                    return;
+                }
+
+                const totalEntries = paginationState.totalEntries;
+                const offset = paginationState.startOffset;
+                const chunkIndex = Math.floor(offset / 32768);
+                const localOffset = offset % 32768;
+
+                log(`Found offset ${offset}`, 'info');
+                log(`Total UTXO count = ${totalEntries}`, 'success');
+
+                // Check for whale address
+                if (paginationState.isWhale) {
+                    log('Whale address detected - excluded from lightweight database', 'info');
+                    setResult(
+                        `Script Pubkey: ${scriptPubkeyHex}\n\n` +
+                        `HASH160: ${scriptHashHex}\n\n` +
+                        `----------------------------------------\n` +
+                        `PIR QUERY RESULTS\n` +
+                        `----------------------------------------\n` +
+                        `  Chunk offset: ${offset}\n` +
+                        `  Chunk index: ${chunkIndex}\n` +
+                        `  Local offset: ${localOffset}\n\n` +
+                        `Whale address detected (entry_count = 0).\n` +
+                        `This address has UTXOs but is excluded from the lightweight database.`
+                    );
+                    document.getElementById('whaleBanner').classList.remove('hidden');
+                    return;
+                }
+
+                setResult(
+                    `Script Pubkey: ${scriptPubkeyHex}\n\n` +
+                    `HASH160: ${scriptHashHex}\n\n` +
+                    `----------------------------------------\n` +
+                    `PIR QUERY RESULTS\n` +
+                    `----------------------------------------\n` +
+                    `  Chunk offset: ${offset}\n` +
+                    `  Chunk index: ${chunkIndex}\n` +
+                    `  Local offset: ${localOffset}\n\n` +
+                    `Number of UTXOs: ${totalEntries}\n\n` +
+                    `Scroll down to view UTXO entries with pagination.`
+                );
+
+                // Show UTXO section if there are entries
+                if (totalEntries > 0n) {
+                    document.getElementById('utxoSection').classList.remove('hidden');
+                    log('Loading first page of UTXO entries...', 'info');
+                    await loadPage(0);
+                }
+
+                log('Query completed', 'success');
+            } catch (error) {
+                log(`Query failed: ${error.message}`, 'error');
+                setResult(`Error: ${error.message}`);
+            }
+        }
+
+        // Add event listeners
+        document.getElementById('connectBtn').addEventListener('click', connect);
+        document.getElementById('reconnectBtn').addEventListener('click', async () => {
+            disconnect();
+            await connect();
+        });
+        document.getElementById('disconnectBtn').addEventListener('click', disconnect);
+        document.getElementById('queryCuckooBtn').addEventListener('click', queryUtxos);
+        document.getElementById('prevPageBtn').addEventListener('click', () => loadPage(currentPage - 1));
+        document.getElementById('nextPageBtn').addEventListener('click', () => loadPage(currentPage + 1));
+
+        // Show reconnect button when URLs change
+        document.getElementById('server1Url').addEventListener('input', updateReconnectButton);
+        document.getElementById('server2Url').addEventListener('input', updateReconnectButton);
+
+        // Initialize with default button states
+        setButtons(false);
+    </script>
+</body>
+</html>

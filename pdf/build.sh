@@ -27,17 +27,17 @@ if ! command -v bibtex &> /dev/null; then
     exit 1
 fi
 
-# First pass xelatex compilation
-xelatex -interaction=nonstopmode main.tex > /dev/null 2>&1
+# First pass xelatex compilation (exit code 1 is expected due to unresolved references)
+xelatex -interaction=nonstopmode main.tex > /dev/null 2>&1 || true
 
 # BibTeX compilation
-bibtex main > /dev/null 2>&1
+bibtex main > /dev/null 2>&1 || true
 
 # Second pass xelatex compilation
-xelatex -interaction=nonstopmode main.tex > /dev/null 2>&1
+xelatex -interaction=nonstopmode main.tex > /dev/null 2>&1 || true
 
 # Third pass xelatex compilation (finalize references)
-xelatex -interaction=nonstopmode main.tex > /dev/null 2>&1
+xelatex -interaction=nonstopmode main.tex > /dev/null 2>&1 || true
 
 # Check if PDF was generated
 if [ -f "main.pdf" ]; then
