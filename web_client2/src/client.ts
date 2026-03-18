@@ -662,10 +662,12 @@ export class PirClient {
     }
 
     // Step 4: Calculate chunk index and local offset, then fetch UTXO count
-    const chunkIndex = Math.floor(foundOffset / CHUNK_SIZE);
-    const localOffset = foundOffset % CHUNK_SIZE;
+    // The stored offset is byte_offset/2 (to fit >4GB files in u32)
+    const byteOffset = foundOffset * 2;
+    const chunkIndex = Math.floor(byteOffset / CHUNK_SIZE);
+    const localOffset = byteOffset % CHUNK_SIZE;
 
-    console.log(`[PIR] Step 4: Offset ${foundOffset} -> chunk_index=${chunkIndex}, local_offset=${localOffset}`);
+    console.log(`[PIR] Step 4: Stored offset ${foundOffset} -> byte offset ${byteOffset} -> chunk_index=${chunkIndex}, local_offset=${localOffset}`);
 
     // Query the chunk
     console.log(`[PIR] Step 4: Fetching chunk ${chunkIndex}...`);
@@ -684,7 +686,7 @@ export class PirClient {
       response2,
       loc1,
       loc2,
-      offset: foundOffset,
+      offset: byteOffset,
       chunkIndex,
       localOffset,
       utxoCount,
@@ -986,7 +988,8 @@ export class PirClient {
       return null;
     }
 
-    const startOffset = cuckooResult.offset;
+    // The stored offset is byte_offset/2 (to fit >4GB files in u32)
+    const startOffset = cuckooResult.offset * 2;
     const chunkIndex = Math.floor(startOffset / CHUNK_SIZE);
     const localOffset = startOffset % CHUNK_SIZE;
 

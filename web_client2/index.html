@@ -194,6 +194,7 @@
         }
         .txid-link {
             color: #0066cc;
+            font-family: monospace;
             font-size: 11px;
             word-break: break-all;
             text-decoration: none;
@@ -320,7 +321,7 @@
     </div>
 
     <script type="module">
-        import { createPirClient, hexToBytes, bytesToHex, cuckooHash1, cuckooHash2, CUCKOO_NUM_BUCKETS, scriptHash } from './src/index.js';
+        import { createPirClient, hexToBytes, bytesToHex, cuckooHash1, cuckooHash2, CUCKOO_NUM_BUCKETS, scriptHash } from './dist/index.js';
 
         let client = null;
         let paginationState = null;
@@ -387,12 +388,11 @@
                 const row = document.createElement('tr');
                 const rowIndex = startIndex + i + 1;
                 const txidHex = txidToReversedHex(entry.txid);
-                const txidShort = txidHex.substring(0, 16);
 
                 row.innerHTML = `
                     <td>${rowIndex}</td>
                     <td>
-                        <a href="https://mempool.space/tx/${txidHex}" target="_blank" class="txid-link">${txidShort}...</a>
+                        <a href="https://mempool.space/tx/${txidHex}" target="_blank" class="txid-link">${txidHex}</a>
                     </td>
                     <td>${entry.vout}</td>
                     <td>${entry.amount.toString()}</td>
@@ -449,7 +449,7 @@
 
                 // Create client with connection state callback for auto-reconnection
                 client = createPirClient(server1Url, server2Url);
-                client = new (await import('./src/index.js')).PirClient({
+                client = new (await import('./dist/index.js')).PirClient({
                     server1Url,
                     server2Url,
                     reconnect: {
