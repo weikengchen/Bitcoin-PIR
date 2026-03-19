@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bitcoin Batch PIR Web Client</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        h1 {
+            color: #333;
+            border-bottom: 3px solid #f7931a;
+            padding-bottom: 10px;
+        }
+        h2 {
+            color: #666;
+            margin-top: 30px;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+        .status.connected { background-color: #d4edda; color: #155724; }
+        .status.disconnected { background-color: #f8d7da; color: #721c24; }
+        .status.connecting { background-color: #fff3cd; color: #856404; }
+        .status.reconnecting { background-color: #ffeaa7; color: #856404; animation: pulse 1.5s infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+
+        button {
+            background-color: #f7931a;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            margin: 5px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        button:hover { background-color: #e0820e; }
+        button:disabled { background-color: #ccc; cursor: not-allowed; }
+        button.secondary { background-color: #6c757d; }
+        button.secondary:hover { background-color: #5a6268; }
+        button.small { padding: 5px 12px; font-size: 12px; margin: 2px; }
+
+        input[type="text"] {
+            padding: 8px;
+            margin: 5px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            width: 300px;
+        }
+        input[type="text"].small { width: 200px; }
+
+        textarea {
+            padding: 8px;
+            margin: 5px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            width: 95%;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            resize: vertical;
+        }
+
+        label {
+            display: block;
+            margin: 10px 0 5px 0;
+            font-weight: bold;
+        }
+
+        .result {
+            background-color: #f8f9fa;
+            padding: 15px;
+            border-radius: 4px;
+            margin: 10px 0;
+            font-family: 'Courier New', Consolas, monospace;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        .step {
+            margin: 20px 0;
+            padding: 15px;
+            border-left: 4px solid #f7931a;
+            background-color: #fff8f0;
+        }
+        .step-number { font-weight: bold; color: #f7931a; }
+
+        .log {
+            background-color: #1e1e1e;
+            color: #d4d4d4;
+            padding: 15px;
+            border-radius: 4px;
+            max-height: 300px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+        }
+        .log-entry { margin: 5px 0; }
+        .log-entry.error { color: #f48771; }
+        .log-entry.success { color: #89d185; }
+        .log-entry.info { color: #4fc1ff; }
+
+        .progress-container { margin: 15px 0; display: none; }
+        .progress-container.active { display: block; }
+        .progress-bar { height: 24px; background-color: #e9ecef; border-radius: 4px; overflow: hidden; }
+        .progress-fill {
+            height: 100%; background-color: #f7931a; transition: width 0.3s;
+            display: flex; align-items: center; justify-content: center;
+            color: white; font-size: 12px; font-weight: bold;
+        }
+        .progress-label { font-size: 13px; color: #666; margin-top: 4px; }
+
+        .utxo-section { margin-top: 20px; border-top: 2px solid #f7931a; padding-top: 20px; }
+        .utxo-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
+        .utxo-table { width: 100%; border-collapse: collapse; font-family: monospace; font-size: 13px; }
+        .utxo-table th { background-color: #f7931a; color: white; padding: 10px; text-align: left; }
+        .utxo-table td { padding: 8px 10px; border-bottom: 1px solid #ddd; }
+        .utxo-table tr:nth-child(even) { background-color: #f9f9f9; }
+        .utxo-table tr:hover { background-color: #fff3e0; }
+        .pagination-controls { display: flex; justify-content: center; align-items: center; margin: 20px 0; gap: 10px; }
+        .pagination-info { font-size: 14px; color: #666; margin: 0 15px; }
+        .hidden { display: none; }
+        .amount-btc { color: #28a745; font-weight: bold; }
+        .txid-link { color: #0066cc; font-family: monospace; font-size: 11px; word-break: break-all; text-decoration: none; }
+        .txid-link:hover { text-decoration: underline; color: #004499; }
+        .server-row { display: flex; align-items: center; gap: 10px; margin: 5px 0; }
+        .server-label { width: 80px; font-weight: normal; }
+
+        .summary-box {
+            background: linear-gradient(135deg, #fff8f0, #fff3e0);
+            border: 2px solid #f7931a; border-radius: 8px; padding: 20px; margin: 15px 0; display: none;
+        }
+        .summary-box.active { display: block; }
+        .summary-stat { display: inline-block; margin: 5px 20px 5px 0; }
+        .summary-stat .label { font-size: 12px; color: #666; text-transform: uppercase; }
+        .summary-stat .value { font-size: 18px; font-weight: bold; color: #333; }
+        .summary-stat .value.btc { color: #f7931a; }
+
+        .examples { margin-top: 10px; }
+        .example-btn {
+            background-color: #e9ecef; color: #333; border: 1px solid #ccc;
+            padding: 4px 10px; margin: 3px; border-radius: 3px; cursor: pointer;
+            font-size: 11px; font-family: monospace;
+        }
+        .example-btn:hover { background-color: #dee2e6; }
+        .example-label { font-size: 12px; color: #888; margin-right: 5px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Bitcoin Batch PIR Web Client</h1>
+        <p>
+            Two-level Batch PIR protocol for private UTXO lookups.
+            Level 1 queries the index, Level 2 fetches chunk data across multiple rounds.
+            Enter one or more scriptPubKeys (one per line) to query their UTXOs privately.
+        </p>
+
+        <div id="status" class="status disconnected">
+            Status: Disconnected
+        </div>
+
+        <div class="step">
+            <span class="step-number">Step 1:</span> Configure & Connect to Batch PIR Servers
+            <br><br>
+            <div class="server-row">
+                <span class="server-label">Server 0:</span>
+                <input type="text" id="server0Url" class="small" value="wss://dpf1.chenweikeng.com">
+            </div>
+            <div class="server-row">
+                <span class="server-label">Server 1:</span>
+                <input type="text" id="server1Url" class="small" value="wss://dpf2.chenweikeng.com">
+            </div>
+            <br>
+            <button id="connectBtn">Connect</button>
+            <button id="disconnectBtn" disabled>Disconnect</button>
+        </div>
+
+        <div class="step">
+            <span class="step-number">Step 2:</span> Query by ScriptPubKey(s)
+            <br><br>
+            <label for="scriptPubkeys">ScriptPubKey(s) — hex, one per line:</label>
+            <textarea id="scriptPubkeys" rows="5" placeholder="Enter one or more scriptPubKey hex values, one per line...">76a914a29bf2fc34b535edb02b96f063455b8e8078080588ac
+0014c6bc6c8d37de54b7c1d0fec69955f3dd73a3c5e5</textarea>
+            <br>
+            <div class="examples">
+                <span class="example-label">Quick examples (click to load single):</span>
+                <button class="example-btn" data-spk="76a914a29bf2fc34b535edb02b96f063455b8e8078080588ac">P2PKH</button>
+                <button class="example-btn" data-spk="00144522913e82e993d58b43dad11509c7efad5c2807">P2WPKH</button>
+                <button class="example-btn" data-spk="a9149829c4fd3fa5964ac2bdddea5317739039f3f9c487">P2SH</button>
+                <button class="example-btn" data-spk="5120fbf447d976a801008e0d2481cc8e21e34e401eca5ef65562a87263c1e25ae902">P2TR</button>
+                <br><br>
+                <span class="example-label">Batch test (from 1000 known scriptPubKeys):</span>
+                <button class="example-btn" id="pickRandomBtn" style="background-color: #d4edda; border-color: #28a745; padding: 6px 14px; font-size: 13px;">Pick 50 random</button>
+                <button class="example-btn" id="pickRandom10Btn" style="background-color: #e2e3f1; border-color: #6c757d;">Pick 10 random</button>
+                <button class="example-btn" id="pickRandom5Btn" style="background-color: #e2e3f1; border-color: #6c757d;">Pick 5 random</button>
+            </div>
+            <br>
+            <button id="queryBtn">Query UTXOs</button>
+        </div>
+
+        <!-- Progress -->
+        <div id="progressContainer" class="progress-container">
+            <div class="progress-bar">
+                <div id="progressFill" class="progress-fill" style="width: 0%"></div>
+            </div>
+            <div id="progressLabel" class="progress-label"></div>
+        </div>
+
+        <!-- Results container — one per queried scriptPubKey -->
+        <div id="resultsContainer"></div>
+
+        <h2>Log</h2>
+        <div id="log" class="log">
+            <div class="log-entry info">Waiting for connection...</div>
+        </div>
+    </div>
+
+    <script type="module">
+        import { BatchPirClient, hexToBytes, bytesToHex, scriptHash, scriptPubKeyToAddress } from './src/index.ts';
+        import EXAMPLE_SPKS from './src/example_spks.json';
+
+        let client = null;
+
+        /** Pick n random elements from an array (Fisher-Yates shuffle, take first n) */
+        function pickRandom(arr, n) {
+            const copy = [...arr];
+            for (let i = copy.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [copy[i], copy[j]] = [copy[j], copy[i]];
+            }
+            return copy.slice(0, Math.min(n, copy.length));
+        }
+
+        function log(message, type = 'info') {
+            const logDiv = document.getElementById('log');
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${type}`;
+            entry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+            logDiv.appendChild(entry);
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+
+        function setButtons(connected) {
+            document.getElementById('connectBtn').disabled = connected;
+            document.getElementById('disconnectBtn').disabled = !connected;
+        }
+
+        function setProgress(percent, label) {
+            const container = document.getElementById('progressContainer');
+            const fill = document.getElementById('progressFill');
+            const lbl = document.getElementById('progressLabel');
+            container.classList.add('active');
+            fill.style.width = `${percent}%`;
+            fill.textContent = percent > 10 ? `${Math.round(percent)}%` : '';
+            lbl.textContent = label;
+        }
+
+        function hideProgress() {
+            document.getElementById('progressContainer').classList.remove('active');
+        }
+
+        function formatBtc(sats) {
+            return (Number(sats) / 100_000_000).toFixed(8);
+        }
+
+        function txidToReversedHex(txid) {
+            return Array.from(txid).reverse().map(b => b.toString(16).padStart(2, '0')).join('');
+        }
+
+        /**
+         * Render a single query result into the results container.
+         */
+        function renderResult(container, spkHex, hashHex, result) {
+            const section = document.createElement('div');
+            section.className = 'container';
+            section.style.marginTop = '15px';
+
+            const address = scriptPubKeyToAddress(spkHex);
+            const displayName = address || spkHex.substring(0, 20) + '...';
+            const addressLink = address
+                ? `<a href="https://mempool.space/address/${address}" target="_blank" style="color: #0066cc; text-decoration: none; font-family: monospace;">${address}</a>`
+                : `<span style="font-family: monospace; font-size: 12px; color: #666;">${spkHex}</span>`;
+
+            if (!result) {
+                section.innerHTML = `
+                    <h2 style="color:#dc3545; margin-top:0;">Not Found</h2>
+                    <p>${addressLink}</p>
+                    <p style="color: #999;">No UTXOs found for this address.</p>
+                `;
+                container.appendChild(section);
+                return;
+            }
+
+            const totalBtc = formatBtc(result.totalSats);
+
+            // Header with address and summary
+            section.innerHTML = `
+                <div style="display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap;">
+                    <h2 style="margin-top:0;">${addressLink}</h2>
+                </div>
+                <div style="display: flex; gap: 30px; flex-wrap: wrap; margin-bottom: 10px;">
+                    <div><span style="color: #888; font-size: 13px;">Balance</span><br><span style="font-size: 18px; font-weight: bold; color: #f7931a;">${totalBtc} BTC</span></div>
+                    <div><span style="color: #888; font-size: 13px;">Sats</span><br><span style="font-size: 16px; font-weight: bold;">${result.totalSats.toLocaleString()}</span></div>
+                    <div><span style="color: #888; font-size: 13px;">UTXOs</span><br><span style="font-size: 16px; font-weight: bold;">${result.entries.length}</span></div>
+                </div>
+            `;
+
+            if (result.entries.length > 0) {
+                const PAGE_SIZE = 20;
+                let currentPage = 0;
+                const entries = result.entries;
+                const totalPages = Math.ceil(entries.length / PAGE_SIZE);
+
+                const tableHtml = `
+                    <table class="utxo-table">
+                        <thead>
+                            <tr>
+                                <th>#</th>
+                                <th style="min-width:280px;">TXID</th>
+                                <th>Vout</th>
+                                <th>Amount (sats)</th>
+                                <th>Amount (BTC)</th>
+                            </tr>
+                        </thead>
+                        <tbody class="utxo-tbody"></tbody>
+                    </table>
+                    <div class="pagination-controls">
+                        <button class="prev-btn" disabled>&#9664; PREV</button>
+                        <span class="page-info">Page 1 of ${totalPages}</span>
+                        <button class="next-btn" ${totalPages <= 1 ? 'disabled' : ''}>NEXT &#9654;</button>
+                    </div>
+                `;
+                const tableDiv = document.createElement('div');
+                tableDiv.className = 'utxo-section';
+                tableDiv.style.borderTop = 'none';
+                tableDiv.innerHTML = tableHtml;
+                section.appendChild(tableDiv);
+
+                const tbody = tableDiv.querySelector('.utxo-tbody');
+                const pageInfoEl = tableDiv.querySelector('.page-info');
+                const prevBtn = tableDiv.querySelector('.prev-btn');
+                const nextBtn = tableDiv.querySelector('.next-btn');
+
+                function renderPage(page) {
+                    currentPage = page;
+                    const start = page * PAGE_SIZE;
+                    const end = Math.min(start + PAGE_SIZE, entries.length);
+                    tbody.innerHTML = '';
+                    for (let i = start; i < end; i++) {
+                        const e = entries[i];
+                        const txidHex = txidToReversedHex(e.txid);
+                        const row = document.createElement('tr');
+                        row.innerHTML = `
+                            <td>${i + 1}</td>
+                            <td><a href="https://mempool.space/tx/${txidHex}" target="_blank" class="txid-link">${txidHex}</a></td>
+                            <td>${e.vout}</td>
+                            <td>${e.amount.toLocaleString()}</td>
+                            <td class="amount-btc">${formatBtc(e.amount)} BTC</td>
+                        `;
+                        tbody.appendChild(row);
+                    }
+                    pageInfoEl.textContent = `Page ${page + 1} of ${totalPages}`;
+                    prevBtn.disabled = page === 0;
+                    nextBtn.disabled = page >= totalPages - 1;
+                }
+
+                prevBtn.addEventListener('click', () => renderPage(currentPage - 1));
+                nextBtn.addEventListener('click', () => renderPage(currentPage + 1));
+                renderPage(0);
+            }
+
+            container.appendChild(section);
+        }
+
+        async function connect() {
+            const server0Url = document.getElementById('server0Url').value.trim();
+            const server1Url = document.getElementById('server1Url').value.trim();
+
+            if (!server0Url || !server1Url) {
+                log('Please enter both server URLs', 'error');
+                return;
+            }
+
+            try {
+                log(`Connecting to servers...`);
+
+                client = new BatchPirClient({
+                    server0Url,
+                    server1Url,
+                    onConnectionStateChange: (state, message) => {
+                        log(`Connection: ${state}${message ? ' - ' + message : ''}`,
+                            state === 'connected' ? 'success' :
+                            state === 'disconnected' ? 'error' : 'info');
+
+                        const statusDiv = document.getElementById('status');
+                        statusDiv.textContent = `Status: ${state.charAt(0).toUpperCase() + state.slice(1)}${message ? ' - ' + message : ''}`;
+                        statusDiv.className = `status ${state}`;
+
+                        if (state === 'connected') setButtons(true);
+                        else if (state === 'disconnected') setButtons(false);
+                    },
+                    onLog: (msg, level) => log(msg, level),
+                });
+
+                await client.connect();
+            } catch (error) {
+                log(`Connection failed: ${error.message}`, 'error');
+                client = null;
+            }
+        }
+
+        function disconnect() {
+            if (client) {
+                client.disconnect();
+                client = null;
+                log('Disconnected', 'info');
+                setButtons(false);
+            }
+            document.getElementById('resultsContainer').innerHTML = '';
+        }
+
+        async function queryUtxos() {
+            if (!client || !client.isConnected()) {
+                log('Not connected. Connecting first...', 'info');
+                await connect();
+                if (!client) return;
+            }
+
+            const textarea = document.getElementById('scriptPubkeys');
+            const lines = textarea.value.trim().split('\n')
+                .map(l => l.trim())
+                .filter(l => l.length > 0);
+
+            if (lines.length === 0) {
+                log('Please enter at least one scriptPubKey', 'error');
+                return;
+            }
+
+            // Reset results
+            const resultsContainer = document.getElementById('resultsContainer');
+            resultsContainer.innerHTML = '';
+            document.getElementById('queryBtn').disabled = true;
+
+            const N = lines.length;
+            log(`Starting batched query for ${N} addresses...`, 'info');
+
+            try {
+                // Compute all script hashes up front
+                const scriptHashes = lines.map(spkHex => scriptHash(hexToBytes(spkHex)));
+
+                setProgress(5, `Batching ${N} queries...`);
+
+                // One batched call — all queries packed into shared batches
+                const results = await client.queryBatch(scriptHashes, (step, detail) => {
+                    let pct = 5;
+                    if (step === 'Level 1') pct = 15;
+                    else if (step === 'Level 2') pct = 50;
+                    else if (step === 'Decode') pct = 90;
+                    setProgress(pct, `${step}: ${detail}`);
+                });
+
+                // Render all results
+                let found = 0;
+                for (let qi = 0; qi < N; qi++) {
+                    const spkHex = lines[qi];
+                    const hashHex = bytesToHex(scriptHashes[qi]);
+                    const result = results[qi];
+                    if (result) found++;
+                    renderResult(resultsContainer, spkHex, hashHex, result);
+                }
+
+                setProgress(100, `Done! ${found}/${N} addresses found`);
+                setTimeout(hideProgress, 2000);
+                log(`Batch complete: ${found}/${N} found`, 'success');
+            } catch (error) {
+                log(`Batch error: ${error.message}`, 'error');
+                setProgress(0, '');
+                hideProgress();
+            }
+
+            document.getElementById('queryBtn').disabled = false;
+        }
+
+        // ─── Example buttons ─────────────────────────────────────────────
+        document.querySelectorAll('.example-btn[data-spk]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                document.getElementById('scriptPubkeys').value = btn.dataset.spk;
+            });
+        });
+
+        document.getElementById('pickRandomBtn').addEventListener('click', () => {
+            document.getElementById('scriptPubkeys').value = pickRandom(EXAMPLE_SPKS, 50).join('\n');
+        });
+        document.getElementById('pickRandom10Btn').addEventListener('click', () => {
+            document.getElementById('scriptPubkeys').value = pickRandom(EXAMPLE_SPKS, 10).join('\n');
+        });
+        document.getElementById('pickRandom5Btn').addEventListener('click', () => {
+            document.getElementById('scriptPubkeys').value = pickRandom(EXAMPLE_SPKS, 5).join('\n');
+        });
+
+        // ─── Main buttons ────────────────────────────────────────────────
+        document.getElementById('connectBtn').addEventListener('click', connect);
+        document.getElementById('disconnectBtn').addEventListener('click', disconnect);
+        document.getElementById('queryBtn').addEventListener('click', queryUtxos);
+
+        setButtons(false);
+    </script>
+</body>
+</html>

@@ -16,7 +16,7 @@
 //! [1 byte: variant] [variant-specific fields...]
 //! ```
 
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 
 use crate::database::DatabaseInfo;
 
@@ -317,12 +317,6 @@ impl Response {
 /// Encode a u32 in little-endian
 #[inline]
 fn encode_u32<W: Write>(w: &mut W, value: u32) -> io::Result<()> {
-    w.write_all(&value.to_le_bytes())
-}
-
-/// Encode a u64 in little-endian
-#[inline]
-fn encode_u64<W: Write>(w: &mut W, value: u64) -> io::Result<()> {
     w.write_all(&value.to_le_bytes())
 }
 

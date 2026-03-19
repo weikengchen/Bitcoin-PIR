@@ -1,6 +1,6 @@
 //! Build UTXO chunks from gen2 UTXO set with bin-packing (multi-pass partitioned)
 //!
-//! Reads `/Volumes/Bitcoin/data/utxo_set.bin` (64-byte entries),
+//! Reads `/Volumes/Bitcoin/data/utxo_set.bin` (68-byte entries),
 //! groups entries by HASH160 script hash, and writes compact output to:
 //! - `/Volumes/Bitcoin/data/utxo_chunks.bin`       — compact UTXO data by address
 //! - `/Volumes/Bitcoin/data/utxo_chunks_index.bin`  — index (script_hash → offset)
@@ -15,11 +15,12 @@
 //! - Pack entries starting with largest, filling blocks optimally
 //! - Large entries (> block size) span multiple blocks
 //!
-//! Input entry format (64 bytes each):
+//! Input entry format (68 bytes each):
 //!   [0..20)  HASH160 script hash (20 bytes)
 //!   [20..52) Full TXID (32 bytes)
 //!   [52..56) vout  (u32 LE)
 //!   [56..64) amount (u64 LE)
+//!   [64..68) height (u32 LE)
 //!
 //! Output chunk format (utxo_chunks.bin):
 //!   For each group (no script_hash prefix — use the index to find groups):
@@ -71,7 +72,7 @@ const CHUNKS_FILE_SMALL: &str = "/Volumes/Bitcoin/data/utxo_chunks_small.bin";
 const INDEX_FILE_SMALL: &str = "/Volumes/Bitcoin/data/utxo_chunks_index_small.bin";
 
 /// Size of each input entry in bytes
-const ENTRY_SIZE: usize = 64;
+const ENTRY_SIZE: usize = 68;
 
 /// Size of the HASH160 script hash
 const SCRIPT_HASH_SIZE: usize = 20;

@@ -8,11 +8,12 @@
 //! txid_locations — it stores the full 32-byte TXID directly and uses
 //! HASH160 (RIPEMD160(SHA256(scriptPubKey))) instead of bare RIPEMD160.
 //!
-//! Output format per UTXO (64 bytes):
+//! Output format per UTXO (68 bytes):
 //!   [0..20)   HASH160 of scriptPubKey (20 bytes) — RIPEMD160(SHA256(script))
 //!   [20..52)  Full TXID (32 bytes)
 //!   [52..56)  vout (u32 little-endian)
 //!   [56..64)  amount in satoshis (u64 little-endian)
+//!   [64..68)  block height (u32 little-endian)
 //!
 //! Usage:
 //!   gen_1_utxo_set <utxo_snapshot_file>
@@ -33,21 +34,23 @@ use txoutset::Dump;
 const OUTPUT_FILE: &str = "/Volumes/Bitcoin/data/utxo_set.bin";
 
 /// Size of each output entry in bytes
-const ENTRY_SIZE: u64 = 64;
+const ENTRY_SIZE: u64 = 68;
 
 /// Write a single UTXO entry to the output file
-/// Format: hash160 (20B) + txid (32B) + vout (4B) + amount (8B) = 64 bytes
+/// Format: hash160 (20B) + txid (32B) + vout (4B) + amount (8B) + height (4B) = 68 bytes
 fn write_utxo_entry(
     writer: &mut BufWriter<File>,
     script_hash: &[u8; 20],
     txid: &[u8; 32],
     vout: u32,
     amount: u64,
+    height: u32,
 ) -> io::Result<()> {
     writer.write_all(script_hash)?;
     writer.write_all(txid)?;
     writer.write_all(&vout.to_le_bytes())?;
     writer.write_all(&amount.to_le_bytes())?;
+    writer.write_all(&height.to_le_bytes())?;
     Ok(())
 }
 
@@ -138,8 +141,10 @@ fn process_utxo_snapshot(snapshot_path: &Path) -> Result<(), String> {
         let hash160 = ripemd160::Hash::hash(&sha256_hash.to_byte_array());
         let script_hash_array: [u8; 20] = hash160.to_byte_array();
 
+        let height = txout.height;
+
         // Write UTXO entry
-        if let Err(e) = write_utxo_entry(&mut writer, &script_hash_array, &txid_bytes, vout, amount)
+        if let Err(e) = write_utxo_entry(&mut writer, &script_hash_array, &txid_bytes, vout, amount, height)
         {
             return Err(format!("Failed to write UTXO entry: {}", e));
         }

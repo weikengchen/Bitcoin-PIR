@@ -1,0 +1,61 @@
+[package]
+name = "build_batchdb"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "gen_0a_utxo_stats"
+path = "src/utxo_stats.rs"
+
+[[bin]]
+name = "gen_0b_index_stats"
+path = "src/index_stats.rs"
+
+[[bin]]
+name = "gen_1_build_utxo_chunks"
+path = "src/build_utxo_chunks.rs"
+
+[[bin]]
+name = "gen_2_build_index_cuckoo"
+path = "src/main.rs"
+
+[[bin]]
+name = "gen_3_verify_index_cuckoo"
+path = "src/verify.rs"
+
+[[bin]]
+name = "gen_4_extract_test_queries"
+path = "src/extract_test_queries.rs"
+
+[[bin]]
+name = "gen_5_assign_queries"
+path = "src/assign_queries.rs"
+
+[[bin]]
+name = "gen_6_test_index_pir"
+path = "src/test_batch_pir.rs"
+
+[[bin]]
+name = "gen_7_build_chunk_cuckoo"
+path = "src/build_chunk_cuckoo.rs"
+
+[[bin]]
+name = "gen_8_verify_chunk_cuckoo"
+path = "src/verify_chunk_cuckoo.rs"
+
+[[bin]]
+name = "gen_9_plan_chunk_rounds"
+path = "src/plan_chunk_rounds.rs"
+
+[[bin]]
+name = "gen_9b_assign_chunk_queries"
+path = "src/assign_chunk_queries.rs"
+
+[[bin]]
+name = "gen_10_test_chunk_pir"
+path = "src/test_chunk_pir_batched.rs"
+
+[dependencies]
+memmap2 = "0.9"
+rayon = "1.10"
+libdpf = { git = "https://github.com/weikengchen/libdpf.git" }
