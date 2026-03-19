@@ -6,27 +6,14 @@ license = "MIT"
 
 [dependencies]
 bitcoin = "0.32.7"
-secp256k1 = { version = "0.29", features = ["global-context"] }
-bitcoin-bip158 = "0.0.0"
 tokio = { version = "1.35", features = ["full"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 hex = "0.4"
-bincode = "1.3"
 log = "0.4.*"
-rayon = { version=">=1.0", optional = true }
-crossbeam-utils = { version=">=0.7.2, <0.9", optional = true }
-wyhash = ">=0.3, <=0.5"
 memmap2 = "0.9"
 txoutset = "0.4"
 
-# Bitcoin block reader dependencies
-brk_reader = "0.1"
-brk_rpc = "0.1"
-
 [dev-dependencies]
 tempfile = "3.8"
-quickcheck = "1.0.2"
 
 [profile.release]
 opt-level = 3
@@ -52,8 +39,3 @@ lto = "thin"
 incremental = true
 debug-assertions = true
 debug = true
-
-[features]
-default = ["parallel", "serde"]
-parallel = ["rayon", "crossbeam-utils"]
-serde = []

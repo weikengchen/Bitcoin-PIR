@@ -1,68 +1,41 @@
 # Bitcoin PIR Scripts
 
-This directory contains scripts for data acquisition, indexing, and querying.
+Helper scripts for running and testing the PIR system.
 
-## Index Scripts (Phase 1.5)
+## Scripts
 
-### index_blocks.py
-Creates global indices for transactions and ScriptPubKeys from a local Bitcoin node.
+### `start_pir_servers.sh`
 
-**Usage**:
+Starts two DPF-PIR WebSocket servers for UTXO lookups.
+
 ```bash
-python3 scripts/index_blocks.py --rpc-user <user> --rpc-password <pass> --count 100 --from-tip
+# Start servers on ports 8091 and 8092 (full database)
+./scripts/start_pir_servers.sh
+
+# Start with small database (whale addresses excluded)
+./scripts/start_pir_servers.sh --small
 ```
 
-**Features**:
-- Fetches blocks via Bitcoin Core JSON-RPC
-- Assigns sequential 4-byte global TXIDs (independent of block boundaries)
-- Assigns sequential 2-byte global ScriptPubKey IDs
-- Creates binary index files:
-  - `tx_global_index.bin` (18 bytes per transaction)
-  - `spk_global_index.bin` (variable length per SPK)
-  - `spk_global_lookup.bin` (34 bytes per unique SPK)
-  - `index_meta.json` (metadata and statistics)
+The script builds the `server` binary, kills any existing servers on the configured ports, and starts two background server processes. Press Ctrl+C to stop both.
 
-**Requirements**:
-- Bitcoin Core node running with RPC enabled
-- Node synced to blockchain
-- RPC credentials (username and password)
+Server logs are written to `/tmp/pir_server1.log` and `/tmp/pir_server2.log`.
 
-### query_index.py
-Queries the generated indices to verify correctness and test lookups.
+### `test_lookup_pir.sh`
 
-**Usage**:
+Tests the PIR lookup client with example scriptPubKey queries.
+
 ```bash
-# Show index summary
-python3 scripts/query_index.py --summary
-
-# Get transaction by global ID
-python3 scripts/query_index.py --get-tx 42
-
-# List transactions
-python3 scripts/query_index.py --get-all-tx
-
-# Get ScriptPubKey by ID
-python3 scripts/query_index.py --get-spk 10
-
-# Get ScriptPubKey ID by hex
-python3 scripts/query_index.py --get-spk-by-hex <spk_hex>
+./scripts/test_lookup_pir.sh
 ```
 
-## Deprecated Scripts (Phase 1 - API-based)
+Builds the `lookup_pir` binary and runs a test query against servers at `ws://127.0.0.1:8091` and `ws://127.0.0.1:8092`.
 
-### fetch_blocks.py.broken
-Original blockchain.info API fetcher. Broken due to API rate limiting.
+### `get_random_hash.sh`
 
-### fetch_blocks_v2.py
-BlockCypher API fetcher. Partially successful (91 blocks), then rate limited. Deprecated in favor of local node approach.
+Samples random entries from the cuckoo hash table for debugging.
 
-### continue_fetch.py
-Attempted to continue fetching from BlockCypher after rate limit. Unsuccessful.
+```bash
+./scripts/get_random_hash.sh
+```
 
-## PIR Scripts (Phases 2-4, To Be Created)
-
-### pir_client.py
-Client for querying PIR server (to be created in Phase 2/3)
-
-### pir_server.py
-PIR server implementation (to be created in Phase 2/3)
+Reads random 20-byte keys from the cuckoo database file at `/Volumes/Bitcoin/pir/utxo_chunks_cuckoo.bin`.

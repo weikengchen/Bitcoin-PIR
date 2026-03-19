@@ -18,3 +18,6 @@ block_tx_counts.bin
 data/*.bin
 data/*.dat
 *.log
+
+# Claude Code
+.claude/

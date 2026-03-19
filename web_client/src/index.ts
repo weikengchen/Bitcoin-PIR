@@ -1,6 +1,6 @@
 /**
  * Bitcoin PIR Web Client
- * 
+ *
  * Main entry point for the Bitcoin PIR web client library
  */
 
@@ -8,7 +8,7 @@
 import { Buffer } from 'buffer';
 if (typeof window !== 'undefined') {
   (window as any).Buffer = Buffer;
-  
+
   // Polyfill crypto.randomBytes for browser environment
   // This is needed by libdpf for random key generation
   if (!(window as any).crypto) {
@@ -41,9 +41,7 @@ export {
   cuckooHash1,
   cuckooHash2,
   cuckooLocations,
-  txidMappingHash1,
-  txidMappingHash2,
-  txidMappingLocations,
+  sha256,
   ripemd160,
   scriptHash,
   reverseBytes,
@@ -63,15 +61,11 @@ export {
 export {
   CUCKOO_DB_ID,
   CHUNKS_DB_ID,
-  TXID_MAPPING_DB_ID,
   CUCKOO_NUM_BUCKETS,
   CUCKOO_BUCKET_SIZE,
   CUCKOO_ENTRY_SIZE,
   CHUNKS_NUM_ENTRIES,
   CHUNK_SIZE,
-  TXID_MAPPING_NUM_BUCKETS,
-  TXID_MAPPING_BUCKET_SIZE,
-  TXID_MAPPING_ENTRY_SIZE,
   DEFAULT_HASH1_SEED,
   DEFAULT_HASH1_PRIME,
   DEFAULT_HASH2_SEED,

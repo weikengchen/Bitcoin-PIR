@@ -1,12 +1,8 @@
-# Web Frontend Implementation Plan for Bitcoin PIR
+# Web Client & WebSocket Protocol
 
-## Executive Summary
+## Overview
 
-**Status: ✅ WEBSOCKET IMPLEMENTATION COMPLETE**
-
-The PIR system now uses **WebSocket only** for both server and client communication. This enables direct browser client connections.
-
----
+The PIR system uses WebSocket for all client-server communication. This enables direct browser connections without any intermediary.
 
 ## Architecture
 
@@ -20,7 +16,7 @@ The PIR system now uses **WebSocket only** for both server and client communicat
 │  │  For Browser/JS Clients and Rust Clients                │   │
 │  │  - Persistent connection                                │   │
 │  │  - Multiple queries per conn                            │   │
-│  │  - Binary bincode protocol                              │   │
+│  │  - Simple Binary Protocol                               │   │
 │  └───────────────────────────┬─────────────────────────────┘   │
 │                              │                                  │
 │                              ▼                                  │
@@ -37,37 +33,31 @@ The PIR system now uses **WebSocket only** for both server and client communicat
 │           │      Database Registry          │                  │
 │           │  - utxo_cuckoo_index            │                  │
 │           │  - utxo_chunks_data             │                  │
-│           │  - utxo_4b_to_32b               │                  │
 │           └─────────────────────────────────┘                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
----
-
-## Current Implementation
-
-### File Structure
+## File Structure
 
 ```
 dpf_pir/src/
 ├── bin/
 │   ├── server.rs          # WebSocket server
-│   └── lookup_pir.rs      # WebSocket client
+│   └── lookup_pir.rs      # WebSocket CLI client
 ├── websocket.rs           # WebSocket protocol handler
+├── pir_protocol.rs        # Simple Binary Protocol codec
 ├── protocol.rs            # Request/Response types
 └── ...
+
+web_client/src/
+├── client.ts              # Browser WebSocket PIR client
+├── dpf.ts                 # DPF key generation
+├── hash.ts                # HASH160, cuckoo hash functions
+├── constants.ts           # Database IDs and parameters
+├── bincode.ts             # Binary serialization
+├── sbp.ts                 # Simple Binary Protocol codec
+└── index.ts               # Main entry point
 ```
-
-### Dependencies
-
-```toml
-# dpf_pir/Cargo.toml
-[dependencies]
-tokio-tungstenite = "0.21"
-futures-util = "0.3"
-```
-
----
 
 ## Running the System
 
@@ -81,34 +71,41 @@ This starts two WebSocket servers:
 - Server 1: `ws://localhost:8091`
 - Server 2: `ws://localhost:8092`
 
-### Test Client
+### Web Client (Development)
 
 ```bash
-./scripts/test_lookup_pir.sh
+cd web_client
+npm install
+npx vite --port 8080
 ```
 
----
+### Web Client (Production Build)
+
+```bash
+cd web_client
+npm run build-web
+# Output in dist-web/, deploy to static hosting
+```
 
 ## WebSocket Protocol
 
 ### Message Format
 
-All messages are **binary** using bincode serialization:
+All messages use the Simple Binary Protocol (SBP) — a compact binary format:
 
-**Request:**
-- `QueryDatabase { database_id, dpf_key1, dpf_key2 }`
-- `QueryDatabaseSingle { database_id, dpf_key }`
-- `ListDatabases`
-- `GetDatabaseInfo { database_id }`
-- `Ping`
+**Request Types:**
+- `Ping` — `[0x01]`
+- `ListDatabases` — `[0x03]`
+- `GetDatabaseInfo` — `[0x05][db_id_len:u16][db_id:bytes]`
+- `QueryDatabaseSingle` — `[0x07][query_data...]`
+- `QueryDatabase` — `[0x07][query_data...]` (two DPF keys)
 
-**Response:**
-- `QueryResult { data: Vec<u8> }`
-- `QueryTwoResults { data1, data2 }`
-- `DatabaseList { databases }`
-- `DatabaseInfo { info }`
-- `Error { message }`
-- `Pong`
+**Response Types:**
+- `Pong` — `[0x02]`
+- `DatabaseList` — `[0x04][count:u32][entries...]`
+- `DatabaseInfo` — `[0x06][info_data...]`
+- `QueryResult` — `[0x08][response_data...]`
+- `Error` — `[0xFF][error_message]`
 
 ### Connection Lifecycle
 
@@ -117,67 +114,70 @@ Client                          Server
   │                               │
   │──── WebSocket Handshake ────▶│
   │                               │
-  │──── Binary Request ─────────▶│
-  │◀─── Binary Response ─────────│
+  │──── Ping ────────────────────▶│
+  │◀─── Pong ─────────────────────│
+  │                               │
+  │──── Query (DPF key) ────────▶│
+  │◀─── QueryResult ──────────────│
   │         ...                   │
   │                               │
-  │──── Close Frame ────────────▶│
-  │◀─── Close Frame ─────────────│
+  │──── Close Frame ─────────────▶│
+  │◀─── Close Frame ──────────────│
 ```
 
----
+### Heartbeat
 
-## JavaScript Client Implementation
+The web client sends periodic Ping messages to keep connections alive. Pong responses are handled by a central message dispatcher that routes them separately from query responses, preventing race conditions.
 
-### Components Needed
+## Two-Phase PIR Query
 
-| Component | Status | Notes |
-|-----------|--------|-------|
-| **DPF** | ✅ Available | `libdpf-ts` exists |
-| **Cuckoo Hash** | ✅ Implementable | Simple arithmetic |
-| **RIPEMD160** | ✅ Available | Web Crypto or `hash.js` |
-| **Bincode** | ⚠️ Needed | Implement subset |
-| **WebSocket** | ✅ Native | Browser built-in |
+### Phase 1: Cuckoo Index Lookup
 
-### Key Constants
+1. Client computes HASH160 = RIPEMD160(SHA256(scriptPubKey))
+2. Client computes two cuckoo bucket locations from the HASH160
+3. Client generates DPF keys targeting both locations
+4. Each server evaluates its DPF key across all buckets and XORs matching entries
+5. Client XORs both server responses to recover the bucket contents
+6. Client searches the bucket for the matching 20-byte HASH160 key
+7. The associated 4-byte value is the chunk offset (stored as byte_offset / 2)
+
+### Phase 2: Chunk Data Retrieval
+
+1. Client computes chunk_index = (offset * 2) / 32768
+2. Client generates DPF keys for the chunk index
+3. Servers evaluate and return XOR'd chunk data
+4. Client XORs responses to recover the 32KB chunk
+5. Client seeks to local_offset = (offset * 2) % 32768 within the chunk
+6. Client reads varint-encoded UTXO entries: [count][32B TXID + varint vout + varint amount] × count
+
+### Whale Address Detection
+
+If `entry_count == 0` (varint 0), the address is a "whale" excluded from the `--small` database variant. The client displays a notification instead of UTXO data.
+
+## Key Constants
 
 ```typescript
-const CUCKOO_DB_ID = "utxo_cuckoo_index";
-const CHUNKS_DB_ID = "utxo_chunks_data";
-const TXID_MAPPING_DB_ID = "utxo_4b_to_32b";
+// Database IDs
+CUCKOO_DB_ID = "utxo_cuckoo_index"
+CHUNKS_DB_ID = "utxo_chunks_data"
 
-const CUCKOO_NUM_BUCKETS = 15_385_139;
-const CHUNKS_NUM_ENTRIES = 33_038;
-const CHUNK_SIZE = 32 * 1024;
-const TXID_MAPPING_NUM_BUCKETS = 30_097_234;
+// Database parameters
+CUCKOO_NUM_BUCKETS = 15_385_139
+CUCKOO_ENTRY_SIZE = 24        // 20B key + 4B offset
+CUCKOO_BUCKET_SIZE = 4
+CHUNK_SIZE = 32_768            // 32KB
+CHUNKS_NUM_ENTRIES = 181_833   // normal (65_294 for small)
 ```
-
-### Example Browser Client
-
-```javascript
-const ws = new WebSocket('ws://localhost:8091');
-ws.binaryType = 'arraybuffer';
-
-ws.onopen = () => {
-    // Send bincode-serialized request
-    const request = encodeRequest({ Ping: {} });
-    ws.send(request);
-};
-
-ws.onmessage = (event) => {
-    const response = decodeResponse(event.data);
-    console.log('Response:', response);
-};
-```
-
----
 
 ## Implementation Checklist
 
 - [x] WebSocket server (`server.rs`)
-- [x] WebSocket client (`lookup_pir.rs`)
+- [x] WebSocket CLI client (`lookup_pir.rs`)
 - [x] WebSocket protocol handler (`websocket.rs`)
 - [x] Server startup script (`start_pir_servers.sh`)
 - [x] Test script (`test_lookup_pir.sh`)
-- [x] JavaScript/TypeScript web client library
-- [x] Browser demo HTML page
+- [x] TypeScript web client library
+- [x] Browser demo page with Vite bundling
+- [x] GitHub Pages deployment via GitHub Actions
+- [x] TLS support (native + Cloudflare Tunnel)
+- [x] Heartbeat with race-condition-safe message dispatch

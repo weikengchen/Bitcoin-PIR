@@ -5,13 +5,24 @@
 #   - Server 1 on port 8091
 #   - Server 2 on port 8092
 #
-# Browser clients can connect directly via WebSocket.
+# Usage:
+#   ./scripts/start_pir_servers.sh [--small]
+#
+# The --small flag uses the smaller database variant that excludes whale addresses.
 
 set -e
 
 # WebSocket Ports
 SERVER1_PORT=8091
 SERVER2_PORT=8092
+
+# Parse --small flag
+SMALL_FLAG=""
+for arg in "$@"; do
+    if [ "$arg" = "--small" ]; then
+        SMALL_FLAG="--small"
+    fi
+done
 
 # Get the script directory
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -31,7 +42,11 @@ echo ""
 echo "Databases configured in dpf_pir/src/server_config.rs:"
 echo "  - utxo_cuckoo_index (cuckoo hash)"
 echo "  - utxo_chunks_data (direct index)"
-echo "  - utxo_4b_to_32b (TXID mapping)"
+if [ -n "$SMALL_FLAG" ]; then
+    echo "  Mode: SMALL (whale addresses excluded)"
+else
+    echo "  Mode: FULL (all addresses included)"
+fi
 echo ""
 
 # Kill any existing servers on these ports
@@ -42,13 +57,13 @@ sleep 1
 
 # Start Server 1 in background
 echo "Starting WebSocket Server 1 on port $SERVER1_PORT..."
-RUST_LOG=info ./target/release/server --port $SERVER1_PORT > /tmp/pir_server1.log 2>&1 &
+RUST_LOG=info ./target/release/server --port $SERVER1_PORT $SMALL_FLAG > /tmp/pir_server1.log 2>&1 &
 SERVER1_PID=$!
 echo "Server 1 PID: $SERVER1_PID"
 
 # Start Server 2 in background
 echo "Starting WebSocket Server 2 on port $SERVER2_PORT..."
-RUST_LOG=info ./target/release/server --port $SERVER2_PORT > /tmp/pir_server2.log 2>&1 &
+RUST_LOG=info ./target/release/server --port $SERVER2_PORT $SMALL_FLAG > /tmp/pir_server2.log 2>&1 &
 SERVER2_PID=$!
 echo "Server 2 PID: $SERVER2_PID"
 
@@ -68,8 +83,8 @@ echo "Logs:"
 echo "  Server 1: /tmp/pir_server1.log"
 echo "  Server 2: /tmp/pir_server2.log"
 echo ""
-echo "To test, run:"
-echo "  ./scripts/test_lookup_pir.sh"
+echo "To test with CLI client:"
+echo "  ./target/release/lookup_pir <script_hex>"
 echo ""
 echo "Press Ctrl+C to stop all servers..."
 

@@ -1,9 +1,9 @@
 //! Build UTXO chunks from gen2 UTXO set with bin-packing (multi-pass partitioned)
 //!
-//! Reads `/Volumes/Bitcoin/data/gen2_utxo_set.bin` (64-byte entries),
+//! Reads `/Volumes/Bitcoin/data/utxo_set.bin` (64-byte entries),
 //! groups entries by HASH160 script hash, and writes compact output to:
-//! - `/Volumes/Bitcoin/data/gen2_utxo_chunks.bin`       — compact UTXO data by address
-//! - `/Volumes/Bitcoin/data/gen2_utxo_chunks_index.bin`  — index (script_hash → offset)
+//! - `/Volumes/Bitcoin/data/utxo_chunks.bin`       — compact UTXO data by address
+//! - `/Volumes/Bitcoin/data/utxo_chunks_index.bin`  — index (script_hash → offset)
 //!
 //! Uses a multi-pass partitioned approach to limit memory usage:
 //! - Entries are partitioned by `script_hash[0] % N`
@@ -21,7 +21,7 @@
 //!   [52..56) vout  (u32 LE)
 //!   [56..64) amount (u64 LE)
 //!
-//! Output chunk format (gen2_utxo_chunks.bin):
+//! Output chunk format (utxo_chunks.bin):
 //!   For each group (no script_hash prefix — use the index to find groups):
 //!     [varint entry_count]
 //!     For each entry (sorted by TXID descending, byte comparison):
@@ -29,7 +29,7 @@
 //!       [varint vout]
 //!       [varint amount]
 //!
-//! Output index format (gen2_utxo_chunks_index.bin):
+//! Output index format (utxo_chunks_index.bin):
 //!   For each group: [20B script_hash] [4B start_offset_half u32 LE]
 //!   NOTE: The stored offset is byte_offset / 2 (right-shifted by 1).
 //!   This doubles the addressable range to ~8.6GB, avoiding u32 overflow
@@ -43,13 +43,13 @@
 //!   `_small` suffix.
 //!
 //! Usage:
-//!   cargo run --bin gen2_2_utxo_chunks -- [block_size_kb] [--partitions N] [--small]
+//!   cargo run --bin gen_2_utxo_chunks -- [block_size_kb] [--partitions N] [--small]
 //!
 //! Examples:
-//!   cargo run --bin gen2_2_utxo_chunks                       # Default: 32KB blocks, 4 partitions
-//!   cargo run --bin gen2_2_utxo_chunks -- 64                 # 64KB blocks
-//!   cargo run --bin gen2_2_utxo_chunks -- 32 --partitions 8  # 8 partitions
-//!   cargo run --bin gen2_2_utxo_chunks -- 32 --small         # Small variant (exclude whales)
+//!   cargo run --bin gen_2_utxo_chunks                       # Default: 32KB blocks, 4 partitions
+//!   cargo run --bin gen_2_utxo_chunks -- 64                 # 64KB blocks
+//!   cargo run --bin gen_2_utxo_chunks -- 32 --partitions 8  # 8 partitions
+//!   cargo run --bin gen_2_utxo_chunks -- 32 --small         # Small variant (exclude whales)
 
 use bitcoinpir::utils;
 use memmap2::Mmap;
@@ -60,15 +60,15 @@ use std::io::{self, BufWriter, Write};
 use std::time::Instant;
 
 /// Input file path
-const INPUT_FILE: &str = "/Volumes/Bitcoin/data/gen2_utxo_set.bin";
+const INPUT_FILE: &str = "/Volumes/Bitcoin/data/utxo_set.bin";
 
 /// Output file paths (normal)
-const CHUNKS_FILE: &str = "/Volumes/Bitcoin/data/gen2_utxo_chunks.bin";
-const INDEX_FILE: &str = "/Volumes/Bitcoin/data/gen2_utxo_chunks_index.bin";
+const CHUNKS_FILE: &str = "/Volumes/Bitcoin/data/utxo_chunks.bin";
+const INDEX_FILE: &str = "/Volumes/Bitcoin/data/utxo_chunks_index.bin";
 
 /// Output file paths (small variant)
-const CHUNKS_FILE_SMALL: &str = "/Volumes/Bitcoin/data/gen2_utxo_chunks_small.bin";
-const INDEX_FILE_SMALL: &str = "/Volumes/Bitcoin/data/gen2_utxo_chunks_index_small.bin";
+const CHUNKS_FILE_SMALL: &str = "/Volumes/Bitcoin/data/utxo_chunks_small.bin";
+const INDEX_FILE_SMALL: &str = "/Volumes/Bitcoin/data/utxo_chunks_index_small.bin";
 
 /// Size of each input entry in bytes
 const ENTRY_SIZE: usize = 64;

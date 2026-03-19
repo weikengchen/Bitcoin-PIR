@@ -6,11 +6,6 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-#[cfg(test)]
-#[macro_use]
-extern crate quickcheck;
-
-pub mod mpfh;
 pub mod utils;
 
 pub struct BlockIndexer {

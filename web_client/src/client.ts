@@ -1,6 +1,6 @@
 /**
  * WebSocket client for Bitcoin PIR system
- * 
+ *
  * Handles communication with PIR servers via WebSocket protocol
  */
 
@@ -10,9 +10,6 @@ import {
   CUCKOO_NUM_BUCKETS,
   CHUNKS_NUM_ENTRIES,
   CHUNK_SIZE,
-  TXID_MAPPING_NUM_BUCKETS,
-  TXID_MAPPING_BUCKET_SIZE,
-  TXID_MAPPING_ENTRY_SIZE,
   KEY_SIZE,
 } from './constants.js';
 
@@ -23,7 +20,7 @@ export type { Request, Response } from './sbp.js';
  * A parsed UTXO entry
  */
 export interface UtxoEntry {
-  txid: number;  // 4-byte mapped TXID
+  txid: Uint8Array;  // 32-byte raw TXID
   vout: number;
   amount: bigint;
 }
@@ -40,15 +37,16 @@ export interface UtxoPaginationState {
   localOffset: number;       // Current position within the chunk
   entriesRead: number;       // Number of entries read so far
   chunksData: Map<number, Uint8Array>;  // Cached chunk data
+  isWhale: boolean;          // True if address has too many UTXOs for lightweight DB
 }
 
 /**
  * Connection state enum
  */
-export type ConnectionState = 
-  | 'disconnected' 
-  | 'connecting' 
-  | 'connected' 
+export type ConnectionState =
+  | 'disconnected'
+  | 'connecting'
+  | 'connected'
   | 'reconnecting';
 
 /**
@@ -96,8 +94,7 @@ export class PirClient {
   private config: PirClientConfig;
   private reconnectConfig: ReconnectConfig;
   private dpf = createDpf();
-  private pendingRequests: Map<number, (response: Response) => void> =
-    new Map();
+  private pendingResponses: Map<1 | 2, Array<(response: Response) => void>> = new Map();
   private requestCounter = 0;
 
   // Reconnection state
@@ -105,7 +102,7 @@ export class PirClient {
   private reconnectAttempts = 0;
   private reconnectTimers: Map<1 | 2, ReturnType<typeof setTimeout>> = new Map();
   private isIntentionalDisconnect = false;
-  
+
   // Heartbeat state
   private heartbeatTimers: Map<1 | 2, ReturnType<typeof setInterval>> = new Map();
   private heartbeatTimeoutTimers: Map<1 | 2, ReturnType<typeof setTimeout>> = new Map();
@@ -114,6 +111,46 @@ export class PirClient {
   constructor(config: PirClientConfig) {
     this.config = config;
     this.reconnectConfig = { ...DEFAULT_RECONNECT_CONFIG, ...config.reconnect };
+    this.pendingResponses.set(1, []);
+    this.pendingResponses.set(2, []);
+  }
+
+  /**
+   * Central message handler for a server's WebSocket.
+   * Routes responses to pending request callbacks in FIFO order.
+   * Pong responses from heartbeats are handled inline without consuming a pending callback.
+   */
+  private handleMessage(serverNum: 1 | 2, event: MessageEvent): void {
+    try {
+      const response = decodeResponse(new Uint8Array(event.data));
+
+      // Handle heartbeat pongs without consuming a pending request callback
+      if ('Pong' in response) {
+        clearTimeout(this.heartbeatTimeoutTimers.get(serverNum));
+        this.heartbeatTimeoutTimers.delete(serverNum);
+        this.lastPongTime.set(serverNum, Date.now());
+        console.log(`[HEARTBEAT] Server ${serverNum} pong received`);
+        return;
+      }
+
+      // Route to the next pending request callback (FIFO)
+      const queue = this.pendingResponses.get(serverNum)!;
+      const callback = queue.shift();
+      if (callback) {
+        callback(response);
+      } else {
+        console.warn(`[PIR] Received unexpected response from server ${serverNum} with no pending request`);
+      }
+    } catch (error) {
+      console.error(`[PIR] Failed to decode response from server ${serverNum}:`, error);
+      // Reject the oldest pending request
+      const queue = this.pendingResponses.get(serverNum)!;
+      const callback = queue.shift();
+      if (callback) {
+        // Can't reject a resolve callback, but at least clear it
+        // The timeout will handle rejection
+      }
+    }
   }
 
   /**
@@ -139,7 +176,7 @@ export class PirClient {
   async connect(): Promise<void> {
     this.isIntentionalDisconnect = false;
     this.setConnectionState('connecting', 'Connecting to servers...');
-    
+
     console.log(`[DEBUG] Main connect(): Starting parallel connection to both servers`);
     try {
       await Promise.all([
@@ -147,11 +184,11 @@ export class PirClient {
         this.connectToServer(2),
       ]);
       console.log(`[DEBUG] Main connect(): Both connections completed successfully`);
-      
+
       // Reset reconnect attempts on successful connection
       this.reconnectAttempts = 0;
       this.setConnectionState('connected', 'Connected to both servers');
-      
+
       // Start heartbeat if enabled
       if (this.reconnectConfig.heartbeatInterval > 0) {
         this.startHeartbeat(1);
@@ -172,7 +209,7 @@ export class PirClient {
     console.log(`[DEBUG] [SERVER ${serverNum}] Step 1: Starting connection to ${url}`);
     console.log(`[DEBUG] [SERVER ${serverNum}] Timestamp: ${new Date().toISOString()}`);
     console.log(`[DEBUG] [SERVER ${serverNum}] Browser WebSocket support: ${typeof WebSocket !== 'undefined'}`);
-    
+
     try {
       const ws = new WebSocket(url);
       ws.binaryType = 'arraybuffer';
@@ -183,7 +220,7 @@ export class PirClient {
 
       return new Promise((resolve, reject) => {
         console.log(`[DEBUG] [SERVER ${serverNum}] Step 3: Creating event handlers`);
-        
+
         ws.onopen = () => {
           console.log(`[DEBUG] [SERVER ${serverNum}] Step 5: onopen event fired! Connection successful!`);
           console.log(`[DEBUG] [SERVER ${serverNum}] WebSocket readyState: ${ws.readyState}`);
@@ -192,6 +229,10 @@ export class PirClient {
           } else {
             this.ws2 = ws;
           }
+          // Install permanent central message handler
+          ws.onmessage = (event) => this.handleMessage(serverNum, event);
+          // Reset the pending response queue for this server
+          this.pendingResponses.set(serverNum, []);
           // Record the time of last pong (connection established)
           this.lastPongTime.set(serverNum, Date.now());
           console.log(`[DEBUG] [SERVER ${serverNum}] Step 6: Resolving connection promise`);
@@ -217,16 +258,16 @@ export class PirClient {
         ws.onclose = (event: CloseEvent) => {
           console.log(`[DEBUG] [SERVER ${serverNum}] Step CLOSE: onclose fired (connection closed)`);
           console.log(`[DEBUG] [SERVER ${serverNum}] Close code: ${event.code}, reason: ${event.reason || 'none'}, wasClean: ${event.wasClean}`);
-          
+
           if (serverNum === 1) {
             this.ws1 = null;
           } else {
             this.ws2 = null;
           }
-          
+
           // Stop heartbeat for this server
           this.stopHeartbeat(serverNum);
-          
+
           // Attempt reconnection if enabled and not intentional disconnect
           if (this.reconnectConfig.enabled && !this.isIntentionalDisconnect) {
             this.attemptReconnect(serverNum);
@@ -266,24 +307,24 @@ export class PirClient {
       this.reconnectConfig.initialDelay * Math.pow(this.reconnectConfig.backoffFactor, this.reconnectAttempts),
       this.reconnectConfig.maxDelay
     );
-    
+
     this.reconnectAttempts++;
     this.setConnectionState('reconnecting', `Reconnecting to server ${serverNum} (attempt ${this.reconnectAttempts})...`);
-    
+
     console.log(`[RECONNECT] Scheduling reconnection to server ${serverNum} in ${delay}ms (attempt ${this.reconnectAttempts})`);
-    
+
     const timer = setTimeout(async () => {
       console.log(`[RECONNECT] Attempting to reconnect to server ${serverNum}...`);
-      
+
       try {
         await this.connectToServer(serverNum);
         console.log(`[RECONNECT] Successfully reconnected to server ${serverNum}`);
-        
+
         // Check if both servers are now connected
         if (this.isConnected()) {
           this.reconnectAttempts = 0;
           this.setConnectionState('connected', 'Reconnected to both servers');
-          
+
           // Restart heartbeats
           if (this.reconnectConfig.heartbeatInterval > 0) {
             this.startHeartbeat(1);
@@ -296,7 +337,7 @@ export class PirClient {
         this.attemptReconnect(serverNum);
       }
     }, delay);
-    
+
     this.reconnectTimers.set(serverNum, timer);
   }
 
@@ -306,25 +347,25 @@ export class PirClient {
   private startHeartbeat(serverNum: 1 | 2): void {
     // Clear any existing heartbeat
     this.stopHeartbeat(serverNum);
-    
+
     if (this.reconnectConfig.heartbeatInterval <= 0) {
       return;
     }
-    
+
     console.log(`[HEARTBEAT] Starting heartbeat for server ${serverNum} (interval: ${this.reconnectConfig.heartbeatInterval}ms)`);
-    
+
     const timer = setInterval(async () => {
       const ws = serverNum === 1 ? this.ws1 : this.ws2;
-      
+
       if (!ws || ws.readyState !== WebSocket.OPEN) {
         return;
       }
-      
+
       try {
         // Send a ping request
         const request: Request = { Ping: {} };
         const encoded = encodeRequest(request);
-        
+
         // Set up timeout for pong response
         const timeoutTimer = setTimeout(() => {
           console.log(`[HEARTBEAT] Server ${serverNum} pong timeout - connection may be stale`);
@@ -334,40 +375,16 @@ export class PirClient {
             wsToClose.close();
           }
         }, this.reconnectConfig.heartbeatTimeout);
-        
+
         this.heartbeatTimeoutTimers.set(serverNum, timeoutTimer);
-        
-        // Send ping
+
+        // Send ping — pong response is handled by the central handleMessage()
         ws.send(encoded);
-        
-        // Set up one-time message handler for pong
-        const originalOnMessage = ws.onmessage;
-        ws.onmessage = (event) => {
-          try {
-            const response = decodeResponse(new Uint8Array(event.data));
-            // Check if it's a Pong response
-            if ('Pong' in response) {
-              clearTimeout(this.heartbeatTimeoutTimers.get(serverNum));
-              this.heartbeatTimeoutTimers.delete(serverNum);
-              this.lastPongTime.set(serverNum, Date.now());
-              console.log(`[HEARTBEAT] Server ${serverNum} pong received`);
-            }
-            // Call original handler if exists
-            if (originalOnMessage) {
-              originalOnMessage.call(ws, event);
-            }
-          } catch (error) {
-            console.error(`[HEARTBEAT] Error processing response:`, error);
-            if (originalOnMessage) {
-              originalOnMessage.call(ws, event);
-            }
-          }
-        };
       } catch (error) {
         console.error(`[HEARTBEAT] Error sending ping to server ${serverNum}:`, error);
       }
     }, this.reconnectConfig.heartbeatInterval);
-    
+
     this.heartbeatTimers.set(serverNum, timer);
   }
 
@@ -380,7 +397,7 @@ export class PirClient {
       clearInterval(timer);
       this.heartbeatTimers.delete(serverNum);
     }
-    
+
     const timeoutTimer = this.heartbeatTimeoutTimers.get(serverNum);
     if (timeoutTimer) {
       clearTimeout(timeoutTimer);
@@ -393,7 +410,7 @@ export class PirClient {
    */
   disconnect(): void {
     this.isIntentionalDisconnect = true;
-    
+
     // Clear all timers
     for (const serverNum of [1, 2] as const) {
       this.stopHeartbeat(serverNum);
@@ -403,13 +420,13 @@ export class PirClient {
         this.reconnectTimers.delete(serverNum);
       }
     }
-    
+
     // Close connections
     this.ws1?.close();
     this.ws2?.close();
     this.ws1 = null;
     this.ws2 = null;
-    
+
     // Reset state
     this.reconnectAttempts = 0;
     this.setConnectionState('disconnected', 'Disconnected');
@@ -440,34 +457,23 @@ export class PirClient {
       throw new Error(`Not connected to server ${serverNum}`);
     }
 
-    const requestId = this.requestCounter++;
     const encoded = encodeRequest(request);
+    const queue = this.pendingResponses.get(serverNum)!;
 
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
-        this.pendingRequests.delete(requestId);
+        // Remove this callback from the queue on timeout
+        const idx = queue.indexOf(callback);
+        if (idx !== -1) queue.splice(idx, 1);
         reject(new Error(`Request to server ${serverNum} timed out`));
       }, 30000); // 30 second timeout
 
-      this.pendingRequests.set(requestId, (response: Response) => {
+      const callback = (response: Response) => {
         clearTimeout(timeout);
         resolve(response);
-      });
-
-      ws.onmessage = (event) => {
-        try {
-          const response = decodeResponse(new Uint8Array(event.data));
-          const callback = this.pendingRequests.get(requestId);
-          if (callback) {
-            this.pendingRequests.delete(requestId);
-            callback(response);
-          }
-        } catch (error) {
-          console.error('Failed to decode response:', error);
-          reject(error);
-        }
       };
 
+      queue.push(callback);
       ws.send(encoded);
     });
   }
@@ -537,7 +543,7 @@ export class PirClient {
   /**
    * Query the cuckoo database for a script hash
    * Uses proper cuckoo hash functions to compute locations
-   * 
+   *
    * This performs a multi-step PIR lookup:
    * Step 1-3: Query cuckoo index to find the chunk offset
    * Step 4: Fetch the chunk and read the UTXO count
@@ -545,10 +551,10 @@ export class PirClient {
   async queryCuckooIndex(
     scriptHash: Uint8Array,
     numBuckets: number = CUCKOO_NUM_BUCKETS,
-  ): Promise<{ 
-    response1: Response; 
-    response2: Response; 
-    loc1: number; 
+  ): Promise<{
+    response1: Response;
+    response2: Response;
+    loc1: number;
     loc2: number;
     // Step 4 results
     offset?: number;
@@ -558,16 +564,16 @@ export class PirClient {
   }> {
     // Import the cuckoo hash functions
     const { cuckooHash1, cuckooHash2 } = await import('./hash.js');
-    
+
     // Step 1: Compute cuckoo locations
     const loc1 = cuckooHash1(scriptHash, numBuckets);
     const loc2 = cuckooHash2(scriptHash, numBuckets);
-    
+
     console.log(`[PIR] Step 1: Cuckoo locations computed: loc1=${loc1}, loc2=${loc2}`);
-    
+
     // Compute n (domain size) from numBuckets
     const n = Math.ceil(Math.log2(numBuckets));
-    
+
     // Step 2: Generate DPF keys for both locations (async)
     const keys1 = await this.dpf.genKeys(loc1, n);
     const keys2 = await this.dpf.genKeys(loc2, n);
@@ -582,7 +588,7 @@ export class PirClient {
         dpf_key2: keys2.key1,  // Server 1 gets key1 for both locations
       },
     };
-    
+
     const request2: Request = {
       QueryDatabase: {
         database_id: 'utxo_cuckoo_index',
@@ -601,7 +607,9 @@ export class PirClient {
 
     // Extract data from responses
     if (!('QueryTwoResults' in response1) || !('QueryTwoResults' in response2)) {
-      console.log(`[PIR] Step 3: Unexpected response type from cuckoo index query`);
+      const err1 = 'Error' in response1 ? (response1 as any).Error.message : JSON.stringify(Object.keys(response1));
+      const err2 = 'Error' in response2 ? (response2 as any).Error.message : JSON.stringify(Object.keys(response2));
+      console.error(`[PIR] Step 3: Unexpected response type from cuckoo index query. Server1: ${err1}, Server2: ${err2}`);
       return { response1, response2, loc1, loc2 };
     }
 
@@ -622,22 +630,22 @@ export class PirClient {
 
     // Search in both locations to find the offset
     let foundOffset: number | undefined;
-    
+
     for (const [bucketData, locName] of [[combined_loc1, 'loc1'], [combined_loc2, 'loc2']] as const) {
       for (let i = 0; i < CUCKOO_BUCKET_SIZE; i++) {
         const entryOffset = i * CUCKOO_ENTRY_SIZE;
         if (entryOffset + CUCKOO_ENTRY_SIZE > bucketData.length) {
           continue;
         }
-        
+
         // Read the key (first 20 bytes)
         const key = bucketData.slice(entryOffset, entryOffset + KEY_SIZE);
-        
+
         // Check if this slot is empty (all zeros)
         if (key.every(b => b === 0)) {
           continue;
         }
-        
+
         // Check if the key matches
         if (this.bytesEqual(key, scriptHash)) {
           // Read the offset (4 bytes after the key, little-endian u32)
@@ -656,29 +664,31 @@ export class PirClient {
     }
 
     // Step 4: Calculate chunk index and local offset, then fetch UTXO count
-    const chunkIndex = Math.floor(foundOffset / CHUNK_SIZE);
-    const localOffset = foundOffset % CHUNK_SIZE;
-    
-    console.log(`[PIR] Step 4: Offset ${foundOffset} -> chunk_index=${chunkIndex}, local_offset=${localOffset}`);
-    
+    // The stored offset is byte_offset/2 (to fit >4GB files in u32)
+    const byteOffset = foundOffset * 2;
+    const chunkIndex = Math.floor(byteOffset / CHUNK_SIZE);
+    const localOffset = byteOffset % CHUNK_SIZE;
+
+    console.log(`[PIR] Step 4: Stored offset ${foundOffset} -> byte offset ${byteOffset} -> chunk_index=${chunkIndex}, local_offset=${localOffset}`);
+
     // Query the chunk
     console.log(`[PIR] Step 4: Fetching chunk ${chunkIndex}...`);
     const chunkData = await this.queryChunk(chunkIndex);
-    
+
     // Read the varint (UTXO count) at the local offset
     const { value: utxoCount, bytesConsumed } = this.readVarint(chunkData, localOffset);
-    
+
     console.log(`[PIR] Step 4: UTXO count = ${utxoCount} (read ${bytesConsumed} bytes at local offset ${localOffset})`);
     console.log(`[PIR] ========================================`);
     console.log(`[PIR] RESULT: Number of UTXOs for this script: ${utxoCount}`);
     console.log(`[PIR] ========================================`);
 
-    return { 
-      response1, 
-      response2, 
-      loc1, 
+    return {
+      response1,
+      response2,
+      loc1,
       loc2,
-      offset: foundOffset,
+      offset: byteOffset,
       chunkIndex,
       localOffset,
       utxoCount,
@@ -705,16 +715,16 @@ export class PirClient {
     numBuckets: number = CUCKOO_NUM_BUCKETS,
   ): Promise<{ offset: number; loc1: number; loc2: number } | null> {
     const { cuckooHash1, cuckooHash2 } = await import('./hash.js');
-    
+
     // Compute cuckoo locations
     const loc1 = cuckooHash1(scriptHash, numBuckets);
     const loc2 = cuckooHash2(scriptHash, numBuckets);
-    
+
     console.log(`[PIR] Cuckoo locations: loc1=${loc1}, loc2=${loc2}`);
-    
+
     // Compute n (domain size) from numBuckets
     const n = Math.ceil(Math.log2(numBuckets));
-    
+
     // Generate DPF keys for both locations
     const keys1 = await this.dpf.genKeys(loc1, n);
     const keys2 = await this.dpf.genKeys(loc2, n);
@@ -728,7 +738,7 @@ export class PirClient {
         dpf_key2: keys2.key1,
       },
     };
-    
+
     // Server 2 gets key2 for both locations
     const request2: Request = {
       QueryDatabase: {
@@ -746,7 +756,9 @@ export class PirClient {
 
     // Extract data from responses
     if (!('QueryTwoResults' in response1) || !('QueryTwoResults' in response2)) {
-      throw new Error('Unexpected response type from cuckoo index query');
+      const err1 = 'Error' in response1 ? (response1 as any).Error.message : JSON.stringify(Object.keys(response1));
+      const err2 = 'Error' in response2 ? (response2 as any).Error.message : JSON.stringify(Object.keys(response2));
+      throw new Error(`Unexpected response type from cuckoo index query. Server1: ${err1}, Server2: ${err2}`);
     }
 
     const data1_loc1 = response1.QueryTwoResults.data1;
@@ -771,15 +783,15 @@ export class PirClient {
         if (offset + CUCKOO_ENTRY_SIZE > bucketData.length) {
           continue;
         }
-        
+
         // Read the key (first 20 bytes)
         const key = bucketData.slice(offset, offset + KEY_SIZE);
-        
+
         // Check if this slot is empty (all zeros)
         if (key.every(b => b === 0)) {
           continue;
         }
-        
+
         // Check if the key matches
         if (this.bytesEqual(key, scriptHash)) {
           // Read the offset (4 bytes after the key, little-endian u32)
@@ -809,12 +821,12 @@ export class PirClient {
   /**
    * Query a single chunk from the chunks database
    * Returns the raw chunk data
-   * 
+   *
    * Uses DPF with two keys - one for each server
    */
   async queryChunk(chunkIndex: number): Promise<Uint8Array> {
     const n = Math.ceil(Math.log2(CHUNKS_NUM_ENTRIES));
-    
+
     // Generate DPF keys for the chunk index
     // key1 goes to server 1, key2 goes to server 2
     const keys = await this.dpf.genKeys(chunkIndex, n);
@@ -827,7 +839,7 @@ export class PirClient {
         dpf_key2: keys.key1,  // Same key for both slots (only querying one location)
       },
     };
-    
+
     const request2: Request = {
       QueryDatabase: {
         database_id: 'utxo_chunks_data',
@@ -844,7 +856,9 @@ export class PirClient {
 
     // Extract data from responses
     if (!('QueryTwoResults' in response1) || !('QueryTwoResults' in response2)) {
-      throw new Error('Unexpected response type from chunk query');
+      const err1 = 'Error' in response1 ? (response1 as any).Error.message : JSON.stringify(Object.keys(response1));
+      const err2 = 'Error' in response2 ? (response2 as any).Error.message : JSON.stringify(Object.keys(response2));
+      throw new Error(`Unexpected response type from chunk query. Server1: ${err1}, Server2: ${err2}`);
     }
 
     // XOR the results from both servers
@@ -852,7 +866,7 @@ export class PirClient {
     // We only need to XOR one of them
     const combined = this.xorBuffers(response1.QueryTwoResults.data1, response2.QueryTwoResults.data1);
     console.log(`[PIR] Chunk ${chunkIndex} retrieved: ${combined.length} bytes`);
-    
+
     return combined;
   }
 
@@ -864,27 +878,27 @@ export class PirClient {
     let result: bigint = 0n;
     let shift = 0;
     let bytesConsumed = 0;
-    
+
     while (true) {
       if (offset + bytesConsumed >= data.length) {
         throw new Error('Unexpected end of data while reading varint');
       }
-      
+
       const byte = data[offset + bytesConsumed];
       bytesConsumed++;
-      
+
       result |= BigInt(byte & 0x7F) << BigInt(shift);
-      
+
       if ((byte & 0x80) === 0) {
         break;
       }
       shift += 7;
-      
+
       if (shift >= 64) {
         throw new Error('VarInt too large');
       }
     }
-    
+
     return { value: result, bytesConsumed };
   }
 
@@ -908,36 +922,38 @@ export class PirClient {
     chunkData?: Uint8Array;
   }> {
     console.log(`[PIR] Starting UTXO count lookup for script hash: ${this.bytesToHex(scriptHash)}`);
-    
+
     // Step 1: Query cuckoo index to get the offset
     const cuckooResult = await this.findScriptOffset(scriptHash, numBuckets);
-    
+
     if (!cuckooResult) {
       console.log(`[PIR] Script hash not found in database`);
       return { found: false };
     }
-    
-    const { offset } = cuckooResult;
-    
+
+    const { offset: storedOffset } = cuckooResult;
+
     // Step 2: Calculate chunk index and local offset
-    const chunkIndex = Math.floor(offset / CHUNK_SIZE);
-    const localOffset = offset % CHUNK_SIZE;
-    
-    console.log(`[PIR] Offset: ${offset}`);
+    // The stored offset is byte_offset/2 (to fit >4GB files in u32)
+    const byteOffset = storedOffset * 2;
+    const chunkIndex = Math.floor(byteOffset / CHUNK_SIZE);
+    const localOffset = byteOffset % CHUNK_SIZE;
+
+    console.log(`[PIR] Stored offset: ${storedOffset}, byte offset: ${byteOffset}`);
     console.log(`[PIR] Chunk index: ${chunkIndex}`);
     console.log(`[PIR] Local offset: ${localOffset}`);
-    
+
     // Step 3: Query the chunk
     const chunkData = await this.queryChunk(chunkIndex);
-    
+
     // Step 4: Read the varint (UTXO count) at the local offset
     const { value: utxoCount, bytesConsumed } = this.readVarint(chunkData, localOffset);
-    
+
     console.log(`[PIR] UTXO count at offset ${localOffset}: ${utxoCount} (varint: ${bytesConsumed} bytes)`);
-    
+
     return {
       found: true,
-      offset,
+      offset: byteOffset,
       chunkIndex,
       localOffset,
       utxoCount,
@@ -978,7 +994,8 @@ export class PirClient {
       return null;
     }
 
-    const startOffset = cuckooResult.offset;
+    // The stored offset is byte_offset/2 (to fit >4GB files in u32)
+    const startOffset = cuckooResult.offset * 2;
     const chunkIndex = Math.floor(startOffset / CHUNK_SIZE);
     const localOffset = startOffset % CHUNK_SIZE;
 
@@ -988,11 +1005,14 @@ export class PirClient {
     // Read the entry count (varint at local offset)
     const { value: totalEntries, bytesConsumed } = this.readVarint(chunkData, localOffset);
 
+    // Whale detection: if totalEntries === 0, this is a whale address
+    const isWhale = totalEntries === 0n;
+
     // Store chunk data
     const chunksData = new Map<number, Uint8Array>();
     chunksData.set(chunkIndex, chunkData);
 
-    console.log(`[PIR] Initialized pagination: ${totalEntries} total entries, starting at chunk ${chunkIndex}, offset ${localOffset + bytesConsumed}`);
+    console.log(`[PIR] Initialized pagination: ${totalEntries} total entries, starting at chunk ${chunkIndex}, offset ${localOffset + bytesConsumed}${isWhale ? ' (WHALE DETECTED)' : ''}`);
 
     return {
       scriptHash,
@@ -1003,6 +1023,7 @@ export class PirClient {
       localOffset: localOffset + bytesConsumed, // Move past the count varint
       entriesRead: 0,
       chunksData,
+      isWhale,
     };
   }
 
@@ -1016,7 +1037,7 @@ export class PirClient {
     if (state.localOffset >= CHUNK_SIZE) {
       state.currentChunkIndex++;
       state.localOffset = 0;
-      
+
       // Check if we have this chunk cached
       if (!state.chunksData.has(state.currentChunkIndex)) {
         console.log(`[PIR] Fetching chunk ${state.currentChunkIndex}...`);
@@ -1060,26 +1081,17 @@ export class PirClient {
   }
 
   /**
-   * Read 4 bytes as u32 from the pagination state
-   */
-  private async readU32FromChunks(state: UtxoPaginationState): Promise<number> {
-    const b0 = await this.readByteFromChunks(state);
-    const b1 = await this.readByteFromChunks(state);
-    const b2 = await this.readByteFromChunks(state);
-    const b3 = await this.readByteFromChunks(state);
-    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
-  }
-
-  /**
    * Fetch more UTXO entries
    * Returns the entries fetched (may be less than requested if end of data)
+   *
+   * Every entry: read 32 raw bytes for TXID (no delta, no special first entry)
    */
   async fetchUtxoEntries(
     state: UtxoPaginationState,
     count: number
   ): Promise<UtxoEntry[]> {
     const totalToRead = Math.min(count, Number(state.totalEntries) - state.entriesRead);
-    
+
     if (totalToRead <= 0) {
       return [];
     }
@@ -1088,27 +1100,17 @@ export class PirClient {
 
     for (let i = 0; i < totalToRead; i++) {
       try {
-        let txid: number;
-        let vout: bigint;
-        let amount: bigint;
-
-        if (state.entriesRead + i === 0) {
-          // First entry: read raw 4-byte TXID
-          txid = await this.readU32FromChunks(state);
-        } else {
-          // Subsequent entries: read varint delta
-          const delta = await this.readVarintFromChunks(state);
-          const prevTxid = state.entries.length > 0 
-            ? state.entries[state.entries.length - 1].txid 
-            : newEntries[newEntries.length - 1].txid;
-          txid = (prevTxid - Number(delta)) >>> 0; // wrapping subtraction
+        // Every entry: read 32 raw bytes for TXID (no delta, no special first entry)
+        const txid = new Uint8Array(32);
+        for (let j = 0; j < 32; j++) {
+          txid[j] = await this.readByteFromChunks(state);
         }
 
         // Read vout as varint
-        vout = await this.readVarintFromChunks(state);
+        const vout = await this.readVarintFromChunks(state);
 
         // Read amount as varint
-        amount = await this.readVarintFromChunks(state);
+        const amount = await this.readVarintFromChunks(state);
 
         const entry: UtxoEntry = {
           txid,
@@ -1168,114 +1170,6 @@ export class PirClient {
       totalEntries: state.totalEntries,
       cachedEntries,
     };
-  }
-
-  /**
-   * Query TXID mapping database to convert 4-byte TXID to 32-byte TXID
-   * 
-   * Uses cuckoo-style hash lookup:
-   * 1. Compute two hash locations for the 4-byte TXID
-   * 2. Query both locations via PIR
-   * 3. Find matching 4-byte key and extract 32-byte TXID
-   * 
-   * @param txid4b - The 4-byte mapped TXID
-   * @returns The 32-byte TXID (reversed for display), or null if not found
-   */
-  async queryTxidMapping(txid4b: number): Promise<Uint8Array | null> {
-    const { txidMappingLocations } = await import('./hash.js');
-    
-    console.log(`[PIR] Querying TXID mapping for 4B TXID: ${txid4b}`);
-    
-    // Compute hash locations
-    const [loc1, loc2] = txidMappingLocations(
-      new Uint8Array([
-        txid4b & 0xff,
-        (txid4b >> 8) & 0xff,
-        (txid4b >> 16) & 0xff,
-        (txid4b >> 24) & 0xff,
-      ]),
-      TXID_MAPPING_NUM_BUCKETS
-    );
-    
-    console.log(`[PIR] TXID mapping locations: loc1=${loc1}, loc2=${loc2}`);
-    
-    // Compute n (domain size) from numBuckets
-    const n = Math.ceil(Math.log2(TXID_MAPPING_NUM_BUCKETS));
-    
-    // Generate DPF keys for both locations
-    const keys1 = await this.dpf.genKeys(loc1, n);
-    const keys2 = await this.dpf.genKeys(loc2, n);
-
-    // Create requests for both servers
-    const request1: Request = {
-      QueryDatabase: {
-        database_id: 'utxo_4b_to_32b',
-        dpf_key1: keys1.key1,
-        dpf_key2: keys2.key1,  // Server 1 gets key1 for both locations
-      },
-    };
-    
-    const request2: Request = {
-      QueryDatabase: {
-        database_id: 'utxo_4b_to_32b',
-        dpf_key1: keys1.key2,  // Server 2 gets key2 for both locations
-        dpf_key2: keys2.key2,
-      },
-    };
-
-    // Send to both servers
-    const [response1, response2] = await Promise.all([
-      this.sendRequest(1, request1),
-      this.sendRequest(2, request2),
-    ]);
-
-    // Extract data from responses
-    if (!('QueryTwoResults' in response1) || !('QueryTwoResults' in response2)) {
-      throw new Error('Unexpected response type from TXID mapping query');
-    }
-
-    // XOR the results from both servers
-    const combined_loc1 = this.xorBuffers(response1.QueryTwoResults.data1, response2.QueryTwoResults.data1);
-    const combined_loc2 = this.xorBuffers(response1.QueryTwoResults.data2, response2.QueryTwoResults.data2);
-
-    console.log(`[PIR] TXID mapping combined results: loc1=${combined_loc1.length} bytes, loc2=${combined_loc2.length} bytes`);
-
-    // The 4-byte key we're looking for
-    const txid4bBytes = new Uint8Array([
-      txid4b & 0xff,
-      (txid4b >> 8) & 0xff,
-      (txid4b >> 16) & 0xff,
-      (txid4b >> 24) & 0xff,
-    ]);
-
-    // Search in both locations
-    for (const [bucketData, locName] of [[combined_loc1, 'loc1'], [combined_loc2, 'loc2']] as const) {
-      for (let i = 0; i < TXID_MAPPING_BUCKET_SIZE; i++) {
-        const offset = i * TXID_MAPPING_ENTRY_SIZE;
-        if (offset + TXID_MAPPING_ENTRY_SIZE > bucketData.length) {
-          continue;
-        }
-        
-        // Read the key (first 4 bytes)
-        const key = bucketData.slice(offset, offset + 4);
-        
-        // Check if this slot is empty (all zeros)
-        if (key.every(b => b === 0)) {
-          continue;
-        }
-        
-        // Check if the key matches
-        if (this.bytesEqual(key, txid4bBytes)) {
-          // Read the 32-byte TXID
-          const txid32b = bucketData.slice(offset + 4, offset + 36);
-          console.log(`[PIR] Found matching key at ${locName} bucket ${i}`);
-          return txid32b;
-        }
-      }
-    }
-
-    console.log(`[PIR] 4B TXID not found in TXID mapping`);
-    return null;
   }
 }
 

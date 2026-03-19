@@ -11,6 +11,10 @@
 //!   - 2 hash functions (over the 20-byte script hash)
 //!   - Bucket size = 4
 //!   - Load factor α = 0.95
+//!
+//! Usage:
+//!   gen_3_cuckoo_chunks           # uses full-size gen2 files
+//!   gen_3_cuckoo_chunks --small   # uses small gen2 files
 
 use memmap2::Mmap;
 use std::fs::File;
@@ -19,6 +23,8 @@ use std::time::Instant;
 
 const INPUT_FILE: &str = "/Volumes/Bitcoin/data/utxo_chunks_index.bin";
 const OUTPUT_FILE: &str = "/Volumes/Bitcoin/data/utxo_chunks_cuckoo.bin";
+const INPUT_FILE_SMALL: &str = "/Volumes/Bitcoin/data/utxo_chunks_index_small.bin";
+const OUTPUT_FILE_SMALL: &str = "/Volumes/Bitcoin/data/utxo_chunks_cuckoo_small.bin";
 const ENTRY_SIZE: usize = 24;
 const KEY_SIZE: usize = 20;
 const BUCKET_SIZE: usize = 4;
@@ -84,7 +90,16 @@ fn other_bucket(mmap: &[u8], entry_idx: u32, current_bucket: usize, num_buckets:
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let small = args.iter().any(|a| a == "--small");
+
+    let input_file = if small { INPUT_FILE_SMALL } else { INPUT_FILE };
+    let output_file = if small { OUTPUT_FILE_SMALL } else { OUTPUT_FILE };
+
     println!("=== Bucketed Cuckoo Hashing for utxo_chunks_index ===");
+    if small {
+        println!("  Mode: SMALL");
+    }
     println!("  Bucket size: {}", BUCKET_SIZE);
     println!("  Load factor: {}", LOAD_FACTOR);
     println!("  Hash functions: 2");
@@ -92,10 +107,10 @@ fn main() {
     println!();
 
     // Step 1: Memory-map the input file
-    println!("[1] Opening input file: {}", INPUT_FILE);
+    println!("[1] Opening input file: {}", input_file);
     let start = Instant::now();
 
-    let file = File::open(INPUT_FILE).expect("Failed to open input file");
+    let file = File::open(input_file).expect("Failed to open input file");
     let file_len = file.metadata().unwrap().len() as usize;
     let n = file_len / ENTRY_SIZE;
 
@@ -225,7 +240,7 @@ fn main() {
     println!("  Total keys:          {}", n);
     println!("  Total slots:         {}", total_slots);
     println!(
-        "  Num buckets:         {} (×{} = {} slots)",
+        "  Num buckets:         {} (x{} = {} slots)",
         num_buckets, BUCKET_SIZE, total_slots
     );
     println!("  Slots occupied:      {}", occupied);
@@ -291,9 +306,9 @@ fn main() {
         placed_count
     );
 
-    println!("  Writing to {}...", OUTPUT_FILE);
+    println!("  Writing to {}...", output_file);
     let write_start = Instant::now();
-    let mut out_file = File::create(OUTPUT_FILE).expect("Failed to create output file");
+    let mut out_file = File::create(output_file).expect("Failed to create output file");
     out_file
         .write_all(&output)
         .expect("Failed to write output file");
@@ -313,7 +328,7 @@ fn main() {
     println!("  Bucket size = {}", BUCKET_SIZE);
     println!("  Load factor target = {}", LOAD_FACTOR);
     println!(
-        "  Total slots = {} ({:.4}× n)",
+        "  Total slots = {} ({:.4}x n)",
         total_slots,
         total_slots as f64 / n as f64
     );
@@ -325,7 +340,7 @@ fn main() {
         (n * ENTRY_SIZE) as f64 / (1024.0 * 1024.0)
     );
     println!(
-        "    Bucketed cuckoo output: {:.2} MB  ({:.4}× n)",
+        "    Bucketed cuckoo output: {:.2} MB  ({:.4}x n)",
         (total_slots * ENTRY_SIZE) as f64 / (1024.0 * 1024.0),
         total_slots as f64 / n as f64
     );

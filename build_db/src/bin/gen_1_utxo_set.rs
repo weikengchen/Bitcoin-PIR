@@ -15,10 +15,10 @@
 //!   [56..64)  amount in satoshis (u64 little-endian)
 //!
 //! Usage:
-//!   gen2_1_utxo_set <utxo_snapshot_file>
+//!   gen_1_utxo_set <utxo_snapshot_file>
 //!
 //! Example:
-//!   gen2_1_utxo_set /path/to/utxo.dat
+//!   gen_1_utxo_set /path/to/utxo.dat
 
 use bitcoin::hashes::{ripemd160, sha256, Hash};
 use bitcoinpir::utils;
@@ -30,7 +30,7 @@ use std::time::Instant;
 use txoutset::Dump;
 
 /// Output file path for the flat UTXO set
-const OUTPUT_FILE: &str = "/Volumes/Bitcoin/data/gen2_utxo_set.bin";
+const OUTPUT_FILE: &str = "/Volumes/Bitcoin/data/utxo_set.bin";
 
 /// Size of each output entry in bytes
 const ENTRY_SIZE: u64 = 64;

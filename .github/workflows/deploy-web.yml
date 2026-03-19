@@ -26,14 +26,14 @@ jobs:
         with:
           node-version: '20'
           cache: 'npm'
-          cache-dependency-path: web_client2/package-lock.json
+          cache-dependency-path: web_client/package-lock.json
 
       - name: Install dependencies
-        working-directory: web_client2
+        working-directory: web_client
         run: npm ci
 
       - name: Build
-        working-directory: web_client2
+        working-directory: web_client
         run: npm run build-web
 
       - name: Setup Pages
@@ -42,7 +42,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: web_client2/dist-web
+          path: web_client/dist-web
 
   deploy:
     environment:

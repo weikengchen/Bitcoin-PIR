@@ -8,11 +8,11 @@ This project enables querying the Bitcoin UTXO set without revealing which addre
 
 ### Key Features
 
-- 🔒 **Privacy-Preserving**: Servers cannot determine which addresses are being queried
-- ⚡ **DPF-Based**: Uses Distributed Point Functions for efficient PIR
-- 🌐 **Web Compatible**: Browser and Node.js clients via WebSocket
-- 🔐 **TLS Support**: Secure WebSocket (wss://) for production deployments
-- 📦 **High Performance**: Memory-mapped databases for fast queries
+- **Privacy-Preserving**: Servers cannot determine which addresses are being queried
+- **DPF-Based**: Uses Distributed Point Functions for efficient PIR
+- **Web Compatible**: Browser and Node.js clients via WebSocket
+- **TLS Support**: Secure WebSocket (wss://) for production deployments
+- **High Performance**: Memory-mapped databases for fast queries
 
 ## Architecture
 
@@ -37,7 +37,7 @@ This project enables querying the Bitcoin UTXO set without revealing which addre
 │   (port 8091)        │    │   (port 8092)        │
 │                      │    │                      │
 │  ┌────────────────┐  │    │  ┌────────────────┐  │
-│  │  Databases     │  │    │  │  Databases     │  │
+│  │  2 Databases   │  │    │  │  2 Databases   │  │
 │  │  (identical)   │  │    │  │  (identical)   │  │
 │  └────────────────┘  │    │  └────────────────┘  │
 └──────────────────────┘    └──────────────────────┘
@@ -55,47 +55,54 @@ BitcoinPIR/
 │   │   ├── database.rs         # Database trait & implementations
 │   │   ├── protocol.rs         # Request/Response types
 │   │   ├── pir_protocol.rs     # Simple Binary Protocol
+│   │   ├── pir_backend.rs      # Pluggable PIR backend trait
 │   │   ├── hash.rs             # Cuckoo hash functions
 │   │   ├── websocket.rs        # WebSocket handler
 │   │   ├── server_config.rs    # Database configuration
 │   │   └── bin/
 │   │       ├── server.rs       # WebSocket server binary
-│   │       ├── servers.rs      # Multi-server manager
-│   │       ├── lookup_pir.rs   # CLI client
-│   │       └── lookup_script.rs # Script lookup tool
+│   │       ├── lookup_pir.rs   # CLI PIR client
+│   │       ├── lookup_script.rs # Script lookup tool
+│   │       └── test_utxo_chunks.rs # Chunk data verifier
 │   └── Cargo.toml
 │
 ├── build_db/                   # Database generation tools (Rust)
-│   └── src/bin/
-│       ├── gen_1_txid_file.rs           # Extract TXIDs from blk*.dat
-│       ├── gen_2_mphf.rs                # Build minimal perfect hash
-│       ├── gen_3_location_index.rs      # Build location index
-│       ├── gen_4_utxo_remapped.rs       # Extract UTXOs with 4B TXIDs
-│       ├── gen_5_utxo_chunks_from_remapped.rs  # Generate UTXO chunks
-│       ├── gen_6_utxo_4b_to_32b.rs      # Build TXID mapping
-│       ├── gen_7_cuckoo_chunks.rs       # Build cuckoo index
-│       ├── gen_8_cuckoo_txid.rs         # Build cuckoo TXID index
-│       └── README.md                    # Detailed pipeline docs
+│   ├── src/
+│   │   ├── lib.rs              # Block filter library
+│   │   ├── utils.rs            # Shared utilities
+│   │   └── bin/
+│   │       ├── gen_1_utxo_set.rs       # Step 1: Extract UTXOs from snapshot
+│   │       ├── gen_2_utxo_chunks.rs    # Step 2: Chunk and index UTXOs
+│   │       ├── gen_3_cuckoo_chunks.rs  # Step 3: Build cuckoo hash index
+│   │       └── (debug/utility binaries)
+│   └── Cargo.toml
 │
 ├── web_client/                 # Browser/Node.js client (TypeScript)
 │   ├── src/
-│   │   ├── index.ts            # Main entry point
-│   │   ├── client.ts           # WebSocket client
-│   │   ├── dpf.ts              # DPF wrapper
-│   │   ├── hash.ts             # Hash functions
+│   │   ├── index.ts            # Main entry point & exports
+│   │   ├── client.ts           # WebSocket PIR client
+│   │   ├── dpf.ts              # DPF key generation wrapper
+│   │   ├── hash.ts             # HASH160, cuckoo hash functions
+│   │   ├── constants.ts        # Database IDs and parameters
 │   │   ├── bincode.ts          # Binary serialization
-│   │   └── constants.ts        # System constants
-│   ├── package.json
-│   └── README.md
+│   │   ├── sbp.ts              # Simple Binary Protocol codec
+│   │   └── polyfills.ts        # Browser compatibility
+│   ├── index.html              # Demo web interface
+│   ├── vite.config.js          # Vite build configuration
+│   └── package.json
 │
 ├── scripts/                    # Helper scripts
 │   ├── start_pir_servers.sh    # Start both PIR servers
 │   ├── test_lookup_pir.sh      # Test PIR lookup
-│   └── run_client.sh           # Run client script
+│   └── get_random_hash.sh      # Sample random cuckoo entries
 │
-└── doc/                        # Documentation
-    ├── DEPLOYMENT.md           # Production deployment guide
-    └── WEB.md                  # Web client implementation
+├── doc/                        # Documentation
+│   ├── DEPLOYMENT.md           # Production deployment guide
+│   └── WEB.md                  # WebSocket protocol details
+│
+└── pdf/                        # Research paper (LaTeX)
+    ├── main.tex
+    └── main.pdf
 ```
 
 ## Quick Start
@@ -103,7 +110,6 @@ BitcoinPIR/
 ### 1. Build the Project
 
 ```bash
-# Clone the repository
 git clone https://github.com/weikengchen/Bitcoin-PIR.git
 cd Bitcoin-PIR
 
@@ -113,50 +119,40 @@ cargo build --release
 
 ### 2. Generate Database Files
 
-The database pipeline transforms Bitcoin blockchain data into PIR-queryable format:
+The database pipeline transforms a Bitcoin Core UTXO snapshot into PIR-queryable format in 3 steps:
 
 ```bash
-# Step 1: Extract TXIDs from Bitcoin blk*.dat files
-cargo run --release --bin gen_1_txid_file -- /path/to/bitcoin
+# Step 1: Extract UTXOs from dumptxoutset snapshot
+#   Input:  Bitcoin Core UTXO snapshot (dumptxoutset)
+#   Output: utxo_set.bin (64 bytes per UTXO)
+#   Format: [20B HASH160(scriptPubKey)] [32B TXID] [4B vout] [8B amount]
+cargo run --release --bin gen_1_utxo_set -- \
+    --utxo-path /path/to/utxo_snapshot.dat \
+    --output-dir /data/pir/
 
-# Step 2: Build minimal perfect hash function
-cargo run --release --bin gen_2_mphf
+# Step 2: Group UTXOs by script hash, serialize into 32KB chunks
+#   Input:  utxo_set.bin
+#   Output: utxo_chunks.bin + utxo_chunks_index.bin (24B entries: 20B hash + 4B offset)
+#   Optional: --small to exclude whale addresses, --partitions N for memory control
+cargo run --release --bin gen_2_utxo_chunks -- \
+    --input /data/pir/utxo_set.bin \
+    --output-dir /data/pir/
 
-# Step 3: Build location index
-cargo run --release --bin gen_3_location_index
-
-# Step 4: Extract UTXOs (requires stopped bitcoind)
-cargo run --release --bin gen_4_utxo_remapped -- /path/to/bitcoin
-
-# Step 5: Generate UTXO chunks
-cargo run --release --bin gen_5_utxo_chunks_from_remapped
-
-# Step 6: Build TXID mapping
-cargo run --release --bin gen_6_utxo_4b_to_32b
-
-# Step 7: Build cuckoo hash index
-cargo run --release --bin gen_7_cuckoo_chunks
-
-# Step 8: Build cuckoo TXID index
-cargo run --release --bin gen_8_cuckoo_txid
+# Step 3: Build bucketed cuckoo hash table from the index
+#   Input:  utxo_chunks_index.bin
+#   Output: utxo_chunks_cuckoo.bin
+cargo run --release --bin gen_3_cuckoo_chunks -- \
+    --input /data/pir/utxo_chunks_index.bin \
+    --output /data/pir/utxo_chunks_cuckoo.bin
 ```
-
-See [`build_db/src/bin/README.md`](build_db/src/bin/README.md) for detailed documentation.
 
 ### 3. Configure Server
 
 Edit `dpf_pir/src/server_config.rs` to set your database paths:
 
 ```rust
-// Update paths to match your data location
-let cuckoo_config = DatabaseConfig::new(
-    "utxo_cuckoo_index",
-    "/data/pir/utxo_chunks_cuckoo.bin",  // Your path here
-    24,    // entry_size
-    1,     // bucket_size
-    15_385_139,  // num_buckets
-    2,     // num_locations (cuckoo)
-);
+let cuckoo_path = "/data/pir/utxo_chunks_cuckoo.bin";
+let chunks_path = "/data/pir/utxo_chunks.bin";
 ```
 
 Rebuild after configuration changes:
@@ -169,69 +165,76 @@ cargo build --release --bin server
 ```bash
 # Start both servers (ports 8091 and 8092)
 ./scripts/start_pir_servers.sh
+
+# Or with small databases (whale addresses excluded):
+./scripts/start_pir_servers.sh --small
 ```
 
 Or manually:
 ```bash
-# Server 1
 RUST_LOG=info ./target/release/server --port 8091
-
-# Server 2 (in another terminal)
-RUST_LOG=info ./target/release/server --port 8092
+RUST_LOG=info ./target/release/server --port 8092  # in another terminal
 ```
 
 ### 5. Query UTXOs
 
 **Using CLI:**
 ```bash
-# Build the client
-cargo build --release --bin lookup_pir
-
-# Query by script pubkey hash
-./target/release/lookup_pir --server1 ws://127.0.0.1:8091 --server2 ws://127.0.0.1:8092 "76a914b64513c1f1b889a556463243cca9c26ee626b9a088ac"
+# Query by scriptPubKey hex
+./target/release/lookup_pir \
+    --server1 ws://127.0.0.1:8091 \
+    --server2 ws://127.0.0.1:8092 \
+    "76a914b64513c1f1b889a556463243cca9c26ee626b9a088ac"
 ```
 
 **Using Web Client:**
 ```bash
 cd web_client
 npm install
-npm run build
-
-# Open example.html in browser, or serve it:
-python -m http.server 8000
-# Navigate to http://localhost:8000/example.html
+npx vite --port 8080
+# Open http://localhost:8080 in your browser
 ```
 
 ## Databases
 
-The system uses three databases for PIR queries:
+The system uses two databases for PIR queries:
 
-### 1. UTXO Cuckoo Index (`utxo_cuckoo_index`)
-- **Purpose**: Maps script hashes to UTXO chunk indices
-- **Hash**: Cuckoo hashing with 2 locations
-- **Entry size**: 24 bytes
+### 1. Cuckoo Index (`utxo_cuckoo_index`)
+- **Purpose**: Maps HASH160(scriptPubKey) to byte offset in chunks file
+- **Hash**: Bucketed cuckoo hashing with 2 locations (FNV-1a style)
+- **Entry size**: 24 bytes (20-byte HASH160 key + 4-byte offset)
+- **Bucket size**: 4 entries per bucket
 - **Buckets**: ~15.4 million
 
 ### 2. UTXO Chunks Data (`utxo_chunks_data`)
-- **Purpose**: Contains actual UTXO data in chunks
-- **Format**: Direct index lookup (no hashing)
-- **Entry size**: 1024 bytes
-- **Entries**: ~1.2 million
+- **Purpose**: Contains serialized UTXO data in 32KB chunks
+- **Format**: Direct index lookup (chunk_index = byte_offset / 32768)
+- **Entry size**: 32,768 bytes (32KB per chunk)
+- **Entries**: ~182K (normal) / ~65K (small)
 
-### 3. TXID Mapping (`utxo_4b_to_32b`)
-- **Purpose**: Maps 4-byte TXID prefixes to full 32-byte TXIDs
-- **Hash**: Cuckoo hashing with 4 entries per bucket
-- **Entry size**: 36 bytes (4-byte key + 32-byte TXID)
-- **Buckets**: ~30 million
+#### Chunk Data Format
+
+Each script hash's UTXOs are serialized as:
+```
+[varint entry_count]
+[32B TXID][varint vout][varint amount]  × entry_count
+```
+
+Full 32-byte TXIDs are stored directly (no compression or mapping needed).
+
+#### Offset Encoding
+
+Byte offsets into the chunks file are stored as `offset / 2` in the cuckoo index (u32), with 2-byte alignment padding. This allows addressing up to ~8.6GB with a 4-byte field. Clients multiply the stored offset by 2 to recover the actual byte offset.
 
 ## Query Flow
 
-1. **Compute script hash**: RIPEMD160 of scriptPubkey
-2. **Calculate cuckoo locations**: Two hash locations for the script hash
-3. **Query cuckoo index**: PIR query to get chunk indices
-4. **Query chunks**: PIR query to retrieve UTXO data
-5. **Combine results**: XOR responses from both servers
-6. **Resolve TXIDs**: Query TXID mapping for full TXIDs
+1. **Compute HASH160**: RIPEMD160(SHA256(scriptPubKey)) — 20 bytes
+2. **Calculate cuckoo locations**: Two bucket indices from the HASH160
+3. **Phase 1 — Query cuckoo index**: PIR query retrieves the index entry, revealing the chunk offset
+4. **Phase 2 — Query chunks**: PIR query retrieves the 32KB chunk containing the UTXO data
+5. **Parse results**: Decode varint-encoded entries to get TXIDs, vouts, and amounts
+
+Each phase sends DPF keys to both servers; responses are XOR'd to recover the plaintext.
 
 ## WebSocket Protocol
 
@@ -263,106 +266,49 @@ openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -node
     --tls-key /path/to/key.pem
 ```
 
-For production, use Let's Encrypt certificates. See [`doc/DEPLOYMENT.md`](doc/DEPLOYMENT.md) for complete deployment instructions.
-
-## API Reference
-
-### Rust Library
-
-```rust
-use dpf_pir::{
-    Database, DatabaseConfig, DatabaseRegistry,
-    CuckooDatabase, UtxoChunkDatabase, TxidMappingDatabase,
-    cuckoo_locations_default, txid_mapping_locations,
-};
-
-// Create a cuckoo database
-let config = DatabaseConfig::new(
-    "my_db",
-    "/path/to/data.bin",
-    24,     // entry_size
-    1,      // bucket_size
-    1000000, // num_buckets
-    2,      // num_locations
-);
-let db = CuckooDatabase::with_mmap(config)?;
-
-// Compute hash locations
-let key = hex::decode("76a914...88ac")?;
-let (loc1, loc2) = cuckoo_locations_default(&key, db.num_buckets());
-
-// Read bucket entries
-let entries = db.read_bucket(loc1)?;
-```
-
-### TypeScript Client
-
-```typescript
-import { createPirClient, hexToBytes, cuckooHash1, cuckooHash2 } from 'bitcoin-pir';
-
-// Create client
-const client = createPirClient(
-  'wss://server1.example.com',
-  'wss://server2.example.com'
-);
-
-// Connect
-await client.connect();
-
-// Query database
-const result = await client.queryDatabase(
-  'utxo_cuckoo_index',
-  location1,
-  location2,
-  24  // DPF parameter
-);
-
-// Disconnect
-client.disconnect();
-```
+See [`doc/DEPLOYMENT.md`](doc/DEPLOYMENT.md) for complete deployment instructions including Cloudflare Tunnel and nginx reverse proxy setups.
 
 ## Development
 
 ```bash
-# Build all components
+# Build all Rust components
 cargo build --release
 
-# Run tests
+# Run Rust tests
 cargo test
 
-# Build web client
-cd web_client && npm run build
+# Build web client for production
+cd web_client && npm run build-web
 
-# Run web client tests
-cd web_client && npm test
+# Run web client dev server
+cd web_client && npx vite --port 8080
 ```
 
 ## Dependencies
 
 ### Rust
-- `tokio` - Async runtime
-- `tokio-tungstenite` - WebSocket support
-- `tokio-rustls` - TLS support
-- `serde` / `bincode` - Serialization
-- `memmap2` - Memory-mapped files
-- `libdpf` - DPF implementation
-- `sha2`, `ripemd` - Hash functions
+- `tokio` — Async runtime
+- `tokio-tungstenite` — WebSocket support
+- `tokio-rustls` — TLS support
+- `memmap2` — Memory-mapped files
+- `libdpf` — DPF implementation
+- `bitcoin` — Bitcoin data structures (build_db)
 
 ### Web Client
 - TypeScript 5+
-- Node.js 18+ or modern browser
-- WebSocket API
+- Vite (build tool)
+- `libdpf` — TypeScript DPF implementation
+- `hash.js` — RIPEMD160 and SHA256
 
 ## Security Model
 
 ### Privacy Guarantees
 - **Two-server model**: Privacy is guaranteed if at least one server is honest
-- **DPF-based queries**: Each server receives a different DPF key
+- **DPF-based queries**: Each server receives a different DPF key; neither can reconstruct the query alone
 - **No query logging**: The library does not log query details
 
 ### Requirements
-- Servers MUST NOT collude
-- Use different hosting providers for each server
+- Servers MUST NOT collude — use different hosting providers
 - Enable TLS in production
 - Keep database files synchronized between servers
 
@@ -370,21 +316,19 @@ cd web_client && npm test
 
 | Operation | Latency | Notes |
 |-----------|---------|-------|
-| Cuckoo Index Query | ~10-50ms | Memory-mapped access |
-| Chunk Query | ~10-50ms | Direct index lookup |
-| TXID Mapping Query | ~10-50ms | Cuckoo with 4 entries/bucket |
-| Full UTXO Lookup | ~100-200ms | All three queries combined |
+| Cuckoo Index Query | ~10–50ms | Memory-mapped access |
+| Chunk Query | ~10–50ms | Direct index lookup |
+| Full UTXO Lookup | ~50–150ms | Both queries combined |
 
 ## Documentation
 
-- [`build_db/src/bin/README.md`](build_db/src/bin/README.md) - Database generation pipeline
-- [`doc/DEPLOYMENT.md`](doc/DEPLOYMENT.md) - Production deployment guide
-- [`doc/WEB.md`](doc/WEB.md) - Web client implementation
-- [`web_client/README.md`](web_client/README.md) - Web client API reference
+- [`doc/DEPLOYMENT.md`](doc/DEPLOYMENT.md) — Production deployment guide
+- [`doc/WEB.md`](doc/WEB.md) — WebSocket protocol and web client details
+- [`web_client/README.md`](web_client/README.md) — Web client API reference
 
 ## License
 
-MIT License
+MIT
 
 ## Contributing
 
@@ -396,9 +340,3 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 - [Distributed Point Functions](https://eprint.iacr.org/2013/679.pdf)
 - [Bitcoin UTXO Model](https://developer.bitcoin.org/devguide/transactions.html)
 - [Cuckoo Hashing](https://en.wikipedia.org/wiki/Cuckoo_hashing)
-<task_progress>- [x] Explore current README and project structure
-- [x] Understand the main components (build_db, dpf_pir, web_client)
-- [x] Review documentation in subdirectories
-- [x] Write comprehensive README update
-- [ ] Verify completeness</task_progress>
-</write_to_file>

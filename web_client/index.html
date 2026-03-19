@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Bitcoin PIR Web Client Demo</title>
+    <title>Bitcoin PIR Web Client Demo (Gen2)</title>
     <style>
         body {
             font-family: Arial, sans-serif;
@@ -192,29 +192,9 @@
             color: #28a745;
             font-weight: bold;
         }
-        .txid-cell {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-        .txid-lookup-btn {
-            background-color: #6c757d;
-            padding: 2px 6px;
-            font-size: 11px;
-            border-radius: 3px;
-        }
-        .txid-lookup-btn:hover {
-            background-color: #5a6268;
-        }
-        .txid-lookup-btn:disabled {
-            background-color: #ccc;
-        }
-        .txid-not-found {
-            color: #dc3545;
-            font-size: 11px;
-        }
         .txid-link {
             color: #0066cc;
+            font-family: monospace;
             font-size: 11px;
             word-break: break-all;
             text-decoration: none;
@@ -233,11 +213,29 @@
             width: 80px;
             font-weight: normal;
         }
+        .whale-banner {
+            background-color: #fff3cd;
+            border: 2px solid #f7931a;
+            border-radius: 8px;
+            padding: 20px;
+            text-align: center;
+            margin: 20px 0;
+        }
+        .whale-banner h3 {
+            color: #856404;
+            margin: 0 0 10px 0;
+            font-size: 20px;
+        }
+        .whale-banner p {
+            color: #856404;
+            margin: 0;
+            font-size: 14px;
+        }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🔐 Bitcoin PIR Web Client Demo</h1>
+        <h1>Bitcoin PIR Web Client Demo (Gen2)</h1>
         <p>
             This demo shows how to query the Bitcoin UTXO set using Private Information Retrieval (PIR).
             Your queries are private - the server learns nothing about which address you're looking up.
@@ -278,22 +276,28 @@
             No results yet. Configure servers and run a query.
         </div>
 
+        <!-- Whale Banner (hidden by default) -->
+        <div id="whaleBanner" class="whale-banner hidden">
+            <h3>Whale Address Detected</h3>
+            <p>This address has UTXOs but is excluded from the lightweight database.</p>
+        </div>
+
         <!-- UTXO Pagination Section -->
         <div id="utxoSection" class="utxo-section hidden">
             <div class="utxo-header">
                 <h2>UTXO Entries</h2>
                 <span id="utxoCountInfo" class="pagination-info"></span>
             </div>
-            
+
             <div id="utxoLoading" class="utxo-loading hidden">
                 Loading entries...
             </div>
-            
+
             <table class="utxo-table" id="utxoTable">
                 <thead>
                     <tr>
                         <th>#</th>
-                        <th style="min-width: 280px;">Transaction Index (click 🔍 to view TXID)</th>
+                        <th style="min-width: 280px;">TXID</th>
                         <th>Vout</th>
                         <th>Amount (satoshis)</th>
                         <th>Amount (BTC)</th>
@@ -302,11 +306,11 @@
                 <tbody id="utxoTableBody">
                 </tbody>
             </table>
-            
+
             <div class="pagination-controls">
-                <button id="prevPageBtn" disabled>◀ PREV PAGE</button>
+                <button id="prevPageBtn" disabled>&#9664; PREV PAGE</button>
                 <span id="pageInfo" class="pagination-info">Page 1 of 1</span>
-                <button id="nextPageBtn" disabled>NEXT PAGE ▶</button>
+                <button id="nextPageBtn" disabled>NEXT PAGE &#9654;</button>
             </div>
         </div>
 
@@ -317,7 +321,7 @@
     </div>
 
     <script type="module">
-        import { createPirClient, hexToBytes, bytesToHex, cuckooHash1, cuckooHash2, CUCKOO_NUM_BUCKETS, scriptHash } from './src/index.js';
+        import { createPirClient, hexToBytes, bytesToHex, cuckooHash1, cuckooHash2, CUCKOO_NUM_BUCKETS, scriptHash } from './src/index.ts';
 
         let client = null;
         let paginationState = null;
@@ -350,7 +354,7 @@
             const server1 = document.getElementById('server1Url').value.trim();
             const server2 = document.getElementById('server2Url').value.trim();
             const reconnectBtn = document.getElementById('reconnectBtn');
-            
+
             // Show reconnect button if URLs have changed since last connection
             if (client && (server1 !== lastConnectedUrls.server1 || server2 !== lastConnectedUrls.server2)) {
                 reconnectBtn.classList.remove('hidden');
@@ -368,34 +372,27 @@
             return btc.toFixed(8);
         }
 
+        /**
+         * Convert a 32-byte TXID Uint8Array to reversed hex string (Bitcoin display format)
+         */
+        function txidToReversedHex(txid) {
+            const reversed = Array.from(txid).reverse();
+            return reversed.map(b => b.toString(16).padStart(2, '0')).join('');
+        }
+
         function updateUtxoTable(entries, startIndex) {
             const tbody = document.getElementById('utxoTableBody');
             tbody.innerHTML = '';
-            
+
             entries.forEach((entry, i) => {
                 const row = document.createElement('tr');
                 const rowIndex = startIndex + i + 1;
-                const txid4b = entry.txid;
-                
-                // Check if we have a cached result for this TXID
-                const cachedResult = txid32bCache.get(txid4b);
-                let cachedHtml = '';
-                if (cachedResult) {
-                    // Make it a clickable link to mempool.space
-                    cachedHtml = `<a href="https://mempool.space/tx/${cachedResult}" target="_blank" class="txid-link">${cachedResult}</a>`;
-                } else if (cachedResult === null) {
-                    cachedHtml = `<div class="txid-not-found">Not found</div>`;
-                }
-                const buttonDisabled = cachedResult !== undefined ? 'disabled' : '';
-                
+                const txidHex = txidToReversedHex(entry.txid);
+
                 row.innerHTML = `
                     <td>${rowIndex}</td>
                     <td>
-                        <div class="txid-cell">
-                            <span id="txid4b-${rowIndex}">${txid4b}</span>
-                            <button class="txid-lookup-btn" id="lookup-btn-${rowIndex}" data-txid="${txid4b}" data-row="${rowIndex}" ${buttonDisabled}>🔍</button>
-                        </div>
-                        <div id="txid32b-${rowIndex}">${cachedHtml}</div>
+                        <a href="https://mempool.space/tx/${txidHex}" target="_blank" class="txid-link">${txidHex}</a>
                     </td>
                     <td>${entry.vout}</td>
                     <td>${entry.amount.toString()}</td>
@@ -403,84 +400,26 @@
                 `;
                 tbody.appendChild(row);
             });
-            
-            // Add click handlers for all lookup buttons that aren't disabled
-            document.querySelectorAll('.txid-lookup-btn:not([disabled])').forEach(btn => {
-                btn.addEventListener('click', async (e) => {
-                    const txid4b = parseInt(e.target.dataset.txid);
-                    const rowNum = e.target.dataset.row;
-                    await lookupTxid32b(txid4b, rowNum);
-                });
-            });
-        }
-        
-        // Cache for 32B TXIDs
-        const txid32bCache = new Map();
-        
-        async function lookupTxid32b(txid4b, rowNum) {
-            if (!client) return;
-            
-            const resultDiv = document.getElementById(`txid32b-${rowNum}`);
-            const btn = document.getElementById(`lookup-btn-${rowNum}`);
-            
-            // Check cache first
-            if (txid32bCache.has(txid4b)) {
-                const cached = txid32bCache.get(txid4b);
-                if (cached) {
-                    resultDiv.innerHTML = `<a href="https://mempool.space/tx/${cached}" target="_blank" class="txid-link">${cached}</a>`;
-                } else {
-                    resultDiv.innerHTML = `<div class="txid-not-found">Not found</div>`;
-                }
-                btn.disabled = true;
-                return;
-            }
-            
-            // Show loading
-            resultDiv.innerHTML = `<div style="color: #6c757d; font-style: italic; font-size: 11px;">Looking up...</div>`;
-            btn.disabled = true;
-            
-            try {
-                log(`Looking up 32B TXID for 4B: ${txid4b}`, 'info');
-                const txid32b = await client.queryTxidMapping(txid4b);
-                
-                if (txid32b) {
-                    // Reverse bytes for display (Bitcoin TXIDs are displayed in reverse byte order)
-                    const reversedTxid = Array.from(txid32b).reverse();
-                    const hex = reversedTxid.map(b => b.toString(16).padStart(2, '0')).join('');
-                    // Make it a clickable link to mempool.space
-                    resultDiv.innerHTML = `<a href="https://mempool.space/tx/${hex}" target="_blank" class="txid-link">${hex}</a>`;
-                    txid32bCache.set(txid4b, hex);
-                    log(`Found 32B TXID: ${hex}`, 'success');
-                } else {
-                    resultDiv.innerHTML = `<div class="txid-not-found">Not found in mapping</div>`;
-                    txid32bCache.set(txid4b, null);
-                    log(`32B TXID not found for 4B: ${txid4b}`, 'error');
-                }
-            } catch (error) {
-                resultDiv.innerHTML = `<div class="txid-not-found">Error: ${error.message}</div>`;
-                log(`Error looking up TXID: ${error.message}`, 'error');
-                btn.disabled = false; // Re-enable on error
-            }
         }
 
         function updatePaginationControls() {
             if (!paginationState) return;
-            
+
             const totalPages = Math.ceil(Number(paginationState.totalEntries) / PAGE_SIZE);
             document.getElementById('pageInfo').textContent = `Page ${currentPage + 1} of ${totalPages}`;
-            document.getElementById('utxoCountInfo').textContent = 
+            document.getElementById('utxoCountInfo').textContent =
                 `${paginationState.totalEntries} total UTXOs | ${paginationState.entries.length} cached`;
-            
+
             document.getElementById('prevPageBtn').disabled = currentPage === 0;
             document.getElementById('nextPageBtn').disabled = currentPage >= totalPages - 1;
         }
 
         async function loadPage(page) {
             if (!paginationState || !client) return;
-            
+
             const loadingDiv = document.getElementById('utxoLoading');
             loadingDiv.classList.remove('hidden');
-            
+
             try {
                 const entries = await client.getUtxoPage(paginationState, page, PAGE_SIZE);
                 const startIndex = page * PAGE_SIZE;
@@ -497,20 +436,20 @@
         async function connect() {
             const server1Url = document.getElementById('server1Url').value.trim();
             const server2Url = document.getElementById('server2Url').value.trim();
-            
+
             if (!server1Url || !server2Url) {
                 log('Please enter both server URLs', 'error');
                 return;
             }
-            
+
             try {
                 log(`Connecting to servers...`);
                 log(`  Server 1: ${server1Url}`);
                 log(`  Server 2: ${server2Url}`);
-                
+
                 // Create client with connection state callback for auto-reconnection
                 client = createPirClient(server1Url, server2Url);
-                client = new (await import('./src/index.js')).PirClient({
+                client = new (await import('./src/index.ts')).PirClient({
                     server1Url,
                     server2Url,
                     reconnect: {
@@ -523,15 +462,15 @@
                         heartbeatTimeout: 10000,   // 10 second pong timeout
                     },
                     onConnectionStateChange: (state, message) => {
-                        log(`Connection state: ${state}${message ? ' - ' + message : ''}`, 
-                            state === 'connected' ? 'success' : 
+                        log(`Connection state: ${state}${message ? ' - ' + message : ''}`,
+                            state === 'connected' ? 'success' :
                             state === 'disconnected' ? 'error' : 'info');
-                        
+
                         // Update UI based on connection state
                         const statusDiv = document.getElementById('status');
                         statusDiv.textContent = `Status: ${state.charAt(0).toUpperCase() + state.slice(1)}${message ? ' - ' + message : ''}`;
                         statusDiv.className = `status ${state}`;
-                        
+
                         // Update buttons based on state
                         if (state === 'connected') {
                             setButtons(true);
@@ -544,9 +483,9 @@
                         }
                     }
                 });
-                
+
                 await client.connect();
-                
+
                 log('Successfully connected to both servers!', 'success');
             } catch (error) {
                 log(`Connection failed: ${error.message}`, 'error');
@@ -566,6 +505,7 @@
             paginationState = null;
             currentPage = 0;
             document.getElementById('utxoSection').classList.add('hidden');
+            document.getElementById('whaleBanner').classList.add('hidden');
         }
 
         async function queryUtxos() {
@@ -582,33 +522,33 @@
                 return;
             }
 
-            // Reset pagination state and cache
+            // Reset pagination state
             paginationState = null;
             currentPage = 0;
-            txid32bCache.clear();
             document.getElementById('utxoSection').classList.add('hidden');
+            document.getElementById('whaleBanner').classList.add('hidden');
 
             try {
                 // Convert script pubkey hex to bytes
                 const scriptPubkey = hexToBytes(scriptPubkeyHex);
                 log(`Script Pubkey: ${scriptPubkeyHex}`, 'info');
                 log(`Script Pubkey length: ${scriptPubkey.length} bytes`, 'info');
-                
-                // Compute RIPEMD160 hash of the script pubkey
+
+                // Compute HASH160 = RIPEMD160(SHA256(script))
                 const scriptHashBytes = await scriptHash(scriptPubkey);
                 const scriptHashHex = bytesToHex(scriptHashBytes);
-                
-                log(`Computed RIPEMD160 hash: ${scriptHashHex}`, 'info');
-                
+
+                log(`Computed HASH160: ${scriptHashHex}`, 'info');
+
                 // Initialize pagination state
                 log('Starting PIR query...', 'info');
                 paginationState = await client.initUtxoPagination(scriptHashBytes);
-                
+
                 if (!paginationState) {
                     log(`Script hash not found in database`, 'error');
                     setResult(
                         `Script Pubkey: ${scriptPubkeyHex}\n\n` +
-                        `RIPEMD160 Hash: ${scriptHashHex}\n\n` +
+                        `HASH160: ${scriptHashHex}\n\n` +
                         `Result: Script hash NOT FOUND\n\n` +
                         `This address has no UTXOs in the database.`
                     );
@@ -622,10 +562,29 @@
 
                 log(`Found offset ${offset}`, 'info');
                 log(`Total UTXO count = ${totalEntries}`, 'success');
-                
+
+                // Check for whale address
+                if (paginationState.isWhale) {
+                    log('Whale address detected - excluded from lightweight database', 'info');
+                    setResult(
+                        `Script Pubkey: ${scriptPubkeyHex}\n\n` +
+                        `HASH160: ${scriptHashHex}\n\n` +
+                        `----------------------------------------\n` +
+                        `PIR QUERY RESULTS\n` +
+                        `----------------------------------------\n` +
+                        `  Chunk offset: ${offset}\n` +
+                        `  Chunk index: ${chunkIndex}\n` +
+                        `  Local offset: ${localOffset}\n\n` +
+                        `Whale address detected (entry_count = 0).\n` +
+                        `This address has UTXOs but is excluded from the lightweight database.`
+                    );
+                    document.getElementById('whaleBanner').classList.remove('hidden');
+                    return;
+                }
+
                 setResult(
                     `Script Pubkey: ${scriptPubkeyHex}\n\n` +
-                    `RIPEMD160 Hash: ${scriptHashHex}\n\n` +
+                    `HASH160: ${scriptHashHex}\n\n` +
                     `----------------------------------------\n` +
                     `PIR QUERY RESULTS\n` +
                     `----------------------------------------\n` +
@@ -642,7 +601,7 @@
                     log('Loading first page of UTXO entries...', 'info');
                     await loadPage(0);
                 }
-                
+
                 log('Query completed', 'success');
             } catch (error) {
                 log(`Query failed: ${error.message}`, 'error');
@@ -660,7 +619,7 @@
         document.getElementById('queryCuckooBtn').addEventListener('click', queryUtxos);
         document.getElementById('prevPageBtn').addEventListener('click', () => loadPage(currentPage - 1));
         document.getElementById('nextPageBtn').addEventListener('click', () => loadPage(currentPage + 1));
-        
+
         // Show reconnect button when URLs change
         document.getElementById('server1Url').addEventListener('input', updateReconnectButton);
         document.getElementById('server2Url').addEventListener('input', updateReconnectButton);

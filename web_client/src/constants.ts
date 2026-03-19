@@ -5,19 +5,14 @@
 // Database IDs
 export const CUCKOO_DB_ID = "utxo_cuckoo_index";
 export const CHUNKS_DB_ID = "utxo_chunks_data";
-export const TXID_MAPPING_DB_ID = "utxo_4b_to_32b";
 
 // Database sizes
 export const CUCKOO_NUM_BUCKETS = 15_385_139;
-export const CUCKOO_BUCKET_SIZE = 1; // 1 entry per bucket
-export const CUCKOO_ENTRY_SIZE = 20 + 32; // 20-byte key + 32-byte value
+export const CUCKOO_BUCKET_SIZE = 4; // 4 entries per bucket
+export const CUCKOO_ENTRY_SIZE = 20 + 4; // 20-byte key + 4-byte offset
 
-export const CHUNKS_NUM_ENTRIES = 33_038;
+export const CHUNKS_NUM_ENTRIES = 181_833;
 export const CHUNK_SIZE = 32 * 1024; // 32 KB
-
-export const TXID_MAPPING_NUM_BUCKETS = 30_097_234;
-export const TXID_MAPPING_BUCKET_SIZE = 4; // 4 entries per bucket
-export const TXID_MAPPING_ENTRY_SIZE = 4 + 32; // 4-byte key + 32-byte value
 
 // Hash constants
 export const DEFAULT_HASH1_SEED = 0xcbf29ce484222325n;

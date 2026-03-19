@@ -1,24 +1,28 @@
-//! DPF-PIR WebSocket Server
-//! 
-//! A WebSocket-based PIR server for browser clients.
+//! DPF-PIR WebSocket Server //!
+//! A WebSocket-based PIR server for browser clients (PIR databases).
 //! Supports multiple queries over a single WebSocket connection.
 //!
 //! ## Usage
 //!
 //! Plain WebSocket (ws://):
 //! ```bash
-//! cargo run --bin server -- --port 8091
+//! cargo run --bin server -- --port 8092
 //! ```
 //!
 //! Secure WebSocket (wss://) with TLS:
 //! ```bash
-//! cargo run --bin server -- --port 8091 --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem
+//! cargo run --bin server -- --port 8092 --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem
+//! ```
+//!
+//! Small databases:
+//! ```bash
+//! cargo run --bin server -- --port 8092 --small
 //! ```
 //!
 //! The server accepts WebSocket connections and processes PIR queries
 //! using the same binary protocol as the TCP server.
 
-use dpf_pir::load_configuration;
+use dpf_pir::server_config::load_configuration;
 use dpf_pir::pir_backend::PirBackend;
 use dpf_pir::DpfPirBackend;
 use dpf_pir::websocket::{DataStore, DataStoreManager};
@@ -41,20 +45,22 @@ struct ServerArgs {
     port: u16,
     tls_cert: Option<String>,
     tls_key: Option<String>,
+    small: bool,
 }
 
 fn parse_args() -> ServerArgs {
     let args: Vec<String> = std::env::args().collect();
-    let mut port = 8091;
+    let mut port = 8092;
     let mut tls_cert: Option<String> = None;
     let mut tls_key: Option<String> = None;
-    
+    let mut small = false;
+
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--port" | "-p" => {
                 if i + 1 < args.len() {
-                    port = args[i + 1].parse::<u16>().unwrap_or(8091);
+                    port = args[i + 1].parse::<u16>().unwrap_or(8092);
                     i += 1;
                 }
             }
@@ -70,22 +76,29 @@ fn parse_args() -> ServerArgs {
                     i += 1;
                 }
             }
+            "--small" => {
+                small = true;
+            }
             "--help" | "-h" => {
-                println!("DPF-PIR WebSocket Server");
+                println!("DPF-PIR WebSocket Server (Gen2)");
                 println!("Usage: {} [OPTIONS]", args[0]);
                 println!();
                 println!("Options:");
-                println!("  --port, -p <PORT>     Port to listen on (default: 8091)");
+                println!("  --port, -p <PORT>     Port to listen on (default: 8092)");
                 println!("  --tls-cert <FILE>     TLS certificate file (PEM format)");
                 println!("  --tls-key <FILE>      TLS private key file (PEM format)");
+                println!("  --small               Use small database files");
                 println!("  --help, -h            Show this help message");
                 println!();
                 println!("Examples:");
                 println!("  # Plain WebSocket (ws://)");
-                println!("  {} --port 8091", args[0]);
+                println!("  {} --port 8092", args[0]);
                 println!();
                 println!("  # Secure WebSocket (wss://)");
-                println!("  {} --port 8091 --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem", args[0]);
+                println!("  {} --port 8092 --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem", args[0]);
+                println!();
+                println!("  # Small databases");
+                println!("  {} --port 8092 --small", args[0]);
                 println!();
                 println!("To generate self-signed certificates for testing:");
                 println!("  openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes");
@@ -102,7 +115,7 @@ fn parse_args() -> ServerArgs {
         std::process::exit(1);
     }
 
-    ServerArgs { port, tls_cert, tls_key }
+    ServerArgs { port, tls_cert, tls_key, small }
 }
 
 /// Load TLS configuration from certificate and key files
@@ -161,11 +174,12 @@ async fn main() {
     };
 
     // Load configuration (databases are registered in server_config.rs)
-    let server_config = load_configuration();
+    let server_config = load_configuration(args.small);
 
     let protocol = if tls_acceptor.is_some() { "wss" } else { "ws" };
     info!("Starting DPF-PIR WebSocket server on port {} ({})", port, protocol);
     info!("Load to memory: {}", server_config.load_to_memory);
+    info!("Small mode: {}", args.small);
 
     // Create data store manager
     let mut store_manager = DataStoreManager::new();
@@ -290,12 +304,12 @@ async fn handle_websocket_connection<S>(
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     info!("[SERVER] Step 4: Starting WebSocket handshake for {}", peer_addr);
-    
+
     // Use accept_hdr_async to handle CORS and allow connections from any origin
     let callback = |req: &Request, mut response: Response| {
         let origin = req.headers().get("origin").map(|v| v.to_str().unwrap_or("*")).unwrap_or("*");
         info!("[SERVER] Step 5: WebSocket handshake request from origin: {}", origin);
-        
+
         // Add CORS headers to the response
         let headers = response.headers_mut();
         headers.insert(
@@ -313,7 +327,7 @@ async fn handle_websocket_connection<S>(
         info!("[SERVER] Step 6: CORS headers added to response");
         Ok(response)
     };
-    
+
     info!("[SERVER] Step 7: Calling accept_hdr_async to complete WebSocket handshake...");
     match accept_hdr_async(stream, callback).await {
         Ok(ws_stream) => {
