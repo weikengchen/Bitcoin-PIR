@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Bitcoin Batch PIR Web Client</title>
+    <title>2-Server DPF-PIR + PBC</title>
     <style>
         body {
             font-family: Arial, sans-serif;
@@ -186,74 +186,73 @@
 </head>
 <body>
     <div class="container">
-        <h1>Bitcoin Batch PIR Web Client</h1>
-        <p>
-            Two-level Batch PIR protocol for private UTXO lookups.
-            Level 1 queries the index, Level 2 fetches chunk data across multiple rounds.
-            Enter one or more scriptPubKeys (one per line) to query their UTXOs privately.
-        </p>
+        <h1>2-Server DPF-PIR + PBC</h1>
         <p style="font-size: 13px; color: #888; margin-top: -5px;">
             Note: UTXOs with &le; 576 sats (dust) are excluded from the database.
             ScriptPubKeys with more than 100 UTXOs are also excluded.
         </p>
 
-        <div id="status" class="status disconnected">
-            Status: Disconnected
+        <div style="display: flex; align-items: center; gap: 12px; margin: 10px 0;">
+            <div id="status" class="status disconnected" style="margin: 0; flex: 1;">
+                Status: Disconnected
+            </div>
+            <button id="connectBtn" class="small">Connect</button>
+            <button id="disconnectBtn" class="small secondary" disabled>Disconnect</button>
         </div>
 
-        <div class="step">
-            <span class="step-number">Step 1:</span> Configure & Connect to Batch PIR Servers
-            <br><br>
-            <div class="server-row">
-                <span class="server-label">Server 0:</span>
-                <input type="text" id="server0Url" class="small" value="wss://dpf1.chenweikeng.com">
+        <details id="serverConfig" style="margin-bottom: 10px;">
+            <summary style="cursor: pointer; font-size: 13px; color: #888;">Server configuration</summary>
+            <div style="margin-top: 8px;">
+                <div class="server-row">
+                    <span class="server-label">Server 0:</span>
+                    <input type="text" id="server0Url" class="small" value="wss://dpf1.chenweikeng.com">
+                </div>
+                <div class="server-row">
+                    <span class="server-label">Server 1:</span>
+                    <input type="text" id="server1Url" class="small" value="wss://dpf2.chenweikeng.com">
+                </div>
             </div>
-            <div class="server-row">
-                <span class="server-label">Server 1:</span>
-                <input type="text" id="server1Url" class="small" value="wss://dpf2.chenweikeng.com">
-            </div>
-            <br>
-            <button id="connectBtn">Connect</button>
-            <button id="disconnectBtn" disabled>Disconnect</button>
-        </div>
+        </details>
 
         <div class="step">
-            <span class="step-number">Step 2:</span> Query by ScriptPubKey(s)
-            <br><br>
-            <label for="scriptPubkeys">ScriptPubKey(s) — hex, one per line:</label>
-            <textarea id="scriptPubkeys" rows="5" placeholder="Enter one or more scriptPubKey hex values, one per line...">76a91484407a2fe50de7b97ef1a80613b41d06af8fa38788ac
-0014528aa6fb623acd8f574abc89508e0a42cde57b8b</textarea>
+            <label for="scriptPubkeys">Bitcoin address(es) or scriptPubKey hex — one per line:</label>
+            <textarea id="scriptPubkeys" rows="4" placeholder="Paste Bitcoin addresses (bc1..., 1..., 3...) or raw scriptPubKey hex, one per line...">1D4HSHPJxoPLqiBNFNarz34dcWPLvpiaeb
+bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
+            <div id="conversionNote" style="font-size: 12px; color: #28a745; margin: 2px 0 6px 5px; display: none;"></div>
+
+            <details id="examplesDetail" style="margin-top: 6px;">
+                <summary style="cursor: pointer; font-size: 13px; color: #666;">Load examples</summary>
+                <div class="examples" style="margin-top: 8px;">
+                    <span class="example-label">Known in dataset:</span>
+                    <button class="example-btn" data-spk="76a91484407a2fe50de7b97ef1a80613b41d06af8fa38788ac" style="background:#fff3cd; border-color:#ffc107;">P2PKH</button>
+                    <button class="example-btn" data-spk="0014528aa6fb623acd8f574abc89508e0a42cde57b8b" style="background:#fff3cd; border-color:#ffc107;">P2WPKH</button>
+                    <button class="example-btn" data-spk="a914977824b90abfb1175a736e7020ac376702953adc87" style="background:#fff3cd; border-color:#ffc107;">P2SH</button>
+                    <button class="example-btn" data-spk="51201c29857ea48bc3c477c9509aafe901a61940f1ac29215f588cb250291f30fe8a" style="background:#fff3cd; border-color:#ffc107;">P2TR</button>
+                    <button class="example-btn" data-spk="0020ebb7d608cfce01578d4e07aa9a82e6a9cff4ae9194a7dce148d87c8dfdc7b55e" style="background:#fff3cd; border-color:#ffc107;">P2WSH</button>
+                    <button class="example-btn" data-spk="512102ab5dbba9d81acbadae5ade8ae7ad1fbae2ffc9b566fc408117377f6ae1cea6e221037e8a78ba439913d64c68cd2606ddd48e5e9a58ef03635a543ba4a34a92f6785e2103bcc4e113b8deda823848e07c157d7b341098a5c97851bfd6315d6fe54a85a74a53ae" style="background:#fff3cd; border-color:#ffc107;">1-of-3 Multisig</button>
+                    <button class="example-btn" data-spk="512102f4aef682535628a7e0492b2b5db1aa312348c3095e0258e26b275b25b10290e62120434e54525052545900000014000042e4a3aa79d50000000005f5e1000100000052ae" style="background:#fff3cd; border-color:#ffc107;">1-of-2 Multisig</button>
+                    <button class="example-btn" id="loadDiverseBtn" style="background:#fff3cd; border-color:#ffc107;">Mix</button>
+                    <br>
+                    <span class="example-label">Top whales (most UTXOs):</span>
+                    <button class="example-btn" data-spk="76a9143cb4b67770d4c1c4539c6b9397e865a05c47c55688ac" style="background:#fde2e2; border-color:#e74c3c;">P2PKH whale</button>
+                    <button class="example-btn" data-spk="76a914d35128db955305f78f550b2b3edd603c198b16d788ac" style="background:#fde2e2; border-color:#e74c3c;">P2PKH whale 2</button>
+                    <button class="example-btn" data-spk="76a9145dcf8d3e1445997806e569b546a2b9d85fe637c188ac" style="background:#fde2e2; border-color:#e74c3c;">P2PKH whale 3</button>
+                    <button class="example-btn" data-spk="00146cc553856b233afc1e18fba7f39a724b460a12b3" style="background:#fde2e2; border-color:#e74c3c;">P2WPKH whale</button>
+                    <button class="example-btn" data-spk="0014c2a2f99dac2bdc8323bfe47e76211fdf310e2bac" style="background:#fde2e2; border-color:#e74c3c;">P2WPKH whale 2</button>
+                    <button class="example-btn" data-spk="a9140e9feac0552727db096a8731289d952b5babd0e087" style="background:#fde2e2; border-color:#e74c3c;">P2SH whale</button>
+                    <button class="example-btn" data-spk="a9148c86d4a4ef15972d636fb87b4acc6bec78baf13487" style="background:#fde2e2; border-color:#e74c3c;">P2SH whale 2</button>
+                    <button class="example-btn" data-spk="00207f6b0309fb368f6c956ec910c747d3af7c8ce57a8f0aef36361675a5047ae012" style="background:#fde2e2; border-color:#e74c3c;">P2WSH whale</button>
+                    <button class="example-btn" data-spk="00203a4f7395b03caf1d7f080cfa3f045d39dc325e04f4c1cf231a868c4632b62b69" style="background:#fde2e2; border-color:#e74c3c;">P2WSH whale 2</button>
+                    <br>
+                    <span class="example-label">Batch test (1000 known scriptPubKeys):</span>
+                    <button class="example-btn" id="pickRandom100Btn" style="background-color: #d4edda; border-color: #28a745; padding: 6px 14px; font-size: 13px;">Pick 100 random</button>
+                    <button class="example-btn" id="pickRandomBtn" style="background-color: #e2e3f1; border-color: #6c757d;">Pick 50 random</button>
+                    <button class="example-btn" id="pickRandom10Btn" style="background-color: #e2e3f1; border-color: #6c757d;">Pick 10 random</button>
+                    <button class="example-btn" id="pickRandom5Btn" style="background-color: #e2e3f1; border-color: #6c757d;">Pick 5 random</button>
+                </div>
+            </details>
             <br>
-            <div class="examples">
-                <span class="example-label">Known in dataset (click to load single):</span>
-                <button class="example-btn" data-spk="76a91484407a2fe50de7b97ef1a80613b41d06af8fa38788ac" style="background:#fff3cd; border-color:#ffc107;">P2PKH</button>
-                <button class="example-btn" data-spk="0014528aa6fb623acd8f574abc89508e0a42cde57b8b" style="background:#fff3cd; border-color:#ffc107;">P2WPKH</button>
-                <button class="example-btn" data-spk="a914977824b90abfb1175a736e7020ac376702953adc87" style="background:#fff3cd; border-color:#ffc107;">P2SH</button>
-                <button class="example-btn" data-spk="51201c29857ea48bc3c477c9509aafe901a61940f1ac29215f588cb250291f30fe8a" style="background:#fff3cd; border-color:#ffc107;">P2TR</button>
-                <button class="example-btn" data-spk="0020ebb7d608cfce01578d4e07aa9a82e6a9cff4ae9194a7dce148d87c8dfdc7b55e" style="background:#fff3cd; border-color:#ffc107;">P2WSH</button>
-                <button class="example-btn" data-spk="512102ab5dbba9d81acbadae5ade8ae7ad1fbae2ffc9b566fc408117377f6ae1cea6e221037e8a78ba439913d64c68cd2606ddd48e5e9a58ef03635a543ba4a34a92f6785e2103bcc4e113b8deda823848e07c157d7b341098a5c97851bfd6315d6fe54a85a74a53ae" style="background:#fff3cd; border-color:#ffc107;">1-of-3 Multisig</button>
-                <button class="example-btn" data-spk="512102f4aef682535628a7e0492b2b5db1aa312348c3095e0258e26b275b25b10290e62120434e54525052545900000014000042e4a3aa79d50000000005f5e1000100000052ae" style="background:#fff3cd; border-color:#ffc107;">1-of-2 Multisig</button>
-                <button class="example-btn" id="loadDiverseBtn" style="background:#fff3cd; border-color:#ffc107;">Mix</button>
-                <br>
-                <span class="example-label">Top whales in dataset (most UTXOs, click to load single):</span>
-                <button class="example-btn" data-spk="76a9143cb4b67770d4c1c4539c6b9397e865a05c47c55688ac" style="background:#fde2e2; border-color:#e74c3c;">P2PKH whale</button>
-                <button class="example-btn" data-spk="76a914d35128db955305f78f550b2b3edd603c198b16d788ac" style="background:#fde2e2; border-color:#e74c3c;">P2PKH whale 2</button>
-                <button class="example-btn" data-spk="76a9145dcf8d3e1445997806e569b546a2b9d85fe637c188ac" style="background:#fde2e2; border-color:#e74c3c;">P2PKH whale 3</button>
-                <button class="example-btn" data-spk="00146cc553856b233afc1e18fba7f39a724b460a12b3" style="background:#fde2e2; border-color:#e74c3c;">P2WPKH whale</button>
-                <button class="example-btn" data-spk="0014c2a2f99dac2bdc8323bfe47e76211fdf310e2bac" style="background:#fde2e2; border-color:#e74c3c;">P2WPKH whale 2</button>
-                <button class="example-btn" data-spk="a9140e9feac0552727db096a8731289d952b5babd0e087" style="background:#fde2e2; border-color:#e74c3c;">P2SH whale</button>
-                <button class="example-btn" data-spk="a9148c86d4a4ef15972d636fb87b4acc6bec78baf13487" style="background:#fde2e2; border-color:#e74c3c;">P2SH whale 2</button>
-                <button class="example-btn" data-spk="00207f6b0309fb368f6c956ec910c747d3af7c8ce57a8f0aef36361675a5047ae012" style="background:#fde2e2; border-color:#e74c3c;">P2WSH whale</button>
-                <button class="example-btn" data-spk="00203a4f7395b03caf1d7f080cfa3f045d39dc325e04f4c1cf231a868c4632b62b69" style="background:#fde2e2; border-color:#e74c3c;">P2WSH whale 2</button>
-                <br>
-                <span class="example-label">Batch test (from 1000 known scriptPubKeys):</span>
-                <button class="example-btn" id="pickRandom100Btn" style="background-color: #d4edda; border-color: #28a745; padding: 6px 14px; font-size: 13px;">Pick 100 random</button>
-                <button class="example-btn" id="pickRandomBtn" style="background-color: #e2e3f1; border-color: #6c757d;">Pick 50 random</button>
-                <button class="example-btn" id="pickRandom10Btn" style="background-color: #e2e3f1; border-color: #6c757d;">Pick 10 random</button>
-                <button class="example-btn" id="pickRandom5Btn" style="background-color: #e2e3f1; border-color: #6c757d;">Pick 5 random</button>
-            </div>
-            <br>
-            <button id="queryBtn">Query UTXOs</button>
+            <button id="queryBtn" style="width: 100%; font-size: 16px; padding: 12px;">Query UTXOs</button>
         </div>
 
         <!-- Progress -->
@@ -267,14 +266,16 @@
         <!-- Results container — one per queried scriptPubKey -->
         <div id="resultsContainer"></div>
 
-        <h2>Log</h2>
-        <div id="log" class="log">
-            <div class="log-entry info">Waiting for connection...</div>
-        </div>
+        <details>
+            <summary style="cursor: pointer; font-size: 18px; color: #666; font-weight: bold; margin-top: 10px;">Log</summary>
+            <div id="log" class="log" style="margin-top: 8px;">
+                <div class="log-entry info">Waiting for connection...</div>
+            </div>
+        </details>
     </div>
 
     <script type="module">
-        import { BatchPirClient, hexToBytes, bytesToHex, scriptHash, scriptPubKeyToAddress, decompileScript } from './src/index.ts';
+        import { BatchPirClient, hexToBytes, bytesToHex, scriptHash, scriptPubKeyToAddress, addressToScriptPubKey, decompileScript } from './src/index.ts';
 
         /**
          * Detect well-known script patterns and return a label, or null.
@@ -540,12 +541,43 @@
             }
 
             const textarea = document.getElementById('scriptPubkeys');
-            const lines = textarea.value.trim().split('\n')
+            const rawLines = textarea.value.trim().split('\n')
                 .map(l => l.trim())
                 .filter(l => l.length > 0);
 
+            if (rawLines.length === 0) {
+                log('Please enter at least one address or scriptPubKey', 'error');
+                return;
+            }
+
+            // Auto-detect addresses and convert to scriptPubKey hex
+            const lines = [];
+            let converted = 0;
+            const convNote = document.getElementById('conversionNote');
+            for (const raw of rawLines) {
+                // If it looks like hex (all hex chars, even length), use as-is
+                if (/^[0-9a-fA-F]+$/.test(raw) && raw.length % 2 === 0) {
+                    lines.push(raw.toLowerCase());
+                } else {
+                    // Try to decode as a Bitcoin address
+                    const spk = addressToScriptPubKey(raw);
+                    if (spk) {
+                        lines.push(spk);
+                        converted++;
+                        log(`Converted address → scriptPubKey: ${raw} → ${spk}`, 'info');
+                    } else {
+                        log(`Unrecognized input (not valid hex or Bitcoin address): ${raw}`, 'error');
+                    }
+                }
+            }
+            if (converted > 0) {
+                convNote.textContent = `✓ Converted ${converted} address${converted > 1 ? 'es' : ''} to scriptPubKey hex`;
+                convNote.style.display = 'block';
+                setTimeout(() => { convNote.style.display = 'none'; }, 5000);
+            }
+
             if (lines.length === 0) {
-                log('Please enter at least one scriptPubKey', 'error');
+                log('No valid inputs found', 'error');
                 return;
             }
 

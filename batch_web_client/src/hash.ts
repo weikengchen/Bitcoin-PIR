@@ -298,6 +298,146 @@ export function scriptPubKeyToAddress(spkHex: string): string | null {
   return null;
 }
 
+// ─── Bitcoin address decoding (address → scriptPubKey) ────────────────────
+
+/** Base58 decode (returns raw bytes including version + checksum) */
+function base58Decode(str: string): Uint8Array {
+  let num = 0n;
+  for (const c of str) {
+    const idx = BASE58_CHARS.indexOf(c);
+    if (idx === -1) throw new Error(`Invalid Base58 character: ${c}`);
+    num = num * 58n + BigInt(idx);
+  }
+  // Count leading '1' chars → leading zero bytes
+  let leadingZeros = 0;
+  for (const c of str) { if (c === '1') leadingZeros++; else break; }
+
+  // Convert bigint to bytes
+  const hexStr = num === 0n ? '' : num.toString(16).padStart(
+    num.toString(16).length + (num.toString(16).length % 2), '0');
+  const rawBytes = hexToBytes(hexStr);
+  const result = new Uint8Array(leadingZeros + rawBytes.length);
+  result.set(rawBytes, leadingZeros);
+  return result;
+}
+
+/** Base58Check decode: verify checksum, return payload (version + data) */
+function base58checkDecode(str: string): Uint8Array {
+  const raw = base58Decode(str);
+  if (raw.length < 5) throw new Error('Base58Check: too short');
+  const payload = raw.slice(0, raw.length - 4);
+  const checksum = raw.slice(raw.length - 4);
+  const hash1 = sha256(payload);
+  const hash2 = sha256(hash1);
+  for (let i = 0; i < 4; i++) {
+    if (hash2[i] !== checksum[i]) throw new Error('Base58Check: invalid checksum');
+  }
+  return payload;
+}
+
+/** Bech32/Bech32m decode: returns { hrp, witnessVersion, program } */
+function bech32Decode(str: string): { hrp: string; witnessVersion: number; program: Uint8Array } | null {
+  const lower = str.toLowerCase();
+  const pos = lower.lastIndexOf('1');
+  if (pos < 1 || pos + 7 > lower.length) return null;
+
+  const hrp = lower.slice(0, pos);
+  const dataChars = lower.slice(pos + 1);
+
+  // Decode 5-bit values
+  const data5: number[] = [];
+  for (const c of dataChars) {
+    const idx = BECH32_CHARSET.indexOf(c);
+    if (idx === -1) return null;
+    data5.push(idx);
+  }
+
+  // Verify checksum (try bech32 encoding=1, bech32m encoding=0x2bc830a3)
+  const values = [...bech32HrpExpand(hrp), ...data5];
+  const polymod = bech32Polymod(values);
+  let encoding: number;
+  if (polymod === 1) encoding = 1;               // bech32
+  else if (polymod === 0x2bc830a3) encoding = 2;  // bech32m
+  else return null;
+
+  // Strip checksum (last 6 chars)
+  const payload5 = data5.slice(0, data5.length - 6);
+  if (payload5.length < 1) return null;
+
+  const witnessVersion = payload5[0];
+  // Convert remaining 5-bit groups back to 8-bit
+  const programBits = payload5.slice(1);
+  const program = convertBitsNoPad(programBits, 5, 8);
+  if (!program) return null;
+
+  // Validate: bech32 for v0, bech32m for v1+
+  if (witnessVersion === 0 && encoding !== 1) return null;
+  if (witnessVersion >= 1 && encoding !== 2) return null;
+
+  return { hrp, witnessVersion, program: new Uint8Array(program) };
+}
+
+/** Convert bits without padding (for bech32 decode) */
+function convertBitsNoPad(data: number[], fromBits: number, toBits: number): number[] | null {
+  let acc = 0;
+  let bits = 0;
+  const ret: number[] = [];
+  const maxv = (1 << toBits) - 1;
+  for (const b of data) {
+    acc = (acc << fromBits) | b;
+    bits += fromBits;
+    while (bits >= toBits) {
+      bits -= toBits;
+      ret.push((acc >> bits) & maxv);
+    }
+  }
+  if (bits >= fromBits || ((acc << (toBits - bits)) & maxv) !== 0) return null;
+  return ret;
+}
+
+/**
+ * Convert a Bitcoin address to its scriptPubKey hex.
+ * Supports P2PKH (1...), P2SH (3...), P2WPKH/P2WSH (bc1q...), P2TR (bc1p...).
+ * Returns null if the address is not recognized.
+ */
+export function addressToScriptPubKey(address: string): string | null {
+  const trimmed = address.trim();
+  if (!trimmed) return null;
+
+  // Try bech32/bech32m first (bc1...)
+  if (trimmed.toLowerCase().startsWith('bc1')) {
+    const decoded = bech32Decode(trimmed);
+    if (!decoded || decoded.hrp !== 'bc') return null;
+
+    const progHex = bytesToHex(decoded.program);
+    if (decoded.witnessVersion === 0 && decoded.program.length === 20) {
+      return '0014' + progHex;  // P2WPKH
+    }
+    if (decoded.witnessVersion === 0 && decoded.program.length === 32) {
+      return '0020' + progHex;  // P2WSH
+    }
+    if (decoded.witnessVersion === 1 && decoded.program.length === 32) {
+      return '5120' + progHex;  // P2TR
+    }
+    return null;
+  }
+
+  // Try base58check (1... or 3...)
+  try {
+    const payload = base58checkDecode(trimmed);
+    if (payload.length === 21) {
+      const version = payload[0];
+      const hashHex = bytesToHex(payload.slice(1));
+      if (version === 0x00) return '76a914' + hashHex + '88ac';  // P2PKH
+      if (version === 0x05) return 'a914' + hashHex + '87';       // P2SH
+    }
+  } catch {
+    // Not valid base58check
+  }
+
+  return null;
+}
+
 // ─── Script decompiler ────────────────────────────────────────────────────
 
 /** Bitcoin opcode names (common ones) */

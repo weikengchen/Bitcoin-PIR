@@ -63,6 +63,7 @@ export {
   ripemd160,
   scriptHash,
   scriptPubKeyToAddress,
+  addressToScriptPubKey,
   decompileScript,
   decompileScriptText,
   type DecompiledOp,
