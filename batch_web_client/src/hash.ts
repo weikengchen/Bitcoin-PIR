@@ -298,6 +298,85 @@ export function scriptPubKeyToAddress(spkHex: string): string | null {
   return null;
 }
 
+// ─── Script decompiler ────────────────────────────────────────────────────
+
+/** Bitcoin opcode names (common ones) */
+const OPCODES: Record<number, string> = {
+  0x00: 'OP_0', 0x4c: 'OP_PUSHDATA1', 0x4d: 'OP_PUSHDATA2', 0x4e: 'OP_PUSHDATA4',
+  0x4f: 'OP_1NEGATE',
+  0x51: 'OP_1', 0x52: 'OP_2', 0x53: 'OP_3', 0x54: 'OP_4', 0x55: 'OP_5',
+  0x56: 'OP_6', 0x57: 'OP_7', 0x58: 'OP_8', 0x59: 'OP_9', 0x5a: 'OP_10',
+  0x5b: 'OP_11', 0x5c: 'OP_12', 0x5d: 'OP_13', 0x5e: 'OP_14', 0x5f: 'OP_15',
+  0x60: 'OP_16',
+  0x69: 'OP_VERIFY', 0x6a: 'OP_RETURN',
+  0x76: 'OP_DUP', 0x87: 'OP_EQUAL', 0x88: 'OP_EQUALVERIFY',
+  0xa6: 'OP_RIPEMD160', 0xa7: 'OP_SHA1', 0xa8: 'OP_SHA256',
+  0xa9: 'OP_HASH160', 0xaa: 'OP_HASH256',
+  0xab: 'OP_CODESEPARATOR', 0xac: 'OP_CHECKSIG', 0xad: 'OP_CHECKSIGVERIFY',
+  0xae: 'OP_CHECKMULTISIG', 0xaf: 'OP_CHECKMULTISIGVERIFY',
+  0xb1: 'OP_CLTV', 0xb2: 'OP_CSV',
+};
+
+/** Small number opcode → number (OP_0=0, OP_1..OP_16 = 1..16) */
+function smallNum(op: number): number | null {
+  if (op === 0x00) return 0;
+  if (op >= 0x51 && op <= 0x60) return op - 0x50;
+  return null;
+}
+
+export interface DecompiledOp {
+  type: 'opcode' | 'data';
+  text: string;       // opcode name or full hex
+  dataLen?: number;    // byte length of pushed data
+}
+
+/**
+ * Decompile a scriptPubKey hex into structured ops.
+ * Returns an array of opcodes and data pushes (full, untruncated).
+ */
+export function decompileScript(spkHex: string): DecompiledOp[] {
+  const bytes = hexToBytes(spkHex);
+  const result: DecompiledOp[] = [];
+
+  let i = 0;
+  while (i < bytes.length) {
+    const op = bytes[i++];
+    if (op >= 0x01 && op <= 0x4b) {
+      const data = bytes.slice(i, i + op);
+      i += op;
+      result.push({ type: 'data', text: bytesToHex(data), dataLen: data.length });
+    } else if (op === 0x4c && i < bytes.length) {
+      const len = bytes[i++];
+      const data = bytes.slice(i, i + len);
+      i += len;
+      result.push({ type: 'data', text: bytesToHex(data), dataLen: data.length });
+    } else if (op === 0x4d && i + 1 < bytes.length) {
+      const len = bytes[i] | (bytes[i + 1] << 8);
+      i += 2;
+      const data = bytes.slice(i, i + len);
+      i += len;
+      result.push({ type: 'data', text: bytesToHex(data), dataLen: data.length });
+    } else {
+      result.push({ type: 'opcode', text: OPCODES[op] || `0x${op.toString(16).padStart(2, '0')}` });
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Render decompiled ops to a plain-text one-liner (for tooltips, etc.).
+ */
+export function decompileScriptText(spkHex: string, maxLen = 120): string {
+  const ops = decompileScript(spkHex);
+  const parts = ops.map(o => o.type === 'data'
+    ? (o.text.length <= 16 ? `<${o.text}>` : `<${o.text.substring(0, 8)}…${o.text.substring(o.text.length - 8)}>`)
+    : o.text);
+  const result = parts.join(' ');
+  if (result.length <= maxLen) return result;
+  return result.substring(0, maxLen - 1) + '…';
+}
+
 // ─── Byte utilities ────────────────────────────────────────────────────────
 
 /** Reverse byte array (for Bitcoin TXID display) */

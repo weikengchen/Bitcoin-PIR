@@ -159,6 +159,29 @@
         }
         .example-btn:hover { background-color: #dee2e6; }
         .example-label { font-size: 12px; color: #888; margin-right: 5px; }
+
+        .script-box {
+            background-color: #1e1e2e;
+            color: #cdd6f4;
+            font-family: 'Courier New', Consolas, monospace;
+            font-size: 12px;
+            line-height: 1.6;
+            padding: 10px 12px;
+            border-radius: 6px;
+            max-height: 90px;
+            overflow-y: auto;
+            overflow-x: hidden;
+            word-break: break-all;
+            overflow-wrap: break-word;
+            margin-top: 6px;
+            border: 1px solid #313244;
+        }
+        .script-box .op { color: #cba6f7; font-weight: bold; }
+        .script-box .data { color: #a6e3a1; }
+        .script-box .data-len { color: #6c7086; font-size: 10px; }
+        .script-box .spk-label { color: #6c7086; display: block; margin-bottom: 4px; font-size: 11px; }
+        .script-box .spk-hex { color: #9399b2; word-break: break-all; }
+        .script-box .separator { border-top: 1px solid #313244; margin: 6px 0; }
     </style>
 </head>
 <body>
@@ -168,6 +191,10 @@
             Two-level Batch PIR protocol for private UTXO lookups.
             Level 1 queries the index, Level 2 fetches chunk data across multiple rounds.
             Enter one or more scriptPubKeys (one per line) to query their UTXOs privately.
+        </p>
+        <p style="font-size: 13px; color: #888; margin-top: -5px;">
+            Note: UTXOs with &le; 576 sats (dust) are excluded from the database.
+            ScriptPubKeys with more than 100 UTXOs are also excluded.
         </p>
 
         <div id="status" class="status disconnected">
@@ -203,9 +230,11 @@
                 <button class="example-btn" data-spk="00144522913e82e993d58b43dad11509c7efad5c2807">P2WPKH</button>
                 <button class="example-btn" data-spk="a9149829c4fd3fa5964ac2bdddea5317739039f3f9c487">P2SH</button>
                 <button class="example-btn" data-spk="5120fbf447d976a801008e0d2481cc8e21e34e401eca5ef65562a87263c1e25ae902">P2TR</button>
+                <button class="example-btn" data-spk="512102ab5dbba9d81acbadae5ade8ae7ad1fbae2ffc9b566fc408117377f6ae1cea6e221037e8a78ba439913d64c68cd2606ddd48e5e9a58ef03635a543ba4a34a92f6785e2103bcc4e113b8deda823848e07c157d7b341098a5c97851bfd6315d6fe54a85a74a53ae">Bare Multisig</button>
                 <br><br>
                 <span class="example-label">Batch test (from 1000 known scriptPubKeys):</span>
-                <button class="example-btn" id="pickRandomBtn" style="background-color: #d4edda; border-color: #28a745; padding: 6px 14px; font-size: 13px;">Pick 50 random</button>
+                <button class="example-btn" id="pickRandom100Btn" style="background-color: #d4edda; border-color: #28a745; padding: 6px 14px; font-size: 13px;">Pick 100 random</button>
+                <button class="example-btn" id="pickRandomBtn" style="background-color: #e2e3f1; border-color: #6c757d;">Pick 50 random</button>
                 <button class="example-btn" id="pickRandom10Btn" style="background-color: #e2e3f1; border-color: #6c757d;">Pick 10 random</button>
                 <button class="example-btn" id="pickRandom5Btn" style="background-color: #e2e3f1; border-color: #6c757d;">Pick 5 random</button>
             </div>
@@ -231,7 +260,48 @@
     </div>
 
     <script type="module">
-        import { BatchPirClient, hexToBytes, bytesToHex, scriptHash, scriptPubKeyToAddress } from './src/index.ts';
+        import { BatchPirClient, hexToBytes, bytesToHex, scriptHash, scriptPubKeyToAddress, decompileScript } from './src/index.ts';
+
+        /**
+         * Detect well-known script patterns and return a label, or null.
+         */
+        function detectScriptLabel(spkHex) {
+            const len = spkHex.length;
+            if (len === 50 && spkHex.startsWith('76a914') && spkHex.endsWith('88ac')) return 'P2PKH';
+            if (len === 46 && spkHex.startsWith('a914') && spkHex.endsWith('87')) return 'P2SH';
+            if (len === 44 && spkHex.startsWith('0014')) return 'P2WPKH';
+            if (len === 68 && spkHex.startsWith('0020')) return 'P2WSH';
+            if (len === 68 && spkHex.startsWith('5120')) return 'P2TR';
+            if (spkHex.startsWith('6a')) return 'OP_RETURN';
+            // Bare multisig: OP_M <pks...> OP_N OP_CHECKMULTISIG
+            if (spkHex.endsWith('ae')) {
+                const ops = decompileScript(spkHex);
+                if (ops.length >= 3 && ops[ops.length - 1].text === 'OP_CHECKMULTISIG') {
+                    const mOp = ops[0].text;
+                    const nOp = ops[ops.length - 2].text;
+                    const mMatch = mOp.match(/^OP_(\d+)$/);
+                    const nMatch = nOp.match(/^OP_(\d+)$/);
+                    if (mMatch && nMatch) {
+                        return `${mMatch[1]}-of-${nMatch[1]} Bare Multisig`;
+                    }
+                }
+            }
+            return null;
+        }
+
+        /**
+         * Render decompiled ops as highlighted HTML.
+         */
+        function renderOpsHtml(ops) {
+            return ops.map(o => {
+                if (o.type === 'opcode') {
+                    return `<span class="op">${o.text}</span>`;
+                } else {
+                    const lenLabel = `<span class="data-len">[${o.dataLen}B]</span>`;
+                    return `${lenLabel}<span class="data">${o.text}</span>`;
+                }
+            }).join(' ');
+        }
         import EXAMPLE_SPKS from './src/example_spks.json';
 
         let client = null;
@@ -291,15 +361,28 @@
             section.style.marginTop = '15px';
 
             const address = scriptPubKeyToAddress(spkHex);
-            const displayName = address || spkHex.substring(0, 20) + '...';
-            const addressLink = address
-                ? `<a href="https://mempool.space/address/${address}" target="_blank" style="color: #0066cc; text-decoration: none; font-family: monospace;">${address}</a>`
-                : `<span style="font-family: monospace; font-size: 12px; color: #666;">${spkHex}</span>`;
+            const scriptLabel = detectScriptLabel(spkHex);
+            const ops = decompileScript(spkHex);
+            const opsHtml = renderOpsHtml(ops);
+
+            // Title line: address link or script label
+            let titleHtml;
+            if (address) {
+                const labelBadge = scriptLabel ? `<span style="font-size: 11px; color: #fff; background: #6c757d; padding: 1px 6px; border-radius: 3px; margin-left: 8px; vertical-align: middle;">${scriptLabel}</span>` : '';
+                titleHtml = `<a href="https://mempool.space/address/${address}" target="_blank" style="color: #0066cc; text-decoration: none; font-family: monospace;">${address}</a>${labelBadge}`;
+            } else {
+                const label = scriptLabel || 'Non-standard Script';
+                titleHtml = `<span style="font-family: monospace; font-size: 14px; color: #555; font-weight: bold;">${label}</span>`;
+            }
+
+            // Script box: raw hex + highlighted opcodes
+            const scriptBox = `<div class="script-box"><span class="spk-label">scriptPubKey:</span><span class="spk-hex">${spkHex}</span><div class="separator"></div>${opsHtml}</div>`;
 
             if (!result) {
                 section.innerHTML = `
                     <h2 style="color:#dc3545; margin-top:0;">Not Found</h2>
-                    <p>${addressLink}</p>
+                    <p>${titleHtml}</p>
+                    ${scriptBox}
                     <p style="color: #999;">No UTXOs found for this address.</p>
                 `;
                 container.appendChild(section);
@@ -311,9 +394,10 @@
             // Header with address and summary
             section.innerHTML = `
                 <div style="display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap;">
-                    <h2 style="margin-top:0;">${addressLink}</h2>
+                    <h2 style="margin-top:0;">${titleHtml}</h2>
                 </div>
-                <div style="display: flex; gap: 30px; flex-wrap: wrap; margin-bottom: 10px;">
+                ${scriptBox}
+                <div style="display: flex; gap: 30px; flex-wrap: wrap; margin: 12px 0 10px 0;">
                     <div><span style="color: #888; font-size: 13px;">Balance</span><br><span style="font-size: 18px; font-weight: bold; color: #f7931a;">${totalBtc} BTC</span></div>
                     <div><span style="color: #888; font-size: 13px;">Sats</span><br><span style="font-size: 16px; font-weight: bold;">${result.totalSats.toLocaleString()}</span></div>
                     <div><span style="color: #888; font-size: 13px;">UTXOs</span><br><span style="font-size: 16px; font-weight: bold;">${result.entries.length}</span></div>
@@ -339,7 +423,7 @@
                         </thead>
                         <tbody class="utxo-tbody"></tbody>
                     </table>
-                    <div class="pagination-controls">
+                    <div class="pagination-controls" ${totalPages <= 1 ? 'style="display:none;"' : ''}>
                         <button class="prev-btn" disabled>&#9664; PREV</button>
                         <span class="page-info">Page 1 of ${totalPages}</span>
                         <button class="next-btn" ${totalPages <= 1 ? 'disabled' : ''}>NEXT &#9654;</button>
@@ -503,6 +587,9 @@
             });
         });
 
+        document.getElementById('pickRandom100Btn').addEventListener('click', () => {
+            document.getElementById('scriptPubkeys').value = pickRandom(EXAMPLE_SPKS, 100).join('\n');
+        });
         document.getElementById('pickRandomBtn').addEventListener('click', () => {
             document.getElementById('scriptPubkeys').value = pickRandom(EXAMPLE_SPKS, 50).join('\n');
         });
