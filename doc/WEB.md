@@ -40,16 +40,15 @@ The PIR system uses WebSocket for all client-server communication. This enables 
 ## File Structure
 
 ```
-dpf_pir/src/
+runtime/src/
 ├── bin/
 │   ├── server.rs          # WebSocket server
-│   └── lookup_pir.rs      # WebSocket CLI client
-├── websocket.rs           # WebSocket protocol handler
-├── pir_protocol.rs        # Simple Binary Protocol codec
-├── protocol.rs            # Request/Response types
-└── ...
+│   └── client.rs          # WebSocket CLI client
+├── eval.rs                # DPF evaluation engine
+├── protocol.rs            # Binary protocol codec
+└── lib.rs                 # Module exports
 
-web_client/src/
+web/src/
 ├── client.ts              # Browser WebSocket PIR client
 ├── dpf.ts                 # DPF key generation
 ├── hash.ts                # HASH160, cuckoo hash functions
@@ -74,7 +73,7 @@ This starts two WebSocket servers:
 ### Web Client (Development)
 
 ```bash
-cd web_client
+cd web
 npm install
 npx vite --port 8080
 ```
@@ -82,7 +81,7 @@ npx vite --port 8080
 ### Web Client (Production Build)
 
 ```bash
-cd web_client
+cd web
 npm run build-web
 # Output in dist-web/, deploy to static hosting
 ```

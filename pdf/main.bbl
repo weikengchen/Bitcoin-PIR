@@ -1,0 +1,141 @@
+\newcommand{\etalchar}[1]{$^{#1}$}
+\begin{thebibliography}{HHCG{\etalchar{+}}23}
+
+\bibitem[AR26]{ar26}
+Pranav~Shriram Arunachalaramanan and Ling Ren.
+\newblock Single-server stateful {PIR} with verifiability and balanced
+  efficiency.
+\newblock In {\em IEEE S\&P 2026}, 2026.
+
+\bibitem[BGI15]{boyle2015fss}
+Elette Boyle, Niv Gilboa, and Yuval Ishai.
+\newblock Function secret sharing.
+\newblock In {\em EUROCRYPT 2015}, 2015.
+
+\bibitem[BGI16]{boyle2016fss}
+Elette Boyle, Niv Gilboa, and Yuval Ishai.
+\newblock Function secret sharing: Improvements and extensions.
+\newblock In {\em ACM CCS 2016}, 2016.
+
+\bibitem[CNS07]{camenisch07}
+Jan Camenisch, Gregory Neven, and Abhi Shelat.
+\newblock Simulatable adaptive oblivious transfer.
+\newblock In {\em EUROCRYPT 2007}, 2007.
+
+\bibitem[dL24]{cl24}
+Leo {de Castro} and Keewoo Lee.
+\newblock {VeriSimplePIR}: Verifiability in {SimplePIR} at no online cost for
+  honest servers.
+\newblock In {\em USENIX Security 2024}, 2024.
+
+\bibitem[DNRS99]{dwork99}
+Cynthia Dwork, Moni Naor, Omer Reingold, and Larry~J. Stockmeyer.
+\newblock Magic functions.
+\newblock In {\em IEEE FOCS 1999}, 1999.
+
+\bibitem[FK23]{fk23}
+Dankrad Feist and Dmitry Khovratovich.
+\newblock Fast amortized {KZG} proofs.
+\newblock IACR ePrint 2023, 2023.
+
+\bibitem[GI14]{gilboa2014dpf}
+Niv Gilboa and Yuval Ishai.
+\newblock Distributed point functions and their applications.
+\newblock In {\em EUROCRYPT 2014}, 2014.
+
+\bibitem[HDCGZ23]{tiptoe23}
+Alexandra Henzinger, Emma Dauterman, Henry Corrigan-Gibbs, and Nickolai
+  Zeldovich.
+\newblock Private web search with tiptoe.
+\newblock In {\em ACM SOSP 2023}, 2023.
+
+\bibitem[HHCG{\etalchar{+}}23]{henz23}
+Alexandra Henzinger, Matthew~M. Hong, Henry Corrigan-Gibbs, Sarah Meiklejohn,
+  and Vinod Vaikuntanathan.
+\newblock One server for the price of two: Simple and fast single-server
+  private information retrieval.
+\newblock In {\em USENIX Security Symposium 2023}, 2023.
+
+\bibitem[HPPY25]{plinko2024}
+Alexander Hoover, Sarvar Patel, Giuseppe Persiano, and Kevin Yeo.
+\newblock Plinko: Single-server {PIR} with efficient updates via invertible
+  {PRFs}.
+\newblock In {\em EUROCRYPT 2025}, 2025.
+
+\bibitem[IKOS04]{IKOS04}
+Yuval Ishai, Eyal Kushilevitz, Rafail Ostrovsky, and Amit Sahai.
+\newblock Batch codes and their applications.
+\newblock In {\em ACM STOC 2004}, 2004.
+
+\bibitem[Kil88]{kilian88}
+Joe Kilian.
+\newblock Founding cryptography on oblivious transfer.
+\newblock In {\em ACM STOC 1988}, 1988.
+
+\bibitem[KS06]{kiraz06}
+Mehmet~S. Kiraz and Berry Schoenmakers.
+\newblock A protocol issue for the malicious case of {Yao}'s garbled circuit
+  construction.
+\newblock In {\em Proceedings of the 27th Symposium on Information Theory in
+  the Benelux}, 2006.
+
+\bibitem[KZG10]{kzg10}
+Aniket Kate, Gregory~M. Zaverucha, and Ian Goldberg.
+\newblock Constant-size commitments to polynomials and their applications.
+\newblock In {\em ASIACRYPT 2010}, 2010.
+
+\bibitem[LHCG25]{lehmkuhl25}
+Ryan Lehmkuhl, Alexandra Henzinger, and Henry Corrigan-Gibbs.
+\newblock Distributional private information retrieval.
+\newblock In {\em USENIX Security 2025}, 2025.
+
+\bibitem[LMRS24]{li24}
+Baiyu Li, Daniele Micciancio, Mariana Raykova, and Mark {Schultz-Wu}.
+\newblock Hintless single-server private information retrieval.
+\newblock In {\em CRYPTO 2024}, 2024.
+
+\bibitem[LP11]{lindell11}
+Yehuda Lindell and Benny Pinkas.
+\newblock Secure two-party computation via cut-and-choose oblivious transfer.
+\newblock In {\em TCC 2011}, 2011.
+
+\bibitem[MW22]{spiral22}
+Samir~Jordan Menon and David~J. Wu.
+\newblock Spiral: Fast, high-rate single-server {PIR} via {FHE} composition.
+\newblock In {\em IEEE S\&P 2022}, 2022.
+
+\bibitem[MW24]{ypir2024}
+Samir~Jordan Menon and David~J. Wu.
+\newblock {YPIR}: High-throughput single-server {PIR} with silent
+  preprocessing.
+\newblock In {\em USENIX Security 2024}, 2024.
+
+\bibitem[NP99]{naor99}
+Moni Naor and Benny Pinkas.
+\newblock Oblivious transfer with adaptive queries.
+\newblock In {\em CRYPTO 1999}, 1999.
+
+\bibitem[PR01]{PR01}
+Rasmus Pagh and Flemming~Friche Rodler.
+\newblock Cuckoo hashing.
+\newblock In {\em Proceedings of the 9th Annual European Symposium on
+  Algorithms (ESA '01)}, 2001.
+
+\bibitem[RLP26]{rlp26}
+Mayank Rathee, Keewoo Lee, and Raluca~Ada Popa.
+\newblock Verifiable {PIR} with small client storage.
+\newblock In {\em IEEE S\&P 2026}, 2026.
+
+\bibitem[RMS24]{rms24}
+Ling Ren, Muhammad~Haris Mughees, and I~Sun.
+\newblock Simple and practical amortized sublinear private information
+  retrieval using dummy subsets.
+\newblock In {\em ACM CCS 2024}, 2024.
+
+\bibitem[ZPZS24]{piano2024}
+Mingxun Zhou, Andrew Park, Wenting Zheng, and Elaine Shi.
+\newblock Piano: Extremely simple, single-server {PIR} with sublinear server
+  computation.
+\newblock In {\em IEEE S\&P 2024}, 2024.
+
+\end{thebibliography}

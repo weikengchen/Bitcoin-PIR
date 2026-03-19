@@ -1,9 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["build_batchdb",
-    "build_db",
-    "dpf_pir",
-    "batch_pir",
+members = ["build",
+    "runtime",
 ]
 
 [profile.release]

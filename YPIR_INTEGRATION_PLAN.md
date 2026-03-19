@@ -60,7 +60,7 @@ No offline hint download. Zero bytes.
 
 ---
 
-## Server-Side Changes (Rust — `dpf_pir/`)
+## Server-Side Changes (Rust — `runtime/`)
 
 ### 1. New dependency in `Cargo.toml`
 ```toml
@@ -138,7 +138,7 @@ let result = backend.process_query(query_data, store);
 
 ---
 
-## Client-Side Changes (TypeScript/WASM — `web_client/`)
+## Client-Side Changes (TypeScript/WASM — `web/`)
 
 ### 1. WASM bindings (built in ypir-fork repo)
 

@@ -1,0 +1,99 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\bibstyle{alpha}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Introduction}{1}{section.1}\protected@file@percent }
+\citation{gilboa2014dpf}
+\citation{boyle2015fss}
+\citation{boyle2016fss}
+\citation{PR01}
+\citation{IKOS04}
+\@writefile{toc}{\contentsline {section}{\numberline {2}Background}{2}{section.2}\protected@file@percent }
+\newlabel{sec:background}{{2}{2}{Background}{section.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.1}Private Information Retrieval}{2}{subsection.2.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.2}Distributed Point Functions (DPF)}{2}{subsection.2.2}\protected@file@percent }
+\newlabel{sec:dpf}{{2.2}{2}{Distributed Point Functions (DPF)}{subsection.2.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.3}Cuckoo Hashing}{2}{subsection.2.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.4}Batch PIR and Probabilistic Batch Codes}{3}{subsection.2.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.5}Bitcoin UTXO Model}{3}{subsection.2.5}\protected@file@percent }
+\citation{ypir2024}
+\citation{henz23}
+\citation{plinko2024}
+\citation{rms24}
+\citation{piano2024}
+\citation{gilboa2014dpf}
+\citation{boyle2015fss}
+\citation{boyle2016fss}
+\citation{li24}
+\citation{tiptoe23}
+\citation{spiral22}
+\citation{gilboa2014dpf}
+\citation{boyle2015fss}
+\citation{boyle2016fss}
+\@writefile{toc}{\contentsline {section}{\numberline {3}PIR Protocol Landscape}{4}{section.3}\protected@file@percent }
+\newlabel{sec:landscape}{{3}{4}{PIR Protocol Landscape}{section.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Single-Server PIR}{4}{subsection.3.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}Two-Server PIR}{4}{subsection.3.2}\protected@file@percent }
+\citation{kilian88}
+\citation{naor99}
+\citation{dwork99}
+\citation{camenisch07}
+\citation{lindell11}
+\citation{kiraz06}
+\citation{kzg10}
+\citation{fk23}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}Query Volume Considerations}{5}{subsection.3.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.4}Integrity and Verifiability}{5}{subsection.3.4}\protected@file@percent }
+\citation{rlp26}
+\citation{cl24}
+\citation{rlp26}
+\citation{ar26}
+\citation{PR01}
+\citation{IKOS04}
+\citation{lehmkuhl25}
+\@writefile{toc}{\contentsline {section}{\numberline {4}PIR for UTXO Set}{7}{section.4}\protected@file@percent }
+\newlabel{sec:utxo-pir}{{4}{7}{PIR for UTXO Set}{section.4}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Two-level batch PIR architecture. The client issues $K$ parallel DPF-PIR queries per level, using Probabilistic Batch Codes to pack multiple lookups into a single round.}}{7}{figure.1}\protected@file@percent }
+\newlabel{fig:two-maps}{{1}{7}{Two-level batch PIR architecture. The client issues $K$ parallel DPF-PIR queries per level, using Probabilistic Batch Codes to pack multiple lookups into a single round}{figure.1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {5}Implementation}{8}{section.5}\protected@file@percent }
+\newlabel{sec:implementation}{{5}{8}{Implementation}{section.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}System Architecture}{8}{subsection.5.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Two-server batch DPF-PIR architecture. The client generates $K$ DPF key pairs (one per PBC bucket) and sends the shares to each server. Each server computes $K$ XOR sums in parallel; the client combines responses to recover all queried entries.}}{8}{figure.2}\protected@file@percent }
+\newlabel{fig:architecture}{{2}{8}{Two-server batch DPF-PIR architecture. The client generates $K$ DPF key pairs (one per PBC bucket) and sends the shares to each server. Each server computes $K$ XOR sums in parallel; the client combines responses to recover all queried entries}{figure.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}Database Generation}{8}{subsection.5.2}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Batch PIR parameters. Each level uses $K$ parallel DPF-PIR queries over tables of $N$ entries.}}{9}{table.1}\protected@file@percent }
+\newlabel{tab:databases}{{1}{9}{Batch PIR parameters. Each level uses $K$ parallel DPF-PIR queries over tables of $N$ entries}{table.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.3}Query Protocol}{9}{subsection.5.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.4}Client Implementations}{9}{subsection.5.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6}Extension: Further Reducing the UTXO Set}{10}{section.6}\protected@file@percent }
+\newlabel{sec:extension}{{6}{10}{Extension: Further Reducing the UTXO Set}{section.6}{}}
+\bibdata{refs}
+\bibcite{ar26}{AR26}
+\bibcite{boyle2015fss}{BGI15}
+\bibcite{boyle2016fss}{BGI16}
+\bibcite{camenisch07}{CNS07}
+\bibcite{cl24}{dL24}
+\bibcite{dwork99}{DNRS99}
+\bibcite{fk23}{FK23}
+\bibcite{gilboa2014dpf}{GI14}
+\bibcite{tiptoe23}{HDCGZ23}
+\bibcite{henz23}{HHCG{$^{+}$}23}
+\bibcite{plinko2024}{HPPY25}
+\bibcite{IKOS04}{IKOS04}
+\bibcite{kilian88}{Kil88}
+\bibcite{kiraz06}{KS06}
+\bibcite{kzg10}{KZG10}
+\bibcite{lehmkuhl25}{LHCG25}
+\bibcite{li24}{LMRS24}
+\bibcite{lindell11}{LP11}
+\@writefile{toc}{\contentsline {section}{Acknowledgments}{11}{section*.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{References}{11}{section*.4}\protected@file@percent }
+\bibcite{spiral22}{MW22}
+\bibcite{ypir2024}{MW24}
+\bibcite{naor99}{NP99}
+\bibcite{PR01}{PR01}
+\bibcite{rlp26}{RLP26}
+\bibcite{rms24}{RMS24}
+\bibcite{piano2024}{ZPZS24}
+\gdef \@abspage@last{12}

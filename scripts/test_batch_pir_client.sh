@@ -16,7 +16,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_DIR"
 
 echo "Building batch PIR client..."
-cargo build --release -p batch_pir --bin client2
+cargo build --release -p runtime --bin client
 
 echo ""
 echo "========================================"
@@ -24,8 +24,8 @@ echo "Two-Level Batch PIR Client Test"
 echo "========================================"
 echo ""
 
-SERVER0="ws://127.0.0.1:8091"
-SERVER1="ws://127.0.0.1:8092"
+SERVER0="ws://127.0.0.1:8093"
+SERVER1="ws://127.0.0.1:8094"
 
 # Use argument or default whale address
 HASH="${1:-20d920103ecb721638eb43f3e7a27c7b8ed3925b}"
@@ -35,7 +35,7 @@ echo "Server 1: $SERVER1"
 echo "Hash:     $HASH"
 echo ""
 
-./target/release/client2 \
+./target/release/client \
   --server0 "$SERVER0" \
   --server1 "$SERVER1" \
   --hash "$HASH"

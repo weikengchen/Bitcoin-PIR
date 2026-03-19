@@ -49,51 +49,41 @@ PIR Security Model: Privacy guaranteed if at least one server doesn't learn quer
 
 ```
 BitcoinPIR/
-├── dpf_pir/                    # PIR server implementation (Rust)
+├── runtime/                    # PIR server & client (Rust)
 │   ├── src/
 │   │   ├── lib.rs              # Library exports
-│   │   ├── database.rs         # Database trait & implementations
-│   │   ├── protocol.rs         # Request/Response types
-│   │   ├── pir_protocol.rs     # Simple Binary Protocol
-│   │   ├── pir_backend.rs      # Pluggable PIR backend trait
-│   │   ├── hash.rs             # Cuckoo hash functions
-│   │   ├── websocket.rs        # WebSocket handler
-│   │   ├── server_config.rs    # Database configuration
+│   │   ├── eval.rs             # DPF evaluation engine
+│   │   ├── protocol.rs         # Binary protocol codec
 │   │   └── bin/
 │   │       ├── server.rs       # WebSocket server binary
-│   │       ├── lookup_pir.rs   # CLI PIR client
-│   │       ├── lookup_script.rs # Script lookup tool
-│   │       └── test_utxo_chunks.rs # Chunk data verifier
+│   │       └── client.rs       # CLI PIR client
 │   └── Cargo.toml
 │
-├── build_db/                   # Database generation tools (Rust)
+├── build/                      # Database generation pipeline (Rust)
 │   ├── src/
-│   │   ├── lib.rs              # Block filter library
-│   │   ├── utils.rs            # Shared utilities
-│   │   └── bin/
-│   │       ├── gen_1_utxo_set.rs       # Step 1: Extract UTXOs from snapshot
-│   │       ├── gen_2_utxo_chunks.rs    # Step 2: Chunk and index UTXOs
-│   │       ├── gen_3_cuckoo_chunks.rs  # Step 3: Build cuckoo hash index
-│   │       └── (debug/utility binaries)
+│   │   ├── gen_0_utxo_set.rs     # Extract UTXOs from dumptxoutset snapshot
+│   │   ├── common.rs             # Shared constants & hash functions
+│   │   ├── main.rs               # Build index cuckoo tables
+│   │   ├── build_utxo_chunks.rs  # Build UTXO chunks (with dust filter)
+│   │   ├── build_chunk_cuckoo.rs # Build chunk cuckoo tables
+│   │   └── (test/verify/stats binaries)
 │   └── Cargo.toml
 │
-├── web_client/                 # Browser/Node.js client (TypeScript)
+├── web/                        # Browser/Node.js client (TypeScript)
 │   ├── src/
 │   │   ├── index.ts            # Main entry point & exports
 │   │   ├── client.ts           # WebSocket PIR client
 │   │   ├── dpf.ts              # DPF key generation wrapper
 │   │   ├── hash.ts             # HASH160, cuckoo hash functions
 │   │   ├── constants.ts        # Database IDs and parameters
-│   │   ├── bincode.ts          # Binary serialization
-│   │   ├── sbp.ts              # Simple Binary Protocol codec
-│   │   └── polyfills.ts        # Browser compatibility
+│   │   └── protocol.ts         # Binary protocol codec
 │   ├── index.html              # Demo web interface
 │   ├── vite.config.js          # Vite build configuration
 │   └── package.json
 │
 ├── scripts/                    # Helper scripts
 │   ├── start_pir_servers.sh    # Start both PIR servers
-│   ├── test_lookup_pir.sh      # Test PIR lookup
+│   ├── test_batch_pir_client.sh # Test PIR client
 │   └── get_random_hash.sh      # Sample random cuckoo entries
 │
 ├── doc/                        # Documentation
@@ -119,77 +109,48 @@ cargo build --release
 
 ### 2. Generate Database Files
 
-The database pipeline transforms a Bitcoin Core UTXO snapshot into PIR-queryable format in 3 steps:
+The database pipeline transforms a Bitcoin Core UTXO snapshot into PIR-queryable format:
 
 ```bash
-# Step 1: Extract UTXOs from dumptxoutset snapshot
+# Step 0: Extract UTXOs from dumptxoutset snapshot
 #   Input:  Bitcoin Core UTXO snapshot (dumptxoutset)
-#   Output: utxo_set.bin (64 bytes per UTXO)
-#   Format: [20B HASH160(scriptPubKey)] [32B TXID] [4B vout] [8B amount]
-cargo run --release --bin gen_1_utxo_set -- \
-    --utxo-path /path/to/utxo_snapshot.dat \
-    --output-dir /data/pir/
+#   Output: utxo_set.bin (68 bytes per UTXO)
+cargo run --release -p build --bin gen_0_extract_utxo_set -- /path/to/utxo_snapshot.dat
 
-# Step 2: Group UTXOs by script hash, serialize into 32KB chunks
-#   Input:  utxo_set.bin
-#   Output: utxo_chunks.bin + utxo_chunks_index.bin (24B entries: 20B hash + 4B offset)
-#   Optional: --small to exclude whale addresses, --partitions N for memory control
-cargo run --release --bin gen_2_utxo_chunks -- \
-    --input /data/pir/utxo_set.bin \
-    --output-dir /data/pir/
-
-# Step 3: Build bucketed cuckoo hash table from the index
-#   Input:  utxo_chunks_index.bin
-#   Output: utxo_chunks_cuckoo.bin
-cargo run --release --bin gen_3_cuckoo_chunks -- \
-    --input /data/pir/utxo_chunks_index.bin \
-    --output /data/pir/utxo_chunks_cuckoo.bin
+# Step 1+: Build batch PIR databases
+#   Builds UTXO chunks, index cuckoo tables, and chunk cuckoo tables
+cargo run --release -p build --bin gen_1_build_utxo_chunks
+cargo run --release -p build --bin gen_2_build_index_cuckoo
+cargo run --release -p build --bin gen_7_build_chunk_cuckoo
 ```
 
-### 3. Configure Server
-
-Edit `dpf_pir/src/server_config.rs` to set your database paths:
-
-```rust
-let cuckoo_path = "/data/pir/utxo_chunks_cuckoo.bin";
-let chunks_path = "/data/pir/utxo_chunks.bin";
-```
-
-Rebuild after configuration changes:
-```bash
-cargo build --release --bin server
-```
-
-### 4. Start PIR Servers
+### 3. Start PIR Servers
 
 ```bash
-# Start both servers (ports 8091 and 8092)
+# Start both servers (ports 8093 and 8094)
 ./scripts/start_pir_servers.sh
-
-# Or with small databases (whale addresses excluded):
-./scripts/start_pir_servers.sh --small
 ```
 
 Or manually:
 ```bash
-RUST_LOG=info ./target/release/server --port 8091
-RUST_LOG=info ./target/release/server --port 8092  # in another terminal
+./target/release/server --port 8093
+./target/release/server --port 8094  # in another terminal
 ```
 
-### 5. Query UTXOs
+### 4. Query UTXOs
 
 **Using CLI:**
 ```bash
-# Query by scriptPubKey hex
-./target/release/lookup_pir \
-    --server1 ws://127.0.0.1:8091 \
-    --server2 ws://127.0.0.1:8092 \
-    "76a914b64513c1f1b889a556463243cca9c26ee626b9a088ac"
+# Query by script hash hex
+./target/release/client \
+    --server0 ws://127.0.0.1:8093 \
+    --server1 ws://127.0.0.1:8094 \
+    --hash <40-char-hex-script-hash>
 ```
 
 **Using Web Client:**
 ```bash
-cd web_client
+cd web
 npm install
 npx vite --port 8080
 # Open http://localhost:8080 in your browser
@@ -278,10 +239,10 @@ cargo build --release
 cargo test
 
 # Build web client for production
-cd web_client && npm run build-web
+cd web && npm run build-web
 
 # Run web client dev server
-cd web_client && npx vite --port 8080
+cd web && npx vite --port 8080
 ```
 
 ## Dependencies
@@ -292,7 +253,7 @@ cd web_client && npx vite --port 8080
 - `tokio-rustls` — TLS support
 - `memmap2` — Memory-mapped files
 - `libdpf` — DPF implementation
-- `bitcoin` — Bitcoin data structures (build_db)
+- `bitcoin` — Bitcoin data structures
 
 ### Web Client
 - TypeScript 5+
@@ -324,7 +285,7 @@ cd web_client && npx vite --port 8080
 
 - [`doc/DEPLOYMENT.md`](doc/DEPLOYMENT.md) — Production deployment guide
 - [`doc/WEB.md`](doc/WEB.md) — WebSocket protocol and web client details
-- [`web_client/README.md`](web_client/README.md) — Web client API reference
+- [`web/`](web/) — Web client
 
 ## License
 

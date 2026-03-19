@@ -67,7 +67,7 @@ git clone https://github.com/weikengchen/Bitcoin-PIR.git
 cd Bitcoin-PIR
 
 # Build the release binary
-cargo build --release --bin server
+cargo build --release -p runtime --bin server
 ```
 
 ### 1.3 Database Files
@@ -86,17 +86,12 @@ sudo chown $USER:$USER /data/pir
 
 ### 1.4 Update Configuration
 
-Edit `dpf_pir/src/server_config.rs` to point to your database paths:
+Database paths are configured in `runtime/src/bin/server.rs`.
 
-```rust
-let cuckoo_path = "/data/pir/utxo_chunks_cuckoo.bin";
-let chunks_path = "/data/pir/utxo_chunks.bin";
-```
-
-After modifying, rebuild:
+Build the server:
 
 ```bash
-cargo build --release --bin server
+cargo build --release -p runtime --bin server
 ```
 
 ---
@@ -286,14 +281,14 @@ sudo certbot --nginx -d pir1.yourdomain.com
 
 The repository includes a GitHub Actions workflow (`.github/workflows/deploy-web.yml`) that automatically deploys the web client to GitHub Pages on every push to `main`.
 
-The workflow runs `npm run build-web` in `web_client/` and deploys `web_client/dist-web/` to GitHub Pages.
+The workflow runs `npm run build-web` in `web/` and deploys `web/dist-web/` to GitHub Pages.
 
 To enable: Go to your repo's Settings → Pages → Source: GitHub Actions.
 
 ### Other Options
 
-- **Vercel/Netlify**: Connect GitHub repo, set root to `web_client`
-- **Self-hosted**: Serve `web_client/dist-web/` with nginx or any static file server
+- **Vercel/Netlify**: Connect GitHub repo, set root to `web`
+- **Self-hosted**: Serve `web/dist-web/` with nginx or any static file server
 
 ---
 
