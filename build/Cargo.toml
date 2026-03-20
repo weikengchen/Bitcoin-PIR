@@ -59,6 +59,10 @@ path = "src/assign_chunk_queries.rs"
 name = "gen_10_test_chunk_pir"
 path = "src/test_chunk_pir_batched.rs"
 
+[[bin]]
+name = "cuckoo4_experiment"
+path = "src/cuckoo4_experiment.rs"
+
 [dependencies]
 bitcoin = "0.32.7"
 txoutset = "0.4"
