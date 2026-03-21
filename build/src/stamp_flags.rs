@@ -21,8 +21,6 @@ use memmap2::MmapMut;
 use std::fs::{self, OpenOptions};
 use std::time::Instant;
 
-const EMPTY: u32 = u32::MAX;
-
 fn main() {
     println!("=== Stamp Placement Flags into Index ===");
     println!();
@@ -86,25 +84,23 @@ fn main() {
         let mut all_found = true;
 
         for (gi, &group_id) in groups.iter().enumerate() {
-            let table_offset = HEADER_SIZE + group_id * slots_per_table * 4;
+            let table_offset = HEADER_SIZE + group_id * slots_per_table * CHUNK_SLOT_SIZE;
 
             let mut found_h: Option<usize> = None;
             for h in 0..CHUNK_CUCKOO_NUM_HASHES {
                 let key = derive_chunk_cuckoo_key(group_id, h);
                 let bin = cuckoo_hash_int(first_chunk_id, key, bins_per_table);
-                let bin_offset = table_offset + bin * CHUNK_CUCKOO_BUCKET_SIZE * 4;
+                let bin_offset = table_offset + bin * CHUNK_CUCKOO_BUCKET_SIZE * CHUNK_SLOT_SIZE;
 
                 for s in 0..CHUNK_CUCKOO_BUCKET_SIZE {
+                    let slot_off = bin_offset + s * CHUNK_SLOT_SIZE;
                     let val = u32::from_le_bytes(
-                        cuckoo_data[bin_offset + s * 4..bin_offset + s * 4 + 4]
+                        cuckoo_data[slot_off..slot_off + 4]
                             .try_into()
                             .unwrap(),
                     );
                     if val == first_chunk_id {
                         found_h = Some(h);
-                        break;
-                    }
-                    if val == EMPTY {
                         break;
                     }
                 }
