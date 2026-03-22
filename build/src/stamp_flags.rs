@@ -84,7 +84,7 @@ fn main() {
         let mut all_found = true;
 
         for (gi, &group_id) in groups.iter().enumerate() {
-            let table_offset = HEADER_SIZE + group_id * slots_per_table * CHUNK_SLOT_SIZE;
+            let table_offset = CHUNK_HEADER_SIZE + group_id * slots_per_table * CHUNK_SLOT_SIZE;
 
             let mut found_h: Option<usize> = None;
             for h in 0..CHUNK_CUCKOO_NUM_HASHES {

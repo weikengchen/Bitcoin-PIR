@@ -177,6 +177,9 @@ pub const CHUNK_MASTER_SEED: u64 = 0xa3f7c2d918e4b065;
 /// File format magic for chunk_pir_cuckoo.bin
 pub const CHUNK_MAGIC: u64 = 0xBA7C_C000_C000_0002;
 
+/// Header size in bytes for chunk_pir_cuckoo.bin (no tag_seed field)
+pub const CHUNK_HEADER_SIZE: usize = 32;
+
 /// Size of one chunk in bytes
 pub const CHUNK_SIZE: usize = 40;
 
@@ -244,7 +247,7 @@ pub fn cuckoo_hash_int(chunk_id: u32, key: u64, num_bins: usize) -> usize {
 
 /// Read bins_per_table from a chunk_pir_cuckoo.bin header.
 pub fn read_chunk_cuckoo_header(data: &[u8]) -> usize {
-    assert!(data.len() >= HEADER_SIZE, "File too small for header");
+    assert!(data.len() >= CHUNK_HEADER_SIZE, "File too small for header");
     let magic = u64::from_le_bytes(data[0..8].try_into().unwrap());
     assert_eq!(magic, CHUNK_MAGIC, "Bad chunk cuckoo magic number");
     let bins_per_table = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;

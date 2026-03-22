@@ -352,7 +352,7 @@ fn main() {
             (0..K_CHUNK)
                 .into_par_iter()
                 .map(|bi| {
-                    let table_offset = HEADER_SIZE + bi * table_byte_size;
+                    let table_offset = CHUNK_HEADER_SIZE + bi * table_byte_size;
                     let table_bytes = &cuckoo_data[table_offset..table_offset + table_byte_size];
 
                     (0..sample_rounds)
@@ -373,7 +373,7 @@ fn main() {
             (0..K_CHUNK)
                 .into_par_iter()
                 .map(|bi| {
-                    let table_offset = HEADER_SIZE + bi * table_byte_size;
+                    let table_offset = CHUNK_HEADER_SIZE + bi * table_byte_size;
                     let table_bytes = &cuckoo_data[table_offset..table_offset + table_byte_size];
 
                     (0..sample_rounds)

@@ -163,7 +163,7 @@ fn server_process(
     let mut results = Vec::with_capacity(K_CHUNK);
 
     for b in 0..K_CHUNK {
-        let table_offset = HEADER_SIZE + b * table_byte_size;
+        let table_offset = CHUNK_HEADER_SIZE + b * table_byte_size;
         let table_bytes = &cuckoo_data[table_offset..table_offset + table_byte_size];
 
         let eval0 = dpf.eval_full(&dpf_keys[b].0);

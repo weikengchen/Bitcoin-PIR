@@ -55,7 +55,7 @@ fn lookup_in_bucket(
     num_cuckoo_hashes: usize,
 ) -> bool {
     let slots_per_table = bins_per_table * cuckoo_bucket_size;
-    let table_offset = HEADER_SIZE + bucket_id * slots_per_table * 4;
+    let table_offset = CHUNK_HEADER_SIZE + bucket_id * slots_per_table * 4;
 
     for h in 0..num_cuckoo_hashes {
         let key = derive_chunk_cuckoo_key(bucket_id, h);
@@ -93,7 +93,7 @@ fn main() {
     });
 
     // ── Parse and validate header ────────────────────────────────────────
-    if cuckoo_mmap.len() < HEADER_SIZE {
+    if cuckoo_mmap.len() < CHUNK_HEADER_SIZE {
         eprintln!("Cuckoo file too small for header");
         std::process::exit(1);
     }
@@ -115,7 +115,7 @@ fn main() {
 
     let slots_per_table = bins_per_table * cuckoo_bucket_size;
     let expected_body = k * slots_per_table * 4;
-    let expected_size = HEADER_SIZE + expected_body;
+    let expected_size = CHUNK_HEADER_SIZE + expected_body;
 
     println!("  Header OK:");
     println!("    k = {}", k);
@@ -145,7 +145,7 @@ fn main() {
     let mut max_occ = 0usize;
 
     for b in 0..k {
-        let table_offset = HEADER_SIZE + b * slots_per_table * 4;
+        let table_offset = CHUNK_HEADER_SIZE + b * slots_per_table * 4;
         let mut occ = 0usize;
         for s in 0..slots_per_table {
             let val = read_u32(&cuckoo_mmap, table_offset + s * 4);

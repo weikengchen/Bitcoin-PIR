@@ -141,7 +141,7 @@ impl ServerData {
                     .map(|k| DpfKey::from_bytes(k).expect("bad dpf key"))
                     .collect();
                 let key_refs: Vec<&DpfKey> = dpf_keys.iter().collect();
-                let table_offset = HEADER_SIZE + b * self.chunk_table_byte_size;
+                let table_offset = CHUNK_HEADER_SIZE + b * self.chunk_table_byte_size;
                 let table_bytes = &self.chunk_cuckoo[table_offset..table_offset + self.chunk_table_byte_size];
                 let (r, timing) = eval::process_chunk_bucket(
                     &key_refs,
