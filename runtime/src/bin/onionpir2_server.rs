@@ -18,7 +18,7 @@ use runtime::onionpir::*;
 use runtime::protocol;
 use futures_util::{SinkExt, StreamExt};
 use memmap2::Mmap;
-use onionpir::{self, Server as PirServer};
+use onionpir::{self, Server as PirServer, KeyStore};
 use std::fs::File;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -101,7 +101,6 @@ fn read_index_meta(data: &[u8]) -> IndexMeta {
 enum PirCommand {
     RegisterKeys {
         client_id: u64,
-        level: u8, // 0=index, 1=chunk
         galois_keys: Vec<u8>,
         gsw_keys: Vec<u8>,
         reply: oneshot::Sender<()>,
@@ -213,6 +212,13 @@ async fn main() {
     let chunk_bins = ch.bins_per_table;
 
     let _pir_thread = std::thread::spawn(move || {
+        // ── Create shared key store ──────────────────────────────────
+        // One KeyStore for all 155 servers — keys deserialized ONCE.
+        // MUST be Box'd: set_key_store stores a raw pointer, so the
+        // KeyStore must not move after servers are attached (same pattern
+        // as chunk_index_tables for set_shared_database).
+        let mut key_store = Box::new(KeyStore::new(0));
+
         // ── Set up chunk servers (shared NTT store) ─────────────────
         println!("\n[4a] Setting up {} chunk PIR servers (shared NTT store)...", k_chunk);
         let t = Instant::now();
@@ -241,6 +247,7 @@ async fn main() {
 
             unsafe {
                 server.set_shared_database(ntt_u64_ptr, ch.num_packed_entries, &index_table);
+                server.set_key_store(&key_store);
             }
             chunk_index_tables.push(index_table);
             chunk_servers.push(server);
@@ -260,6 +267,7 @@ async fn main() {
                 server.load_db(path.to_str().unwrap()),
                 "Failed to load index database: {:?}", path
             );
+            unsafe { server.set_key_store(&key_store); }
             index_servers.push(server);
         }
         println!("  Index servers ready in {:.2?}", t.elapsed());
@@ -268,20 +276,13 @@ async fn main() {
         // ── Event loop ──────────────────────────────────────────────
         while let Some(cmd) = pir_rx.blocking_recv() {
             match cmd {
-                PirCommand::RegisterKeys { client_id, level, galois_keys, gsw_keys, reply } => {
+                PirCommand::RegisterKeys { client_id, galois_keys, gsw_keys, reply } => {
                     let t = Instant::now();
-                    let servers: &mut [PirServer] = if level == 0 {
-                        &mut index_servers
-                    } else {
-                        &mut chunk_servers
-                    };
-                    for s in servers.iter_mut() {
-                        s.set_galois_key(client_id, &galois_keys);
-                        s.set_gsw_key(client_id, &gsw_keys);
-                    }
-                    let level_name = if level == 0 { "index" } else { "chunk" };
-                    println!("[keys] client {} {} registered ({} servers) in {:.2?}",
-                        client_id, level_name, servers.len(), t.elapsed());
+                    // Deserialize once into shared store — all servers see it
+                    key_store.set_galois_key(client_id, &galois_keys);
+                    key_store.set_gsw_key(client_id, &gsw_keys);
+                    println!("[keys] client {} registered (shared store) in {:.2?}",
+                        client_id, t.elapsed());
                     let _ = reply.send(());
                 }
                 PirCommand::AnswerBatch { client_id, level, round_id, queries, reply } => {
@@ -357,9 +358,6 @@ async fn main() {
             };
             let (mut sink, mut ws_stream) = ws.split();
 
-            // Track key registration: first call = index (level 0), second = chunk (level 1)
-            let mut key_reg_count: u8 = 0;
-
             while let Some(msg) = ws_stream.next().await {
                 let msg = match msg {
                     Ok(m) => m,
@@ -390,12 +388,9 @@ async fn main() {
                     REQ_REGISTER_KEYS => {
                         match RegisterKeysMsg::decode(body) {
                             Ok(keys_msg) => {
-                                let level = key_reg_count % 2;
-                                key_reg_count += 1;
                                 let (tx, rx) = oneshot::channel();
                                 let _ = pir_tx.send(PirCommand::RegisterKeys {
                                     client_id,
-                                    level,
                                     galois_keys: keys_msg.galois_keys,
                                     gsw_keys: keys_msg.gsw_keys,
                                     reply: tx,

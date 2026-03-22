@@ -441,23 +441,36 @@ async fn main() {
     println!("  Chunk: K={}, bins={}, total_packed={}", chunk_k, chunk_bins, total_packed);
     println!();
 
-    // ── 3. Create PIR clients and register index keys ───────────────────
-    println!("[3] Creating PIR clients...");
+    // ── 3. Create PIR client and register keys (single registration) ────
+    // Keys are independent of num_entries. We generate keys once, export the
+    // secret key, then create per-level clients with the correct num_entries
+    // for query generation and decryption.
+    println!("[3] Creating PIR client...");
     let key_start = Instant::now();
-    let mut index_client = PirClient::new(index_bins as u64);
-    let mut chunk_client = PirClient::new(chunk_bins as u64);
-    let index_galois = index_client.generate_galois_keys();
-    let index_gsw = index_client.generate_gsw_keys();
+    let mut keygen_client = PirClient::new(0);
+    let client_id = keygen_client.id();
+    let galois = keygen_client.generate_galois_keys();
+    let gsw = keygen_client.generate_gsw_keys();
+    let secret_key = keygen_client.export_secret_key();
     println!("  Key generation: {:.2?}", key_start.elapsed());
 
+    // Create per-level clients sharing the same secret key
+    let mut index_client = PirClient::new_from_secret_key(
+        index_bins as u64, client_id, &secret_key,
+    );
+    let mut chunk_client = PirClient::new_from_secret_key(
+        chunk_bins as u64, client_id, &secret_key,
+    );
+
+    // Register keys once — shared across all levels
     let reg_msg = RegisterKeysMsg {
-        galois_keys: index_galois,
-        gsw_keys: index_gsw,
+        galois_keys: galois,
+        gsw_keys: gsw,
     };
     sink.send(Message::Binary(reg_msg.encode().into())).await.expect("send keys");
     let ack = recv_binary(&mut stream, &mut sink).await;
     assert_eq!(ack[4], RESP_KEYS_ACK);
-    println!("  Index keys registered.\n");
+    println!("  Keys registered (single registration, shared secret key).\n");
 
     // ══════════════════════════════════════════════════════════════════════
     // LEVEL 1: Index PIR (batched across addresses)
@@ -625,19 +638,6 @@ async fn main() {
     if unique_entry_ids.is_empty() {
         println!("  No entries to fetch — skipping chunk phase.");
     } else {
-        // Register chunk keys only if there are entries to fetch
-        println!("  Registering chunk keys...");
-        let chunk_galois = chunk_client.generate_galois_keys();
-        let chunk_gsw = chunk_client.generate_gsw_keys();
-        let reg_msg2 = RegisterKeysMsg {
-            galois_keys: chunk_galois,
-            gsw_keys: chunk_gsw,
-        };
-        sink.send(Message::Binary(reg_msg2.encode().into())).await.expect("send chunk keys");
-        let ack2 = recv_binary(&mut stream, &mut sink).await;
-        assert_eq!(ack2[4], RESP_KEYS_ACK);
-        println!("  Chunk keys registered.");
-
     // PBC place entries into chunk groups
     let entry_pbc_groups: Vec<[usize; NUM_HASHES]> = unique_entry_ids.iter()
         .map(|&eid| derive_chunk_buckets(eid))

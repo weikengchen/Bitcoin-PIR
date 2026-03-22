@@ -4,11 +4,24 @@
 export interface OnionPirModule {
     /**
      * Create a new PIR client for a database with the given number of entries.
+     * Pass numEntries=0 for key generation only (keys are independent of DB size).
      * Call .delete() when done to free WASM heap memory.
      */
     OnionPirClient: {
         new(numEntries: number): OnionPirClient;
     };
+
+    /**
+     * Create a PIR client from an existing secret key.
+     * Use this to create per-database clients that share the same encryption keys
+     * but use the correct numEntries for query generation and response decryption.
+     * Call .delete() when done to free WASM heap memory.
+     *
+     * @param numEntries - Database entry count (must match the server)
+     * @param clientId - Client ID from the original key-generation client
+     * @param secretKey - Secret key bytes from exportSecretKey()
+     */
+    createClientFromSecretKey(numEntries: number, clientId: number, secretKey: Uint8Array): OnionPirClient;
 
     /**
      * Get PIR database parameters for a given number of entries.
@@ -49,7 +62,14 @@ export interface OnionPirClient {
     /** Get this client's unique ID (for server key registration). */
     id(): number;
 
-    /** Generate Galois keys to send to the server. ~274 KB. */
+    /**
+     * Export the client's secret key for creating per-database clients.
+     * Use with createClientFromSecretKey() to create clients with correct
+     * numEntries while sharing the same encryption keys.
+     */
+    exportSecretKey(): Uint8Array;
+
+    /** Generate Galois keys to send to the server. ~379 KB. */
     generateGaloisKeys(): Uint8Array;
 
     /** Generate GSW keys to send to the server. ~324 KB. */

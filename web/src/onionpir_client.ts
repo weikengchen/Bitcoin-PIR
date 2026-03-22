@@ -49,12 +49,14 @@ const RESP_ONIONPIR_CHUNK_RESULT  = 0x32;
 
 interface OnionPirModule {
   OnionPirClient: { new(numEntries: number): WasmPirClient };
+  createClientFromSecretKey(numEntries: number, clientId: number, secretKey: Uint8Array): WasmPirClient;
   paramsInfo(numEntries: number): { numEntries: number; entrySize: number };
   buildCuckooBs1(entries: Uint32Array, keys: Uint32Array, numBins: number): Uint32Array;
 }
 
 interface WasmPirClient {
   id(): number;
+  exportSecretKey(): Uint8Array;
   generateGaloisKeys(): Uint8Array;
   generateGswKeys(): Uint8Array;
   generateQuery(entryIndex: number): Uint8Array;
@@ -517,22 +519,29 @@ export class OnionPirWebClient {
     const progress = onProgress || (() => {});
     this.log(`=== Batch query: ${N} script hashes ===`);
 
-    // ── Create WASM PIR clients ─────────────────────────────────────────
-    progress('Setup', 'Creating PIR clients...');
-    const indexClient = new this.wasmModule.OnionPirClient(this.indexBins);
-    const chunkClient = new this.wasmModule.OnionPirClient(this.chunkBins);
+    // ── Generate keys and create per-level clients ─────────────────────
+    // Keys are independent of num_entries. We generate once, export the
+    // secret key, then create per-level clients with correct num_entries.
+    progress('Setup', 'Creating PIR client...');
+    const keygenClient = new this.wasmModule.OnionPirClient(0);
+    const clientId = keygenClient.id();
+    const galoisKeys = keygenClient.generateGaloisKeys();
+    const gswKeys = keygenClient.generateGswKeys();
+    const secretKey = keygenClient.exportSecretKey();
+    keygenClient.delete();
+
+    const indexClient = this.wasmModule.createClientFromSecretKey(this.indexBins, clientId, secretKey);
+    let chunkClient: WasmPirClient | null = null;
 
     try {
-      // ── Register index keys ─────────────────────────────────────────
-      progress('Setup', 'Generating index keys...');
-      const galoisKeys = indexClient.generateGaloisKeys();
-      const gswKeys = indexClient.generateGswKeys();
-      this.log(`Index keys: ${galoisKeys.length + gswKeys.length} bytes`);
+      // ── Register keys once (shared across all levels) ────────────
+      progress('Setup', 'Registering keys...');
+      this.log(`Keys: ${galoisKeys.length + gswKeys.length} bytes`);
 
       const regMsg = encodeRegisterKeys(galoisKeys, gswKeys);
       const ack = await this.sendRaw(regMsg);
       if (ack[4] !== RESP_KEYS_ACK) throw new Error('Key registration failed');
-      this.log('Index keys registered');
+      this.log('Keys registered (single registration, shared secret key)');
 
       // ════════════════════════════════════════════════════════════════
       // LEVEL 1: Index PIR
@@ -675,14 +684,8 @@ export class OnionPirWebClient {
       let chunkRoundsCount = 0;
 
       if (uniqueEntryIds.length > 0) {
-        // Only register chunk keys and query if there are entries to fetch
-        progress('Level 2', 'Registering chunk keys...');
-        const chunkGalois = chunkClient.generateGaloisKeys();
-        const chunkGsw = chunkClient.generateGswKeys();
-        const regMsg2 = encodeRegisterKeys(chunkGalois, chunkGsw);
-        const ack2 = await this.sendRaw(regMsg2);
-        if (ack2[4] !== RESP_KEYS_ACK) throw new Error('Chunk key registration failed');
-        this.log('Chunk keys registered');
+        // Create chunk client from same secret key (no extra registration needed)
+        chunkClient = this.wasmModule!.createClientFromSecretKey(this.chunkBins, clientId, secretKey);
 
         const entryPbcGroups = uniqueEntryIds.map(eid => deriveChunkBuckets(eid));
         const chunkRounds = planPbcRounds(entryPbcGroups, this.chunkK);
@@ -726,7 +729,7 @@ export class OnionPirWebClient {
             const idx = qi !== undefined
               ? queryInfos[qi].bin
               : Number(this.rng.nextU64() % BigInt(this.chunkBins));
-            queries.push(chunkClient.generateQuery(idx));
+            queries.push(chunkClient!.generateQuery(idx));
           }
 
           const batchMsg = encodeBatchQuery(REQ_ONIONPIR_CHUNK_QUERY, ri, queries);
@@ -737,7 +740,7 @@ export class OnionPirWebClient {
           const { results } = decodeBatchResult(respPayload, 1);
 
           for (const qi of queryInfos) {
-            const entryBytes = chunkClient.decryptResponse(qi.bin, results[qi.group]);
+            const entryBytes = chunkClient!.decryptResponse(qi.bin, results[qi.group]);
             decryptedEntries.set(qi.entryId, entryBytes.slice(0, PACKED_ENTRY_SIZE));
           }
         }
@@ -793,9 +796,9 @@ export class OnionPirWebClient {
       return results;
 
     } finally {
-      // Always free WASM clients
+      // Free WASM clients
       indexClient.delete();
-      chunkClient.delete();
+      if (chunkClient) chunkClient.delete();
     }
   }
 }
