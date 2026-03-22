@@ -7,7 +7,7 @@
  */
 
 import {
-  K, K_CHUNK, NUM_HASHES,
+  K, K_CHUNK, NUM_HASHES, INDEX_CUCKOO_NUM_HASHES,
   FLAG_WHALE, CHUNK_MASTER_SEED,
 } from './constants.js';
 
@@ -562,31 +562,36 @@ export class OnionPirWebClient {
       const indexResults: (IndexResult | null)[] = new Array(N).fill(null);
       let totalIndexRounds = 0;
 
-      // PBC place all addresses — group assignments reused for hash1 retry
+      // PBC place all addresses into groups (same logic as DPF-PIR)
       const allGroups = addrInfos.map(a => a.groups);
       const indexRounds = planPbcRounds(allGroups, this.indexK);
       this.log(`Level 1: ${N} queries → ${indexRounds.length} round(s)`);
 
-      // Track group assignment per address for hash1 retry (must use same group)
-      const addrGroupAssignment = new Map<number, number>();
-
-      // Hash0 pass
+      // Each round: 2 queries per group (hash0 + hash1 bins), matching DPF approach
       for (const round of indexRounds) {
-        progress('Level 1', `Index round ${totalIndexRounds + 1}/${indexRounds.length} (hash0)...`);
+        progress('Level 1', `Index round ${totalIndexRounds + 1}/${indexRounds.length}...`);
 
-        const groupMap = new Map<number, { addrIdx: number; bin: number }>();
+        const groupMap = new Map<number, number>(); // group → addrIdx
         for (const [addrIdx, group] of round) {
-          addrGroupAssignment.set(addrIdx, group);
-          const key0 = deriveCuckooKey(group, 0);
-          const bin0 = cuckooHash(scriptHashes[addrIdx], key0, this.indexBins);
-          groupMap.set(group, { addrIdx, bin: bin0 });
+          groupMap.set(group, addrIdx);
         }
 
+        // Generate 2*K queries: [g0_h0, g0_h1, g1_h0, g1_h1, ...]
         const queries: Uint8Array[] = [];
+        const queryBins: number[] = [];
         for (let g = 0; g < this.indexK; g++) {
-          const real = groupMap.get(g);
-          const idx = real ? real.bin : Number(this.rng.nextU64() % BigInt(this.indexBins));
-          queries.push(indexClient.generateQuery(idx));
+          for (let h = 0; h < INDEX_CUCKOO_NUM_HASHES; h++) {
+            let bin: number;
+            const addrIdx = groupMap.get(g);
+            if (addrIdx !== undefined) {
+              const key = deriveCuckooKey(g, h);
+              bin = cuckooHash(scriptHashes[addrIdx], key, this.indexBins);
+            } else {
+              bin = Number(this.rng.nextU64() % BigInt(this.indexBins));
+            }
+            queries.push(indexClient.generateQuery(bin));
+            queryBins.push(bin);
+          }
         }
 
         const batchMsg = encodeBatchQuery(REQ_ONIONPIR_INDEX_QUERY, totalIndexRounds, queries);
@@ -597,53 +602,18 @@ export class OnionPirWebClient {
         if (respPayload[0] !== RESP_ONIONPIR_INDEX_RESULT) throw new Error('Unexpected index response');
         const { results } = decodeBatchResult(respPayload, 1);
 
+        // Decrypt both hash results and scan for tag
         for (const [addrIdx, group] of round) {
-          const { bin } = groupMap.get(group)!;
-          const entryBytes = indexClient.decryptResponse(bin, results[group]);
-          const found = this.scanIndexBin(entryBytes, addrInfos[addrIdx].tag);
-          if (found) indexResults[addrIdx] = found;
-        }
-      }
-
-      // Hash1 retry — reuse SAME group assignments from hash0
-      const missed: number[] = [];
-      for (let i = 0; i < N; i++) { if (!indexResults[i]) missed.push(i); }
-
-      if (missed.length > 0) {
-        this.log(`${missed.length} missed hash0, retrying hash1 (same groups)...`);
-
-        // All missed addresses have non-colliding group assignments from hash0,
-        // so they can all go in a single round
-        const groupMap = new Map<number, { addrIdx: number; bin: number }>();
-        for (const addrIdx of missed) {
-          const group = addrGroupAssignment.get(addrIdx)!;
-          const key1 = deriveCuckooKey(group, 1);
-          const bin1 = cuckooHash(scriptHashes[addrIdx], key1, this.indexBins);
-          groupMap.set(group, { addrIdx, bin: bin1 });
-        }
-
-        const queries: Uint8Array[] = [];
-        for (let g = 0; g < this.indexK; g++) {
-          const real = groupMap.get(g);
-          const idx = real ? real.bin : Number(this.rng.nextU64() % BigInt(this.indexBins));
-          queries.push(indexClient.generateQuery(idx));
-        }
-
-        progress('Level 1', `Hash1 retry for ${missed.length} addresses...`);
-        const batchMsg = encodeBatchQuery(REQ_ONIONPIR_INDEX_QUERY, totalIndexRounds, queries);
-        const respRaw = await this.sendRaw(batchMsg);
-        totalIndexRounds++;
-
-        const respPayload = respRaw.slice(4);
-        if (respPayload[0] !== RESP_ONIONPIR_INDEX_RESULT) throw new Error('Unexpected index response');
-        const { results } = decodeBatchResult(respPayload, 1);
-
-        for (const addrIdx of missed) {
-          const group = addrGroupAssignment.get(addrIdx)!;
-          const { bin } = groupMap.get(group)!;
-          const entryBytes = indexClient.decryptResponse(bin, results[group]);
-          const found = this.scanIndexBin(entryBytes, addrInfos[addrIdx].tag);
-          if (found) indexResults[addrIdx] = found;
+          for (let h = 0; h < INDEX_CUCKOO_NUM_HASHES; h++) {
+            const qi = group * 2 + h;
+            const bin = queryBins[qi];
+            const entryBytes = indexClient.decryptResponse(bin, results[qi]);
+            const found = this.scanIndexBin(entryBytes, addrInfos[addrIdx].tag);
+            if (found) {
+              indexResults[addrIdx] = found;
+              break;
+            }
+          }
         }
       }
 

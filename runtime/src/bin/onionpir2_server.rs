@@ -288,24 +288,48 @@ async fn main() {
                 PirCommand::AnswerBatch { client_id, level, round_id, queries, reply } => {
                     let t = Instant::now();
                     let servers = if level == 0 { &mut index_servers } else { &mut chunk_servers };
-                    assert_eq!(queries.len(), servers.len(), "query count mismatch");
-                    let results: Vec<Vec<u8>> = queries.iter().enumerate().map(|(b, q)| {
-                        if q.is_empty() {
-                            Vec::new()
-                        } else {
-                            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                servers[b].answer_query(client_id, q)
-                            })) {
-                                Ok(result) => result,
-                                Err(e) => {
-                                    eprintln!("[ERROR] answer_query panicked for group {}: {:?}", b, e);
-                                    Vec::new()
+
+                    // Index level: 2 queries per group (hash0 + hash1 bins)
+                    // Chunk level: 1 query per group
+                    let results: Vec<Vec<u8>> = if level == 0 {
+                        assert_eq!(queries.len(), 2 * servers.len(),
+                            "index query count mismatch: expected 2*{}, got {}", servers.len(), queries.len());
+                        queries.iter().enumerate().map(|(i, q)| {
+                            let g = i / 2; // group index
+                            if q.is_empty() {
+                                Vec::new()
+                            } else {
+                                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    servers[g].answer_query(client_id, q)
+                                })) {
+                                    Ok(result) => result,
+                                    Err(e) => {
+                                        eprintln!("[ERROR] answer_query panicked for index group {} hash {}: {:?}", g, i % 2, e);
+                                        Vec::new()
+                                    }
                                 }
                             }
-                        }
-                    }).collect();
+                        }).collect()
+                    } else {
+                        assert_eq!(queries.len(), servers.len(), "chunk query count mismatch");
+                        queries.iter().enumerate().map(|(b, q)| {
+                            if q.is_empty() {
+                                Vec::new()
+                            } else {
+                                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    servers[b].answer_query(client_id, q)
+                                })) {
+                                    Ok(result) => result,
+                                    Err(e) => {
+                                        eprintln!("[ERROR] answer_query panicked for chunk group {}: {:?}", b, e);
+                                        Vec::new()
+                                    }
+                                }
+                            }
+                        }).collect()
+                    };
                     let level_name = if level == 0 { "index" } else { "chunk" };
-                    println!("[{}] r{} {} groups answered in {:.2?}",
+                    println!("[{}] r{} {} queries answered in {:.2?}",
                         level_name, round_id, queries.len(), t.elapsed());
                     let _ = reply.send(results);
                 }
