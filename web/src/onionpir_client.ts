@@ -672,6 +672,8 @@ export class OnionPirWebClient {
 
       if (uniqueEntryIds.length > 0) {
         // Create chunk client from same secret key (no extra registration needed)
+        progress('Level 2', 'Setting up chunk phase...');
+        await new Promise(r => setTimeout(r, 0));
         chunkClient = this.wasmModule!.createClientFromSecretKey(this.chunkBins, clientId, secretKey);
 
         const entryPbcGroups = uniqueEntryIds.map(eid => deriveChunkBuckets(eid));
@@ -688,12 +690,17 @@ export class OnionPirWebClient {
           const queryInfos: { entryId: number; group: number; bin: number }[] = [];
           const groupToQi = new Map<number, number>();
 
+          let tablesBuilt = 0;
           for (const [ei, group] of round) {
             const eid = uniqueEntryIds[ei];
             if (!cuckooCache.has(group)) {
               const t0 = performance.now();
               cuckooCache.set(group, buildChunkCuckooForGroup(this.wasmModule!, group, this.totalPacked, this.chunkBins));
+              tablesBuilt++;
               this.log(`  Cuckoo table for group ${group}: ${(performance.now() - t0).toFixed(0)}ms`);
+              // Yield after each table build — each scans 815K entries
+              progress('Level 2', `Chunk round ${ri + 1}/${chunkRounds.length}: built ${tablesBuilt} cuckoo tables...`);
+              await new Promise(r => setTimeout(r, 0));
             }
 
             const keys: bigint[] = [];
