@@ -597,8 +597,8 @@ export class OnionPirWebClient {
             queries.push(indexClient.generateQuery(bin));
             queryBins.push(bin);
           }
-          // Yield to event loop periodically to prevent UI freeze
-          if (g % 10 === 9) {
+          // Yield after every group — each generateQuery is ~20-50ms of WASM FHE work
+          if (g % 3 === 2) {
             progress('Level 1', `Round ${roundNum}/${totalRounds}: ${(g + 1) * 2}/${this.indexK * 2} queries...`);
             await new Promise(r => setTimeout(r, 0));
           }
@@ -613,8 +613,9 @@ export class OnionPirWebClient {
         if (respPayload[0] !== RESP_ONIONPIR_INDEX_RESULT) throw new Error('Unexpected index response');
         const { results } = decodeBatchResult(respPayload, 1);
 
-        // Decrypt both hash results and scan for tag
+        // Decrypt only real addresses (skip dummy groups — client knows which are fake)
         let decrypted = 0;
+        const totalDecrypts = round.length * INDEX_CUCKOO_NUM_HASHES;
         for (const [addrIdx, group] of round) {
           for (let h = 0; h < INDEX_CUCKOO_NUM_HASHES; h++) {
             const qi = group * 2 + h;
@@ -626,10 +627,8 @@ export class OnionPirWebClient {
               indexResults[addrIdx] = found;
               break;
             }
-          }
-          // Yield frequently during decryption to prevent UI freeze
-          if (decrypted % 5 === 0) {
-            progress('Level 1', `Round ${roundNum}/${totalRounds}: decrypted ${decrypted}/${round.length * 2}...`);
+            // Yield after every decrypt — each is ~100ms+ of WASM FHE work
+            progress('Level 1', `Round ${roundNum}/${totalRounds}: decrypted ${decrypted}/${totalDecrypts}...`);
             await new Promise(r => setTimeout(r, 0));
           }
         }
@@ -718,8 +717,8 @@ export class OnionPirWebClient {
               ? queryInfos[qi].bin
               : Number(this.rng.nextU64() % BigInt(this.chunkBins));
             queries.push(chunkClient!.generateQuery(idx));
-            // Yield periodically
-            if (g % 10 === 9) {
+            // Yield frequently — each generateQuery is expensive WASM FHE work
+            if (g % 3 === 2) {
               progress('Level 2', `Chunk round ${ri + 1}/${chunkRounds.length}: ${g + 1}/${this.chunkK} queries...`);
               await new Promise(r => setTimeout(r, 0));
             }
@@ -738,10 +737,8 @@ export class OnionPirWebClient {
             const entryBytes = chunkClient!.decryptResponse(qi.bin, results[qi.group]);
             decryptedEntries.set(qi.entryId, entryBytes.slice(0, PACKED_ENTRY_SIZE));
             chunkDecrypted++;
-            if (chunkDecrypted % 5 === 0) {
-              progress('Level 2', `Chunk round ${ri + 1}/${chunkRounds.length}: decrypted ${chunkDecrypted}/${queryInfos.length}...`);
-              await new Promise(r => setTimeout(r, 0));
-            }
+            progress('Level 2', `Chunk round ${ri + 1}/${chunkRounds.length}: decrypted ${chunkDecrypted}/${queryInfos.length}...`);
+            await new Promise(r => setTimeout(r, 0));
           }
         }
       }
