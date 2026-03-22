@@ -291,39 +291,33 @@ async fn main() {
 
                     // Index level: 2 queries per group (hash0 + hash1 bins)
                     // Chunk level: 1 query per group
+                    // Server processes ALL queries uniformly — no skipping,
+                    // so it cannot distinguish real from dummy queries.
                     let results: Vec<Vec<u8>> = if level == 0 {
                         assert_eq!(queries.len(), 2 * servers.len(),
                             "index query count mismatch: expected 2*{}, got {}", servers.len(), queries.len());
                         queries.iter().enumerate().map(|(i, q)| {
-                            let g = i / 2; // group index
-                            if q.is_empty() {
-                                Vec::new()
-                            } else {
-                                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    servers[g].answer_query(client_id, q)
-                                })) {
-                                    Ok(result) => result,
-                                    Err(e) => {
-                                        eprintln!("[ERROR] answer_query panicked for index group {} hash {}: {:?}", g, i % 2, e);
-                                        Vec::new()
-                                    }
+                            let g = i / 2;
+                            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                servers[g].answer_query(client_id, q)
+                            })) {
+                                Ok(result) => result,
+                                Err(e) => {
+                                    eprintln!("[ERROR] answer_query panicked for index group {} hash {}: {:?}", g, i % 2, e);
+                                    Vec::new()
                                 }
                             }
                         }).collect()
                     } else {
                         assert_eq!(queries.len(), servers.len(), "chunk query count mismatch");
                         queries.iter().enumerate().map(|(b, q)| {
-                            if q.is_empty() {
-                                Vec::new()
-                            } else {
-                                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    servers[b].answer_query(client_id, q)
-                                })) {
-                                    Ok(result) => result,
-                                    Err(e) => {
-                                        eprintln!("[ERROR] answer_query panicked for chunk group {}: {:?}", b, e);
-                                        Vec::new()
-                                    }
+                            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                servers[b].answer_query(client_id, q)
+                            })) {
+                                Ok(result) => result,
+                                Err(e) => {
+                                    eprintln!("[ERROR] answer_query panicked for chunk group {}: {:?}", b, e);
+                                    Vec::new()
                                 }
                             }
                         }).collect()
