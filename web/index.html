@@ -1169,13 +1169,17 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
             }
         }
 
+        let hpConnecting = false;
         async function hpConnect() {
+            if (hpConnecting) return; // prevent double-click
             const hintServerUrl = document.getElementById('hp-hintServerUrl').value.trim();
             const queryServerUrl = document.getElementById('hp-queryServerUrl').value.trim();
             if (!hintServerUrl || !queryServerUrl) {
                 log('HarmonyPIR: Please enter both server URLs', 'error');
                 return;
             }
+            hpConnecting = true;
+            document.getElementById('hp-connectBtn').disabled = true;
             try {
                 const statusDiv = document.getElementById('hp-status');
                 statusDiv.textContent = 'Status: Connecting...';
@@ -1227,6 +1231,12 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                 statusDiv.textContent = 'Status: Disconnected';
                 statusDiv.className = 'status disconnected';
                 hpClient = null;
+            } finally {
+                hpConnecting = false;
+                // Re-enable connect button only if not connected.
+                if (!hpClient) {
+                    document.getElementById('hp-connectBtn').disabled = false;
+                }
             }
         }
 
