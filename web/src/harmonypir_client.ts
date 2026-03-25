@@ -226,19 +226,26 @@ export class HarmonyPirClient {
   async fetchHints(): Promise<void> {
     this.log('Fetching hints from Hint Server...');
 
+    const total = K + K_CHUNK; // 75 + 80 = 155 buckets total
+    let globalReceived = 0;
+
+    const onBucketDone = () => {
+      globalReceived++;
+      const pct = Math.round((globalReceived / total) * 100);
+      this.log(`  Hints: ${globalReceived}/${total} (${pct}%)`);
+    };
+
     // Connect to Hint Server.
     const hintWs = await this.connectHintServer();
 
-    // Request index hints.
-    await this.requestHints(hintWs, 0, K, this.indexBuckets, HARMONY_INDEX_W);
-    this.log('Index hints loaded');
+    // Request index hints (75 buckets).
+    await this.requestHints(hintWs, 0, K, this.indexBuckets, HARMONY_INDEX_W, onBucketDone);
 
-    // Request chunk hints.
-    await this.requestHints(hintWs, 1, K_CHUNK, this.chunkBuckets, HARMONY_CHUNK_W);
-    this.log('Chunk hints loaded');
+    // Request chunk hints (80 buckets).
+    await this.requestHints(hintWs, 1, K_CHUNK, this.chunkBuckets, HARMONY_CHUNK_W, onBucketDone);
 
     hintWs.close();
-    this.log('Hints complete (~' + this.estimateHintSize() + ' MB)');
+    this.log('Hints downloaded successfully');
   }
 
   /**
@@ -405,6 +412,7 @@ export class HarmonyPirClient {
     numBuckets: number,
     buckets: Map<number, HarmonyBucketWasm>,
     w: number,
+    onBucketDone?: () => void,
   ): Promise<void> {
     // Build hint request.
     const bucketIds = Array.from({ length: numBuckets }, (_, i) => i);
@@ -444,7 +452,7 @@ export class HarmonyPirClient {
           }
 
           received++;
-          this.log(`  Hints: ${received}/${numBuckets} (level ${level})`);
+          onBucketDone?.();
           if (received === numBuckets) {
             resolve();
           }
