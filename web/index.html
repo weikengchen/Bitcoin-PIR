@@ -218,11 +218,14 @@
             ScriptPubKeys with more than 100 UTXOs are also excluded.
         </p>
 
-        <!-- Tab bar -->
-        <div class="tab-bar" style="margin-top: 12px;">
-            <button class="tab-btn active" data-tab="dpf">2-Server DPF-PIR</button>
-            <button class="tab-btn" data-tab="onionpir">1-Server OnionPIR</button>
-            <button class="tab-btn" data-tab="harmonypir">2-Server HarmonyPIR</button>
+        <!-- Tab bar + localhost toggle -->
+        <div style="display: flex; align-items: center; margin-top: 12px;">
+            <div class="tab-bar" style="flex: 1;">
+                <button class="tab-btn active" data-tab="dpf">2-Server DPF-PIR</button>
+                <button class="tab-btn" data-tab="onionpir">1-Server OnionPIR</button>
+                <button class="tab-btn" data-tab="harmonypir">2-Server HarmonyPIR</button>
+            </div>
+            <button id="localhostToggle" class="small secondary" style="font-size: 11px; padding: 4px 10px; white-space: nowrap;" title="Switch all server URLs between remote and localhost">🌐 Remote</button>
         </div>
 
         <!-- ═══ DPF Tab ═══ -->
@@ -241,11 +244,11 @@
             <div style="margin-top: 8px;">
                 <div class="server-row">
                     <span class="server-label">Server 0:</span>
-                    <input type="text" id="server0Url" class="small" value="ws://localhost:8091">
+                    <input type="text" id="server0Url" class="small" value="wss://dpf1.chenweikeng.com">
                 </div>
                 <div class="server-row">
                     <span class="server-label">Server 1:</span>
-                    <input type="text" id="server1Url" class="small" value="ws://localhost:8092">
+                    <input type="text" id="server1Url" class="small" value="wss://dpf2.chenweikeng.com">
                 </div>
             </div>
         </details>
@@ -942,6 +945,38 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                 btn.classList.add('active');
                 document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
             });
+        });
+
+        // ═══════════════════════════════════════════════════════════════
+        // Localhost / Remote toggle
+        // ═══════════════════════════════════════════════════════════════
+        const serverPresets = {
+            remote: {
+                'server0Url':       'wss://dpf1.chenweikeng.com',
+                'server1Url':       'wss://dpf2.chenweikeng.com',
+                'op-serverUrl':     'wss://onionpirv2.chenweikeng.com',
+                'hp-hintServerUrl': 'wss://harmonyhint.chenweikeng.com',
+                'hp-queryServerUrl':'wss://harmonydata.chenweikeng.com',
+            },
+            local: {
+                'server0Url':       'ws://localhost:8091',
+                'server1Url':       'ws://localhost:8092',
+                'op-serverUrl':     'ws://localhost:8093',
+                'hp-hintServerUrl': 'ws://localhost:8094',
+                'hp-queryServerUrl':'ws://localhost:8095',
+            },
+        };
+        let useLocalhost = false;
+        document.getElementById('localhostToggle').addEventListener('click', () => {
+            useLocalhost = !useLocalhost;
+            const preset = useLocalhost ? serverPresets.local : serverPresets.remote;
+            for (const [id, url] of Object.entries(preset)) {
+                const el = document.getElementById(id);
+                if (el) el.value = url;
+            }
+            const btn = document.getElementById('localhostToggle');
+            btn.textContent = useLocalhost ? '💻 Localhost' : '🌐 Remote';
+            btn.style.background = useLocalhost ? '#fff3cd' : '';
         });
 
         // ═══════════════════════════════════════════════════════════════
