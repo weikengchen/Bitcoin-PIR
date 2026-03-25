@@ -295,7 +295,7 @@ export class HarmonyPirClient {
     return null;
   }
 
-  /** Decode UTXOs from chunk data. Simple varint-encoded format. */
+  /** Decode UTXOs from chunk data. Varint-encoded format matching DPF-PIR. */
   private decodeUtxos(chunks: Uint8Array[]): UtxoEntry[] {
     if (chunks.length === 0) return [];
 
@@ -308,24 +308,47 @@ export class HarmonyPirClient {
       pos += chunk.length;
     }
 
-    // Decode: each UTXO is [32B txid][4B vout LE][8B value LE] = 44 bytes
-    // But the actual format depends on the build pipeline encoding.
-    // For now, return raw data as a single entry.
+    // Format: [varint numEntries][per entry: 32B txid, varint vout, varint amount]
+    const { value: numEntries, bytesRead: countBytes } = this.readVarint(data, 0);
+    pos = countBytes;
+
     const utxos: UtxoEntry[] = [];
-    let offset = 0;
-    while (offset + 44 <= data.length) {
-      const view = new DataView(data.buffer, data.byteOffset + offset);
-      const txidBytes = data.slice(offset, offset + 32);
-      // Check if all zeros (padding).
-      if (txidBytes.every(b => b === 0)) break;
+    for (let i = 0; i < Number(numEntries); i++) {
+      if (pos + 32 > data.length) break;
+
+      const txidBytes = data.slice(pos, pos + 32);
+      pos += 32;
+
+      const { value: vout, bytesRead: vr } = this.readVarint(data, pos);
+      pos += vr;
+
+      const { value: amount, bytesRead: ar } = this.readVarint(data, pos);
+      pos += ar;
+
       const txid = bytesToHex(new Uint8Array([...txidBytes].reverse()));
-      const vout = view.getUint32(32, true);
-      const value = Number(view.getBigUint64(36, true));
-      utxos.push({ txid, vout, value });
-      offset += 44;
+      utxos.push({ txid, vout: Number(vout), value: Number(amount) });
     }
 
     return utxos;
+  }
+
+  /** Read a LEB128 varint from data at offset. */
+  private readVarint(data: Uint8Array, offset: number): { value: bigint; bytesRead: number } {
+    let result = 0n;
+    let shift = 0;
+    let bytesRead = 0;
+    while (true) {
+      if (offset + bytesRead >= data.length) {
+        throw new Error('Unexpected end of data while reading varint');
+      }
+      const byte = data[offset + bytesRead];
+      bytesRead++;
+      result |= BigInt(byte & 0x7F) << BigInt(shift);
+      if ((byte & 0x80) === 0) break;
+      shift += 7;
+      if (shift >= 64) throw new Error('VarInt too large');
+    }
+    return { value: result, bytesRead };
   }
 
   /** Send a request to Query Server and wait for the response. */
