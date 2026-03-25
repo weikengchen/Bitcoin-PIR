@@ -177,20 +177,10 @@ fn parse_prp_key(args: &[String]) -> [u8; 16] {
         key.copy_from_slice(&bytes);
         key
     } else {
-        // Generate random key using std thread_rng.
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        use std::time::SystemTime;
+        // Generate random key using OS CSPRNG.
+        use rand::RngCore;
         let mut key = [0u8; 16];
-        let seed = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        for i in 0..16 {
-            let mut h = DefaultHasher::new();
-            (seed, i as u64).hash(&mut h);
-            key[i] = h.finish() as u8;
-        }
+        rand::thread_rng().fill_bytes(&mut key);
         key
     }
 }

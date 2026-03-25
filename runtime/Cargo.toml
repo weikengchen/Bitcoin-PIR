@@ -76,3 +76,4 @@ rayon = "1.10"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
+rand = "0.8"

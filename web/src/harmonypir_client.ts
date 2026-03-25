@@ -137,8 +137,9 @@ export class HarmonyPirClient {
     if (this.pool) return; // already loaded
     const backend = this.config.prpBackend ?? 0;
     const backendName = ['Hoang', 'FastPRP', 'ALF'][backend] ?? 'Hoang';
-    const jsUrl = `${this.wasmDir}/harmonypir_wasm.js`;
-    const binaryUrl = `${this.wasmDir}/harmonypir_wasm_bg.wasm`;
+    // Resolve to fully-qualified URLs so blob-URL workers can fetch them.
+    const jsUrl = new URL(`${this.wasmDir}/harmonypir_wasm.js`, document.baseURI).href;
+    const binaryUrl = new URL(`${this.wasmDir}/harmonypir_wasm_bg.wasm`, document.baseURI).href;
 
     // Also load WASM on main thread (for planning helpers like computeTag).
     const oldScript = document.getElementById('harmonypir-wasm-script');

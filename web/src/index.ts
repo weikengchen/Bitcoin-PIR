@@ -18,9 +18,7 @@ if (typeof window !== 'undefined') {
       if (window.crypto && window.crypto.getRandomValues) {
         window.crypto.getRandomValues(bytes);
       } else {
-        for (let i = 0; i < size; i++) {
-          bytes[i] = Math.floor(Math.random() * 256);
-        }
+        throw new Error('crypto.getRandomValues is required but not available in this browser');
       }
       return Buffer.from(bytes);
     };
