@@ -197,6 +197,7 @@
         .tab-content.active { display: block; }
     </style>
     <script src="/wasm/onionpir_client.js"></script>
+    <script src="/wasm/harmonypir/harmonypir_wasm.js"></script>
 </head>
 <body>
     <div class="container">
@@ -221,6 +222,7 @@
         <div class="tab-bar" style="margin-top: 12px;">
             <button class="tab-btn active" data-tab="dpf">2-Server DPF-PIR</button>
             <button class="tab-btn" data-tab="onionpir">1-Server OnionPIR</button>
+            <button class="tab-btn" data-tab="harmonypir">2-Server HarmonyPIR</button>
         </div>
 
         <!-- ═══ DPF Tab ═══ -->
@@ -399,6 +401,121 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
 
         </div><!-- end tab-onionpir -->
 
+        <!-- ═══════════════════════════════════════════════════════════ -->
+        <!-- HarmonyPIR Tab                                             -->
+        <!-- ═══════════════════════════════════════════════════════════ -->
+        <div id="tab-harmonypir" class="tab-content" style="border: 2px solid #f7931a; border-top: none; border-radius: 0 0 8px 8px; padding: 15px; margin-bottom: 15px;">
+
+        <div style="display: flex; align-items: center; gap: 12px; margin: 10px 0;">
+            <div id="hp-status" class="status disconnected" style="margin: 0; flex: 1;">
+                Status: Disconnected
+            </div>
+            <button id="hp-connectBtn" class="small">Connect</button>
+            <button id="hp-disconnectBtn" class="small secondary" disabled>Disconnect</button>
+        </div>
+
+        <details style="margin-bottom: 10px;">
+            <summary style="cursor: pointer; font-size: 13px; color: #888;">Server configuration &amp; PRP</summary>
+            <div style="margin-top: 8px;">
+                <div class="server-row">
+                    <span class="server-label">Hint Server:</span>
+                    <input type="text" id="hp-hintServerUrl" class="small" value="ws://localhost:8093">
+                </div>
+                <div class="server-row">
+                    <span class="server-label">Query Server:</span>
+                    <input type="text" id="hp-queryServerUrl" class="small" value="ws://localhost:8091">
+                </div>
+                <div style="margin: 8px 0;">
+                    <label style="display: inline; font-weight: bold; font-size: 13px;">PRP Backend:</label>
+                    <select id="hp-prpSelect" style="padding: 4px 8px; margin-left: 6px; border-radius: 4px; border: 1px solid #ddd;">
+                        <option value="0" selected>Hoang (default)</option>
+                        <option value="1" disabled>FastPRP (requires separate WASM)</option>
+                        <option value="2" disabled>ALF (requires separate WASM)</option>
+                    </select>
+                    <span id="hp-prpNote" style="font-size: 11px; color: #888; margin-left: 6px;"></span>
+                </div>
+            </div>
+        </details>
+
+        <!-- Offline phase indicator (unique to HarmonyPIR) -->
+        <div id="hp-offlineContainer" style="margin: 10px 0; display: none;">
+            <div style="background: #e8f4f8; border: 1px solid #8cc4d7; border-radius: 6px; padding: 12px;">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <span style="font-weight: bold; color: #2980b9;">&#128274; Offline Phase (Hint Download)</span>
+                    <span id="hp-offlineStatus" style="font-size: 12px; color: #666;">Not started</span>
+                </div>
+                <div class="progress-bar" style="margin-top: 8px;">
+                    <div id="hp-offlineFill" class="progress-fill" style="width: 0%; background-color: #3498db;"></div>
+                </div>
+                <div id="hp-offlineLabel" style="font-size: 12px; color: #666; margin-top: 4px;"></div>
+            </div>
+        </div>
+
+        <div class="step">
+            <label for="hp-scriptPubkeys">Bitcoin address(es) or scriptPubKey hex — one per line:</label>
+            <textarea id="hp-scriptPubkeys" rows="4" placeholder="Paste Bitcoin addresses (bc1..., 1..., 3...) or raw scriptPubKey hex, one per line...">1D4HSHPJxoPLqiBNFNarz34dcWPLvpiaeb
+bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
+            <div id="hp-conversionNote" style="font-size: 12px; color: #28a745; margin: 2px 0 6px 5px; display: none;"></div>
+
+            <details style="margin-top: 6px;">
+                <summary style="cursor: pointer; font-size: 13px; color: #666;">Load examples</summary>
+                <div class="examples" style="margin-top: 8px;">
+                    <span class="example-label">Known in dataset:</span>
+                    <button class="example-btn hp-example" data-spk="76a91484407a2fe50de7b97ef1a80613b41d06af8fa38788ac" style="background:#fff3cd; border-color:#ffc107;">P2PKH</button>
+                    <button class="example-btn hp-example" data-spk="0014528aa6fb623acd8f574abc89508e0a42cde57b8b" style="background:#fff3cd; border-color:#ffc107;">P2WPKH</button>
+                    <button class="example-btn hp-example" data-spk="a914977824b90abfb1175a736e7020ac376702953adc87" style="background:#fff3cd; border-color:#ffc107;">P2SH</button>
+                    <button class="example-btn hp-example" data-spk="51201c29857ea48bc3c477c9509aafe901a61940f1ac29215f588cb250291f30fe8a" style="background:#fff3cd; border-color:#ffc107;">P2TR</button>
+                    <button class="example-btn hp-example" data-spk="0020ebb7d608cfce01578d4e07aa9a82e6a9cff4ae9194a7dce148d87c8dfdc7b55e" style="background:#fff3cd; border-color:#ffc107;">P2WSH</button>
+                    <button class="example-btn hp-example" data-spk="512102ab5dbba9d81acbadae5ade8ae7ad1fbae2ffc9b566fc408117377f6ae1cea6e221037e8a78ba439913d64c68cd2606ddd48e5e9a58ef03635a543ba4a34a92f6785e2103bcc4e113b8deda823848e07c157d7b341098a5c97851bfd6315d6fe54a85a74a53ae" style="background:#fff3cd; border-color:#ffc107;">1-of-3 Multisig</button>
+                    <button class="example-btn hp-example" data-spk="512102f4aef682535628a7e0492b2b5db1aa312348c3095e0258e26b275b25b10290e62120434e54525052545900000014000042e4a3aa79d50000000005f5e1000100000052ae" style="background:#fff3cd; border-color:#ffc107;">1-of-2 Multisig</button>
+                    <button class="example-btn" id="hp-loadDiverseBtn" style="background:#fff3cd; border-color:#ffc107;">Mix</button>
+                    <br>
+                    <span class="example-label">Top whales (most UTXOs, in dataset):</span>
+                    <button class="example-btn hp-example" data-spk="76a9143cb4b67770d4c1c4539c6b9397e865a05c47c55688ac" style="background:#fff3cd; border-color:#ffc107;">P2PKH whale</button>
+                    <button class="example-btn hp-example" data-spk="76a914d35128db955305f78f550b2b3edd603c198b16d788ac" style="background:#fff3cd; border-color:#ffc107;">P2PKH whale 2</button>
+                    <button class="example-btn hp-example" data-spk="76a9145dcf8d3e1445997806e569b546a2b9d85fe637c188ac" style="background:#fff3cd; border-color:#ffc107;">P2PKH whale 3</button>
+                    <button class="example-btn hp-example" data-spk="00146cc553856b233afc1e18fba7f39a724b460a12b3" style="background:#fff3cd; border-color:#ffc107;">P2WPKH whale</button>
+                    <button class="example-btn hp-example" data-spk="0014c2a2f99dac2bdc8323bfe47e76211fdf310e2bac" style="background:#fff3cd; border-color:#ffc107;">P2WPKH whale 2</button>
+                    <button class="example-btn hp-example" data-spk="a9140e9feac0552727db096a8731289d952b5babd0e087" style="background:#fff3cd; border-color:#ffc107;">P2SH whale</button>
+                    <button class="example-btn hp-example" data-spk="a9148c86d4a4ef15972d636fb87b4acc6bec78baf13487" style="background:#fff3cd; border-color:#ffc107;">P2SH whale 2</button>
+                    <button class="example-btn hp-example" data-spk="00207f6b0309fb368f6c956ec910c747d3af7c8ce57a8f0aef36361675a5047ae012" style="background:#fff3cd; border-color:#ffc107;">P2WSH whale</button>
+                    <button class="example-btn hp-example" data-spk="00203a4f7395b03caf1d7f080cfa3f045d39dc325e04f4c1cf231a868c4632b62b69" style="background:#fff3cd; border-color:#ffc107;">P2WSH whale 2</button>
+                    <br>
+                    <span class="example-label">Excluded whales (&gt;100 UTXOs):</span>
+                    <button class="example-btn hp-example" data-spk="76a914000000000000000000000000000000000000000088ac" style="background:#fde2e2; border-color:#e74c3c;">P2PKH 376k UTXOs</button>
+                    <button class="example-btn hp-example" data-spk="76a914fa0692278afe508514b5ffee8fe5e97732ce066988ac" style="background:#fde2e2; border-color:#e74c3c;">P2PKH 161k UTXOs</button>
+                    <button class="example-btn hp-example" data-spk="76a9149f21a07a0c7c3cf65a51f586051395762267cdaf88ac" style="background:#fde2e2; border-color:#e74c3c;">P2PKH 117k UTXOs</button>
+                    <button class="example-btn hp-example" data-spk="0014c015c65276d5f38d599d445c4cb03aa7aa0dc365" style="background:#fde2e2; border-color:#e74c3c;">P2WPKH 128k UTXOs</button>
+                    <button class="example-btn hp-example" data-spk="001409e4581b5a796feffc1c4f0669206e801cb7a9eb" style="background:#fde2e2; border-color:#e74c3c;">P2WPKH 338k UTXOs</button>
+                    <button class="example-btn hp-example" data-spk="a914ea6b832a05c6ca578baa3836f3f25553d41068a587" style="background:#fde2e2; border-color:#e74c3c;">P2SH 215k UTXOs</button>
+                    <button class="example-btn hp-example" data-spk="a9140c42e8868812fccabb2c364390539106cd5fa8d987" style="background:#fde2e2; border-color:#e74c3c;">P2SH 51k UTXOs</button>
+                    <button class="example-btn hp-example" data-spk="a91456483d546400fc354bab9fc373238ee94002cc2b87" style="background:#fde2e2; border-color:#e74c3c;">P2SH 45k UTXOs</button>
+                    <button class="example-btn hp-example" data-spk="5120a669250ad7137b88ec550d446d8d34e4b1fa13067274c3627469e885e90743e4" style="background:#fde2e2; border-color:#e74c3c;">P2TR 35k UTXOs</button>
+                    <br>
+                    <span class="example-label">Batch test (1000 known scriptPubKeys):</span>
+                    <button class="example-btn" id="hp-pickRandom100Btn" style="background-color: #d4edda; border-color: #28a745; padding: 6px 14px; font-size: 13px;">Pick 100 random</button>
+                    <button class="example-btn" id="hp-pickRandomBtn" style="background-color: #e2e3f1; border-color: #6c757d;">Pick 50 random</button>
+                    <button class="example-btn" id="hp-pickRandom10Btn" style="background-color: #e2e3f1; border-color: #6c757d;">Pick 10 random</button>
+                    <button class="example-btn" id="hp-pickRandom5Btn" style="background-color: #e2e3f1; border-color: #6c757d;">Pick 5 random</button>
+                </div>
+            </details>
+            <br>
+            <button id="hp-queryBtn" style="width: 100%; font-size: 16px; padding: 12px;">Query UTXOs</button>
+        </div>
+
+        <!-- Progress -->
+        <div id="hp-progressContainer" class="progress-container">
+            <div class="progress-bar">
+                <div id="hp-progressFill" class="progress-fill" style="width: 0%"></div>
+            </div>
+            <div id="hp-progressLabel" class="progress-label"></div>
+        </div>
+
+        <!-- Results -->
+        <div id="hp-resultsContainer"></div>
+
+        </div><!-- end tab-harmonypir -->
+
         <details>
             <summary style="cursor: pointer; font-size: 18px; color: #666; font-weight: bold; margin-top: 10px;">Log</summary>
             <div id="log" class="log" style="margin-top: 8px;">
@@ -408,7 +525,7 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
     </div>
 
     <script type="module">
-        import { BatchPirClient, OnionPirWebClient, hexToBytes, bytesToHex, scriptHash, scriptPubKeyToAddress, addressToScriptPubKey, decompileScript } from './src/index.ts';
+        import { BatchPirClient, OnionPirWebClient, HarmonyPirClient, hexToBytes, bytesToHex, scriptHash, scriptPubKeyToAddress, addressToScriptPubKey, decompileScript } from './src/index.ts';
 
         /**
          * Detect well-known script patterns and return a label, or null.
@@ -989,6 +1106,266 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
         document.getElementById('op-disconnectBtn').addEventListener('click', opDisconnect);
         document.getElementById('op-queryBtn').addEventListener('click', opQueryUtxos);
         opSetButtons(false);
+
+        // ═══════════════════════════════════════════════════════════════
+        // HarmonyPIR tab logic
+        // ═══════════════════════════════════════════════════════════════
+
+        let hpClient = null;
+        let hpHintsLoaded = false;
+        let hpCurrentPrp = 0;
+
+        function hpSetButtons(connected) {
+            document.getElementById('hp-connectBtn').disabled = connected;
+            document.getElementById('hp-disconnectBtn').disabled = !connected;
+        }
+
+        function hpSetProgress(percent, label) {
+            const container = document.getElementById('hp-progressContainer');
+            const fill = document.getElementById('hp-progressFill');
+            const lbl = document.getElementById('hp-progressLabel');
+            container.classList.add('active');
+            fill.style.width = `${percent}%`;
+            fill.textContent = percent > 10 ? `${Math.round(percent)}%` : '';
+            lbl.textContent = label;
+        }
+
+        function hpHideProgress() {
+            document.getElementById('hp-progressContainer').classList.remove('active');
+        }
+
+        function harmonyResultToRenderFormat(hr) {
+            if (!hr) return null;
+            if (hr.whale) return { entries: [], totalSats: 0n, isWhale: true };
+            const entries = hr.utxos.map(u => ({
+                txid: new Uint8Array([...hexToBytes(u.txid)].reverse()),
+                vout: u.vout,
+                amount: BigInt(u.value),
+            }));
+            const totalSats = entries.reduce((sum, e) => sum + e.amount, 0n);
+            return { entries, totalSats, isWhale: false };
+        }
+
+        async function hpFetchHints() {
+            if (!hpClient) return;
+            const offlineStatus = document.getElementById('hp-offlineStatus');
+            const offlineFill = document.getElementById('hp-offlineFill');
+            const offlineLabel = document.getElementById('hp-offlineLabel');
+            offlineStatus.textContent = 'Downloading...';
+            offlineFill.style.width = '0%';
+            offlineLabel.textContent = 'Fetching hints from Hint Server...';
+            try {
+                await hpClient.fetchHints();
+                hpHintsLoaded = true;
+                offlineStatus.textContent = 'Hints loaded';
+                offlineFill.style.width = '100%';
+                offlineFill.style.backgroundColor = '#28a745';
+                offlineLabel.textContent = 'Hints loaded (~' + hpClient.estimateHintSize() + ' MB). Ready for queries.';
+                log('HarmonyPIR: Hints downloaded successfully', 'success');
+            } catch (error) {
+                offlineStatus.textContent = 'Failed';
+                offlineLabel.textContent = `Error: ${error.message}`;
+                log(`HarmonyPIR hint download failed: ${error.message}`, 'error');
+            }
+        }
+
+        async function hpConnect() {
+            const hintServerUrl = document.getElementById('hp-hintServerUrl').value.trim();
+            const queryServerUrl = document.getElementById('hp-queryServerUrl').value.trim();
+            if (!hintServerUrl || !queryServerUrl) {
+                log('HarmonyPIR: Please enter both server URLs', 'error');
+                return;
+            }
+            try {
+                const statusDiv = document.getElementById('hp-status');
+                statusDiv.textContent = 'Status: Connecting...';
+                statusDiv.className = 'status connecting';
+                log('HarmonyPIR: Loading WASM + connecting...');
+
+                hpClient = new HarmonyPirClient({
+                    hintServerUrl,
+                    queryServerUrl,
+                    prpBackend: hpCurrentPrp,
+                    onProgress: (msg) => {
+                        log(`HarmonyPIR: ${msg}`);
+                        // Update offline indicator from hint progress messages.
+                        const match = msg.match(/Hints:\s+(\d+)\/(\d+)/);
+                        if (match) {
+                            const [, received, total] = match;
+                            const pct = Math.round((parseInt(received) / parseInt(total)) * 100);
+                            const fill = document.getElementById('hp-offlineFill');
+                            const label = document.getElementById('hp-offlineLabel');
+                            if (fill) fill.style.width = `${pct}%`;
+                            if (label) label.textContent = `${received}/${total} bucket hints received...`;
+                        }
+                    },
+                });
+
+                await hpClient.loadWasm();
+                log('HarmonyPIR: WASM loaded', 'success');
+
+                await hpClient.connectQueryServer();
+                await hpClient.fetchServerInfo();
+                hpClient.initBuckets();
+
+                statusDiv.textContent = 'Status: Connected (downloading hints...)';
+                statusDiv.className = 'status connected';
+                hpSetButtons(true);
+                hpHintsLoaded = false;
+
+                document.getElementById('hp-offlineContainer').style.display = 'block';
+                document.getElementById('hp-offlineStatus').textContent = 'Downloading...';
+
+                await hpFetchHints();
+
+                if (hpHintsLoaded) {
+                    statusDiv.textContent = 'Status: Ready';
+                }
+            } catch (error) {
+                log(`HarmonyPIR connection failed: ${error.message}`, 'error');
+                const statusDiv = document.getElementById('hp-status');
+                statusDiv.textContent = 'Status: Disconnected';
+                statusDiv.className = 'status disconnected';
+                hpClient = null;
+            }
+        }
+
+        function hpDisconnect() {
+            if (hpClient) {
+                hpClient.disconnect();
+                hpClient = null;
+            }
+            hpHintsLoaded = false;
+            document.getElementById('hp-resultsContainer').innerHTML = '';
+            document.getElementById('hp-offlineContainer').style.display = 'none';
+            const statusDiv = document.getElementById('hp-status');
+            statusDiv.textContent = 'Status: Disconnected';
+            statusDiv.className = 'status disconnected';
+            hpSetButtons(false);
+            hpHideProgress();
+        }
+
+        async function hpQueryUtxos() {
+            if (!hpClient || !hpHintsLoaded) {
+                log('HarmonyPIR: Not ready. Connect and wait for hints first.', 'error');
+                return;
+            }
+
+            const textarea = document.getElementById('hp-scriptPubkeys');
+            const rawLines = textarea.value.trim().split('\n').map(l => l.trim()).filter(l => l.length > 0);
+            if (rawLines.length === 0) { log('Please enter at least one address', 'error'); return; }
+
+            // Convert addresses to scriptPubKey hex.
+            const lines = [];
+            let converted = 0;
+            const convNote = document.getElementById('hp-conversionNote');
+            for (const raw of rawLines) {
+                if (/^[0-9a-fA-F]+$/.test(raw) && raw.length % 2 === 0) {
+                    lines.push(raw.toLowerCase());
+                } else {
+                    const spk = addressToScriptPubKey(raw);
+                    if (spk) { lines.push(spk); converted++; }
+                    else { log(`Unrecognized input: ${raw}`, 'error'); }
+                }
+            }
+            if (converted > 0) {
+                convNote.textContent = `Converted ${converted} address${converted > 1 ? 'es' : ''} to scriptPubKey hex`;
+                convNote.style.display = 'block';
+                setTimeout(() => { convNote.style.display = 'none'; }, 5000);
+            }
+            if (lines.length === 0) { log('No valid inputs', 'error'); return; }
+
+            const resultsContainer = document.getElementById('hp-resultsContainer');
+            resultsContainer.innerHTML = '';
+            document.getElementById('hp-queryBtn').disabled = true;
+
+            const N = lines.length;
+            log(`HarmonyPIR: Starting batch query for ${N} addresses...`, 'info');
+            const scriptHashes = lines.map(spkHex => scriptHash(hexToBytes(spkHex)));
+
+            try {
+                hpSetProgress(5, `Batching ${N} queries...`);
+
+                // Pass hex scriptPubKeys — queryBatch now accepts both hex and addresses.
+                const results = await hpClient.queryBatch(lines, (phase, detail) => {
+                    let pct = 5;
+                    if (phase === 'Level 1') pct = 25;
+                    else if (phase === 'Level 2') pct = 55;
+                    else if (phase === 'Reassemble') pct = 90;
+                    hpSetProgress(pct, `${phase}: ${detail}`);
+                });
+
+                let found = 0;
+                for (let qi = 0; qi < N; qi++) {
+                    const spkHex = lines[qi];
+                    const hashHex = bytesToHex(scriptHashes[qi]);
+                    const hResult = results.get(qi);
+                    const result = harmonyResultToRenderFormat(hResult);
+                    if (result && result.entries.length > 0) found++;
+                    renderResult(resultsContainer, spkHex, hashHex, result);
+                }
+
+                hpSetProgress(100, `Done! ${found}/${N} addresses found`);
+                setTimeout(hpHideProgress, 2000);
+                log(`HarmonyPIR batch complete: ${found}/${N} found`, 'success');
+            } catch (error) {
+                log(`HarmonyPIR error: ${error.message}`, 'error');
+                console.error(error);
+                hpSetProgress(0, '');
+                hpHideProgress();
+            }
+
+            document.getElementById('hp-queryBtn').disabled = false;
+        }
+
+        // PRP change handler
+        document.getElementById('hp-prpSelect').addEventListener('change', async (e) => {
+            const newPrp = parseInt(e.target.value);
+            if (newPrp === hpCurrentPrp) return;
+            hpCurrentPrp = newPrp;
+            hpHintsLoaded = false;
+            const names = ['Hoang', 'FastPRP', 'ALF'];
+            log(`HarmonyPIR: PRP changed to ${names[newPrp]}. Reconnecting...`, 'info');
+            if (hpClient) {
+                hpDisconnect();
+                await hpConnect();
+            }
+        });
+
+        // HarmonyPIR example buttons
+        document.querySelectorAll('.hp-example[data-spk]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                document.getElementById('hp-scriptPubkeys').value = btn.dataset.spk;
+            });
+        });
+
+        document.getElementById('hp-loadDiverseBtn').addEventListener('click', () => {
+            document.getElementById('hp-scriptPubkeys').value = [
+                '0020ebb7d608cfce01578d4e07aa9a82e6a9cff4ae9194a7dce148d87c8dfdc7b55e',
+                'a914977824b90abfb1175a736e7020ac376702953adc87',
+                '51201c29857ea48bc3c477c9509aafe901a61940f1ac29215f588cb250291f30fe8a',
+                '512102ab5dbba9d81acbadae5ade8ae7ad1fbae2ffc9b566fc408117377f6ae1cea6e221037e8a78ba439913d64c68cd2606ddd48e5e9a58ef03635a543ba4a34a92f6785e2103bcc4e113b8deda823848e07c157d7b341098a5c97851bfd6315d6fe54a85a74a53ae',
+            ].join('\n');
+        });
+
+        document.getElementById('hp-pickRandom100Btn').addEventListener('click', () => {
+            document.getElementById('hp-scriptPubkeys').value = pickRandom(EXAMPLE_SPKS, 100).join('\n');
+        });
+        document.getElementById('hp-pickRandomBtn').addEventListener('click', () => {
+            document.getElementById('hp-scriptPubkeys').value = pickRandom(EXAMPLE_SPKS, 50).join('\n');
+        });
+        document.getElementById('hp-pickRandom10Btn').addEventListener('click', () => {
+            document.getElementById('hp-scriptPubkeys').value = pickRandom(EXAMPLE_SPKS, 10).join('\n');
+        });
+        document.getElementById('hp-pickRandom5Btn').addEventListener('click', () => {
+            document.getElementById('hp-scriptPubkeys').value = pickRandom(EXAMPLE_SPKS, 5).join('\n');
+        });
+
+        // HarmonyPIR buttons
+        document.getElementById('hp-connectBtn').addEventListener('click', hpConnect);
+        document.getElementById('hp-disconnectBtn').addEventListener('click', hpDisconnect);
+        document.getElementById('hp-queryBtn').addEventListener('click', hpQueryUtxos);
+        hpSetButtons(false);
     </script>
 </body>
 </html>

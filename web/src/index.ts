@@ -81,6 +81,7 @@ export {
   CUCKOO_BUCKET_SIZE, INDEX_CUCKOO_NUM_HASHES,
   CHUNK_CUCKOO_BUCKET_SIZE, CHUNK_CUCKOO_NUM_HASHES,
   DPF_N, CHUNK_DPF_N,
+  HARMONY_INDEX_W, HARMONY_CHUNK_W, HARMONY_EMPTY,
   DEFAULT_SERVER0_URL,
   DEFAULT_SERVER1_URL,
 } from './constants.js';
@@ -90,3 +91,10 @@ export {
   createOnionPirWebClient,
   type OnionPirClientConfig,
 } from './onionpir_client.js';
+
+export {
+  HarmonyPirClient,
+  createHarmonyPirClient,
+  type HarmonyPirClientConfig,
+  type HarmonyQueryResult,
+} from './harmonypir_client.js';

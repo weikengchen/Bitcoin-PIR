@@ -33,6 +33,8 @@ export interface HarmonyPirClientConfig {
   hintServerUrl: string;
   queryServerUrl: string;
   onProgress?: (msg: string) => void;
+  /** PRP backend: 0=Hoang (default), 1=FastPRP, 2=ALF */
+  prpBackend?: number;
 }
 
 export interface UtxoEntry {
@@ -118,12 +120,15 @@ export class HarmonyPirClient {
   /** Load the HarmonyPIR WASM module. */
   async loadWasm(): Promise<void> {
     if (this.wasm) return;
-    // The WASM module is expected at /wasm/harmonypir/harmonypir_wasm.js
-    const init = (globalThis as any).harmonypir_wasm_init;
-    if (!init) {
+    // wasm-pack --target no-modules sets globalThis.wasm_bindgen.
+    const wb = (globalThis as any).wasm_bindgen;
+    if (!wb) {
       throw new Error('HarmonyPIR WASM not loaded. Include harmonypir_wasm.js before using.');
     }
-    this.wasm = await init();
+    // Initialize the WASM module (loads the .wasm file from the same directory).
+    await wb();
+    // After init, wasm_bindgen exposes HarmonyBucket, compute_balanced_t, etc.
+    this.wasm = wb as any;
   }
 
   /** Connect to the Query Server via WebSocket. */
@@ -378,6 +383,7 @@ export class HarmonyPirClient {
           }
 
           received++;
+          this.log(`  Hints: ${received}/${numBuckets} (level ${level})`);
           if (received === numBuckets) {
             resolve();
           }
@@ -390,7 +396,7 @@ export class HarmonyPirClient {
     });
   }
 
-  private estimateHintSize(): string {
+  estimateHintSize(): string {
     let total = 0;
     for (const [_, bucket] of this.indexBuckets) {
       total += bucket.m() * bucket.w();
@@ -429,13 +435,20 @@ export class HarmonyPirClient {
     const N = addresses.length;
     const results = new Map<number, HarmonyQueryResult>();
 
-    // ── Prepare script hashes ──
+    // ── Prepare script hashes (accept both addresses and hex scriptPubKeys) ──
     const scriptHashes: Uint8Array[] = [];
     const shHexes: string[] = [];
     for (let i = 0; i < N; i++) {
-      const spk = addressToScriptPubKey(addresses[i]);
-      if (!spk) { this.log(`Invalid address ${i}: ${addresses[i]}`); continue; }
-      const sh = computeScriptHash(hexToBytes(spk));
+      const input = addresses[i];
+      let spkHex: string | null;
+      // Detect raw hex scriptPubKey vs. Bitcoin address.
+      if (/^[0-9a-fA-F]+$/.test(input) && input.length % 2 === 0) {
+        spkHex = input.toLowerCase();
+      } else {
+        spkHex = addressToScriptPubKey(input);
+      }
+      if (!spkHex) { this.log(`Invalid input ${i}: ${input}`); continue; }
+      const sh = computeScriptHash(hexToBytes(spkHex));
       scriptHashes.push(sh);
       shHexes.push(bytesToHex(sh));
     }
