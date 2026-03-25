@@ -42,7 +42,7 @@ export class HarmonyWorkerPool {
     // For Vite: use `new Worker(new URL(...), { type: 'module' })` pattern.
     // For compatibility: use inline blob worker that loads the compiled JS.
 
-    const workerCode = await this.fetchWorkerCode();
+    const workerCode = this.getWorkerCode();
     const blob = new Blob([workerCode], { type: 'application/javascript' });
     const workerUrl = URL.createObjectURL(blob);
 
@@ -215,25 +215,96 @@ export class HarmonyWorkerPool {
     }
   }
 
-  /** Fetch and return the compiled worker JS code. */
-  private async fetchWorkerCode(): Promise<string> {
-    // The worker TS is compiled alongside the main bundle by Vite.
-    // We fetch the compiled JS from the same origin.
-    // Try the Vite dev path first, then the production path.
-    const paths = [
-      '/src/harmonypir_worker.ts',   // Vite dev (serves TS directly)
-      '/harmonypir_worker.js',       // Production build
-    ];
+  /** Return the worker JS code as an inline string. */
+  private getWorkerCode(): string {
+    // Inlined JS (no TypeScript) to avoid fetch/compile issues.
+    // This must stay in sync with harmonypir_worker.ts.
+    return `
+'use strict';
+const buckets = new Map();
+let wasm = null;
 
-    for (const path of paths) {
+self.onmessage = async (ev) => {
+  const msg = ev.data;
+  switch (msg.type) {
+    case 'init': {
       try {
-        const resp = await fetch(path);
-        if (resp.ok) {
-          return await resp.text();
+        const resp = await fetch(msg.wasmJsUrl);
+        if (!resp.ok) throw new Error('Fetch failed: ' + resp.status);
+        let jsText = await resp.text();
+        if (jsText.startsWith('let wasm_bindgen')) {
+          jsText = 'var wasm_bindgen' + jsText.slice('let wasm_bindgen'.length);
         }
-      } catch { /* try next */ }
+        (0, eval)(jsText);
+        const wb = self.wasm_bindgen;
+        if (!wb) throw new Error('wasm_bindgen not defined after eval');
+        await wb(msg.wasmBinaryUrl);
+        wasm = wb;
+        self.postMessage({ type: 'ready' });
+      } catch (e) {
+        self.postMessage({ type: 'error', error: e.message });
+      }
+      break;
     }
-
-    throw new Error('Could not load harmonypir_worker code');
+    case 'createBucket': {
+      if (!wasm) { self.postMessage({ type: 'error', error: 'WASM not loaded' }); return; }
+      try {
+        const bucket = wasm.HarmonyBucket.new_with_backend(
+          msg.n, msg.w, msg.t, msg.prpKey, msg.bucketId, msg.backend
+        );
+        buckets.set(msg.bucketId, bucket);
+        self.postMessage({ type: 'bucketCreated', bucketId: msg.bucketId });
+      } catch (e) {
+        self.postMessage({ type: 'error', error: 'createBucket(' + msg.bucketId + '): ' + e.message });
+      }
+      break;
+    }
+    case 'loadHints': {
+      const bucket = buckets.get(msg.bucketId);
+      if (!bucket) { self.postMessage({ type: 'error', error: 'bucket ' + msg.bucketId + ' not found' }); return; }
+      try {
+        bucket.load_hints(msg.hints);
+        self.postMessage({ type: 'hintsLoaded', bucketId: msg.bucketId });
+      } catch (e) {
+        self.postMessage({ type: 'error', error: 'loadHints(' + msg.bucketId + '): ' + e.message });
+      }
+      break;
+    }
+    case 'buildBatch': {
+      const results = [];
+      const transferables = [];
+      for (const item of msg.items) {
+        const bucket = buckets.get(item.bucketId);
+        if (!bucket) continue;
+        let bytes;
+        if (item.binIndex !== undefined) {
+          const req = bucket.build_request(item.binIndex);
+          bytes = new Uint8Array(req.request);
+          req.free();
+        } else {
+          bytes = new Uint8Array(bucket.build_synthetic_dummy());
+        }
+        results.push({ bucketId: item.bucketId, bytes });
+        transferables.push(bytes.buffer);
+      }
+      self.postMessage({ type: 'buildBatchResult', requestId: msg.requestId, results }, transferables);
+      break;
+    }
+    case 'processBatch': {
+      const results = [];
+      const transferables = [];
+      for (const item of msg.items) {
+        const bucket = buckets.get(item.bucketId);
+        if (!bucket) continue;
+        const answer = bucket.process_response(item.response);
+        results.push({ bucketId: item.bucketId, answer });
+        transferables.push(answer.buffer);
+      }
+      self.postMessage({ type: 'processBatchResult', requestId: msg.requestId, results }, transferables);
+      break;
+    }
+  }
+};
+`;
   }
 }
