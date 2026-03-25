@@ -197,7 +197,7 @@
         .tab-content.active { display: block; }
     </style>
     <script src="/wasm/onionpir_client.js"></script>
-    <script src="/wasm/harmonypir/harmonypir_wasm.js"></script>
+    <!-- HarmonyPIR WASM loaded dynamically in loadWasm() based on PRP selection -->
 </head>
 <body>
     <div class="container">
@@ -429,8 +429,8 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                     <label style="display: inline; font-weight: bold; font-size: 13px;">PRP Backend:</label>
                     <select id="hp-prpSelect" style="padding: 4px 8px; margin-left: 6px; border-radius: 4px; border: 1px solid #ddd;">
                         <option value="0" selected>Hoang (default)</option>
-                        <option value="1" disabled>FastPRP (requires separate WASM)</option>
-                        <option value="2" disabled>ALF (requires separate WASM)</option>
+                        <option value="1">FastPRP</option>
+                        <option value="2">ALF</option>
                     </select>
                     <span id="hp-prpNote" style="font-size: 11px; color: #888; margin-left: 6px;"></span>
                 </div>

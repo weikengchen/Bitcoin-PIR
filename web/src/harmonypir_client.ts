@@ -117,18 +117,43 @@ export class HarmonyPirClient {
     this.config.onProgress?.(msg);
   }
 
-  /** Load the HarmonyPIR WASM module. */
+  /** Load the HarmonyPIR WASM module for the selected PRP backend. */
   async loadWasm(): Promise<void> {
     if (this.wasm) return;
-    // wasm-pack --target no-modules sets globalThis.wasm_bindgen.
+    const backend = this.config.prpBackend ?? 0;
+
+    // Each PRP backend has its own WASM build in a separate directory.
+    const wasmDirs: Record<number, string> = {
+      0: '/wasm/harmonypir',          // Hoang (default)
+      1: '/wasm/harmonypir-fastprp',  // FastPRP
+      2: '/wasm/harmonypir-alf',      // ALF
+    };
+    const wasmDir = wasmDirs[backend] ?? wasmDirs[0];
+    const jsUrl = `${wasmDir}/harmonypir_wasm.js`;
+
+    // Remove any previously loaded wasm_bindgen script to avoid conflicts.
+    const oldScript = document.getElementById('harmonypir-wasm-script');
+    if (oldScript) oldScript.remove();
+    (globalThis as any).wasm_bindgen = undefined;
+
+    // Dynamically load the WASM JS file.
+    await new Promise<void>((resolve, reject) => {
+      const script = document.createElement('script');
+      script.id = 'harmonypir-wasm-script';
+      script.src = jsUrl;
+      script.onload = () => resolve();
+      script.onerror = () => reject(new Error(`Failed to load WASM from ${jsUrl}`));
+      document.head.appendChild(script);
+    });
+
     const wb = (globalThis as any).wasm_bindgen;
     if (!wb) {
-      throw new Error('HarmonyPIR WASM not loaded. Include harmonypir_wasm.js before using.');
+      throw new Error(`HarmonyPIR WASM did not initialize from ${jsUrl}`);
     }
-    // Initialize the WASM module (loads the .wasm file from the same directory).
-    await wb();
-    // After init, wasm_bindgen exposes HarmonyBucket, compute_balanced_t, etc.
+    // Initialize the WASM module (loads .wasm from the same directory).
+    await wb(`${wasmDir}/harmonypir_wasm_bg.wasm`);
     this.wasm = wb as any;
+    this.log(`WASM loaded: ${['Hoang', 'FastPRP', 'ALF'][backend]} (${jsUrl})`);
   }
 
   /** Connect to the Query Server via WebSocket. */
@@ -830,6 +855,8 @@ export class HarmonyPirClient {
     for (const [_, b] of this.chunkBuckets) b.free();
     this.indexBuckets.clear();
     this.chunkBuckets.clear();
+    // Reset WASM so loadWasm() reloads the correct backend on reconnect.
+    this.wasm = null;
   }
 }
 
