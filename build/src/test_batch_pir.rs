@@ -23,9 +23,9 @@ use rayon::prelude::*;
 const QUERIES_FILE: &str = "/Volumes/Bitcoin/data/test_queries_50.bin";
 const OUTPUT_FILE: &str = "/Volumes/Bitcoin/data/batch_pir_results.bin";
 
-/// Each cuckoo bin has 3 slots, each a 14-byte inlined tagged entry.
-/// Result per DPF query = 3 * 14 = 42 bytes.
-const SLOT_SIZE: usize = INDEX_SLOT_SIZE; // 14
+/// Each cuckoo bin has 3 slots, each a 13-byte inlined tagged entry.
+/// Result per DPF query = 3 * 13 = 39 bytes.
+const SLOT_SIZE: usize = INDEX_SLOT_SIZE; // 13
 const SLOTS: usize = CUCKOO_BUCKET_SIZE;  // 3
 const RESULT_SIZE: usize = SLOTS * SLOT_SIZE; // 42
 
@@ -112,7 +112,7 @@ fn process_bucket(
 /// XOR `src` into `dst` in-place, using u64 chunks for speed.
 #[inline]
 fn xor_into(dst: &mut [u8; RESULT_SIZE], src: &[u8]) {
-    // RESULT_SIZE = 42 = 5 * 8 + 2, so handle remainder
+    // RESULT_SIZE = 39 = 4 * 8 + 7, so handle remainder
     const N: usize = RESULT_SIZE / 8;
     let d = unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u64, N) };
     let s = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u64, N) };
@@ -318,8 +318,8 @@ fn main() {
     let mut found = 0;
     let mut not_found = 0;
 
-    // Output: (script_hash[20], start_chunk_id[4], num_chunks[1], flags[1])
-    let mut output_entries: Vec<(Vec<u8>, [u8; 4], u8, u8)> = Vec::with_capacity(num_queries);
+    // Output: (script_hash[20], start_chunk_id[4], num_chunks[1])
+    let mut output_entries: Vec<(Vec<u8>, [u8; 4], u8)> = Vec::with_capacity(num_queries);
 
     for qi in 0..num_queries {
         let b = query_bucket[qi];
@@ -338,10 +338,10 @@ fn main() {
         // Check if our tag appears in either result
         let mut matched = false;
         for result in [&result_q0, &result_q1] {
-            if let Some((start_chunk_id, num_chunks, flags)) =
+            if let Some((start_chunk_id, num_chunks)) =
                 find_entry_in_result(result, expected_tag)
             {
-                output_entries.push((sh.to_vec(), start_chunk_id, num_chunks, flags));
+                output_entries.push((sh.to_vec(), start_chunk_id, num_chunks));
                 matched = true;
                 found += 1;
                 break;
@@ -350,7 +350,7 @@ fn main() {
 
         if !matched {
             not_found += 1;
-            output_entries.push((sh.to_vec(), [0u8; 4], 0u8, 0u8));
+            output_entries.push((sh.to_vec(), [0u8; 4], 0u8));
             let hex: String = sh.iter().map(|x| format!("{:02x}", x)).collect();
             println!(
                 "  MISS: query {} bucket {} loc0={} loc1={} hash={}",
@@ -373,17 +373,16 @@ fn main() {
     println!();
     println!("[7] Writing results to: {}", OUTPUT_FILE);
 
-    // File format: for each query, 26 bytes = [20B script_hash | 4B start_chunk_id | 1B num_chunks | 1B flags]
+    // File format: for each query, 25 bytes = [20B script_hash | 4B start_chunk_id | 1B num_chunks]
     let mut out_file = std::fs::File::create(OUTPUT_FILE).expect("create output");
-    for (sh, start_chunk_id, num_chunks, flags) in &output_entries {
+    for (sh, start_chunk_id, num_chunks) in &output_entries {
         out_file.write_all(sh).unwrap();
         out_file.write_all(start_chunk_id).unwrap();
         out_file.write_all(&[*num_chunks]).unwrap();
-        out_file.write_all(&[*flags]).unwrap();
     }
     println!(
-        "  Written {} bytes ({} queries x 26 bytes)",
-        num_queries * 26,
+        "  Written {} bytes ({} queries x 25 bytes)",
+        num_queries * 25,
         num_queries
     );
 
@@ -401,7 +400,7 @@ fn main() {
         "-".repeat(12),
         "-".repeat(10)
     );
-    for (qi, (sh, start_chunk_id, num_chunks, _flags)) in output_entries.iter().enumerate() {
+    for (qi, (sh, start_chunk_id, num_chunks)) in output_entries.iter().enumerate() {
         let hex: String = sh.iter().map(|x| format!("{:02x}", x)).collect();
         let offset = u32::from_le_bytes(*start_chunk_id);
         println!("  {:>4}  {}  {:>12}  {:>10}", qi, hex, offset, *num_chunks);
@@ -411,12 +410,12 @@ fn main() {
     println!("  Total time: {:.2?}", start.elapsed());
 }
 
-/// Find the expected tag in the result's slots and return (start_chunk_id bytes, num_chunks, flags).
-/// Slot layout: [8B tag | 4B start_chunk_id | 1B num_chunks | 1B flags]
+/// Find the expected tag in the result's slots and return (start_chunk_id bytes, num_chunks).
+/// Slot layout: [8B tag | 4B start_chunk_id | 1B num_chunks]
 fn find_entry_in_result(
     result: &[u8; RESULT_SIZE],
     expected_tag: u64,
-) -> Option<([u8; 4], u8, u8)> {
+) -> Option<([u8; 4], u8)> {
     for slot in 0..SLOTS {
         let base = slot * SLOT_SIZE;
         let slot_tag = u64::from_le_bytes(result[base..base + TAG_SIZE].try_into().unwrap());
@@ -424,8 +423,7 @@ fn find_entry_in_result(
             let mut start_chunk_id = [0u8; 4];
             start_chunk_id.copy_from_slice(&result[base + TAG_SIZE..base + TAG_SIZE + 4]);
             let num_chunks = result[base + TAG_SIZE + 4];
-            let flags = result[base + TAG_SIZE + 5];
-            return Some((start_chunk_id, num_chunks, flags));
+            return Some((start_chunk_id, num_chunks));
         }
     }
     None

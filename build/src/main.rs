@@ -7,8 +7,8 @@
 //! 4. Serializes all 75 cuckoo tables into a single flat binary file, with every table
 //!    padded to the same size (max num_bins across buckets).
 //!
-//! Each slot in the output stores a 14-byte tagged entry:
-//!   [8B fingerprint tag | 4B start_chunk_id | 1B num_chunks | 1B flags]
+//! Each slot in the output stores a 13-byte tagged entry:
+//!   [8B fingerprint tag | 4B start_chunk_id | 1B num_chunks]
 //! The tag is computed as: splitmix64(sh_a ^ tag_seed ^ sh_b ^ sh_c).
 //!
 //! Output file layout:
@@ -40,8 +40,8 @@ const INDEX_FILE: &str = "/Volumes/Bitcoin/data/utxo_chunks_index_nodust.bin";
 /// Output file for the serialized Batch PIR cuckoo tables
 const OUTPUT_FILE: &str = "/Volumes/Bitcoin/data/batch_pir_cuckoo.bin";
 
-/// Size of each index entry in the intermediate file: 20B script_hash + 4B start_chunk_id + 1B num_chunks + 1B flags
-const INDEX_ENTRY_SIZE: usize = 26;
+/// Size of each index entry in the intermediate file: 20B script_hash + 4B start_chunk_id + 1B num_chunks
+const INDEX_ENTRY_SIZE: usize = 25;
 
 /// Size of the script hash portion (in intermediate file, used for bucket/cuckoo derivation)
 const SCRIPT_HASH_SIZE: usize = 20;
@@ -49,8 +49,8 @@ const SCRIPT_HASH_SIZE: usize = 20;
 /// Size of the fingerprint tag in the final cuckoo table
 const TAG_SIZE: usize = 8;
 
-/// Size of each tagged entry in the final cuckoo table: 8B tag + 4B + 1B + 1B
-const TAGGED_ENTRY_SIZE: usize = TAG_SIZE + 4 + 1 + 1; // 14
+/// Size of each tagged entry in the final cuckoo table: 8B tag + 4B + 1B
+const TAGGED_ENTRY_SIZE: usize = TAG_SIZE + 4 + 1; // 13
 
 /// Number of Batch PIR buckets
 const K: usize = 75;
@@ -387,7 +387,7 @@ fn main() {
     println!("  tag_seed = 0x{:016x}", TAG_SEED);
 
     // Write body: K tables with tagged entries (TAGGED_ENTRY_SIZE per slot).
-    // Each slot: [8B tag | 4B start_chunk_id | 1B num_chunks | 1B flags]
+    // Each slot: [8B tag | 4B start_chunk_id | 1B num_chunks]
     // Tag is computed from the 20-byte script_hash in the intermediate index file.
     let mut sorted: Vec<&(Vec<u32>, CuckooResult)> = results.iter().collect();
     sorted.sort_by_key(|(_, res)| res.bucket_id);
@@ -403,7 +403,7 @@ fn main() {
                 let script_hash = &mmap[offset..offset + SCRIPT_HASH_SIZE];
                 let tag = compute_tag(TAG_SEED, script_hash);
                 writer.write_all(&tag.to_le_bytes()).unwrap();
-                // start_chunk_id (4B) + num_chunks (1B) + flags (1B)
+                // start_chunk_id (4B) + num_chunks (1B)
                 writer.write_all(&mmap[offset + SCRIPT_HASH_SIZE..offset + INDEX_ENTRY_SIZE]).unwrap();
             }
         }

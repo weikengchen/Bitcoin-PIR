@@ -1,7 +1,7 @@
 //! Append whale sentinel entries to the existing UTXO index file.
 //!
 //! Scans utxo_set.bin to find script hashes with more than MAX_UTXOS_PER_SPK
-//! non-dust UTXOs and appends sentinel index entries (num_chunks=0, flags=FLAG_WHALE)
+//! non-dust UTXOs and appends sentinel index entries (num_chunks=0)
 //! for each one. Also writes whale_addresses.txt for testing.
 //!
 //! Run this AFTER gen_1 (which may have been built before the whale sentinel feature)
@@ -132,7 +132,6 @@ fn main() {
             writer.write_all(script_hash).unwrap();          // 20B script_hash
             writer.write_all(&0u32.to_le_bytes()).unwrap();   // 4B start_chunk_id = 0
             writer.write_all(&[0u8]).unwrap();                // 1B num_chunks = 0
-            writer.write_all(&[FLAG_WHALE]).unwrap();         // 1B flags = whale marker
         }
         writer.flush().unwrap();
 
@@ -169,6 +168,5 @@ fn main() {
     println!("  Total time: {:.2?}", start.elapsed());
     println!();
     println!("Next steps:");
-    println!("  1. cargo run --release -p build --bin gen_2b_stamp_flags");
-    println!("  2. cargo run --release -p build --bin gen_3_build_index_cuckoo");
+    println!("  1. cargo run --release -p build --bin gen_3_build_index_cuckoo");
 }

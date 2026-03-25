@@ -37,7 +37,7 @@ fn main() {
 
     // Collect per-query chunk ranges and all unique chunk_ids
     let mut all_chunk_ids = BTreeSet::new();
-    let mut query_ranges: Vec<(u32, u32, u8)> = Vec::with_capacity(num_queries); // (start_chunk, num_chunks, flags)
+    let mut query_ranges: Vec<(u32, u32)> = Vec::with_capacity(num_queries); // (start_chunk, num_chunks)
 
     for i in 0..num_queries {
         let base = i * INDEX_ENTRY_SIZE;
@@ -45,15 +45,14 @@ fn main() {
             data[base + 20..base + 24].try_into().unwrap(),
         );
         let num_chunks = data[base + 24] as u32;
-        let flags = data[base + 25];
 
         if num_chunks == 0 {
-            // No chunks: either a MISS or a WHALE sentinel
-            query_ranges.push((0, 0, flags));
+            // No chunks: whale or miss
+            query_ranges.push((0, 0));
             continue;
         }
 
-        query_ranges.push((start_chunk, num_chunks, flags));
+        query_ranges.push((start_chunk, num_chunks));
 
         for c in 0..num_chunks {
             all_chunk_ids.insert(start_chunk + c);
@@ -69,15 +68,11 @@ fn main() {
     println!();
     println!("  Per-query chunk ranges:");
     for i in 0..num_queries {
-        let (start, nc, fl) = query_ranges[i];
+        let (start, nc) = query_ranges[i];
         let sh = &data[i * INDEX_ENTRY_SIZE..i * INDEX_ENTRY_SIZE + SCRIPT_HASH_SIZE];
         let hex: String = sh.iter().map(|b| format!("{:02x}", b)).collect();
         if nc == 0 {
-            if fl & FLAG_WHALE != 0 {
-                println!("    q{:>3}: {} → WHALE (excluded, >{} UTXOs)", i, hex, 100);
-            } else {
-                println!("    q{:>3}: {} → MISS (skipped)", i, hex);
-            }
+            println!("    q{:>3}: {} → no chunks (whale or miss)", i, hex);
         } else {
             println!(
                 "    q{:>3}: {} → chunks {}..{} ({} chunks)",

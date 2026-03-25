@@ -19,10 +19,6 @@ name = "gen_2_build_chunk_cuckoo"
 path = "src/build_chunk_cuckoo.rs"
 
 [[bin]]
-name = "gen_2b_stamp_flags"
-path = "src/stamp_flags.rs"
-
-[[bin]]
 name = "gen_3_build_index_cuckoo"
 path = "src/main.rs"
 

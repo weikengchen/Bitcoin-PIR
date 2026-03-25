@@ -8,7 +8,7 @@
 
 import {
   K, K_CHUNK, NUM_HASHES, INDEX_CUCKOO_NUM_HASHES,
-  FLAG_WHALE, CHUNK_MASTER_SEED,
+  CHUNK_MASTER_SEED,
 } from './constants.js';
 
 import {
@@ -682,7 +682,7 @@ export class OnionPirWebClient {
       for (let i = 0; i < N; i++) {
         const ir = indexResults[i];
         if (!ir) continue;
-        if (ir.numEntries === FLAG_WHALE) { whaleQueries.add(i); continue; }
+        if (ir.numEntries === 0) { whaleQueries.add(i); continue; }
         for (let j = 0; j < ir.numEntries; j++) {
           const eid = ir.entryId + j;
           if (!entryIdSet.has(eid)) {

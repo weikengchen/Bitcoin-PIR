@@ -22,10 +22,10 @@ export const CUCKOO_BUCKET_SIZE = 3;
 export const INDEX_CUCKOO_NUM_HASHES = 2;
 
 /** Cuckoo hash table bucket size for CHUNK level (slots per bin) */
-export const CHUNK_CUCKOO_BUCKET_SIZE = 2;
+export const CHUNK_CUCKOO_BUCKET_SIZE = 3;
 
 /** Number of cuckoo hash functions for CHUNK level */
-export const CHUNK_CUCKOO_NUM_HASHES = 3;
+export const CHUNK_CUCKOO_NUM_HASHES = 2;
 
 /** Script hash size in bytes (used for computing script_hash and bucket derivation) */
 export const SCRIPT_HASH_SIZE = 20;
@@ -33,13 +33,10 @@ export const SCRIPT_HASH_SIZE = 20;
 /** Size of the fingerprint tag in the final cuckoo table */
 export const TAG_SIZE = 8;
 
-/** Size of each tagged index entry: 8B tag + 4B start_chunk_id + 1B num_chunks + 1B flags */
-export const INDEX_ENTRY_SIZE = 14;
+/** Size of each tagged index entry: 8B tag + 4B start_chunk_id + 1B num_chunks */
+export const INDEX_ENTRY_SIZE = 13;
 
-/** Flags byte bit 6: address excluded from database due to too many UTXOs ("whale") */
-export const FLAG_WHALE = 0x40;
-
-/** Index result size: 3 slots * 26 bytes = 78 bytes */
+/** Index result size: 3 slots * 13 bytes = 39 bytes */
 export const INDEX_RESULT_SIZE = CUCKOO_BUCKET_SIZE * INDEX_ENTRY_SIZE;
 
 // ─── Chunk-level constants ─────────────────────────────────────────────────
@@ -62,7 +59,7 @@ export const UNIT_DATA_SIZE = CHUNKS_PER_UNIT * CHUNK_SIZE;
 /** Each chunk slot: 4B chunk_id + UNIT_DATA_SIZE data */
 export const CHUNK_SLOT_SIZE = 4 + UNIT_DATA_SIZE;
 
-/** Chunk result size: 2 slots * slot_size */
+/** Chunk result size: 3 slots * slot_size */
 export const CHUNK_RESULT_SIZE = CHUNK_CUCKOO_BUCKET_SIZE * CHUNK_SLOT_SIZE;
 
 // ─── DPF ───────────────────────────────────────────────────────────────────
@@ -85,6 +82,27 @@ export const RESP_INFO = 0x01;
 export const RESP_INDEX_BATCH = 0x11;
 export const RESP_CHUNK_BATCH = 0x21;
 export const RESP_ERROR = 0xFF;
+
+// ─── HarmonyPIR constants ─────────────────────────────────────────────────
+
+/** HarmonyPIR entry size for index level: one cuckoo bin = CUCKOO_BUCKET_SIZE * INDEX_ENTRY_SIZE */
+export const HARMONY_INDEX_W = CUCKOO_BUCKET_SIZE * INDEX_ENTRY_SIZE; // 39
+
+/** HarmonyPIR entry size for chunk level: one cuckoo bin = CHUNK_CUCKOO_BUCKET_SIZE * CHUNK_SLOT_SIZE */
+export const HARMONY_CHUNK_W = CHUNK_CUCKOO_BUCKET_SIZE * CHUNK_SLOT_SIZE; // 132
+
+/** EMPTY sentinel for HarmonyPIR requests (u32::MAX) */
+export const HARMONY_EMPTY = 0xFFFFFFFF;
+
+// ─── HarmonyPIR protocol codes ────────────────────────────────────────────
+
+export const REQ_HARMONY_GET_INFO = 0x40;
+export const REQ_HARMONY_HINTS = 0x41;
+export const REQ_HARMONY_QUERY = 0x42;
+
+export const RESP_HARMONY_INFO = 0x40;
+export const RESP_HARMONY_HINTS = 0x41;
+export const RESP_HARMONY_QUERY = 0x42;
 
 // ─── Default server URLs ───────────────────────────────────────────────────
 

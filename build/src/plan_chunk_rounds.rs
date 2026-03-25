@@ -204,13 +204,10 @@ fn main() {
         let start_chunk =
             u32::from_le_bytes(results_data[base + 20..base + 24].try_into().unwrap());
         let num_chunks = results_data[base + 24] as u32;
-        let flags = results_data[base + 25];
 
         if num_chunks == 0 {
-            if flags & FLAG_WHALE != 0 {
-                let hex: String = sh.iter().map(|b| format!("{:02x}", b)).collect();
-                println!("  Skipping whale address: {}", hex);
-            }
+            let hex: String = sh.iter().map(|b| format!("{:02x}", b)).collect();
+            println!("  Skipping address with 0 chunks (whale or miss): {}", hex);
             continue;
         }
 

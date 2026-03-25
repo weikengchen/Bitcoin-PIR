@@ -289,7 +289,7 @@ fn main() {
     println!("[2] Computing chunk queries from first-level results...");
 
     let mut all_chunk_ids = BTreeSet::new();
-    let mut query_ranges: Vec<(u32, u32, u8)> = Vec::with_capacity(num_first_queries); // (start_chunk, num_chunks, flags)
+    let mut query_ranges: Vec<(u32, u32)> = Vec::with_capacity(num_first_queries); // (start_chunk, num_chunks)
 
     for i in 0..num_first_queries {
         let base = i * INDEX_ENTRY_SIZE;
@@ -297,13 +297,12 @@ fn main() {
             results_data[base + 20..base + 24].try_into().unwrap(),
         );
         let num_chunks = results_data[base + 24] as u32;
-        let flags = results_data[base + 25];
 
         if num_chunks == 0 {
-            query_ranges.push((0, 0, flags));
+            query_ranges.push((0, 0));
             continue;
         }
-        query_ranges.push((start_chunk, num_chunks, flags));
+        query_ranges.push((start_chunk, num_chunks));
 
         for c in 0..num_chunks {
             all_chunk_ids.insert(start_chunk + c);
@@ -478,7 +477,7 @@ fn main() {
     let mut total_bytes_written = 4usize;
 
     for i in 0..num_first_queries {
-        let (start_chunk, nc, _flags) = query_ranges[i];
+        let (start_chunk, nc) = query_ranges[i];
         out_file.write_all(&start_chunk.to_le_bytes()).unwrap();
         out_file.write_all(&nc.to_le_bytes()).unwrap();
         total_bytes_written += 8;
@@ -520,10 +519,10 @@ fn main() {
     for i in 0..num_first_queries {
         let sh = &results_data[i * INDEX_ENTRY_SIZE..i * INDEX_ENTRY_SIZE + SCRIPT_HASH_SIZE];
         let hex: String = sh.iter().map(|b| format!("{:02x}", b)).collect();
-        let (start_chunk, nc, fl) = query_ranges[i];
+        let (start_chunk, nc) = query_ranges[i];
 
         if nc == 0 {
-            let label = if fl & FLAG_WHALE != 0 { "WHALE (excluded)" } else { "SKIP (miss)" };
+            let label = "no chunks (whale or miss)";
             println!(
                 "  {:>4}  {}  {:>12}  {:>8}  {}",
                 i, hex, "-", "-", label

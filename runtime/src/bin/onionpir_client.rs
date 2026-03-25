@@ -1,47 +1,76 @@
-//! OnionPIRv2-based 1-server Batch PIR client.
+//! OnionPIR v2 client — multi-address batch queries.
 //!
-//! Queries a Bitcoin script hash through a single PIR server:
-//!   0. Key exchange (galois + GSW keys — sent once per session)
-//!   1. Level 1: index PIR → (offset, num_chunks, flags)
-//!   2. Level 2: chunk PIR → actual UTXO data (multi-round)
+//! Queries multiple Bitcoin script hashes through a single OnionPIR v2 server.
+//! Uses PBC cuckoo placement to batch queries across addresses into rounds,
+//! minimizing the number of server round-trips.
 //!
-//! Unlike the 2-server DPF client, this connects to a SINGLE server.
-//! Privacy is provided by FHE (OnionPIR) rather than secret-shared DPF.
+//! Level 1 (Index): 2-hash cuckoo with 256 slots/bin → scan for tag match
+//! Level 2 (Chunk): client computes 6-hash cuckoo table → knows exact bin → 1 query
 //!
 //! Usage:
 //!   cargo run --release -p runtime --bin onionpir_client -- \
-//!     --server ws://localhost:8090 \
-//!     --hash <40-char hex script hash>
+//!     --server ws://localhost:8091 \
+//!     --hash <hex1> --hash <hex2> ...
+//!   Or with a file (one hex hash per line):
+//!     --file addresses.txt
 
-use runtime::eval;
 use runtime::onionpir::*;
 use runtime::protocol;
 use build::common::*;
 use futures_util::{SinkExt, StreamExt};
 use onionpir::Client as PirClient;
+use std::collections::HashMap;
 use std::time::Instant;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
+
+// ─── Constants for the new layout ───────────────────────────────────────────
+
+const PACKED_ENTRY_SIZE: usize = 3840;
+
+/// Chunk cuckoo: 6 hash functions, bucket_size=1
+const CHUNK_CUCKOO_NUM_HASHES: usize = 6;
+const CHUNK_CUCKOO_MAX_KICKS: usize = 10000;
+const CHUNK_CUCKOO_SEED: u64 = 0xa3f7c2d918e4b065;
+const EMPTY: u32 = u32::MAX;
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
 struct Args {
     server: String,
-    script_hash: [u8; SCRIPT_HASH_SIZE],
+    script_hashes: Vec<[u8; SCRIPT_HASH_SIZE]>,
+}
+
+fn parse_hex_hash(hex: &str) -> [u8; SCRIPT_HASH_SIZE] {
+    if hex.len() != 40 {
+        eprintln!("Error: hash must be 40 hex chars, got {}: '{}'", hex.len(), hex);
+        std::process::exit(1);
+    }
+    let mut hash = [0u8; SCRIPT_HASH_SIZE];
+    for j in 0..SCRIPT_HASH_SIZE {
+        hash[j] = u8::from_str_radix(&hex[j * 2..j * 2 + 2], 16)
+            .unwrap_or_else(|_| { eprintln!("Invalid hex: {}", hex); std::process::exit(1); });
+    }
+    hash
 }
 
 fn parse_args() -> Args {
     let args: Vec<String> = std::env::args().collect();
-    let mut server = "ws://localhost:8090".to_string();
-    let mut hash_hex = String::new();
+    let mut server = "ws://localhost:8091".to_string();
+    let mut hashes: Vec<[u8; SCRIPT_HASH_SIZE]> = Vec::new();
+    let mut file_path: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--server" | "-s" => { server = args[i + 1].clone(); i += 1; }
-            "--hash" | "-h" => { hash_hex = args[i + 1].clone(); i += 1; }
+            "--hash" | "-h" => {
+                hashes.push(parse_hex_hash(&args[i + 1]));
+                i += 1;
+            }
+            "--file" | "-f" => { file_path = Some(args[i + 1].clone()); i += 1; }
             "--help" => {
-                println!("Usage: onionpir_client --hash <hex> [--server URL]");
+                println!("Usage: onionpir_client [--hash <hex>]... [--file <path>] [--server URL]");
                 std::process::exit(0);
             }
             _ => {}
@@ -49,18 +78,23 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    if hash_hex.len() != 40 {
-        eprintln!("Error: --hash must be a 40-character hex string (20 bytes)");
+    if let Some(path) = file_path {
+        let contents = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| { eprintln!("Error reading {}: {}", path, e); std::process::exit(1); });
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                hashes.push(parse_hex_hash(trimmed));
+            }
+        }
+    }
+
+    if hashes.is_empty() {
+        eprintln!("Error: no addresses specified. Use --hash <hex> or --file <path>");
         std::process::exit(1);
     }
 
-    let mut script_hash = [0u8; SCRIPT_HASH_SIZE];
-    for j in 0..SCRIPT_HASH_SIZE {
-        script_hash[j] = u8::from_str_radix(&hash_hex[j * 2..j * 2 + 2], 16)
-            .expect("invalid hex in --hash");
-    }
-
-    Args { server, script_hash }
+    Args { server, script_hashes: hashes }
 }
 
 // ─── WebSocket helpers ──────────────────────────────────────────────────────
@@ -77,7 +111,6 @@ type WsStream = futures_util::stream::SplitStream<
     >,
 >;
 
-/// Receive the next binary message, handling pings transparently.
 async fn recv_binary(stream: &mut WsStream, sink: &mut WsSink) -> Vec<u8> {
     loop {
         let msg = stream.next().await.expect("no response").expect("read error");
@@ -89,79 +122,98 @@ async fn recv_binary(stream: &mut WsStream, sink: &mut WsSink) -> Vec<u8> {
     }
 }
 
-// ─── Cuckoo assignment for chunk level (same as DPF client) ─────────────────
+// ─── PRNG for dummy queries ─────────────────────────────────────────────────
 
-fn plan_chunk_rounds(chunk_ids: &[u32]) -> Vec<Vec<(u32, u8)>> {
-    let mut remaining: Vec<u32> = chunk_ids.to_vec();
+struct DummyRng { state: u64 }
+
+impl DummyRng {
+    fn new() -> Self {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap()
+            .as_nanos() as u64;
+        Self { state: splitmix64(seed) }
+    }
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9e3779b97f4a7c15);
+        splitmix64(self.state)
+    }
+}
+
+// ─── PBC batch placement ────────────────────────────────────────────────────
+
+/// Place items into groups using PBC cuckoo hashing.
+/// Each item has NUM_HASHES (3) candidate groups out of `k` total groups.
+/// Returns rounds of (original_item_index, assigned_group).
+/// Each group has at most 1 item per round.
+fn plan_pbc_rounds(
+    candidate_groups: &[[usize; NUM_HASHES]],
+    k: usize,
+) -> Vec<Vec<(usize, usize)>> {
+    let mut remaining: Vec<usize> = (0..candidate_groups.len()).collect();
     let mut rounds = Vec::new();
 
     while !remaining.is_empty() {
-        let candidates: Vec<(u32, [usize; NUM_HASHES])> = remaining
-            .iter()
-            .map(|&cid| (cid, derive_chunk_buckets(cid)))
+        let round_cands: Vec<[usize; NUM_HASHES]> = remaining.iter()
+            .map(|&orig| candidate_groups[orig])
             .collect();
 
-        let mut buckets: [Option<usize>; K_CHUNK] = [None; K_CHUNK];
-        let mut round_entries: Vec<(u32, u8)> = Vec::new();
-        let mut placed_set = Vec::new();
+        let mut buckets: Vec<Option<usize>> = vec![None; k];
+        let mut placed_round_indices = Vec::new();
 
-        let cand_buckets: Vec<[usize; NUM_HASHES]> = candidates.iter().map(|c| c.1).collect();
-
-        for i in 0..candidates.len() {
-            if round_entries.len() >= K_CHUNK {
-                break;
-            }
-            let saved = buckets;
-            if cuckoo_place(&cand_buckets, &mut buckets, i, 500) {
-                placed_set.push(i);
+        for ri in 0..round_cands.len() {
+            if placed_round_indices.len() >= k { break; }
+            let saved = buckets.clone();
+            if pbc_cuckoo_place(&round_cands, &mut buckets, ri, 500) {
+                placed_round_indices.push(ri);
             } else {
                 buckets = saved;
             }
         }
 
-        for b in 0..K_CHUNK {
-            if let Some(ci) = buckets[b] {
-                round_entries.push((candidates[ci].0, b as u8));
+        let mut round = Vec::new();
+        for g in 0..k {
+            if let Some(ri) = buckets[g] {
+                round.push((remaining[ri], g));
             }
         }
 
-        if round_entries.is_empty() {
-            eprintln!("ERROR: could not place any chunks in round, {} remaining", remaining.len());
+        if round.is_empty() {
+            eprintln!("PBC placement failed for {} remaining items", remaining.len());
             break;
         }
 
-        let placed_ids: Vec<u32> = placed_set.iter().map(|&i| candidates[i].0).collect();
-        remaining.retain(|cid| !placed_ids.contains(cid));
+        let placed_originals: Vec<usize> = placed_round_indices.iter()
+            .map(|&ri| remaining[ri]).collect();
+        remaining.retain(|idx| !placed_originals.contains(idx));
 
-        rounds.push(round_entries);
+        rounds.push(round);
     }
 
     rounds
 }
 
-fn cuckoo_place(
-    cand_buckets: &[[usize; NUM_HASHES]],
-    buckets: &mut [Option<usize>; K_CHUNK],
+fn pbc_cuckoo_place(
+    cands: &[[usize; NUM_HASHES]],
+    buckets: &mut [Option<usize>],
     qi: usize,
     max_kicks: usize,
 ) -> bool {
-    let cands = &cand_buckets[qi];
-    for &c in cands {
+    for &c in &cands[qi] {
         if buckets[c].is_none() {
             buckets[c] = Some(qi);
             return true;
         }
     }
+
     let mut current_qi = qi;
-    let mut current_bucket = cand_buckets[current_qi][0];
+    let mut current_bucket = cands[qi][0];
 
     for kick in 0..max_kicks {
         let evicted_qi = buckets[current_bucket].unwrap();
         buckets[current_bucket] = Some(current_qi);
-        let ev_cands = &cand_buckets[evicted_qi];
 
         for offset in 0..NUM_HASHES {
-            let c = ev_cands[(kick + offset) % NUM_HASHES];
+            let c = cands[evicted_qi][(kick + offset) % NUM_HASHES];
             if c == current_bucket { continue; }
             if buckets[c].is_none() {
                 buckets[c] = Some(evicted_qi);
@@ -169,9 +221,9 @@ fn cuckoo_place(
             }
         }
 
-        let mut next_bucket = ev_cands[0];
+        let mut next_bucket = cands[evicted_qi][0];
         for offset in 0..NUM_HASHES {
-            let c = ev_cands[(kick + offset) % NUM_HASHES];
+            let c = cands[evicted_qi][(kick + offset) % NUM_HASHES];
             if c != current_bucket {
                 next_bucket = c;
                 break;
@@ -180,7 +232,169 @@ fn cuckoo_place(
         current_qi = evicted_qi;
         current_bucket = next_bucket;
     }
+
     false
+}
+
+// ─── Chunk cuckoo hash utilities (6-hash, bucket_size=1) ────────────────────
+
+#[inline]
+fn chunk_derive_cuckoo_key(group_id: usize, hash_fn: usize) -> u64 {
+    splitmix64(
+        CHUNK_CUCKOO_SEED
+            .wrapping_add((group_id as u64).wrapping_mul(0x9e3779b97f4a7c15))
+            .wrapping_add((hash_fn as u64).wrapping_mul(0x517cc1b727220a95)),
+    )
+}
+
+#[inline]
+fn chunk_cuckoo_hash(entry_id: u32, key: u64, num_bins: usize) -> usize {
+    (splitmix64((entry_id as u64) ^ key) % num_bins as u64) as usize
+}
+
+/// Build reverse index: group → sorted entry_ids, in a single pass over all entries.
+/// 80× faster than scanning per-group.
+fn build_chunk_reverse_index(total_entries: usize) -> Vec<Vec<u32>> {
+    let mut index: Vec<Vec<u32>> = (0..K_CHUNK).map(|_| Vec::new()).collect();
+    for eid in 0..total_entries as u32 {
+        let buckets = derive_chunk_buckets(eid);
+        for &g in &buckets {
+            index[g].push(eid);
+        }
+    }
+    // Already sorted since we iterate eid in order
+    index
+}
+
+/// Build the chunk cuckoo table for a specific group (deterministic).
+/// Replicates what the server did in gen_2_onion.
+fn build_chunk_cuckoo_for_group(
+    group_id: usize,
+    reverse_index: &[Vec<u32>],
+    bins_per_table: usize,
+) -> Vec<u32> {
+    let entries = &reverse_index[group_id];
+
+    let mut keys = [0u64; CHUNK_CUCKOO_NUM_HASHES];
+    for h in 0..CHUNK_CUCKOO_NUM_HASHES {
+        keys[h] = chunk_derive_cuckoo_key(group_id, h);
+    }
+
+    let mut table = vec![EMPTY; bins_per_table];
+
+    for &entry_id in entries {
+        let mut placed = false;
+        for h in 0..CHUNK_CUCKOO_NUM_HASHES {
+            let bin = chunk_cuckoo_hash(entry_id, keys[h], bins_per_table);
+            if table[bin] == EMPTY {
+                table[bin] = entry_id;
+                placed = true;
+                break;
+            }
+        }
+        if placed { continue; }
+
+        let mut current_id = entry_id;
+        let mut current_hash_fn = 0;
+        let mut current_bin = chunk_cuckoo_hash(entry_id, keys[0], bins_per_table);
+        let mut success = false;
+
+        for kick in 0..CHUNK_CUCKOO_MAX_KICKS {
+            let evicted = table[current_bin];
+            table[current_bin] = current_id;
+
+            for h in 0..CHUNK_CUCKOO_NUM_HASHES {
+                let try_h = (current_hash_fn + 1 + h) % CHUNK_CUCKOO_NUM_HASHES;
+                let bin = chunk_cuckoo_hash(evicted, keys[try_h], bins_per_table);
+                if bin == current_bin { continue; }
+                if table[bin] == EMPTY {
+                    table[bin] = evicted;
+                    success = true;
+                    break;
+                }
+            }
+            if success { break; }
+
+            let alt_h = (current_hash_fn + 1 + kick % (CHUNK_CUCKOO_NUM_HASHES - 1)) % CHUNK_CUCKOO_NUM_HASHES;
+            let alt_bin = chunk_cuckoo_hash(evicted, keys[alt_h], bins_per_table);
+            let final_bin = if alt_bin == current_bin {
+                let h2 = (alt_h + 1) % CHUNK_CUCKOO_NUM_HASHES;
+                chunk_cuckoo_hash(evicted, keys[h2], bins_per_table)
+            } else {
+                alt_bin
+            };
+
+            current_id = evicted;
+            current_hash_fn = alt_h;
+            current_bin = final_bin;
+        }
+
+        if !success {
+            panic!("Client cuckoo failed for entry_id={}", entry_id);
+        }
+    }
+
+    table
+}
+
+/// Find which bin holds entry_id in a cuckoo table.
+fn find_entry_in_cuckoo(
+    table: &[u32],
+    entry_id: u32,
+    keys: &[u64; CHUNK_CUCKOO_NUM_HASHES],
+    bins_per_table: usize,
+) -> Option<usize> {
+    for h in 0..CHUNK_CUCKOO_NUM_HASHES {
+        let bin = chunk_cuckoo_hash(entry_id, keys[h], bins_per_table);
+        if table[bin] == entry_id {
+            return Some(bin);
+        }
+    }
+    None
+}
+
+// ─── Varint ─────────────────────────────────────────────────────────────────
+
+fn read_varint(data: &[u8]) -> (u64, usize) {
+    let mut value: u64 = 0;
+    let mut shift = 0;
+    for (i, &byte) in data.iter().enumerate() {
+        value |= ((byte & 0x7F) as u64) << shift;
+        if byte & 0x80 == 0 { return (value, i + 1); }
+        shift += 7;
+        if shift >= 64 { panic!("varint too large"); }
+    }
+    panic!("unexpected end of varint");
+}
+
+// ─── Index query helpers ────────────────────────────────────────────────────
+
+/// Result from the index level for one address.
+struct IndexResult {
+    entry_id: u32,
+    byte_offset: u16,
+    num_entries: u8,
+}
+
+/// Scan a decrypted index bin (256 slots) for a matching tag.
+fn scan_index_bin(
+    entry_bytes: &[u8],
+    tag: u64,
+    bucket_size: usize,
+    slot_size: usize,
+) -> Option<IndexResult> {
+    for slot in 0..bucket_size {
+        let off = slot * slot_size;
+        if off + slot_size > entry_bytes.len() { break; }
+        let slot_tag = u64::from_le_bytes(entry_bytes[off..off + 8].try_into().unwrap());
+        if slot_tag == tag && slot_tag != 0 {
+            let entry_id = u32::from_le_bytes(entry_bytes[off + 8..off + 12].try_into().unwrap());
+            let byte_offset = u16::from_le_bytes(entry_bytes[off + 12..off + 14].try_into().unwrap());
+            let num_entries = entry_bytes[off + 14];
+            return Some(IndexResult { entry_id, byte_offset, num_entries });
+        }
+    }
+    None
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
@@ -188,23 +402,26 @@ fn cuckoo_place(
 #[tokio::main]
 async fn main() {
     let args = parse_args();
-    let hash_hex: String = args.script_hash.iter().map(|b| format!("{:02x}", b)).collect();
+    let num_addresses = args.script_hashes.len();
 
-    println!("=== OnionPIR 1-Server Batch PIR Client ===");
-    println!("  Script hash: {}", hash_hex);
-    println!("  Server:      {}", args.server);
+    println!("=== OnionPIR v2 Client ({} address{}) ===",
+        num_addresses, if num_addresses == 1 { "" } else { "es" });
+    println!("  Server: {}", args.server);
+    for (i, sh) in args.script_hashes.iter().enumerate() {
+        let hex: String = sh.iter().map(|b| format!("{:02x}", b)).collect();
+        println!("  [{}] {}", i + 1, hex);
+    }
     println!();
 
     let total_start = Instant::now();
 
-    // ── Connect ─────────────────────────────────────────────────────────
+    // ── 1. Connect ──────────────────────────────────────────────────────
     println!("[1] Connecting...");
-    let (ws, _) = connect_async(&args.server).await.expect("connect server");
+    let (ws, _) = connect_async(&args.server).await.expect("connect");
     let (mut sink, mut stream) = ws.split();
-    println!("  Connected.");
-    println!();
+    println!("  Connected.\n");
 
-    // ── Get server info ─────────────────────────────────────────────────
+    // ── 2. Get server info ──────────────────────────────────────────────
     println!("[2] Getting server info...");
     {
         let mut req = Vec::with_capacity(5);
@@ -213,343 +430,324 @@ async fn main() {
         sink.send(Message::Binary(req.into())).await.expect("send");
     }
     let info_bytes = recv_binary(&mut stream, &mut sink).await;
-    let info_payload = &info_bytes[4..]; // skip length prefix
-    let info = OnionPirServerInfo::decode(&info_payload[1..]).expect("decode info");
+    let info_payload = &info_bytes[4..];
+    let body = &info_payload[1..];
 
-    let index_bins = info.index_bins_per_table as usize;
-    let chunk_bins = info.chunk_bins_per_table as usize;
-    let tag_seed = info.tag_seed;
+    let index_k = body[0] as usize;
+    let chunk_k = body[1] as usize;
+    let index_bins = u32::from_le_bytes(body[2..6].try_into().unwrap()) as usize;
+    let chunk_bins = u32::from_le_bytes(body[6..10].try_into().unwrap()) as usize;
+    let tag_seed = u64::from_le_bytes(body[10..18].try_into().unwrap());
+    let total_packed = u32::from_le_bytes(body[18..22].try_into().unwrap()) as usize;
+    let index_bucket_size = u16::from_le_bytes(body[22..24].try_into().unwrap()) as usize;
+    let index_slot_size = body[24] as usize;
 
-    println!("  Index: K={}, bins_per_table={}", info.index_k, index_bins);
-    println!("  Chunk: K={}, bins_per_table={}", info.chunk_k, chunk_bins);
-    println!("  tag_seed: 0x{:016x}", tag_seed);
-    println!("  OnionPIR: entry_size={}, num_entries={}", info.onionpir_entry_size, info.onionpir_num_entries);
+    println!("  Index: K={}, bins={}, bucket_size={}, slot_size={}",
+        index_k, index_bins, index_bucket_size, index_slot_size);
+    println!("  Chunk: K={}, bins={}, total_packed={}", chunk_k, chunk_bins, total_packed);
     println!();
 
-    // ── Create OnionPIR client and exchange keys ────────────────────────
-    println!("[3] Generating encryption keys...");
+    // ── 3. Create PIR client and register keys (single registration) ────
+    // Keys are independent of num_entries. We generate keys once, export the
+    // secret key, then create per-level clients with the correct num_entries
+    // for query generation and decryption.
+    println!("[3] Creating PIR client...");
     let key_start = Instant::now();
-
-    // num_entries must match the server's value
-    let mut pir_client = PirClient::new(index_bins as u64);
-    let galois_keys = pir_client.generate_galois_keys();
-    let gsw_keys = pir_client.generate_gsw_keys();
-
+    let mut keygen_client = PirClient::new(0);
+    let client_id = keygen_client.id();
+    let galois = keygen_client.generate_galois_keys();
+    let gsw = keygen_client.generate_gsw_keys();
+    let secret_key = keygen_client.export_secret_key();
     println!("  Key generation: {:.2?}", key_start.elapsed());
-    println!("  Galois keys: {} bytes", galois_keys.len());
-    println!("  GSW keys:    {} bytes", gsw_keys.len());
 
-    let reg_start = Instant::now();
+    // Create per-level clients sharing the same secret key
+    let mut index_client = PirClient::new_from_secret_key(
+        index_bins as u64, client_id, &secret_key,
+    );
+    let mut chunk_client = PirClient::new_from_secret_key(
+        chunk_bins as u64, client_id, &secret_key,
+    );
+
+    // Register keys once — shared across all levels
     let reg_msg = RegisterKeysMsg {
-        galois_keys: galois_keys.clone(),
-        gsw_keys: gsw_keys.clone(),
+        galois_keys: galois,
+        gsw_keys: gsw,
     };
     sink.send(Message::Binary(reg_msg.encode().into())).await.expect("send keys");
     let ack = recv_binary(&mut stream, &mut sink).await;
-    assert_eq!(ack[4], RESP_KEYS_ACK, "Expected keys ack");
-    println!("  Key exchange: {:.2?}", reg_start.elapsed());
-    println!();
+    assert_eq!(ack[4], RESP_KEYS_ACK);
+    println!("  Keys registered (single registration, shared secret key).\n");
 
     // ══════════════════════════════════════════════════════════════════════
-    // LEVEL 1: Index PIR
+    // LEVEL 1: Index PIR (batched across addresses)
     // ══════════════════════════════════════════════════════════════════════
-    println!("[4] Level 1: Index PIR...");
+    println!("[4] Level 1: Index PIR ({} addresses)...", num_addresses);
     let l1_start = Instant::now();
 
-    // Compute PBC bucket assignment for our script hash
-    let my_buckets = derive_buckets(&args.script_hash);
-    let assigned_bucket = my_buckets[0]; // use first bucket for single query
-
-    // Within the assigned bucket, compute cuckoo hash locations.
-    // We need to query each possible cuckoo hash function to find where the
-    // entry was placed. With INDEX_CUCKOO_NUM_HASHES = 2, we query 2 locations.
-    let mut my_cuckoo_bins: Vec<usize> = Vec::new();
-    for h in 0..INDEX_CUCKOO_NUM_HASHES {
-        let key = derive_cuckoo_key(assigned_bucket, h);
-        my_cuckoo_bins.push(cuckoo_hash(&args.script_hash, key, index_bins));
+    // Prepare per-address info
+    struct AddrInfo {
+        tag: u64,
+        groups: [usize; NUM_HASHES],
     }
+    let addr_infos: Vec<AddrInfo> = args.script_hashes.iter().map(|sh| {
+        AddrInfo {
+            tag: compute_tag(tag_seed, sh),
+            groups: derive_buckets(sh),
+        }
+    }).collect();
 
-    println!("  Assigned bucket: {}", assigned_bucket);
-    println!("  Cuckoo bins: {:?}", my_cuckoo_bins);
+    let mut index_results: Vec<Option<IndexResult>> = (0..num_addresses).map(|_| None).collect();
+    let mut rng = DummyRng::new();
+    let mut total_index_rounds = 0u16;
 
-    // Generate OnionPIR queries for all K buckets.
-    // For the assigned bucket, we generate INDEX_CUCKOO_NUM_HASHES queries
-    // (one for each possible cuckoo location). For dummy buckets, we query
-    // a random index to maintain privacy.
-    //
-    // NOTE: With OnionPIR each query targets a single entry index.
-    // We need to try each cuckoo hash function because we don't know which
-    // one was used to place our entry. This means INDEX_CUCKOO_NUM_HASHES
-    // queries for the real bucket.
-    //
-    // For the initial implementation, we send one query per bucket and try
-    // cuckoo hash functions sequentially if the first doesn't match.
+    // PBC place all addresses into groups
+    let all_groups: Vec<[usize; NUM_HASHES]> = addr_infos.iter().map(|a| a.groups).collect();
+    let index_rounds = plan_pbc_rounds(&all_groups, index_k);
+    println!("  PBC placement: {} addresses → {} round{}",
+        num_addresses, index_rounds.len(),
+        if index_rounds.len() == 1 { "" } else { "s" });
 
-    // First attempt: query using cuckoo hash function 0 for the assigned bucket
-    let mut queries: Vec<Vec<u8>> = Vec::with_capacity(K);
-    let mut rng_state: u64 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap()
-        .as_nanos() as u64;
-
-    for b in 0..K {
-        let target_index = if b == assigned_bucket {
-            my_cuckoo_bins[0] as u64
-        } else {
-            rng_state = splitmix64(rng_state.wrapping_add(0x9e3779b97f4a7c15));
-            rng_state % index_bins as u64
-        };
-        queries.push(pir_client.generate_query(target_index));
-    }
-
-    // Send query batch
-    let batch = OnionPirBatchQuery { round_id: 0, queries };
-    let encoded = batch.encode(REQ_ONIONPIR_INDEX_QUERY);
-    sink.send(Message::Binary(encoded.into())).await.expect("send index query");
-
-    // Receive response
-    let resp_bytes = recv_binary(&mut stream, &mut sink).await;
-    let resp_payload = &resp_bytes[4..];
-    assert_eq!(resp_payload[0], RESP_ONIONPIR_INDEX_RESULT);
-    let result_batch = OnionPirBatchResult::decode(&resp_payload[1..]).expect("decode index result");
-
-    // Decrypt the response for our assigned bucket
-    let entry_bytes = pir_client.decrypt_response(my_cuckoo_bins[0] as u64, &result_batch.results[assigned_bucket]);
-
-    // The decrypted entry is `entry_size` bytes, but only the first `bin_byte_size`
-    // bytes are meaningful. A cuckoo bin contains CUCKOO_BUCKET_SIZE (3) slots of
-    // INDEX_SLOT_SIZE (14) bytes each = 42 bytes total.
-    let index_bin_size = CUCKOO_BUCKET_SIZE * INDEX_SLOT_SIZE;
-    let bin_data = &entry_bytes[..index_bin_size];
-
-    // Compute expected tag
-    let my_tag = compute_tag(tag_seed, &args.script_hash);
-
-    // Search the bin's slots for our tag
-    let mut found_entry = eval::find_entry_in_index_result(bin_data, my_tag);
-
-    // If not found with hash function 0, try hash function 1
-    if found_entry.is_none() && INDEX_CUCKOO_NUM_HASHES > 1 {
-        println!("  Cuckoo hash 0 miss, trying hash 1...");
-
-        // Generate a new query for the second cuckoo location
-        let mut queries2: Vec<Vec<u8>> = Vec::with_capacity(K);
-        for b in 0..K {
-            let target_index = if b == assigned_bucket {
-                my_cuckoo_bins[1] as u64
-            } else {
-                rng_state = splitmix64(rng_state.wrapping_add(0x9e3779b97f4a7c15));
-                rng_state % index_bins as u64
-            };
-            queries2.push(pir_client.generate_query(target_index));
+    // Each round: 2 queries per group (hash0 + hash1 bins), matching DPF approach
+    for round in &index_rounds {
+        let mut group_map: HashMap<usize, usize> = HashMap::new(); // group → addr_idx
+        for &(addr_idx, group) in round {
+            group_map.insert(group, addr_idx);
         }
 
-        let batch2 = OnionPirBatchQuery { round_id: 1, queries: queries2 };
-        let encoded2 = batch2.encode(REQ_ONIONPIR_INDEX_QUERY);
-        sink.send(Message::Binary(encoded2.into())).await.expect("send index query 2");
+        // Generate 2*K queries: [g0_h0, g0_h1, g1_h0, g1_h1, ...]
+        let mut queries = Vec::with_capacity(2 * index_k);
+        let mut query_bins: Vec<u64> = Vec::with_capacity(2 * index_k);
+        for g in 0..index_k {
+            for h in 0..INDEX_CUCKOO_NUM_HASHES {
+                let bin = if let Some(&addr_idx) = group_map.get(&g) {
+                    let key = derive_cuckoo_key(g, h);
+                    cuckoo_hash(&args.script_hashes[addr_idx], key, index_bins) as u64
+                } else {
+                    rng.next_u64() % index_bins as u64
+                };
+                queries.push(index_client.generate_query(bin));
+                query_bins.push(bin);
+            }
+        }
 
-        let resp_bytes2 = recv_binary(&mut stream, &mut sink).await;
-        let resp_payload2 = &resp_bytes2[4..];
-        assert_eq!(resp_payload2[0], RESP_ONIONPIR_INDEX_RESULT);
-        let result_batch2 = OnionPirBatchResult::decode(&resp_payload2[1..]).expect("decode index result 2");
+        let batch = OnionPirBatchQuery { round_id: total_index_rounds, queries };
+        sink.send(Message::Binary(batch.encode(REQ_ONIONPIR_INDEX_QUERY).into())).await.expect("send");
+        total_index_rounds += 1;
 
-        let entry_bytes2 = pir_client.decrypt_response(
-            my_cuckoo_bins[1] as u64,
-            &result_batch2.results[assigned_bucket],
-        );
-        let bin_data2 = &entry_bytes2[..index_bin_size];
-        found_entry = eval::find_entry_in_index_result(bin_data2, my_tag);
+        let resp_bytes = recv_binary(&mut stream, &mut sink).await;
+        let resp_payload = &resp_bytes[4..];
+        assert_eq!(resp_payload[0], RESP_ONIONPIR_INDEX_RESULT);
+        let result_batch = OnionPirBatchResult::decode(&resp_payload[1..]).expect("decode");
+
+        // Decrypt both hash results and scan for tag
+        for &(addr_idx, group) in round {
+            for h in 0..INDEX_CUCKOO_NUM_HASHES {
+                let qi = group * 2 + h;
+                let bin = query_bins[qi];
+                let entry_bytes = index_client.decrypt_response(
+                    bin,
+                    &result_batch.results[qi],
+                );
+                if let Some(ir) = scan_index_bin(&entry_bytes, addr_infos[addr_idx].tag, index_bucket_size, index_slot_size) {
+                    index_results[addr_idx] = Some(ir);
+                    break;
+                }
+            }
+        }
     }
 
-    let (start_chunk, num_chunks, flags) = found_entry
-        .unwrap_or_else(|| {
-            eprintln!("ERROR: script hash not found in index PIR result!");
-            std::process::exit(1);
-        });
-
-    let num_units = (num_chunks as usize + CHUNKS_PER_UNIT - 1) / CHUNKS_PER_UNIT;
-    let placement = eval::decode_placement(flags);
-
-    println!("  Found: start_chunk={}, num_chunks={}, flags=0x{:02x}", start_chunk, num_chunks, flags);
-    if let Some(ref p) = placement {
-        println!("  Placement bits: h={:?}", p);
-    }
-    println!("  Units to fetch: {}", num_units);
-    println!("  Level 1 time: {:.2?}", l1_start.elapsed());
+    // Report index results
+    let found_count = index_results.iter().filter(|r| r.is_some()).count();
+    let whale_count = index_results.iter().filter(|r| {
+        matches!(r, Some(ir) if ir.num_entries == 0)
+    }).count();
+    println!("  Found: {}/{} addresses ({} whale, {} not found)",
+        found_count, num_addresses, whale_count, num_addresses - found_count);
+    println!("  Level 1: {} rounds in {:.2?}", total_index_rounds, l1_start.elapsed());
     println!();
 
-    // ── Whale detection ─────────────────────────────────────────────────
-    if num_chunks == 0 && (flags & FLAG_WHALE) != 0 {
-        println!("=== WHALE ADDRESS (EXCLUDED) ===");
-        println!("  This address has too many UTXOs and was excluded from the PIR database.");
-        println!("  Total time: {:.2?}", total_start.elapsed());
-        return;
-    }
-
     // ══════════════════════════════════════════════════════════════════════
-    // LEVEL 2: Chunk PIR (multi-round)
+    // LEVEL 2: Chunk PIR (batched across all entry_ids)
     // ══════════════════════════════════════════════════════════════════════
     println!("[5] Level 2: Chunk PIR...");
     let l2_start = Instant::now();
 
-    // If chunk bins differ from index bins, we need a separate PirClient
-    // with the chunk num_entries. For now, create one unconditionally.
-    let mut chunk_pir_client = PirClient::new(chunk_bins as u64);
-    {
-        // Register chunk-level keys (reuse or regenerate)
-        // In practice, if index and chunk have different num_entries,
-        // the client needs separate SEAL contexts.
-        let chunk_galois = chunk_pir_client.generate_galois_keys();
-        let chunk_gsw = chunk_pir_client.generate_gsw_keys();
+    // Collect all unique entry_ids needed BEFORE registering chunk keys
+    let mut unique_entry_ids: Vec<u32> = Vec::new();
+    let mut entry_id_set: HashMap<u32, usize> = HashMap::new();
 
-        // Send keys (the server registers with chunk-level servers)
-        let reg = RegisterKeysMsg {
-            galois_keys: chunk_galois,
-            gsw_keys: chunk_gsw,
-        };
-        sink.send(Message::Binary(reg.encode().into())).await.expect("send chunk keys");
-        let ack = recv_binary(&mut stream, &mut sink).await;
-        assert_eq!(ack[4], RESP_KEYS_ACK, "Expected chunk keys ack");
+    for ir in &index_results {
+        if let Some(ir) = ir {
+            if ir.num_entries == 0 {
+                println!("  (whale address excluded)");
+                continue;
+            }
+            for i in 0..ir.num_entries as u32 {
+                let eid = ir.entry_id + i;
+                if !entry_id_set.contains_key(&eid) {
+                    let idx = unique_entry_ids.len();
+                    entry_id_set.insert(eid, idx);
+                    unique_entry_ids.push(eid);
+                }
+            }
+        }
     }
 
-    let chunk_ids: Vec<u32> = (0..num_units)
-        .map(|u| start_chunk + (u as u32) * CHUNKS_PER_UNIT as u32)
+    // Decrypted entry data: entry_id → raw bytes
+    let mut decrypted_entries: HashMap<u32, Vec<u8>> = HashMap::new();
+    let mut chunk_rounds_count = 0usize;
+
+    if unique_entry_ids.is_empty() {
+        println!("  No entries to fetch — skipping chunk phase.");
+    } else {
+    // Build reverse index once: group → entry_ids (single pass over all entries)
+    let t_rev = Instant::now();
+    let reverse_index = build_chunk_reverse_index(total_packed);
+    println!("  Reverse index built in {:.2?}", t_rev.elapsed());
+
+    // PBC place entries into chunk groups
+    let entry_pbc_groups: Vec<[usize; NUM_HASHES]> = unique_entry_ids.iter()
+        .map(|&eid| derive_chunk_buckets(eid))
         .collect();
+    let chunk_rounds = plan_pbc_rounds(&entry_pbc_groups, chunk_k);
 
-    let rounds = plan_chunk_rounds(&chunk_ids);
-    println!("  {} chunks → {} rounds", chunk_ids.len(), rounds.len());
+    println!("  {} unique entries → {} chunk round{}",
+        unique_entry_ids.len(), chunk_rounds.len(),
+        if chunk_rounds.len() == 1 { "" } else { "s" });
 
-    let mut recovered_chunks: std::collections::HashMap<u32, Vec<u8>> =
-        std::collections::HashMap::new();
+    // Cuckoo table cache (group_id → table)
+    let mut cuckoo_cache: HashMap<usize, Vec<u32>> = HashMap::new();
 
-    let chunk_bin_byte_size = CHUNK_CUCKOO_BUCKET_SIZE * CHUNK_SLOT_SIZE; // 2 * 44 = 88
+    for (ri, round) in chunk_rounds.iter().enumerate() {
+        // For each entry in this round, build cuckoo table if needed and find bin
+        struct ChunkQuery {
+            entry_id: u32,
+            group: usize,
+            bin: usize,
+        }
+        let mut chunk_queries: Vec<ChunkQuery> = Vec::new();
+        let mut group_to_qi: HashMap<usize, usize> = HashMap::new();
 
-    for (ri, round_plan) in rounds.iter().enumerate() {
-        // For each bucket with a real query, compute the target cuckoo bin.
-        // With OnionPIR we query ONE bin per bucket (using placement if available,
-        // otherwise we try cuckoo hash 0 first).
-        let mut bucket_targets: Vec<Option<(u32, usize)>> = vec![None; K_CHUNK]; // (chunk_id, bin_index)
-        let first_chunk_groups = derive_chunk_buckets(start_chunk);
+        let t_cuckoo = Instant::now();
+        let mut tables_built = 0usize;
 
-        for &(chunk_id, bucket_id) in round_plan {
-            let b = bucket_id as usize;
+        for &(ei, group) in round {
+            let eid = unique_entry_ids[ei];
 
-            // Determine which cuckoo hash function placed this chunk
-            let h = if chunk_id == start_chunk {
-                if let Some(ref p) = placement {
-                    let group_idx = first_chunk_groups.iter().position(|&g| g == b)
-                        .expect("bucket_id must be one of the chunk's groups");
-                    p[group_idx]
-                } else {
-                    0 // try hash 0 first
-                }
+            if !cuckoo_cache.contains_key(&group) {
+                let table = build_chunk_cuckoo_for_group(group, &reverse_index, chunk_bins);
+                cuckoo_cache.insert(group, table);
+                tables_built += 1;
+            }
+
+            let mut keys = [0u64; CHUNK_CUCKOO_NUM_HASHES];
+            for h in 0..CHUNK_CUCKOO_NUM_HASHES {
+                keys[h] = chunk_derive_cuckoo_key(group, h);
+            }
+            let bin = find_entry_in_cuckoo(cuckoo_cache.get(&group).unwrap(), eid, &keys, chunk_bins)
+                .unwrap_or_else(|| panic!("entry_id {} not in cuckoo table for group {}", eid, group));
+
+            let qi = chunk_queries.len();
+            chunk_queries.push(ChunkQuery { entry_id: eid, group, bin });
+            group_to_qi.insert(group, qi);
+        }
+
+        if tables_built > 0 {
+            println!("  Round {}: built {} cuckoo table{} in {:.2?}",
+                ri + 1, tables_built,
+                if tables_built == 1 { "" } else { "s" },
+                t_cuckoo.elapsed());
+        }
+
+        // Generate 80 queries (real for assigned groups, dummy for rest)
+        let mut queries = Vec::with_capacity(chunk_k);
+        for g in 0..chunk_k {
+            let idx = if let Some(&qi) = group_to_qi.get(&g) {
+                chunk_queries[qi].bin as u64
             } else {
-                0 // no placement info for non-first chunks; try hash 0
+                rng.next_u64() % chunk_bins as u64
             };
-
-            let key = derive_chunk_cuckoo_key(b, h);
-            let bin = cuckoo_hash_int(chunk_id, key, chunk_bins);
-            bucket_targets[b] = Some((chunk_id, bin));
+            queries.push(chunk_client.generate_query(idx));
         }
 
-        // Generate OnionPIR queries
-        let mut queries: Vec<Vec<u8>> = Vec::with_capacity(K_CHUNK);
-        for b in 0..K_CHUNK {
-            let target_index = match &bucket_targets[b] {
-                Some((_, bin)) => *bin as u64,
-                None => {
-                    rng_state = splitmix64(rng_state.wrapping_add(0x9e3779b97f4a7c15));
-                    rng_state % chunk_bins as u64
-                }
-            };
-            queries.push(chunk_pir_client.generate_query(target_index));
-        }
-
-        // Send
         let batch = OnionPirBatchQuery { round_id: ri as u16, queries };
-        let encoded = batch.encode(REQ_ONIONPIR_CHUNK_QUERY);
-        sink.send(Message::Binary(encoded.into())).await.expect("send chunk query");
+        sink.send(Message::Binary(batch.encode(REQ_ONIONPIR_CHUNK_QUERY).into())).await.expect("send");
 
-        // Receive
         let resp_bytes = recv_binary(&mut stream, &mut sink).await;
         let resp_payload = &resp_bytes[4..];
         assert_eq!(resp_payload[0], RESP_ONIONPIR_CHUNK_RESULT);
-        let result_batch = OnionPirBatchResult::decode(&resp_payload[1..]).expect("decode chunk result");
+        let result_batch = OnionPirBatchResult::decode(&resp_payload[1..]).expect("decode");
 
-        // Decrypt and extract
-        for &(chunk_id, bucket_id) in round_plan {
-            let b = bucket_id as usize;
-            let (_, bin_index) = bucket_targets[b].unwrap();
-
-            let entry_bytes = chunk_pir_client.decrypt_response(
-                bin_index as u64,
-                &result_batch.results[b],
+        // Decrypt and store entries
+        for cq in &chunk_queries {
+            let entry_bytes = chunk_client.decrypt_response(
+                cq.bin as u64,
+                &result_batch.results[cq.group],
             );
-            let bin_data = &entry_bytes[..chunk_bin_byte_size];
+            decrypted_entries.insert(cq.entry_id, entry_bytes[..PACKED_ENTRY_SIZE].to_vec());
+        }
+    }
 
-            if let Some(data) = eval::find_chunk_in_result(bin_data, chunk_id) {
-                recovered_chunks.insert(chunk_id, data.to_vec());
+    chunk_rounds_count = chunk_rounds.len();
+    } // end if unique_entry_ids not empty
+
+    println!("  Level 2: {} rounds in {:.2?}", chunk_rounds_count, l2_start.elapsed());
+    println!();
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Decode and output UTXO data per address
+    // ══════════════════════════════════════════════════════════════════════
+    println!("[6] Results:\n");
+
+    for (addr_idx, sh) in args.script_hashes.iter().enumerate() {
+        let hex: String = sh.iter().map(|b| format!("{:02x}", b)).collect();
+
+        let ir = match &index_results[addr_idx] {
+            Some(ir) => ir,
+            None => {
+                println!("  Address {}/{}: {} — NOT FOUND\n", addr_idx + 1, num_addresses, hex);
+                continue;
+            }
+        };
+
+        if ir.num_entries == 0 {
+            println!("  Address {}/{}: {} — WHALE (excluded)\n", addr_idx + 1, num_addresses, hex);
+            continue;
+        }
+
+        // Assemble data from entries
+        let mut full_data = Vec::new();
+        for i in 0..ir.num_entries as u32 {
+            let eid = ir.entry_id + i;
+            let entry = decrypted_entries.get(&eid)
+                .unwrap_or_else(|| panic!("missing entry_id {}", eid));
+
+            if i == 0 {
+                let start = ir.byte_offset as usize;
+                full_data.extend_from_slice(&entry[start..]);
             } else {
-                // If using hash 0 and it missed, we'd need to retry with other hashes.
-                // For now, log a warning. A full implementation would retry.
-                eprintln!("  WARNING: chunk {} not found in round {} bucket {} (may need cuckoo retry)",
-                    chunk_id, ri, b);
+                full_data.extend_from_slice(entry);
             }
         }
 
-        if (ri + 1) % 10 == 0 || ri + 1 == rounds.len() {
-            println!("  Round {}/{}: recovered {}/{} chunks",
-                ri + 1, rounds.len(), recovered_chunks.len(), chunk_ids.len());
-        }
-    }
-
-    println!("  Level 2 time: {:.2?}", l2_start.elapsed());
-    println!();
-
-    // ══════════════════════════════════════════════════════════════════════
-    // Reassemble and output (identical to DPF client)
-    // ══════════════════════════════════════════════════════════════════════
-    println!("[6] Reassembling UTXO data...");
-
-    let mut full_data = Vec::new();
-    let mut missing = 0;
-    for &cid in &chunk_ids {
-        if let Some(d) = recovered_chunks.get(&cid) {
-            full_data.extend_from_slice(d);
-        } else {
-            missing += 1;
-            full_data.extend_from_slice(&vec![0u8; UNIT_DATA_SIZE]);
-        }
-    }
-
-    println!("  Recovered: {}/{} units", chunk_ids.len() - missing, chunk_ids.len());
-    if missing > 0 {
-        println!("  WARNING: {} units missing!", missing);
-    }
-    println!("  Total data: {} bytes", full_data.len());
-    println!();
-
-    // Decode UTXO entries
-    println!("[7] Decoding UTXO entries:");
-    {
+        // Decode UTXOs
         let mut pos = 0;
-        let (num_entries, bytes_read) = read_varint(&full_data[pos..]);
-        pos += bytes_read;
-        println!("  Number of UTXOs: {}", num_entries);
-        println!();
+        let (num_utxos, vr) = read_varint(&full_data[pos..]);
+        pos += vr;
+
+        println!("  Address {}/{}: {} ({} UTXOs)", addr_idx + 1, num_addresses, hex, num_utxos);
 
         let mut total_sats: u64 = 0;
-        for i in 0..num_entries as usize {
+        for i in 0..num_utxos as usize {
             if pos + 32 > full_data.len() {
-                println!("  (data truncated at entry {})", i);
+                println!("    (data truncated at UTXO {})", i);
                 break;
             }
             let txid_bytes = &full_data[pos..pos + 32];
             pos += 32;
 
             let mut txid_rev = [0u8; 32];
-            for j in 0..32 {
-                txid_rev[j] = txid_bytes[31 - j];
-            }
+            for j in 0..32 { txid_rev[j] = txid_bytes[31 - j]; }
             let txid_hex: String = txid_rev.iter().map(|b| format!("{:02x}", b)).collect();
 
             let (vout, vr) = read_varint(&full_data[pos..]);
@@ -559,35 +757,18 @@ async fn main() {
 
             total_sats += amount;
             let btc = amount as f64 / 100_000_000.0;
-            println!("  UTXO #{}: {}:{} — {} sats ({:.8} BTC)",
-                i + 1, txid_hex, vout, amount, btc);
+            println!("    UTXO #{}: {}:{} — {} sats ({:.8} BTC)", i + 1, txid_hex, vout, amount, btc);
         }
 
-        println!();
         let total_btc = total_sats as f64 / 100_000_000.0;
-        println!("  Total: {} sats ({:.8} BTC) across {} UTXOs",
-            total_sats, total_btc, num_entries);
+        println!("    Total: {} sats ({:.8} BTC)\n", total_sats, total_btc);
     }
 
-    println!();
+    // ── Summary ─────────────────────────────────────────────────────────
     println!("=== Done ===");
+    println!("  {} addresses, {} index rounds, {} chunk rounds",
+        num_addresses, total_index_rounds, chunk_rounds_count);
     println!("  Total time: {:.2?}", total_start.elapsed());
-    println!("  Script hash: {}", hash_hex);
-    println!("  Chunks: {}, Rounds: {}", num_chunks, rounds.len());
-}
 
-fn read_varint(data: &[u8]) -> (u64, usize) {
-    let mut value: u64 = 0;
-    let mut shift = 0;
-    for (i, &byte) in data.iter().enumerate() {
-        value |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 == 0 {
-            return (value, i + 1);
-        }
-        shift += 7;
-        if shift >= 64 {
-            panic!("varint too large");
-        }
-    }
-    panic!("unexpected end of varint data");
+    let _ = sink.send(Message::Close(None)).await;
 }

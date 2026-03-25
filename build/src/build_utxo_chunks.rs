@@ -33,8 +33,7 @@ const DEFAULT_PARTITIONS: usize = 4;
 const DUST_THRESHOLD: u64 = 576; // sats
 const MAX_UTXOS_PER_SPK: usize = 100; // skip script pubkeys with more than this many UTXOs
 const TOP_N: usize = 100;
-const INDEX_ENTRY_SIZE: usize = 20 + 4 + 1 + 1; // script_hash + start_chunk_id(u32) + num_chunks(u8) + flags(u8)
-const FLAG_WHALE: u8 = 0x40; // bit 6: excluded whale address
+const INDEX_ENTRY_SIZE: usize = 20 + 4 + 1; // script_hash + start_chunk_id(u32) + num_chunks(u8)
 const WHALES_FILE: &str = "/Volumes/Bitcoin/data/whale_addresses.txt";
 
 /// Zero buffer for padding (max padding = BLOCK_SIZE - 1 = 79 bytes)
@@ -246,11 +245,10 @@ fn main() {
 
         for (script_hash, mut entries) in map.drain() {
             if entries.len() > MAX_UTXOS_PER_SPK {
-                // Write a sentinel index entry: num_chunks=0, flags=FLAG_WHALE
+                // Write a sentinel index entry: num_chunks=0 (whale)
                 index_writer.write_all(&script_hash).unwrap();
                 index_writer.write_all(&0u32.to_le_bytes()).unwrap(); // start_chunk_id = 0
                 index_writer.write_all(&[0u8]).unwrap();             // num_chunks = 0
-                index_writer.write_all(&[FLAG_WHALE]).unwrap();      // flags = whale marker
                 whale_entries.push((script_hash, entries.len()));
                 partition_whale_skipped += 1;
                 continue;
@@ -279,13 +277,12 @@ fn main() {
             let padded_len = num_chunks * BLOCK_SIZE;
             let padding = padded_len - data_len;
 
-            // Write index entry: [20B script_hash][4B start_chunk_id LE][1B num_chunks][1B flags]
+            // Write index entry: [20B script_hash][4B start_chunk_id LE][1B num_chunks]
             let start_chunk_id = (current_offset / BLOCK_SIZE as u64) as u32;
             assert!(num_chunks <= 255, "num_chunks {} exceeds u8 max", num_chunks);
             index_writer.write_all(&script_hash).unwrap();
             index_writer.write_all(&start_chunk_id.to_le_bytes()).unwrap();
             index_writer.write_all(&[num_chunks as u8]).unwrap();
-            index_writer.write_all(&[0u8]).unwrap(); // flags (reserved)
 
             // Write data
             chunks_writer.write_all(&data).unwrap();

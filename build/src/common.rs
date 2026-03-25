@@ -4,11 +4,8 @@
 /// Path to the UTXO chunks index file (nodust, 40-byte blocks)
 pub const INDEX_FILE: &str = "/Volumes/Bitcoin/data/utxo_chunks_index_nodust.bin";
 
-/// Size of each index entry in the intermediate file: 20B script_hash + 4B start_chunk_id + 1B num_chunks + 1B flags
-pub const INDEX_ENTRY_SIZE: usize = 26;
-
-/// Flags byte bit 6: address excluded from database due to too many UTXOs ("whale")
-pub const FLAG_WHALE: u8 = 0x40;
+/// Size of each index entry in the intermediate file: 20B script_hash + 4B start_chunk_id + 1B num_chunks
+pub const INDEX_ENTRY_SIZE: usize = 25;
 
 /// Size of the script hash portion (in intermediate file and for bucket/cuckoo derivation)
 pub const SCRIPT_HASH_SIZE: usize = 20;
@@ -32,10 +29,10 @@ pub const CUCKOO_BUCKET_SIZE: usize = 3;
 pub const INDEX_CUCKOO_NUM_HASHES: usize = 2;
 
 /// Cuckoo hash table bucket size for CHUNK level (slots per bin)
-pub const CHUNK_CUCKOO_BUCKET_SIZE: usize = 2;
+pub const CHUNK_CUCKOO_BUCKET_SIZE: usize = 3;
 
 /// Number of cuckoo hash functions for CHUNK level
-pub const CHUNK_CUCKOO_NUM_HASHES: usize = 3;
+pub const CHUNK_CUCKOO_NUM_HASHES: usize = 2;
 
 /// File format magic number for the batch_pir_cuckoo.bin file (v2: 8-byte fingerprint tags)
 pub const MAGIC: u64 = 0xBA7C_C000_C000_0003;
@@ -140,8 +137,8 @@ pub fn cuckoo_hash(script_hash: &[u8], key: u64, num_bins: usize) -> usize {
     (h % num_bins as u64) as usize
 }
 
-/// Size of one inlined index slot in the final cuckoo table: 8B tag + 4B + 1B + 1B = 14 bytes
-pub const INDEX_SLOT_SIZE: usize = TAG_SIZE + 4 + 1 + 1;
+/// Size of one inlined index slot in the final cuckoo table: 8B tag + 4B + 1B = 13 bytes
+pub const INDEX_SLOT_SIZE: usize = TAG_SIZE + 4 + 1;
 
 /// Size of one inlined chunk slot: 4B chunk_id + CHUNK_SIZE data
 pub const CHUNK_SLOT_SIZE: usize = 4 + CHUNK_SIZE; // 44

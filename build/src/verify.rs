@@ -17,7 +17,7 @@ const INDEX_FILE: &str = "/Volumes/Bitcoin/data/utxo_chunks_index_nodust.bin";
 /// Path to the serialized Batch PIR cuckoo tables
 const CUCKOO_FILE: &str = "/Volumes/Bitcoin/data/batch_pir_cuckoo.bin";
 
-const INDEX_ENTRY_SIZE: usize = 26;
+const INDEX_ENTRY_SIZE: usize = 25;
 const SCRIPT_HASH_SIZE: usize = 20;
 const MAGIC: u64 = 0xBA7C_C000_C000_0001;
 const HEADER_SIZE: usize = 32;

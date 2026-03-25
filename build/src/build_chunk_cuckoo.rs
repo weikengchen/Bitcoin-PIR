@@ -2,7 +2,7 @@
 //!
 //! 1. Reads the chunks file, computes N = file_size / 40.
 //! 2. Assigns each chunk_id (0..N) to 3 distinct buckets out of K_CHUNK=80.
-//! 3. Within each bucket, builds a cuckoo hash table (3 hash fns, bucket size 2,
+//! 3. Within each bucket, builds a cuckoo hash table (2 hash fns, bucket size 3,
 //!    load factor 0.95).  Each slot stores a u32 chunk_id internally.
 //! 4. Serialises all 80 tables to `chunk_pir_cuckoo.bin` with inlined data:
 //!    each slot is [4B chunk_id LE | 40B chunk_data] = 44 bytes.
@@ -34,8 +34,8 @@ const K: usize = 80;
 const NUM_HASHES: usize = 3;
 
 /// Cuckoo hash table parameters
-const CUCKOO_BUCKET_SIZE: usize = 2;
-const CUCKOO_NUM_HASHES: usize = 3;
+const CUCKOO_BUCKET_SIZE: usize = 3;
+const CUCKOO_NUM_HASHES: usize = 2;
 const CUCKOO_LOAD_FACTOR: f64 = 0.95;
 const CUCKOO_MAX_KICKS: usize = 2000;
 const EMPTY: u32 = u32::MAX;

@@ -31,15 +31,15 @@ pub const CHUNK_DPF_N: u8 = 21;
 
 // ─── Index-level constants ──────────────────────────────────────────────────
 
-/// Each cuckoo bin has CUCKOO_BUCKET_SIZE (3) slots, each INDEX_SLOT_SIZE (14) bytes.
+/// Each cuckoo bin has CUCKOO_BUCKET_SIZE (3) slots, each INDEX_SLOT_SIZE (13) bytes.
 pub const INDEX_SLOTS: usize = CUCKOO_BUCKET_SIZE; // 3
-pub const INDEX_RESULT_SIZE: usize = INDEX_SLOTS * INDEX_SLOT_SIZE; // 3 * 14 = 42
+pub const INDEX_RESULT_SIZE: usize = INDEX_SLOTS * INDEX_SLOT_SIZE; // 3 * 13 = 39
 
 // ─── Chunk-level constants ──────────────────────────────────────────────────
 
 /// Each slot: [4B chunk_id LE | UNIT_DATA_SIZE data]
 pub const CHUNK_SLOT_SIZE: usize = 4 + UNIT_DATA_SIZE;
-pub const CHUNK_SLOTS: usize = CHUNK_CUCKOO_BUCKET_SIZE; // 2
+pub const CHUNK_SLOTS: usize = CHUNK_CUCKOO_BUCKET_SIZE; // 3
 pub const CHUNK_RESULT_SIZE: usize = CHUNK_SLOTS * CHUNK_SLOT_SIZE;
 
 // ─── DPF bit extraction ────────────────────────────────────────────────────
@@ -156,7 +156,7 @@ fn process_bucket_generic(
 // ─── Index-level evaluation (inlined cuckoo tables) ─────────────────────────
 
 /// Fetch INDEX_SLOTS inlined index entries at `bin` directly from the table.
-/// Each slot is INDEX_SLOT_SIZE (14) bytes, stored contiguously.
+/// Each slot is INDEX_SLOT_SIZE (13) bytes, stored contiguously.
 #[inline]
 fn fetch_index_bin(table_bytes: &[u8], bin: usize, out: &mut [u8]) {
     let src_offset = bin * INDEX_RESULT_SIZE;
@@ -201,8 +201,8 @@ fn fetch_chunk_bin(table_bytes: &[u8], bin: usize, out: &mut [u8]) {
     out.copy_from_slice(&table_bytes[src_offset..src_offset + CHUNK_RESULT_SIZE]);
 }
 
-/// Process one chunk-level bucket: evaluate CHUNK_CUCKOO_NUM_HASHES (3) DPF keys, XOR-accumulate.
-/// Returns Vec of 3 results, each CHUNK_RESULT_SIZE bytes, plus timing.
+/// Process one chunk-level bucket: evaluate CHUNK_CUCKOO_NUM_HASHES (2) DPF keys, XOR-accumulate.
+/// Returns Vec of 2 results, each CHUNK_RESULT_SIZE bytes, plus timing.
 pub fn process_chunk_bucket(
     keys: &[&DpfKey],
     table_bytes: &[u8],
@@ -222,8 +222,8 @@ pub fn process_chunk_bucket(
 
 /// Find a matching tag in an index-level result's slots.
 /// `expected_tag` is the 8-byte fingerprint computed by the client.
-/// Returns (start_chunk_id, num_chunks, flags) if found.
-pub fn find_entry_in_index_result(result: &[u8], expected_tag: u64) -> Option<(u32, u32, u8)> {
+/// Returns (start_chunk_id, num_chunks) if found.
+pub fn find_entry_in_index_result(result: &[u8], expected_tag: u64) -> Option<(u32, u32)> {
     for slot in 0..INDEX_SLOTS {
         let base = slot * INDEX_SLOT_SIZE;
         let slot_tag = u64::from_le_bytes(result[base..base + TAG_SIZE].try_into().unwrap());
@@ -232,22 +232,10 @@ pub fn find_entry_in_index_result(result: &[u8], expected_tag: u64) -> Option<(u
                 result[base + TAG_SIZE..base + TAG_SIZE + 4].try_into().unwrap(),
             );
             let num_chunks = result[base + TAG_SIZE + 4] as u32;
-            let flags = result[base + TAG_SIZE + 5];
-            return Some((start_chunk_id, num_chunks, flags));
+            return Some((start_chunk_id, num_chunks));
         }
     }
     None
-}
-
-/// Decode chunk placement bits from the flags byte.
-/// Returns None if flags are not valid, or Some([h0, h1, h2]) where each h is the
-/// cuckoo hash function index (0-2) for the corresponding group.
-pub fn decode_placement(flags: u8) -> Option<[usize; 3]> {
-    if (flags >> 5) & 1 != 1 {
-        return None;
-    }
-    let encoded = (flags & 0x1F) as usize;
-    Some([encoded % 3, (encoded / 3) % 3, (encoded / 9) % 3])
 }
 
 /// Find a chunk_id in a chunk-level result's slots.
