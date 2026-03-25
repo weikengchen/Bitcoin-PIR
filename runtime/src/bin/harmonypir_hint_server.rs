@@ -21,10 +21,11 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use harmonypir::params::{Params, BETA};
+use harmonypir::params::Params;
 use harmonypir::prp::hoang::HoangPrp;
 use harmonypir::prp::Prp;
 use harmonypir::relocation::RelocationDS;
+use harmonypir_wasm; // for find_best_t, pad_n_for_t, compute_rounds
 
 // ─── Server data ────────────────────────────────────────────────────────────
 
@@ -87,44 +88,50 @@ impl HintServerData {
             _ => panic!("invalid level"),
         };
 
-        let n = bins_per_table;
+        let real_n = bins_per_table;
         let w = entry_size;
 
-        // Compute T (must divide 2N).
-        let t = find_best_t(n);
+        // Must use the SAME find_best_t + pad_n_for_t as the WASM client.
+        // WASM: T = sqrt(2n).round(), then pad n up so 2*padded_n % T == 0.
+        let t_raw = harmonypir_wasm::find_best_t(real_n as u32);
+        let (padded_n, t_val) = harmonypir_wasm::pad_n_for_t(real_n as u32, t_raw);
+        let pn = padded_n as usize;
+        let t = t_val as usize;
 
-        let params = Params::new(n, w, t).expect("valid params");
+        let params = Params::new(pn, w, t).expect("valid params");
         let m = params.m;
 
         // Derive per-bucket PRP key (same derivation as WASM client).
         let derived_key = derive_bucket_key(prp_key, k_offset + bucket_id as u32);
 
-        // Compute PRP rounds.
-        let domain = 2 * n;
-        let log_domain = (domain as f64).log2().ceil() as usize;
-        let r_raw = log_domain + 40;
-        let r = ((r_raw + BETA - 1) / BETA) * BETA;
+        // Compute PRP rounds using padded domain.
+        let domain = 2 * pn;
+        let r = harmonypir_wasm::compute_rounds(padded_n);
 
         let prp: Box<dyn Prp> = Box::new(HoangPrp::new(domain, r, &derived_key));
-        let ds = RelocationDS::new(n, t, prp).expect("DS init");
+        let ds = RelocationDS::new(pn, t, prp).expect("DS init");
 
         // Compute hint parities.
+        // Values 0..real_n are real DB rows; real_n..padded_n are virtual zeros.
         let mut hints: Vec<Vec<u8>> = (0..m).map(|_| vec![0u8; w]).collect();
 
         let table_offset = header_size + bucket_id as usize * bins_per_table * entry_size;
-        for k in 0..n {
+        for k in 0..pn {
             let cell = ds.locate(k).expect("locate during hint computation");
             let segment = cell / t;
 
-            let entry_offset = table_offset + k * entry_size;
-            let entry = &table_bytes[entry_offset..entry_offset + entry_size];
-            xor_into(&mut hints[segment], entry);
+            if k < real_n {
+                let entry_offset = table_offset + k * entry_size;
+                let entry = &table_bytes[entry_offset..entry_offset + entry_size];
+                xor_into(&mut hints[segment], entry);
+            }
+            // k >= real_n → virtual row, XOR with zeros = no-op
         }
 
         // Flatten hints.
         let flat: Vec<u8> = hints.into_iter().flat_map(|h| h.into_iter()).collect();
 
-        (bucket_id, n as u32, t as u32, m as u32, flat)
+        (bucket_id, padded_n, t_val as u32, m as u32, flat)
     }
 }
 
@@ -143,28 +150,6 @@ fn derive_bucket_key(master_key: &[u8; 16], bucket_id: u32) -> [u8; 16] {
         key[12 + i] ^= id_bytes[i];
     }
     key
-}
-
-/// Find balanced T that divides 2*n. Must match WASM client computation.
-fn find_best_t(n: usize) -> usize {
-    let two_n = 2 * n;
-    let t_approx = (two_n as f64).sqrt() as usize;
-    if t_approx > 0 && two_n % t_approx == 0 {
-        return t_approx;
-    }
-    for delta in 1..t_approx {
-        let up = t_approx + delta;
-        if up <= two_n && two_n % up == 0 {
-            return up;
-        }
-        if t_approx > delta {
-            let down = t_approx - delta;
-            if down > 0 && two_n % down == 0 {
-                return down;
-            }
-        }
-    }
-    1
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
@@ -269,20 +254,25 @@ async fn main() {
                         let num = hint_req.bucket_ids.len();
                         println!("[{}] Hint request: level={} buckets={}", peer, level, num);
 
-                        // Compute hints in parallel using rayon.
+                        // Stream hints as they complete.
+                        // Use a channel: rayon workers produce hints, tokio sends them.
                         let prp_key: [u8; 16] = hint_req.prp_key;
                         let bucket_ids = hint_req.bucket_ids.clone();
                         let data_ref = Arc::clone(&data);
 
-                        let results: Vec<_> = tokio::task::spawn_blocking(move || {
-                            bucket_ids.par_iter().map(|&bid| {
-                                data_ref.compute_hints_for_bucket(&prp_key, level, bid)
-                            }).collect()
-                        }).await.unwrap();
+                        let (tx, mut rx) = tokio::sync::mpsc::channel::<(u8, u32, u32, u32, Vec<u8>)>(4);
 
-                        // Stream results back.
-                        for (bucket_id, n, t, m, flat_hints) in results {
-                            // Wire: [4B len][1B RESP_HARMONY_HINTS][1B bucket_id][4B n][4B t][4B m][hints...]
+                        // Spawn blocking rayon work that sends each hint as it's computed.
+                        tokio::task::spawn_blocking(move || {
+                            bucket_ids.par_iter().for_each_with(tx, |tx, &bid| {
+                                let result = data_ref.compute_hints_for_bucket(&prp_key, level, bid);
+                                let _ = tx.blocking_send(result);
+                            });
+                        });
+
+                        // Receive and stream hints to client as they arrive.
+                        let mut sent = 0;
+                        while let Some((bucket_id, n, t, m, flat_hints)) = rx.recv().await {
                             let hint_payload_len = 1 + 1 + 4 + 4 + 4 + flat_hints.len();
                             let mut resp = Vec::with_capacity(4 + hint_payload_len);
                             resp.extend_from_slice(&(hint_payload_len as u32).to_le_bytes());
@@ -297,10 +287,11 @@ async fn main() {
                                 eprintln!("[{}] Send error: {}", peer, e);
                                 break;
                             }
+                            sent += 1;
                         }
 
-                        println!("[{}] Hints sent: level={} buckets={} in {:.2?}",
-                            peer, level, num, t_start.elapsed());
+                        println!("[{}] Hints streamed: level={} {}/{} buckets in {:.2?}",
+                            peer, level, sent, num, t_start.elapsed());
                     }
                     _ => {
                         let resp = Response::Error("unsupported request on hint server".into());
