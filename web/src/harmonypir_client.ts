@@ -750,7 +750,13 @@ export class HarmonyPirClient {
             if (found.numChunks === 0) {
               whaleQueries.add(qi);
               const qd = inspectorMap.get(qi);
-              if (qd) qd.isWhale = true;
+              if (qd) {
+                qd.isWhale = true;
+                qd.indexHashRound = h;
+                qd.startChunkId = found.startChunkId;
+                qd.numChunks = 0;
+                qd.tagHex = computeTag(this.tagSeed, scriptHashes[qi]).toString(16).padStart(16, '0');
+              }
             } else {
               indexResults.set(qi, found);
               // Inspector: record tag match details.
@@ -760,7 +766,7 @@ export class HarmonyPirClient {
                 qd.startChunkId = found.startChunkId;
                 qd.numChunks = found.numChunks;
                 // Compute tag hex for display.
-                qd.tagHex = bytesToHex(computeTag(this.tagSeed, scriptHashes[qi]));
+                qd.tagHex = computeTag(this.tagSeed, scriptHashes[qi]).toString(16).padStart(16, '0');
               }
             }
             foundThisPlacement.add(qi);
