@@ -20,8 +20,8 @@ import {
   reverseBytes,
 } from 'bitcoin-batch-pir-web-client';
 
-import { addressToPirScriptHash, addressToSpk } from './address.js';
-import type { Utxo, PirBackend } from './types.js';
+import { resolveToHash160, queryKey, queryToSpk } from './address.js';
+import type { Utxo, PirBackend, ScriptQuery } from './types.js';
 
 // ─── Unified client wrapper ────────────────────────────────────────────────
 
@@ -89,34 +89,41 @@ class PirClientWrapper {
   }
 
   /**
-   * Query multiple addresses in a single PIR batch.
-   * Returns a Map from address → Utxo[].
+   * Query multiple targets in a single PIR batch.
+   * Each target can be an address string or a { scriptPubKey } object.
+   * Returns a Map from canonical key → Utxo[].
    */
-  async queryBatch(addresses: string[]): Promise<Map<string, Utxo[]>> {
+  async queryBatch(queries: ScriptQuery[]): Promise<Map<string, Utxo[]>> {
+    const keys = queries.map(q => queryKey(q));
     const result = new Map<string, Utxo[]>();
 
     switch (this.backend.type) {
       case 'dpf': {
-        const scriptHashes = addresses.map(a => addressToPirScriptHash(a));
+        const scriptHashes = queries.map(q => resolveToHash160(q));
         const results = await this.dpfClient!.queryBatch(scriptHashes);
-        for (let i = 0; i < addresses.length; i++) {
-          result.set(addresses[i], results[i] ? normalizeQueryResult(results[i]!) : []);
+        for (let i = 0; i < queries.length; i++) {
+          result.set(keys[i], results[i] ? normalizeQueryResult(results[i]!) : []);
         }
         break;
       }
       case 'harmony': {
-        const harmonyResults = await this.harmonyClient!.queryBatch(addresses);
-        for (let i = 0; i < addresses.length; i++) {
+        // HarmonyPIR client takes address strings; for raw SPK queries,
+        // pass the HASH160 hex as the lookup key.
+        const harmonyKeys = queries.map(q =>
+          typeof q === 'string' ? q : bytesToHex(resolveToHash160(q))
+        );
+        const harmonyResults = await this.harmonyClient!.queryBatch(harmonyKeys);
+        for (let i = 0; i < queries.length; i++) {
           const hr = harmonyResults.get(i);
-          result.set(addresses[i], hr ? normalizeHarmonyResult(hr) : []);
+          result.set(keys[i], hr ? normalizeHarmonyResult(hr) : []);
         }
         break;
       }
       case 'onionpir': {
-        const scriptHashes = addresses.map(a => addressToPirScriptHash(a));
+        const scriptHashes = queries.map(q => resolveToHash160(q));
         const results = await this.onionpirClient!.queryBatch(scriptHashes);
-        for (let i = 0; i < addresses.length; i++) {
-          result.set(addresses[i], results[i] ? normalizeQueryResult(results[i]!) : []);
+        for (let i = 0; i < queries.length; i++) {
+          result.set(keys[i], results[i] ? normalizeQueryResult(results[i]!) : []);
         }
         break;
       }
@@ -169,30 +176,48 @@ export class PirUtxoProvider {
   }
 
   /**
-   * Fetch UTXOs for a single Bitcoin address via PIR.
+   * Fetch UTXOs for a single target via PIR.
    *
-   * Returns UTXOs in a format ready for bitcoinjs-lib PSBT:
+   * Accepts a Bitcoin address string or a raw scriptPubKey hex:
+   *   provider.fetchUtxos('bc1q...')
+   *   provider.fetchUtxos({ scriptPubKey: '5221...ae' })  // bare multisig
+   *
+   * Returns UTXOs ready for bitcoinjs-lib PSBT:
    *   psbt.addInput({
    *     hash: utxo.txid,
    *     index: utxo.vout,
    *     witnessUtxo: { script: scriptPubKeyBuffer, value: utxo.value }
    *   });
    */
-  async fetchUtxos(address: string): Promise<Utxo[]> {
-    const results = await this.client.queryBatch([address]);
-    return results.get(address) ?? [];
+  async fetchUtxos(query: ScriptQuery): Promise<Utxo[]> {
+    const key = queryKey(query);
+    const results = await this.client.queryBatch([query]);
+    return results.get(key) ?? [];
   }
 
   /**
-   * Fetch UTXOs for multiple addresses in a single PIR batch.
-   * Efficient: all addresses share the same PBC rounds.
+   * Fetch UTXOs for multiple targets in a single PIR batch.
+   * Efficient: all queries share the same PBC rounds.
+   *
+   * Accepts any mix of address strings and raw scriptPubKey objects:
+   *   provider.fetchUtxosBatch([
+   *     'bc1q...',                             // segwit address
+   *     { scriptPubKey: '5221...ae' },          // bare 2-of-3 multisig
+   *     'bc1p...',                              // taproot
+   *   ])
+   *
+   * Returns Map keyed by the canonical form: address string as-is,
+   * or "spk:<hex>" for raw scriptPubKey queries.
    */
-  async fetchUtxosBatch(addresses: string[]): Promise<Map<string, Utxo[]>> {
-    return this.client.queryBatch(addresses);
+  async fetchUtxosBatch(queries: ScriptQuery[]): Promise<Map<string, Utxo[]>> {
+    return this.client.queryBatch(queries);
   }
 
-  /** Get scriptPubKey hex for an address (for witnessUtxo construction). */
-  scriptPubKey(address: string): string {
-    return addressToSpk(address);
+  /**
+   * Get scriptPubKey hex for a query target (for witnessUtxo construction).
+   * For addresses, derives it. For raw SPK queries, returns it directly.
+   */
+  scriptPubKey(query: ScriptQuery): string {
+    return queryToSpk(query);
   }
 }

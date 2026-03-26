@@ -19,11 +19,12 @@ import type {
   AddressInfo,
   TxHistoryEntry,
   Utxo,
+  ScriptQuery,
 } from './types.js';
 
 import { PirUtxoProvider } from './utxo-provider.js';
 import { EsploraFallback } from './esplora-fallback.js';
-import { addressToElectrumScriptHash } from './address.js';
+import { addressToElectrumScriptHash, queryKey } from './address.js';
 
 // ─── Cache entry ────────────────────────────────────────────────────────────
 
@@ -96,20 +97,52 @@ export class PirExplorer implements Explorer {
     this.cache.set(address, { utxos, timestamp: Date.now() });
   }
 
-  /** Internal: get UTXOs for an address, using cache. */
-  private async getUtxos(address: string): Promise<Utxo[]> {
-    const cached = this.getCached(address);
+  /** Internal: get UTXOs for a query target, using cache. */
+  private async getUtxos(query: ScriptQuery): Promise<Utxo[]> {
+    const key = queryKey(query);
+    const cached = this.getCached(key);
     if (cached) return cached;
 
-    const utxos = await this.provider.fetchUtxos(address);
-    this.setCache(address, utxos);
+    const utxos = await this.provider.fetchUtxos(query);
+    this.setCache(key, utxos);
     return utxos;
+  }
+
+  /** Internal: batch-get UTXOs for multiple targets, using cache. */
+  private async getUtxosBatch(queries: ScriptQuery[]): Promise<Map<string, Utxo[]>> {
+    const result = new Map<string, Utxo[]>();
+    const uncached: ScriptQuery[] = [];
+
+    for (const q of queries) {
+      const key = queryKey(q);
+      const cached = this.getCached(key);
+      if (cached) {
+        result.set(key, cached);
+      } else {
+        uncached.push(q);
+      }
+    }
+
+    if (uncached.length > 0) {
+      const fetched = await this.provider.fetchUtxosBatch(uncached);
+      for (const [key, utxos] of fetched) {
+        this.setCache(key, utxos);
+        result.set(key, utxos);
+      }
+    }
+
+    return result;
   }
 
   // ─── Privacy-sensitive methods (PIR-backed) ─────────────────────────────
 
-  async fetchAddress(address: string): Promise<AddressInfo> {
-    const utxos = await this.getUtxos(address);
+  /**
+   * Fetch address info. Accepts an address string or raw scriptPubKey:
+   *   explorer.fetchAddress('bc1q...')
+   *   explorer.fetchAddress({ scriptPubKey: '5221...ae' })
+   */
+  async fetchAddress(query: ScriptQuery): Promise<AddressInfo> {
+    const utxos = await this.getUtxos(query);
     return utxosToAddressInfo(utxos);
   }
 
@@ -124,34 +157,42 @@ export class PirExplorer implements Explorer {
     return { balance: 0, txCount: 0, unconfirmedBalance: 0, unconfirmedTxCount: 0 };
   }
 
+  /**
+   * Fetch tx history for a single target.
+   * Accepts address string or raw scriptPubKey via `scriptPubKey` field.
+   */
   async fetchTxHistory(params: {
     address?: string;
     scriptHash?: string;
+    scriptPubKey?: string;
   }): Promise<TxHistoryEntry[]> {
-    const { address } = params;
-    if (!address) {
-      // Cannot derive address from scriptHash alone
-      this.log('fetchTxHistory: no address provided, returning empty');
+    const query: ScriptQuery | null = params.address
+      ? params.address
+      : params.scriptPubKey
+        ? { scriptPubKey: params.scriptPubKey }
+        : null;
+
+    if (!query) {
+      this.log('fetchTxHistory: no address or scriptPubKey provided, returning empty');
       return [];
     }
 
-    const utxos = await this.getUtxos(address);
+    return utxosToTxHistory(await this.getUtxos(query));
+  }
 
-    // Extract unique txids from UTXO set
-    const seen = new Set<string>();
-    const entries: TxHistoryEntry[] = [];
-    for (const u of utxos) {
-      if (!seen.has(u.txid)) {
-        seen.add(u.txid);
-        entries.push({
-          txId: u.txid,
-          blockHeight: 0,      // Unknown from PIR; consumer calls fetchTx to learn more
-          irreversible: true,   // In the confirmed UTXO set
-        });
-      }
+  /**
+   * Batch-fetch tx history for multiple targets in a single PIR batch.
+   * Accepts any mix of address strings and raw scriptPubKey objects.
+   *
+   * Returns Map keyed by canonical form (address or "spk:<hex>").
+   */
+  async fetchTxHistoryBatch(queries: ScriptQuery[]): Promise<Map<string, TxHistoryEntry[]>> {
+    const batchUtxos = await this.getUtxosBatch(queries);
+    const result = new Map<string, TxHistoryEntry[]>();
+    for (const [key, utxos] of batchUtxos) {
+      result.set(key, utxosToTxHistory(utxos));
     }
-
-    return entries;
+    return result;
   }
 
   // ─── Non-sensitive methods (Esplora fallback) ───────────────────────────
@@ -192,4 +233,20 @@ function utxosToAddressInfo(utxos: Utxo[]): AddressInfo {
     unconfirmedBalance: 0,
     unconfirmedTxCount: 0,
   };
+}
+
+function utxosToTxHistory(utxos: Utxo[]): TxHistoryEntry[] {
+  const seen = new Set<string>();
+  const entries: TxHistoryEntry[] = [];
+  for (const u of utxos) {
+    if (!seen.has(u.txid)) {
+      seen.add(u.txid);
+      entries.push({
+        txId: u.txid,
+        blockHeight: 0,      // Unknown from PIR; consumer calls fetchTx to learn more
+        irreversible: true,   // In the confirmed UTXO set
+      });
+    }
+  }
+  return entries;
 }

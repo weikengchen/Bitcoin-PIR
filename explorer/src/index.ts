@@ -21,6 +21,9 @@ export {
   addressToSpk,
   addressToPirScriptHash,
   addressToElectrumScriptHash,
+  resolveToHash160,
+  queryKey,
+  queryToSpk,
 } from './address.js';
 
 export type {
@@ -31,4 +34,5 @@ export type {
   Utxo,
   PirBackend,
   PirExplorerConfig,
+  ScriptQuery,
 } from './types.js';

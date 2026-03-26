@@ -6,6 +6,17 @@
  * runtime dependency.
  */
 
+// ─── Query input types ──────────────────────────────────────────────────────
+
+/**
+ * A query target: either a standard Bitcoin address string, or a raw
+ * scriptPubKey hex for scripts that have no address encoding (e.g. bare
+ * multisig: OP_2 <pk1> <pk2> <pk3> OP_3 OP_CHECKMULTISIG).
+ *
+ * Both paths converge to HASH160(scriptPubKey) internally.
+ */
+export type ScriptQuery = string | { scriptPubKey: string };
+
 // ─── UTXO type ──────────────────────────────────────────────────────────────
 
 /** A confirmed UTXO returned by PIR. */

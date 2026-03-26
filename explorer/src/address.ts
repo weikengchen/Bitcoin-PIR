@@ -14,6 +14,8 @@ import {
   reverseBytes,
 } from 'bitcoin-batch-pir-web-client';
 
+import type { ScriptQuery } from './types.js';
+
 /**
  * Convert a Bitcoin address to its scriptPubKey hex.
  * Supports P2PKH, P2SH, P2WPKH, P2WSH, P2TR.
@@ -56,6 +58,40 @@ export function addressToElectrumScriptHash(address: string): string {
  */
 export function electrumScriptHashToSpk(_scriptHash: string): null {
   return null;
+}
+
+// ─── ScriptQuery resolution ─────────────────────────────────────────────────
+
+/**
+ * Resolve a ScriptQuery (address string or raw scriptPubKey hex) to the
+ * 20-byte HASH160 used as the PIR database key.
+ *
+ * Both paths converge: address → scriptPubKey → HASH160(spk).
+ */
+export function resolveToHash160(query: ScriptQuery): Uint8Array {
+  if (typeof query === 'string') {
+    return addressToPirScriptHash(query);
+  }
+  const spkBytes = hexToBytes(query.scriptPubKey);
+  return hash160(spkBytes);
+}
+
+/**
+ * Return a stable string key for a ScriptQuery, suitable for Map keys / caching.
+ * For addresses, returns the address itself. For raw SPK, returns "spk:<hex>".
+ */
+export function queryKey(query: ScriptQuery): string {
+  if (typeof query === 'string') return query;
+  return `spk:${query.scriptPubKey}`;
+}
+
+/**
+ * Get the scriptPubKey hex for a ScriptQuery.
+ * For addresses, derives it. For raw SPK, returns it directly.
+ */
+export function queryToSpk(query: ScriptQuery): string {
+  if (typeof query === 'string') return addressToSpk(query);
+  return query.scriptPubKey;
 }
 
 export { hexToBytes, bytesToHex, reverseBytes };
