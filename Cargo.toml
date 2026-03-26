@@ -4,6 +4,7 @@ members = ["build",
     "runtime",
     "harmonypir-wasm",
 ]
+exclude = ["electrum_plugin/harmonypir-python"]
 
 [profile.release]
 opt-level = 3

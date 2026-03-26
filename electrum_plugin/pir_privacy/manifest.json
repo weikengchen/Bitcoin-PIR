@@ -1,0 +1,7 @@
+{
+    "display_name": "PIR Privacy",
+    "description": "Privacy-preserving wallet sync via Private Information Retrieval (PIR). Replaces Electrum's address-leaking server queries with PIR lookups — the server learns nothing about which addresses you own.",
+    "requires_wallet_type": ["standard", "2of2", "2of3"],
+    "available_for": ["qt", "cmdline"],
+    "version": "0.1.0"
+}
