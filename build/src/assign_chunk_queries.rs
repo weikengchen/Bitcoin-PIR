@@ -108,7 +108,7 @@ fn main() {
 
     let mut success = true;
     for i in 0..num_chunk_queries {
-        if !cuckoo_place(&candidates, &mut buckets, i) {
+        if !pbc_cuckoo_place(&candidates, &mut buckets, i, MAX_KICKS, NUM_HASHES) {
             eprintln!("  FAILED to place chunk query {} (chunk_id={}) after {} kicks",
                 i, chunk_queries[i], MAX_KICKS);
             success = false;
@@ -203,54 +203,4 @@ fn main() {
     }
     println!();
     println!("Done.");
-}
-
-/// Try to place query `qi` into one of its candidate buckets using cuckoo eviction.
-fn cuckoo_place(
-    candidates: &[[usize; NUM_HASHES]],
-    buckets: &mut [Option<usize>; K_CHUNK],
-    qi: usize,
-) -> bool {
-    let cands = &candidates[qi];
-
-    for &c in cands {
-        if buckets[c].is_none() {
-            buckets[c] = Some(qi);
-            return true;
-        }
-    }
-
-    let mut current_qi = qi;
-    let mut current_bucket = candidates[current_qi][0];
-
-    for kick in 0..MAX_KICKS {
-        let evicted_qi = buckets[current_bucket].unwrap();
-        buckets[current_bucket] = Some(current_qi);
-
-        let ev_cands = &candidates[evicted_qi];
-
-        for offset in 0..NUM_HASHES {
-            let c = ev_cands[(kick + offset) % NUM_HASHES];
-            if c == current_bucket {
-                continue;
-            }
-            if buckets[c].is_none() {
-                buckets[c] = Some(evicted_qi);
-                return true;
-            }
-        }
-
-        let mut next_bucket = ev_cands[0];
-        for offset in 0..NUM_HASHES {
-            let c = ev_cands[(kick + offset) % NUM_HASHES];
-            if c != current_bucket {
-                next_bucket = c;
-                break;
-            }
-        }
-        current_qi = evicted_qi;
-        current_bucket = next_bucket;
-    }
-
-    false
 }

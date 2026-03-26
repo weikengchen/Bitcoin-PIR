@@ -18,7 +18,7 @@ import {
 import {
   deriveBuckets, deriveCuckooKey, cuckooHash,
   deriveChunkBuckets, deriveChunkCuckooKey, cuckooHashInt,
-  splitmix64, computeTag,
+  computeTag,
 } from './hash.js';
 
 import { genDpfKeys, genChunkDpfKeys } from './dpf.js';
@@ -27,6 +27,9 @@ import {
   encodeRequest, decodeResponse,
   type Request, type Response, type BatchQuery, type BatchResult, type ServerInfo,
 } from './protocol.js';
+
+import { cuckooPlace, planRounds } from './pbc.js';
+import { readVarint, decodeUtxoData, DummyRng } from './codec.js';
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -53,21 +56,6 @@ export interface BatchPirClientConfig {
   server1Url: string;
   onConnectionStateChange?: (state: ConnectionState, message?: string) => void;
   onLog?: (message: string, level: 'info' | 'success' | 'error') => void;
-}
-
-// ─── PRNG for dummy queries ────────────────────────────────────────────────
-
-class DummyRng {
-  private state: bigint;
-
-  constructor() {
-    this.state = splitmix64(BigInt(Date.now()));
-  }
-
-  nextU64(): bigint {
-    this.state = (this.state + 0x9e3779b97f4a7c15n) & 0xFFFFFFFFFFFFFFFFn;
-    return splitmix64(this.state);
-  }
 }
 
 // ─── Client ────────────────────────────────────────────────────────────────
@@ -339,162 +327,9 @@ export class BatchPirClient {
     return null;
   }
 
-  // ─── Cuckoo placement (generic) ───────────────────────────────────────
+  // ─── Cuckoo placement and round planning (delegates to shared pbc.ts) ──
 
-  /** Cuckoo placement with eviction. Returns true if qi was placed. */
-  private cuckooPlace(
-    candBuckets: number[][],
-    buckets: (number | null)[],
-    qi: number,
-    maxKicks: number,
-  ): boolean {
-    const cands = candBuckets[qi];
-
-    // Try direct placement
-    for (const c of cands) {
-      if (buckets[c] === null) {
-        buckets[c] = qi;
-        return true;
-      }
-    }
-
-    // Eviction loop
-    let currentQi = qi;
-    let currentBucket = candBuckets[currentQi][0];
-
-    for (let kick = 0; kick < maxKicks; kick++) {
-      const evictedQi = buckets[currentBucket]!;
-      buckets[currentBucket] = currentQi;
-      const evCands = candBuckets[evictedQi];
-
-      for (let offset = 0; offset < NUM_HASHES; offset++) {
-        const c = evCands[(kick + offset) % NUM_HASHES];
-        if (c === currentBucket) continue;
-        if (buckets[c] === null) {
-          buckets[c] = evictedQi;
-          return true;
-        }
-      }
-
-      let nextBucket = evCands[0];
-      for (let offset = 0; offset < NUM_HASHES; offset++) {
-        const c = evCands[(kick + offset) % NUM_HASHES];
-        if (c !== currentBucket) {
-          nextBucket = c;
-          break;
-        }
-      }
-      currentQi = evictedQi;
-      currentBucket = nextBucket;
-    }
-
-    return false;
-  }
-
-  /**
-   * Plan multi-round placement for items with NUM_HASHES candidate buckets.
-   * Returns rounds, each round is array of [itemIndex, bucketId].
-   */
-  private planRounds(
-    itemBuckets: number[][],
-    numBuckets: number,
-  ): [number, number][][] {
-    let remaining = itemBuckets.map((_, i) => i);
-    const rounds: [number, number][][] = [];
-
-    while (remaining.length > 0) {
-      const candBuckets = remaining.map(i => itemBuckets[i]);
-      const bucketOwner: (number | null)[] = new Array(numBuckets).fill(null);
-      const placedLocal: number[] = [];
-
-      for (let li = 0; li < candBuckets.length; li++) {
-        if (placedLocal.length >= numBuckets) break;
-        const savedBuckets = [...bucketOwner];
-        if (this.cuckooPlace(candBuckets, bucketOwner, li, 500)) {
-          placedLocal.push(li);
-        } else {
-          for (let b = 0; b < numBuckets; b++) bucketOwner[b] = savedBuckets[b];
-        }
-      }
-
-      const roundEntries: [number, number][] = [];
-      for (let b = 0; b < numBuckets; b++) {
-        const localIdx = bucketOwner[b];
-        if (localIdx !== null) {
-          roundEntries.push([remaining[localIdx], b]);
-        }
-      }
-
-      if (roundEntries.length === 0) {
-        this.log(`ERROR: could not place any items, ${remaining.length} remaining`, 'error');
-        break;
-      }
-
-      const placedOrigIdx = new Set(placedLocal.map(li => remaining[li]));
-      remaining = remaining.filter(i => !placedOrigIdx.has(i));
-      rounds.push(roundEntries);
-    }
-
-    return rounds;
-  }
-
-  // ─── Varint decoder ───────────────────────────────────────────────────
-
-  private readVarint(data: Uint8Array, offset: number): { value: bigint; bytesRead: number } {
-    let result = 0n;
-    let shift = 0;
-    let bytesRead = 0;
-
-    while (true) {
-      if (offset + bytesRead >= data.length) {
-        throw new Error('Unexpected end of data while reading varint');
-      }
-      const byte = data[offset + bytesRead];
-      bytesRead++;
-      result |= BigInt(byte & 0x7F) << BigInt(shift);
-      if ((byte & 0x80) === 0) break;
-      shift += 7;
-      if (shift >= 64) throw new Error('VarInt too large');
-    }
-
-    return { value: result, bytesRead };
-  }
-
-  // ─── Decode UTXO data from chunk bytes ────────────────────────────────
-
-  private decodeUtxoData(fullData: Uint8Array): { entries: UtxoEntry[]; totalSats: bigint } {
-    let pos = 0;
-    const { value: numEntries, bytesRead: countBytes } = this.readVarint(fullData, pos);
-    pos += countBytes;
-
-    const entries: UtxoEntry[] = [];
-    let totalSats = 0n;
-
-    for (let i = 0; i < Number(numEntries); i++) {
-      if (pos + 32 > fullData.length) {
-        this.log(`Data truncated at entry ${i}`, 'error');
-        break;
-      }
-
-      const txid = fullData.slice(pos, pos + 32);
-      pos += 32;
-
-      const { value: vout, bytesRead: vr } = this.readVarint(fullData, pos);
-      pos += vr;
-
-      const { value: amount, bytesRead: ar } = this.readVarint(fullData, pos);
-      pos += ar;
-
-      totalSats += amount;
-      entries.push({
-        txid: new Uint8Array(txid),
-        vout: Number(vout),
-        amount,
-      });
-    }
-
-    return { entries, totalSats };
-  }
+  // ─── Decode UTXO data (delegates to shared codec.ts) ──────────────────
 
   // ─── Single-query method (for backward compat) ────────────────────────
 
@@ -541,7 +376,7 @@ export class BatchPirClient {
     const indexCandBuckets = scriptHashes.map(sh => deriveBuckets(sh));
 
     // Plan index rounds using cuckoo placement
-    const indexRounds = this.planRounds(indexCandBuckets, K);
+    const indexRounds = planRounds(indexCandBuckets, K, NUM_HASHES, (msg) => this.log(msg, 'error'));
     this.log(`Level 1: ${N} queries → ${indexRounds.length} index round(s)`);
 
     // Per-query results from Level 1: query index → { startChunkId, numChunks }
@@ -659,9 +494,11 @@ export class BatchPirClient {
 
     // Plan chunk rounds collectively
     const chunkCandBuckets = allChunkIds.map(cid => deriveChunkBuckets(cid));
-    const chunkRounds = this.planRounds(
+    const chunkRounds = planRounds(
       chunkCandBuckets,
       K_CHUNK,
+      NUM_HASHES,
+      (msg) => this.log(msg, 'error'),
     );
     // chunkRounds[r][i] = [chunkListIndex, bucketId]
     this.log(`  ${allChunkIds.length} chunks → ${chunkRounds.length} chunk round(s)`);
@@ -789,7 +626,7 @@ export class BatchPirClient {
         this.log(`Query ${qi}: ${missing} chunks missing`, 'error');
       }
 
-      const { entries, totalSats } = this.decodeUtxoData(fullData);
+      const { entries, totalSats } = decodeUtxoData(fullData, (msg) => this.log(msg, 'error'));
       results[qi] = {
         entries,
         totalSats,

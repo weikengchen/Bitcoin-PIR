@@ -17,6 +17,9 @@ import {
   splitmix64, computeTag,
 } from './hash.js';
 
+import { cuckooPlace, planRounds } from './pbc.js';
+import { readVarint, decodeUtxoData, DummyRng } from './codec.js';
+
 import type { UtxoEntry, QueryResult, ConnectionState } from './client.js';
 
 // ─── Constants for OnionPIR v2 layout ─────────────────────────────────────
@@ -175,119 +178,16 @@ function findEntryInCuckoo(
   return null;
 }
 
-// ─── PBC batch placement ──────────────────────────────────────────────────
+// ─── PBC batch placement (uses shared pbc.ts) ───────────────────────────────
 
 function planPbcRounds(
   candidateGroups: number[][],
   k: number,
 ): [number, number][][] {
-  let remaining = candidateGroups.map((_, i) => i);
-  const rounds: [number, number][][] = [];
-
-  while (remaining.length > 0) {
-    const roundCands = remaining.map(i => candidateGroups[i]);
-    const buckets: (number | null)[] = new Array(k).fill(null);
-    const placedLocal: number[] = [];
-
-    for (let li = 0; li < roundCands.length; li++) {
-      if (placedLocal.length >= k) break;
-      const saved = [...buckets];
-      if (pbcCuckooPlace(roundCands, buckets, li, 500)) {
-        placedLocal.push(li);
-      } else {
-        for (let b = 0; b < k; b++) buckets[b] = saved[b];
-      }
-    }
-
-    const round: [number, number][] = [];
-    for (let g = 0; g < k; g++) {
-      if (buckets[g] !== null) {
-        round.push([remaining[buckets[g]!], g]);
-      }
-    }
-
-    if (round.length === 0) break;
-
-    const placedSet = new Set(placedLocal.map(li => remaining[li]));
-    remaining = remaining.filter(i => !placedSet.has(i));
-    rounds.push(round);
-  }
-
-  return rounds;
+  return planRounds(candidateGroups, k, NUM_HASHES);
 }
 
-function pbcCuckooPlace(
-  cands: number[][],
-  buckets: (number | null)[],
-  qi: number,
-  maxKicks: number,
-): boolean {
-  for (const c of cands[qi]) {
-    if (buckets[c] === null) {
-      buckets[c] = qi;
-      return true;
-    }
-  }
-
-  let currentQi = qi;
-  let currentBucket = cands[qi][0];
-
-  for (let kick = 0; kick < maxKicks; kick++) {
-    const evictedQi = buckets[currentBucket]!;
-    buckets[currentBucket] = currentQi;
-
-    for (let offset = 0; offset < NUM_HASHES; offset++) {
-      const c = cands[evictedQi][(kick + offset) % NUM_HASHES];
-      if (c === currentBucket) continue;
-      if (buckets[c] === null) {
-        buckets[c] = evictedQi;
-        return true;
-      }
-    }
-
-    let nextBucket = cands[evictedQi][0];
-    for (let offset = 0; offset < NUM_HASHES; offset++) {
-      const c = cands[evictedQi][(kick + offset) % NUM_HASHES];
-      if (c !== currentBucket) {
-        nextBucket = c;
-        break;
-      }
-    }
-    currentQi = evictedQi;
-    currentBucket = nextBucket;
-  }
-
-  return false;
-}
-
-// ─── PRNG for dummy queries ───────────────────────────────────────────────
-
-class DummyRng {
-  private state: bigint;
-  constructor() { this.state = splitmix64(BigInt(Date.now())); }
-  nextU64(): bigint {
-    this.state = (this.state + 0x9e3779b97f4a7c15n) & MASK64;
-    return splitmix64(this.state);
-  }
-}
-
-// ─── Varint decoder ───────────────────────────────────────────────────────
-
-function readVarint(data: Uint8Array, offset: number): { value: bigint; bytesRead: number } {
-  let result = 0n;
-  let shift = 0;
-  let bytesRead = 0;
-  while (true) {
-    if (offset + bytesRead >= data.length) throw new Error('Unexpected end of varint');
-    const byte = data[offset + bytesRead];
-    bytesRead++;
-    result |= BigInt(byte & 0x7F) << BigInt(shift);
-    if ((byte & 0x80) === 0) break;
-    shift += 7;
-    if (shift >= 64) throw new Error('Varint too large');
-  }
-  return { value: result, bytesRead };
-}
+// DummyRng and readVarint imported from codec.ts
 
 // ─── Wire protocol helpers ────────────────────────────────────────────────
 
@@ -515,26 +415,10 @@ export class OnionPirWebClient {
     return null;
   }
 
-  // ─── UTXO decoder ─────────────────────────────────────────────────────
+  // ─── UTXO decoder (delegates to shared codec.ts) ────────────────────────
 
   private decodeUtxoData(fullData: Uint8Array): { entries: UtxoEntry[]; totalSats: bigint } {
-    let pos = 0;
-    const { value: numEntries, bytesRead: countBytes } = readVarint(fullData, pos);
-    pos += countBytes;
-    const entries: UtxoEntry[] = [];
-    let totalSats = 0n;
-    for (let i = 0; i < Number(numEntries); i++) {
-      if (pos + 32 > fullData.length) break;
-      const txid = fullData.slice(pos, pos + 32);
-      pos += 32;
-      const { value: vout, bytesRead: vr } = readVarint(fullData, pos);
-      pos += vr;
-      const { value: amount, bytesRead: ar } = readVarint(fullData, pos);
-      pos += ar;
-      totalSats += amount;
-      entries.push({ txid: new Uint8Array(txid), vout: Number(vout), amount });
-    }
-    return { entries, totalSats };
+    return decodeUtxoData(fullData, (msg) => this.log(msg, 'error'));
   }
 
   // ═══════════════════════════════════════════════════════════════════════

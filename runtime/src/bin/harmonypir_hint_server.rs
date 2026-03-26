@@ -11,9 +11,7 @@ use build::common::*;
 use runtime::protocol::*;
 
 use futures_util::{SinkExt, StreamExt};
-use memmap2::Mmap;
 use rayon::prelude::*;
-use std::fs::File;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -27,35 +25,16 @@ use harmonypir_wasm; // for find_best_t, pad_n_for_t, compute_rounds
 
 // ─── Server data ────────────────────────────────────────────────────────────
 
-struct HintServerData {
-    index_cuckoo: Mmap,
-    index_bins_per_table: usize,
-    tag_seed: u64,
+use runtime::table::CuckooTablePair;
 
-    chunk_cuckoo: Mmap,
-    chunk_bins_per_table: usize,
+struct HintServerData {
+    tables: CuckooTablePair,
 }
 
 impl HintServerData {
     fn load() -> Self {
-        println!("[1] Loading index cuckoo: {}", CUCKOO_FILE);
-        let f = File::open(CUCKOO_FILE).expect("open index cuckoo");
-        let index_cuckoo = unsafe { Mmap::map(&f) }.expect("mmap index cuckoo");
-        let (index_bins_per_table, tag_seed) = read_cuckoo_header(&index_cuckoo);
-        println!("  bins_per_table = {}, tag_seed = 0x{:016x}", index_bins_per_table, tag_seed);
-
-        println!("[2] Loading chunk cuckoo: {}", CHUNK_CUCKOO_FILE);
-        let f = File::open(CHUNK_CUCKOO_FILE).expect("open chunk cuckoo");
-        let chunk_cuckoo = unsafe { Mmap::map(&f) }.expect("mmap chunk cuckoo");
-        let chunk_bins_per_table = read_chunk_cuckoo_header(&chunk_cuckoo);
-        println!("  bins_per_table = {}", chunk_bins_per_table);
-
         HintServerData {
-            index_cuckoo,
-            index_bins_per_table,
-            tag_seed,
-            chunk_cuckoo,
-            chunk_bins_per_table,
+            tables: CuckooTablePair::load(),
         }
     }
 
@@ -71,15 +50,15 @@ impl HintServerData {
     ) -> (u8, u32, u32, u32, Vec<u8>) {
         let (table_bytes, bins_per_table, entry_size, header_size, k_offset) = match level {
             0 => (
-                &self.index_cuckoo[..],
-                self.index_bins_per_table,
+                &self.tables.index_cuckoo[..],
+                self.tables.index_bins_per_table,
                 CUCKOO_BUCKET_SIZE * INDEX_SLOT_SIZE,
                 HEADER_SIZE,
                 0u32,
             ),
             1 => (
-                &self.chunk_cuckoo[..],
-                self.chunk_bins_per_table,
+                &self.tables.chunk_cuckoo[..],
+                self.tables.chunk_bins_per_table,
                 CHUNK_CUCKOO_BUCKET_SIZE * (4 + CHUNK_SIZE),
                 CHUNK_HEADER_SIZE,
                 K as u32, // Chunk buckets use offset bucket IDs for PRP derivation
@@ -203,8 +182,8 @@ async fn main() {
     let addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
     let listener = TcpListener::bind(addr).await.expect("bind");
     println!("Listening on ws://{}", addr);
-    println!("  Index: K={}, bins_per_table={}", K, data.index_bins_per_table);
-    println!("  Chunk: K_CHUNK={}, bins_per_table={}", K_CHUNK, data.chunk_bins_per_table);
+    println!("  Index: K={}, bins_per_table={}", K, data.tables.index_bins_per_table);
+    println!("  Chunk: K_CHUNK={}, bins_per_table={}", K_CHUNK, data.tables.chunk_bins_per_table);
     println!();
 
     loop {
@@ -257,11 +236,11 @@ async fn main() {
                     }
                     Request::HarmonyGetInfo | Request::GetInfo => {
                         let resp = Response::HarmonyInfo(ServerInfo {
-                            index_bins_per_table: data.index_bins_per_table as u32,
-                            chunk_bins_per_table: data.chunk_bins_per_table as u32,
+                            index_bins_per_table: data.tables.index_bins_per_table as u32,
+                            chunk_bins_per_table: data.tables.chunk_bins_per_table as u32,
                             index_k: K as u8,
                             chunk_k: K_CHUNK as u8,
-                            tag_seed: data.tag_seed,
+                            tag_seed: data.tables.tag_seed,
                         });
                         let _ = sink.send(Message::Binary(resp.encode().into())).await;
                     }

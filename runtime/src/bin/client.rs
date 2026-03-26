@@ -119,98 +119,23 @@ async fn ws_roundtrip(
 /// Plan multi-round chunk retrieval for a set of chunk_ids.
 /// Returns Vec of rounds, each round is Vec of (chunk_id, bucket_id).
 fn plan_chunk_rounds(chunk_ids: &[u32]) -> Vec<Vec<(u32, u8)>> {
-    let mut remaining: Vec<u32> = chunk_ids.to_vec();
-    let mut rounds = Vec::new();
+    let cand_buckets: Vec<[usize; NUM_HASHES]> = chunk_ids
+        .iter()
+        .map(|&cid| derive_chunk_buckets(cid))
+        .collect();
 
-    while !remaining.is_empty() {
-        let candidates: Vec<(u32, [usize; NUM_HASHES])> = remaining
-            .iter()
-            .map(|&cid| (cid, derive_chunk_buckets(cid)))
-            .collect();
+    let rounds = pbc_plan_rounds(&cand_buckets, K_CHUNK, NUM_HASHES, 500);
 
-        // Try to place up to K_CHUNK items
-        let mut buckets: [Option<usize>; K_CHUNK] = [None; K_CHUNK];
-        let mut round_entries: Vec<(u32, u8)> = Vec::new();
-        let mut placed_set = Vec::new();
-
-        let cand_buckets: Vec<[usize; NUM_HASHES]> = candidates.iter().map(|c| c.1).collect();
-
-        for i in 0..candidates.len() {
-            if round_entries.len() >= K_CHUNK {
-                break;
-            }
-            let saved = buckets;
-            if cuckoo_place(&cand_buckets, &mut buckets, i, 500) {
-                placed_set.push(i);
-            } else {
-                buckets = saved;
-            }
-        }
-
-        // Extract placed entries
-        for b in 0..K_CHUNK {
-            if let Some(ci) = buckets[b] {
-                round_entries.push((candidates[ci].0, b as u8));
-            }
-        }
-
-        if round_entries.is_empty() {
-            eprintln!("ERROR: could not place any chunks in round, {} remaining", remaining.len());
-            break;
-        }
-
-        // Remove placed from remaining
-        let placed_ids: Vec<u32> = placed_set.iter().map(|&i| candidates[i].0).collect();
-        remaining.retain(|cid| !placed_ids.contains(cid));
-
-        rounds.push(round_entries);
-    }
-
+    // Map (item_index, bucket_id) back to (chunk_id, bucket_id as u8)
     rounds
-}
-
-fn cuckoo_place(
-    cand_buckets: &[[usize; NUM_HASHES]],
-    buckets: &mut [Option<usize>; K_CHUNK],
-    qi: usize,
-    max_kicks: usize,
-) -> bool {
-    let cands = &cand_buckets[qi];
-    for &c in cands {
-        if buckets[c].is_none() {
-            buckets[c] = Some(qi);
-            return true;
-        }
-    }
-    let mut current_qi = qi;
-    let mut current_bucket = cand_buckets[current_qi][0];
-
-    for kick in 0..max_kicks {
-        let evicted_qi = buckets[current_bucket].unwrap();
-        buckets[current_bucket] = Some(current_qi);
-        let ev_cands = &cand_buckets[evicted_qi];
-
-        for offset in 0..NUM_HASHES {
-            let c = ev_cands[(kick + offset) % NUM_HASHES];
-            if c == current_bucket { continue; }
-            if buckets[c].is_none() {
-                buckets[c] = Some(evicted_qi);
-                return true;
-            }
-        }
-
-        let mut next_bucket = ev_cands[0];
-        for offset in 0..NUM_HASHES {
-            let c = ev_cands[(kick + offset) % NUM_HASHES];
-            if c != current_bucket {
-                next_bucket = c;
-                break;
-            }
-        }
-        current_qi = evicted_qi;
-        current_bucket = next_bucket;
-    }
-    false
+        .into_iter()
+        .map(|round| {
+            round
+                .into_iter()
+                .map(|(item_idx, bucket)| (chunk_ids[item_idx], bucket as u8))
+                .collect()
+        })
+        .collect()
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
@@ -535,23 +460,7 @@ async fn main() {
     println!("  Chunks: {}, Rounds: {}", num_chunks, rounds.len());
 }
 
-// Decode a varint (LEB128 unsigned) from a byte slice.
-// Returns (value, bytes_consumed).
-fn read_varint(data: &[u8]) -> (u64, usize) {
-    let mut value: u64 = 0;
-    let mut shift = 0;
-    for (i, &byte) in data.iter().enumerate() {
-        value |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 == 0 {
-            return (value, i + 1);
-        }
-        shift += 7;
-        if shift >= 64 {
-            panic!("varint too large");
-        }
-    }
-    panic!("unexpected end of varint data");
-}
+// read_varint uses shared build::common::read_varint
 
 // Helper to receive a binary response, handling pings
 async fn recv_response(

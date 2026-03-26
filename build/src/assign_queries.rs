@@ -57,6 +57,7 @@ fn main() {
 
     // ── Compute candidate buckets for each query ─────────────────────────
     let mut queries: Vec<QueryInfo> = Vec::with_capacity(num_queries);
+    let mut candidate_buckets: Vec<[usize; NUM_HASHES]> = Vec::with_capacity(num_queries);
     for i in 0..num_queries {
         let sh = &data[i * SCRIPT_HASH_SIZE..(i + 1) * SCRIPT_HASH_SIZE];
         let candidates = derive_buckets(sh);
@@ -64,6 +65,7 @@ fn main() {
             query_idx: i,
             candidates,
         });
+        candidate_buckets.push(candidates);
     }
 
     // ── Cuckoo assign queries to buckets ─────────────────────────────────
@@ -73,7 +75,7 @@ fn main() {
 
     let mut success = true;
     for i in 0..num_queries {
-        if !cuckoo_place(&queries, &mut buckets, i) {
+        if !pbc_cuckoo_place(&candidate_buckets, &mut buckets, i, MAX_KICKS, NUM_HASHES) {
             eprintln!("  FAILED to place query {} after {} kicks", i, MAX_KICKS);
             success = false;
             break;
@@ -174,59 +176,4 @@ fn main() {
     }
     println!();
     println!("Done.");
-}
-
-/// Try to place query `qi` into one of its candidate buckets using cuckoo eviction.
-fn cuckoo_place(
-    queries: &[QueryInfo],
-    buckets: &mut [Option<usize>; K],
-    qi: usize,
-) -> bool {
-    let cands = &queries[qi].candidates;
-
-    // Try each candidate directly
-    for &c in cands {
-        if buckets[c].is_none() {
-            buckets[c] = Some(qi);
-            return true;
-        }
-    }
-
-    // Eviction: kick from the first candidate
-    let mut current_qi = qi;
-    let mut current_bucket = queries[current_qi].candidates[0];
-
-    for kick in 0..MAX_KICKS {
-        // Place current in current_bucket, evicting whoever is there
-        let evicted_qi = buckets[current_bucket].unwrap();
-        buckets[current_bucket] = Some(current_qi);
-
-        // Try to place evicted query in one of its OTHER candidate buckets
-        let ev_cands = &queries[evicted_qi].candidates;
-
-        for offset in 0..NUM_HASHES {
-            let c = ev_cands[(kick + offset) % NUM_HASHES];
-            if c == current_bucket {
-                continue;
-            }
-            if buckets[c].is_none() {
-                buckets[c] = Some(evicted_qi);
-                return true;
-            }
-        }
-
-        // Pick an alternative bucket to continue evicting from
-        let mut next_bucket = ev_cands[0];
-        for offset in 0..NUM_HASHES {
-            let c = ev_cands[(kick + offset) % NUM_HASHES];
-            if c != current_bucket {
-                next_bucket = c;
-                break;
-            }
-        }
-        current_qi = evicted_qi;
-        current_bucket = next_bucket;
-    }
-
-    false
 }

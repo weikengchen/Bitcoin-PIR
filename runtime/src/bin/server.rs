@@ -12,9 +12,7 @@ use runtime::protocol::{BatchQuery, BatchResult, Request, Response, ServerInfo};
 use build::common::*;
 use futures_util::{SinkExt, StreamExt};
 use libdpf::DpfKey;
-use memmap2::Mmap;
 use rayon::prelude::*;
-use std::fs::File;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,79 +22,16 @@ use tokio_tungstenite::tungstenite::Message;
 
 // ─── Server data ────────────────────────────────────────────────────────────
 
-struct ServerData {
-    // Level 1 (Index) — inlined cuckoo table
-    index_cuckoo: Mmap,
-    index_bins_per_table: usize,
-    index_table_byte_size: usize,
-    tag_seed: u64,
+use runtime::table::CuckooTablePair;
 
-    // Level 2 (Chunk) — inlined cuckoo table
-    chunk_cuckoo: Mmap,
-    chunk_bins_per_table: usize,
-    chunk_table_byte_size: usize,
+struct ServerData {
+    tables: CuckooTablePair,
 }
 
 impl ServerData {
     fn load() -> Self {
-        println!("[1] Loading inlined index cuckoo: {}", CUCKOO_FILE);
-        let index_cuckoo_file = File::open(CUCKOO_FILE).expect("open index cuckoo");
-        let index_cuckoo = unsafe { Mmap::map(&index_cuckoo_file) }.expect("mmap index cuckoo");
-        let (index_bins_per_table, tag_seed) = read_cuckoo_header(&index_cuckoo);
-        // Inlined: each bin has CUCKOO_BUCKET_SIZE slots × INDEX_SLOT_SIZE bytes
-        let index_table_byte_size = index_bins_per_table * CUCKOO_BUCKET_SIZE * INDEX_SLOT_SIZE;
-        println!("  bins_per_table = {}, slot_size = {}B, table_size = {:.1} MB",
-            index_bins_per_table, INDEX_SLOT_SIZE,
-            index_table_byte_size as f64 / (1024.0 * 1024.0));
-        println!("  tag_seed = 0x{:016x}", tag_seed);
-        println!("  total file = {:.2} GB", index_cuckoo.len() as f64 / (1024.0 * 1024.0 * 1024.0));
-
-        // Advise sequential access for the inlined table
-        #[cfg(unix)]
-        {
-            use libc::{madvise, MADV_SEQUENTIAL};
-            unsafe {
-                madvise(
-                    index_cuckoo.as_ptr() as *mut libc::c_void,
-                    index_cuckoo.len(),
-                    MADV_SEQUENTIAL,
-                );
-            }
-        }
-
-        println!("[2] Loading inlined chunk cuckoo: {}", CHUNK_CUCKOO_FILE);
-        let chunk_cuckoo_file = File::open(CHUNK_CUCKOO_FILE).expect("open chunk cuckoo");
-        let chunk_cuckoo = unsafe { Mmap::map(&chunk_cuckoo_file) }.expect("mmap chunk cuckoo");
-        let chunk_bins_per_table = read_chunk_cuckoo_header(&chunk_cuckoo);
-        // Inlined: each bin has CHUNK_CUCKOO_BUCKET_SIZE slots × CHUNK_SLOT_SIZE bytes
-        let chunk_slot_size = 4 + CHUNK_SIZE; // 44 bytes
-        let chunk_table_byte_size = chunk_bins_per_table * CHUNK_CUCKOO_BUCKET_SIZE * chunk_slot_size;
-        println!("  bins_per_table = {}, slot_size = {}B, table_size = {:.1} MB",
-            chunk_bins_per_table, chunk_slot_size,
-            chunk_table_byte_size as f64 / (1024.0 * 1024.0));
-        println!("  total file = {:.2} GB", chunk_cuckoo.len() as f64 / (1024.0 * 1024.0 * 1024.0));
-
-        // Advise sequential access for the inlined table
-        #[cfg(unix)]
-        {
-            use libc::{madvise, MADV_SEQUENTIAL};
-            unsafe {
-                madvise(
-                    chunk_cuckoo.as_ptr() as *mut libc::c_void,
-                    chunk_cuckoo.len(),
-                    MADV_SEQUENTIAL,
-                );
-            }
-        }
-
         ServerData {
-            index_cuckoo,
-            index_bins_per_table,
-            index_table_byte_size,
-            tag_seed,
-            chunk_cuckoo,
-            chunk_bins_per_table,
-            chunk_table_byte_size,
+            tables: CuckooTablePair::load(),
         }
     }
 
@@ -109,12 +44,12 @@ impl ServerData {
                     .map(|k| DpfKey::from_bytes(k).expect("bad dpf key"))
                     .collect();
                 let key_refs: Vec<&DpfKey> = dpf_keys.iter().collect();
-                let table_offset = HEADER_SIZE + b * self.index_table_byte_size;
-                let table_bytes = &self.index_cuckoo[table_offset..table_offset + self.index_table_byte_size];
+                let table_offset = HEADER_SIZE + b * self.tables.index_table_byte_size;
+                let table_bytes = &self.tables.index_cuckoo[table_offset..table_offset + self.tables.index_table_byte_size];
                 let (r0, r1, timing) = eval::process_index_bucket(
                     &key_refs[0], &key_refs[1],
                     table_bytes,
-                    self.index_bins_per_table,
+                    self.tables.index_bins_per_table,
                 );
                 (vec![r0, r1], timing)
             })
@@ -141,12 +76,12 @@ impl ServerData {
                     .map(|k| DpfKey::from_bytes(k).expect("bad dpf key"))
                     .collect();
                 let key_refs: Vec<&DpfKey> = dpf_keys.iter().collect();
-                let table_offset = CHUNK_HEADER_SIZE + b * self.chunk_table_byte_size;
-                let table_bytes = &self.chunk_cuckoo[table_offset..table_offset + self.chunk_table_byte_size];
+                let table_offset = CHUNK_HEADER_SIZE + b * self.tables.chunk_table_byte_size;
+                let table_bytes = &self.tables.chunk_cuckoo[table_offset..table_offset + self.tables.chunk_table_byte_size];
                 let (r, timing) = eval::process_chunk_bucket(
                     &key_refs,
                     table_bytes,
-                    self.chunk_bins_per_table,
+                    self.tables.chunk_bins_per_table,
                 );
                 (r, timing)
             })
@@ -174,14 +109,14 @@ impl ServerData {
     ) -> Response {
         let (table_bytes, bins_per_table, entry_size, header_size) = match query.level {
             0 => (
-                &self.index_cuckoo[..],
-                self.index_bins_per_table,
+                &self.tables.index_cuckoo[..],
+                self.tables.index_bins_per_table,
                 CUCKOO_BUCKET_SIZE * INDEX_SLOT_SIZE,
                 HEADER_SIZE,
             ),
             1 => (
-                &self.chunk_cuckoo[..],
-                self.chunk_bins_per_table,
+                &self.tables.chunk_cuckoo[..],
+                self.tables.chunk_bins_per_table,
                 CHUNK_CUCKOO_BUCKET_SIZE * (4 + CHUNK_SIZE),
                 CHUNK_HEADER_SIZE,
             ),
@@ -238,14 +173,14 @@ impl ServerData {
     fn handle_harmony_query(&self, query: &runtime::protocol::HarmonyQuery) -> Response {
         let (table_bytes, bins_per_table, entry_size, header_size) = match query.level {
             0 => (
-                &self.index_cuckoo[..],
-                self.index_bins_per_table,
+                &self.tables.index_cuckoo[..],
+                self.tables.index_bins_per_table,
                 CUCKOO_BUCKET_SIZE * INDEX_SLOT_SIZE,
                 HEADER_SIZE,
             ),
             1 => (
-                &self.chunk_cuckoo[..],
-                self.chunk_bins_per_table,
+                &self.tables.chunk_cuckoo[..],
+                self.tables.chunk_bins_per_table,
                 CHUNK_CUCKOO_BUCKET_SIZE * (4 + CHUNK_SIZE),
                 CHUNK_HEADER_SIZE,
             ),
@@ -314,9 +249,9 @@ async fn main() {
     let listener = TcpListener::bind(addr).await.expect("bind");
     println!("Listening on ws://{}", addr);
     println!("  Index: K={}, bins_per_table={}, cuckoo={}-hash bs={}",
-        K, data.index_bins_per_table, INDEX_CUCKOO_NUM_HASHES, CUCKOO_BUCKET_SIZE);
+        K, data.tables.index_bins_per_table, INDEX_CUCKOO_NUM_HASHES, CUCKOO_BUCKET_SIZE);
     println!("  Chunk: K={}, bins_per_table={}, cuckoo={}-hash bs={}",
-        K_CHUNK, data.chunk_bins_per_table, CHUNK_CUCKOO_NUM_HASHES, CHUNK_CUCKOO_BUCKET_SIZE);
+        K_CHUNK, data.tables.chunk_bins_per_table, CHUNK_CUCKOO_NUM_HASHES, CHUNK_CUCKOO_BUCKET_SIZE);
     println!();
 
     loop {
@@ -381,11 +316,11 @@ async fn main() {
                     match request {
                         Request::Ping => Response::Pong,
                         Request::GetInfo => Response::Info(ServerInfo {
-                            index_bins_per_table: data_ref.index_bins_per_table as u32,
-                            chunk_bins_per_table: data_ref.chunk_bins_per_table as u32,
+                            index_bins_per_table: data_ref.tables.index_bins_per_table as u32,
+                            chunk_bins_per_table: data_ref.tables.chunk_bins_per_table as u32,
                             index_k: K as u8,
                             chunk_k: K_CHUNK as u8,
-                            tag_seed: data_ref.tag_seed,
+                            tag_seed: data_ref.tables.tag_seed,
                         }),
                         Request::IndexBatch(q) => {
                             let t = Instant::now();
@@ -409,11 +344,11 @@ async fn main() {
                             Response::ChunkBatch(batch)
                         }
                         Request::HarmonyGetInfo => Response::HarmonyInfo(ServerInfo {
-                            index_bins_per_table: data_ref.index_bins_per_table as u32,
-                            chunk_bins_per_table: data_ref.chunk_bins_per_table as u32,
+                            index_bins_per_table: data_ref.tables.index_bins_per_table as u32,
+                            chunk_bins_per_table: data_ref.tables.chunk_bins_per_table as u32,
                             index_k: K as u8,
                             chunk_k: K_CHUNK as u8,
-                            tag_seed: data_ref.tag_seed,
+                            tag_seed: data_ref.tables.tag_seed,
                         }),
                         Request::HarmonyQuery(q) => {
                             let t = Instant::now();

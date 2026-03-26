@@ -168,56 +168,11 @@ fn cuckoo_assign(
     let num = queries.len();
 
     for i in 0..num {
-        if !cuckoo_place(queries, &mut buckets, i) {
+        if !pbc_cuckoo_place(queries, &mut buckets, i, MAX_KICKS, NUM_HASHES) {
             return Err("Cuckoo assignment failed");
         }
     }
     Ok(buckets)
-}
-
-fn cuckoo_place(
-    queries: &[[usize; NUM_HASHES]],
-    buckets: &mut [Option<usize>; K],
-    qi: usize,
-) -> bool {
-    let cands = &queries[qi];
-    for &c in cands {
-        if buckets[c].is_none() {
-            buckets[c] = Some(qi);
-            return true;
-        }
-    }
-    let mut current_qi = qi;
-    let mut current_bucket = queries[current_qi][0];
-
-    for kick in 0..MAX_KICKS {
-        let evicted_qi = buckets[current_bucket].unwrap();
-        buckets[current_bucket] = Some(current_qi);
-        let ev_cands = &queries[evicted_qi];
-
-        for offset in 0..NUM_HASHES {
-            let c = ev_cands[(kick + offset) % NUM_HASHES];
-            if c == current_bucket {
-                continue;
-            }
-            if buckets[c].is_none() {
-                buckets[c] = Some(evicted_qi);
-                return true;
-            }
-        }
-
-        let mut next_bucket = ev_cands[0];
-        for offset in 0..NUM_HASHES {
-            let c = ev_cands[(kick + offset) % NUM_HASHES];
-            if c != current_bucket {
-                next_bucket = c;
-                break;
-            }
-        }
-        current_qi = evicted_qi;
-        current_bucket = next_bucket;
-    }
-    false
 }
 
 // ─── Main test ───────────────────────────────────────────────────────────────

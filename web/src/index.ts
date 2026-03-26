@@ -95,4 +95,17 @@ export {
   createHarmonyPirClient,
   type HarmonyPirClientConfig,
   type HarmonyQueryResult,
+  type HarmonyUtxoEntry,
 } from './harmonypir_client.js';
+
+export {
+  cuckooPlace,
+  planRounds,
+} from './pbc.js';
+
+export {
+  readVarint,
+  decodeUtxoData,
+  DummyRng,
+  type UtxoEntryRaw,
+} from './codec.js';

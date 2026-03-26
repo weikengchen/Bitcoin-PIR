@@ -10,23 +10,19 @@ Port of web/src/client.ts to Python.
 
 from __future__ import annotations
 
-import struct
 import logging
-import time
 from dataclasses import dataclass, field
 from typing import Optional, Callable
 
 from .pir_constants import (
     K, K_CHUNK, NUM_HASHES,
-    TAG_SIZE, INDEX_ENTRY_SIZE,
-    CUCKOO_BUCKET_SIZE, INDEX_CUCKOO_NUM_HASHES,
-    CHUNK_CUCKOO_BUCKET_SIZE, CHUNK_CUCKOO_NUM_HASHES,
-    CHUNK_SLOT_SIZE, CHUNKS_PER_UNIT, UNIT_DATA_SIZE,
+    INDEX_CUCKOO_NUM_HASHES,
+    CHUNK_CUCKOO_NUM_HASHES,
+    CHUNKS_PER_UNIT, UNIT_DATA_SIZE,
     DPF_N, CHUNK_DPF_N,
-    MASK64,
 )
 from .pir_hash import (
-    splitmix64, compute_tag,
+    compute_tag,
     derive_buckets, derive_cuckoo_key, cuckoo_hash,
     derive_chunk_buckets, derive_chunk_cuckoo_key, cuckoo_hash_int,
 )
@@ -36,6 +32,10 @@ from .pir_protocol import (
     decode_response, ServerInfo,
 )
 from .pir_ws_client import PirConnection
+from .pir_common import (
+    cuckoo_place, plan_rounds, read_varint, decode_utxo_data,
+    find_entry_in_index_result, find_chunk_in_result, DummyRng,
+)
 
 import asyncio
 
@@ -68,18 +68,6 @@ class QueryResult:
     is_whale: bool = False
 
 
-# ── PRNG for dummy queries ─────────────────────────────────────────────────
-
-
-class _DummyRng:
-    def __init__(self):
-        self.state = splitmix64(int(time.time() * 1000) & MASK64)
-
-    def next_u64(self) -> int:
-        self.state = (self.state + 0x9e3779b97f4a7c15) & MASK64
-        return splitmix64(self.state)
-
-
 # ── Client ─────────────────────────────────────────────────────────────────
 
 
@@ -91,7 +79,7 @@ class BatchPirClient:
         self.server1_url = server1_url
         self._conn0 = PirConnection(server0_url)
         self._conn1 = PirConnection(server1_url)
-        self._rng = _DummyRng()
+        self._rng = DummyRng()
 
         # Server info (fetched on connect)
         self.index_bins = 0
@@ -146,173 +134,8 @@ class BatchPirClient:
             result[i] = (a[i] if i < la else 0) ^ (b[i] if i < lb else 0)
         return bytes(result)
 
-    # ── Index result parsing ───────────────────────────────────────────────
-
-    @staticmethod
-    def _find_entry_in_index_result(
-        result: bytes, expected_tag: int
-    ) -> Optional[tuple[int, int]]:
-        """Search cuckoo bin slots for matching tag. Returns (start_chunk_id, num_chunks) or None."""
-        for slot in range(CUCKOO_BUCKET_SIZE):
-            base = slot * INDEX_ENTRY_SIZE
-            slot_tag = struct.unpack_from('<Q', result, base)[0]
-            if slot_tag == expected_tag:
-                start_chunk_id = struct.unpack_from('<I', result, base + TAG_SIZE)[0]
-                num_chunks = result[base + TAG_SIZE + 4]
-                return (start_chunk_id, num_chunks)
-        return None
-
-    # ── Chunk result parsing ───────────────────────────────────────────────
-
-    @staticmethod
-    def _find_chunk_in_result(result: bytes, chunk_id: int) -> Optional[bytes]:
-        """Search chunk slots for matching chunk_id. Returns chunk data or None."""
-        target = struct.pack('<I', chunk_id)
-        for slot in range(CHUNK_CUCKOO_BUCKET_SIZE):
-            base = slot * CHUNK_SLOT_SIZE
-            if result[base:base + 4] == target:
-                return result[base + 4:base + CHUNK_SLOT_SIZE]
-        return None
-
-    # ── Cuckoo placement ───────────────────────────────────────────────────
-
-    @staticmethod
-    def _cuckoo_place(
-        cand_buckets: list[list[int]],
-        buckets: list[Optional[int]],
-        qi: int,
-        max_kicks: int,
-    ) -> bool:
-        """Cuckoo placement with eviction. Returns True if qi was placed."""
-        cands = cand_buckets[qi]
-
-        # Try direct placement
-        for c in cands:
-            if buckets[c] is None:
-                buckets[c] = qi
-                return True
-
-        # Eviction loop
-        current_qi = qi
-        current_bucket = cand_buckets[current_qi][0]
-
-        for kick in range(max_kicks):
-            evicted_qi = buckets[current_bucket]
-            buckets[current_bucket] = current_qi
-            ev_cands = cand_buckets[evicted_qi]
-
-            for offset in range(NUM_HASHES):
-                c = ev_cands[(kick + offset) % NUM_HASHES]
-                if c == current_bucket:
-                    continue
-                if buckets[c] is None:
-                    buckets[c] = evicted_qi
-                    return True
-
-            next_bucket = ev_cands[0]
-            for offset in range(NUM_HASHES):
-                c = ev_cands[(kick + offset) % NUM_HASHES]
-                if c != current_bucket:
-                    next_bucket = c
-                    break
-            current_qi = evicted_qi
-            current_bucket = next_bucket
-
-        return False
-
-    def _plan_rounds(
-        self,
-        item_buckets: list[list[int]],
-        num_buckets: int,
-    ) -> list[list[tuple[int, int]]]:
-        """
-        Plan multi-round placement for items with NUM_HASHES candidate buckets.
-        Returns rounds, each round is a list of (item_index, bucket_id) tuples.
-        """
-        remaining = list(range(len(item_buckets)))
-        rounds: list[list[tuple[int, int]]] = []
-
-        while remaining:
-            cand_buckets = [item_buckets[i] for i in remaining]
-            bucket_owner: list[Optional[int]] = [None] * num_buckets
-            placed_local: list[int] = []
-
-            for li in range(len(cand_buckets)):
-                if len(placed_local) >= num_buckets:
-                    break
-                saved = list(bucket_owner)
-                if self._cuckoo_place(cand_buckets, bucket_owner, li, 500):
-                    placed_local.append(li)
-                else:
-                    for b in range(num_buckets):
-                        bucket_owner[b] = saved[b]
-
-            round_entries: list[tuple[int, int]] = []
-            for b in range(num_buckets):
-                local_idx = bucket_owner[b]
-                if local_idx is not None:
-                    round_entries.append((remaining[local_idx], b))
-
-            if not round_entries:
-                logger.error(f'Could not place any items, {len(remaining)} remaining')
-                break
-
-            placed_orig = {remaining[li] for li in placed_local}
-            remaining = [i for i in remaining if i not in placed_orig]
-            rounds.append(round_entries)
-
-        return rounds
-
-    # ── Varint decoder ─────────────────────────────────────────────────────
-
-    @staticmethod
-    def _read_varint(data: bytes, offset: int) -> tuple[int, int]:
-        """Read a varint. Returns (value, bytes_read)."""
-        result = 0
-        shift = 0
-        bytes_read = 0
-        while True:
-            if offset + bytes_read >= len(data):
-                raise ValueError('Unexpected end of data while reading varint')
-            byte = data[offset + bytes_read]
-            bytes_read += 1
-            result |= (byte & 0x7F) << shift
-            if (byte & 0x80) == 0:
-                break
-            shift += 7
-            if shift >= 64:
-                raise ValueError('VarInt too large')
-        return (result, bytes_read)
-
-    # ── Decode UTXO data from chunk bytes ──────────────────────────────────
-
-    def _decode_utxo_data(self, full_data: bytes) -> tuple[list[UtxoEntry], int]:
-        """Decode varint-encoded UTXO entries. Returns (entries, total_sats)."""
-        pos = 0
-        num_entries, count_bytes = self._read_varint(full_data, pos)
-        pos += count_bytes
-
-        entries: list[UtxoEntry] = []
-        total_sats = 0
-
-        for i in range(num_entries):
-            if pos + 32 > len(full_data):
-                logger.error(f'Data truncated at entry {i}')
-                break
-
-            txid = full_data[pos:pos + 32]
-            pos += 32
-
-            vout, vr = self._read_varint(full_data, pos)
-            pos += vr
-
-            amount, ar = self._read_varint(full_data, pos)
-            pos += ar
-
-            total_sats += amount
-            entries.append(UtxoEntry(txid=txid, vout=vout, amount=amount))
-
-        return (entries, total_sats)
+    # Index/chunk result parsing, cuckoo placement, varint, and UTXO decoding
+    # are provided by pir_common module.
 
     # ── Single query ───────────────────────────────────────────────────────
 
@@ -357,7 +180,7 @@ class BatchPirClient:
         index_cand_buckets = [derive_buckets(sh) for sh in script_hashes]
 
         # Plan index rounds using cuckoo placement
-        index_rounds = self._plan_rounds(index_cand_buckets, K)
+        index_rounds = plan_rounds(index_cand_buckets, K, NUM_HASHES)
         logger.info(f'Level 1: {N} queries -> {len(index_rounds)} index round(s)')
 
         # Per-query results from Level 1
@@ -421,7 +244,7 @@ class BatchPirClient:
                 expected_tag = compute_tag(self.tag_seed, script_hashes[query_idx])
                 for h in range(INDEX_CUCKOO_NUM_HASHES):
                     result = self._xor_bytes(r0[h], r1[h])
-                    found = self._find_entry_in_index_result(result, expected_tag)
+                    found = find_entry_in_index_result(result, expected_tag)
                     if found:
                         break
 
@@ -460,7 +283,7 @@ class BatchPirClient:
 
         # Plan chunk rounds
         chunk_cand_buckets = [derive_chunk_buckets(cid) for cid in all_chunk_ids]
-        chunk_rounds = self._plan_rounds(chunk_cand_buckets, K_CHUNK)
+        chunk_rounds = plan_rounds(chunk_cand_buckets, K_CHUNK, NUM_HASHES)
         logger.info(f'  {len(all_chunk_ids)} chunks -> {len(chunk_rounds)} chunk round(s)')
 
         # Execute chunk rounds
@@ -521,7 +344,7 @@ class BatchPirClient:
                 data = None
                 for h in range(len(cr0)):
                     result = self._xor_bytes(cr0[h], cr1[h])
-                    data = self._find_chunk_in_result(result, chunk_id)
+                    data = find_chunk_in_result(result, chunk_id)
                     if data:
                         break
 
@@ -564,7 +387,7 @@ class BatchPirClient:
             if missing > 0:
                 logger.error(f'Query {qi}: {missing} chunks missing')
 
-            entries, total_sats = self._decode_utxo_data(bytes(full_data))
+            entries, total_sats = decode_utxo_data(bytes(full_data))
             results[qi] = QueryResult(
                 entries=entries,
                 total_sats=total_sats,

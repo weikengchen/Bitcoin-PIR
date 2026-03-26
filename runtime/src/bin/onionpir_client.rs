@@ -139,102 +139,7 @@ impl DummyRng {
     }
 }
 
-// ─── PBC batch placement ────────────────────────────────────────────────────
-
-/// Place items into groups using PBC cuckoo hashing.
-/// Each item has NUM_HASHES (3) candidate groups out of `k` total groups.
-/// Returns rounds of (original_item_index, assigned_group).
-/// Each group has at most 1 item per round.
-fn plan_pbc_rounds(
-    candidate_groups: &[[usize; NUM_HASHES]],
-    k: usize,
-) -> Vec<Vec<(usize, usize)>> {
-    let mut remaining: Vec<usize> = (0..candidate_groups.len()).collect();
-    let mut rounds = Vec::new();
-
-    while !remaining.is_empty() {
-        let round_cands: Vec<[usize; NUM_HASHES]> = remaining.iter()
-            .map(|&orig| candidate_groups[orig])
-            .collect();
-
-        let mut buckets: Vec<Option<usize>> = vec![None; k];
-        let mut placed_round_indices = Vec::new();
-
-        for ri in 0..round_cands.len() {
-            if placed_round_indices.len() >= k { break; }
-            let saved = buckets.clone();
-            if pbc_cuckoo_place(&round_cands, &mut buckets, ri, 500) {
-                placed_round_indices.push(ri);
-            } else {
-                buckets = saved;
-            }
-        }
-
-        let mut round = Vec::new();
-        for g in 0..k {
-            if let Some(ri) = buckets[g] {
-                round.push((remaining[ri], g));
-            }
-        }
-
-        if round.is_empty() {
-            eprintln!("PBC placement failed for {} remaining items", remaining.len());
-            break;
-        }
-
-        let placed_originals: Vec<usize> = placed_round_indices.iter()
-            .map(|&ri| remaining[ri]).collect();
-        remaining.retain(|idx| !placed_originals.contains(idx));
-
-        rounds.push(round);
-    }
-
-    rounds
-}
-
-fn pbc_cuckoo_place(
-    cands: &[[usize; NUM_HASHES]],
-    buckets: &mut [Option<usize>],
-    qi: usize,
-    max_kicks: usize,
-) -> bool {
-    for &c in &cands[qi] {
-        if buckets[c].is_none() {
-            buckets[c] = Some(qi);
-            return true;
-        }
-    }
-
-    let mut current_qi = qi;
-    let mut current_bucket = cands[qi][0];
-
-    for kick in 0..max_kicks {
-        let evicted_qi = buckets[current_bucket].unwrap();
-        buckets[current_bucket] = Some(current_qi);
-
-        for offset in 0..NUM_HASHES {
-            let c = cands[evicted_qi][(kick + offset) % NUM_HASHES];
-            if c == current_bucket { continue; }
-            if buckets[c].is_none() {
-                buckets[c] = Some(evicted_qi);
-                return true;
-            }
-        }
-
-        let mut next_bucket = cands[evicted_qi][0];
-        for offset in 0..NUM_HASHES {
-            let c = cands[evicted_qi][(kick + offset) % NUM_HASHES];
-            if c != current_bucket {
-                next_bucket = c;
-                break;
-            }
-        }
-        current_qi = evicted_qi;
-        current_bucket = next_bucket;
-    }
-
-    false
-}
+// PBC batch placement uses shared build::common::{pbc_cuckoo_place, pbc_plan_rounds}
 
 // ─── Chunk cuckoo hash utilities (6-hash, bucket_size=1) ────────────────────
 
@@ -353,19 +258,7 @@ fn find_entry_in_cuckoo(
     None
 }
 
-// ─── Varint ─────────────────────────────────────────────────────────────────
-
-fn read_varint(data: &[u8]) -> (u64, usize) {
-    let mut value: u64 = 0;
-    let mut shift = 0;
-    for (i, &byte) in data.iter().enumerate() {
-        value |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 == 0 { return (value, i + 1); }
-        shift += 7;
-        if shift >= 64 { panic!("varint too large"); }
-    }
-    panic!("unexpected end of varint");
-}
+// read_varint uses shared build::common::read_varint
 
 // ─── Index query helpers ────────────────────────────────────────────────────
 
@@ -502,7 +395,7 @@ async fn main() {
 
     // PBC place all addresses into groups
     let all_groups: Vec<[usize; NUM_HASHES]> = addr_infos.iter().map(|a| a.groups).collect();
-    let index_rounds = plan_pbc_rounds(&all_groups, index_k);
+    let index_rounds = pbc_plan_rounds(&all_groups, index_k, NUM_HASHES, 500);
     println!("  PBC placement: {} addresses → {} round{}",
         num_addresses, index_rounds.len(),
         if index_rounds.len() == 1 { "" } else { "s" });
@@ -609,7 +502,7 @@ async fn main() {
     let entry_pbc_groups: Vec<[usize; NUM_HASHES]> = unique_entry_ids.iter()
         .map(|&eid| derive_chunk_buckets(eid))
         .collect();
-    let chunk_rounds = plan_pbc_rounds(&entry_pbc_groups, chunk_k);
+    let chunk_rounds = pbc_plan_rounds(&entry_pbc_groups, chunk_k, NUM_HASHES, 500);
 
     println!("  {} unique entries → {} chunk round{}",
         unique_entry_ids.len(), chunk_rounds.len(),

@@ -27,6 +27,9 @@ import {
   hexToBytes, bytesToHex,
 } from './hash.js';
 
+import { cuckooPlace, planRounds } from './pbc.js';
+import { readVarint, decodeUtxoData } from './codec.js';
+
 import { HarmonyWorkerPool, BuildItem, BuildResult, ProcessItem } from './harmonypir_worker_pool.js';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -39,7 +42,7 @@ export interface HarmonyPirClientConfig {
   prpBackend?: number;
 }
 
-export interface UtxoEntry {
+export interface HarmonyUtxoEntry {
   txid: string;
   vout: number;
   value: number;
@@ -48,7 +51,7 @@ export interface UtxoEntry {
 export interface HarmonyQueryResult {
   address: string;
   scriptHash: string;
-  utxos: UtxoEntry[];
+  utxos: HarmonyUtxoEntry[];
   whale: boolean;
 }
 
@@ -394,8 +397,8 @@ export class HarmonyPirClient {
     return null;
   }
 
-  /** Decode UTXOs from chunk data. Varint-encoded format matching DPF-PIR. */
-  private decodeUtxos(chunks: Uint8Array[]): UtxoEntry[] {
+  /** Decode UTXOs from chunk data. Uses shared codec, converts to HarmonyUtxoEntry format. */
+  private decodeUtxos(chunks: Uint8Array[]): HarmonyUtxoEntry[] {
     if (chunks.length === 0) return [];
 
     // Concatenate all chunk data.
@@ -407,47 +410,12 @@ export class HarmonyPirClient {
       pos += chunk.length;
     }
 
-    // Format: [varint numEntries][per entry: 32B txid, varint vout, varint amount]
-    const { value: numEntries, bytesRead: countBytes } = this.readVarint(data, 0);
-    pos = countBytes;
-
-    const utxos: UtxoEntry[] = [];
-    for (let i = 0; i < Number(numEntries); i++) {
-      if (pos + 32 > data.length) break;
-
-      const txidBytes = data.slice(pos, pos + 32);
-      pos += 32;
-
-      const { value: vout, bytesRead: vr } = this.readVarint(data, pos);
-      pos += vr;
-
-      const { value: amount, bytesRead: ar } = this.readVarint(data, pos);
-      pos += ar;
-
-      const txid = bytesToHex(new Uint8Array([...txidBytes].reverse()));
-      utxos.push({ txid, vout: Number(vout), value: Number(amount) });
-    }
-
-    return utxos;
-  }
-
-  /** Read a LEB128 varint from data at offset. */
-  private readVarint(data: Uint8Array, offset: number): { value: bigint; bytesRead: number } {
-    let result = 0n;
-    let shift = 0;
-    let bytesRead = 0;
-    while (true) {
-      if (offset + bytesRead >= data.length) {
-        throw new Error('Unexpected end of data while reading varint');
-      }
-      const byte = data[offset + bytesRead];
-      bytesRead++;
-      result |= BigInt(byte & 0x7F) << BigInt(shift);
-      if ((byte & 0x80) === 0) break;
-      shift += 7;
-      if (shift >= 64) throw new Error('VarInt too large');
-    }
-    return { value: result, bytesRead };
+    const { entries } = decodeUtxoData(data);
+    return entries.map(e => ({
+      txid: bytesToHex(new Uint8Array([...e.txid].reverse())),
+      vout: e.vout,
+      value: Number(e.amount),
+    }));
   }
 
   /** Send a request to Query Server and wait for the response. */
@@ -640,7 +608,7 @@ export class HarmonyPirClient {
 
     const tL1Start = performance.now();
     const indexCandBuckets = scriptHashes.map(sh => deriveBuckets(sh));
-    const indexRounds = this.planRounds(indexCandBuckets, K);
+    const indexRounds = planRounds(indexCandBuckets, K, NUM_HASHES, (msg) => this.log(msg));
     this.log(`Level 1: ${N} queries → ${indexRounds.length} index placement round(s) × ${INDEX_CUCKOO_NUM_HASHES} hash-fn rounds`);
 
     // Pre-populate inspector data for each query.
@@ -814,7 +782,7 @@ export class HarmonyPirClient {
 
     if (allChunkIds.length > 0) {
       const chunkCandBuckets = allChunkIds.map(cid => deriveChunkBuckets(cid));
-      const chunkRounds = this.planRounds(chunkCandBuckets, K_CHUNK);
+      const chunkRounds = planRounds(chunkCandBuckets, K_CHUNK, NUM_HASHES, (msg) => this.log(msg));
       this.log(`  ${allChunkIds.length} chunks → ${chunkRounds.length} chunk placement round(s) × ${CHUNK_CUCKOO_NUM_HASHES} hash-fn rounds`);
 
       for (let ri = 0; ri < chunkRounds.length; ri++) {
@@ -953,107 +921,7 @@ export class HarmonyPirClient {
     return results;
   }
 
-  // ─── Cuckoo placement (from DPF-PIR client.ts) ────────────────────────────
-
-  /**
-   * Cuckoo-place item qi into one of its candidate buckets.
-   * Returns true if placed, false if maxKicks exceeded.
-   */
-  private cuckooPlace(
-    candBuckets: number[][],
-    buckets: (number | null)[],
-    qi: number,
-    maxKicks: number,
-  ): boolean {
-    const cands = candBuckets[qi];
-
-    // Try direct placement.
-    for (const c of cands) {
-      if (buckets[c] === null) {
-        buckets[c] = qi;
-        return true;
-      }
-    }
-
-    // Eviction loop.
-    let currentQi = qi;
-    let currentBucket = candBuckets[currentQi][0];
-
-    for (let kick = 0; kick < maxKicks; kick++) {
-      const evictedQi = buckets[currentBucket]!;
-      buckets[currentBucket] = currentQi;
-      const evCands = candBuckets[evictedQi];
-
-      for (let offset = 0; offset < NUM_HASHES; offset++) {
-        const c = evCands[(kick + offset) % NUM_HASHES];
-        if (c === currentBucket) continue;
-        if (buckets[c] === null) {
-          buckets[c] = evictedQi;
-          return true;
-        }
-      }
-
-      let nextBucket = evCands[0];
-      for (let offset = 0; offset < NUM_HASHES; offset++) {
-        const c = evCands[(kick + offset) % NUM_HASHES];
-        if (c !== currentBucket) {
-          nextBucket = c;
-          break;
-        }
-      }
-      currentQi = evictedQi;
-      currentBucket = nextBucket;
-    }
-
-    return false;
-  }
-
-  /**
-   * Plan multi-round placement for items with NUM_HASHES candidate buckets.
-   * Returns rounds, each round = [[itemIndex, bucketId], ...].
-   */
-  private planRounds(
-    itemBuckets: number[][],
-    numBuckets: number,
-  ): [number, number][][] {
-    let remaining = itemBuckets.map((_, i) => i);
-    const rounds: [number, number][][] = [];
-
-    while (remaining.length > 0) {
-      const candBuckets = remaining.map(i => itemBuckets[i]);
-      const bucketOwner: (number | null)[] = new Array(numBuckets).fill(null);
-      const placedLocal: number[] = [];
-
-      for (let li = 0; li < candBuckets.length; li++) {
-        if (placedLocal.length >= numBuckets) break;
-        const savedBuckets = [...bucketOwner];
-        if (this.cuckooPlace(candBuckets, bucketOwner, li, 500)) {
-          placedLocal.push(li);
-        } else {
-          for (let b = 0; b < numBuckets; b++) bucketOwner[b] = savedBuckets[b];
-        }
-      }
-
-      const roundEntries: [number, number][] = [];
-      for (let b = 0; b < numBuckets; b++) {
-        const localIdx = bucketOwner[b];
-        if (localIdx !== null) {
-          roundEntries.push([remaining[localIdx], b]);
-        }
-      }
-
-      if (roundEntries.length === 0) {
-        this.log(`ERROR: could not place any items, ${remaining.length} remaining`);
-        break;
-      }
-
-      const placedOrigIdx = new Set(placedLocal.map(li => remaining[li]));
-      remaining = remaining.filter(i => !placedOrigIdx.has(i));
-      rounds.push(roundEntries);
-    }
-
-    return rounds;
-  }
+  // ─── Cuckoo placement and round planning (uses shared pbc.ts) ──────────────
 
   // ─── Batch wire protocol ───────────────────────────────────────────────────
 

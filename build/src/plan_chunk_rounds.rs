@@ -109,58 +109,6 @@ fn adaptive_max_kicks(remaining: usize) -> usize {
 
 // ─── Cuckoo placement with rollback ─────────────────────────────────────────
 
-fn cuckoo_place(
-    cand_buckets: &[[usize; NUM_HASHES]],
-    buckets: &mut [Option<usize>; K_CHUNK],
-    qi: usize,
-    max_kicks: usize,
-) -> bool {
-    let cands = &cand_buckets[qi];
-
-    // Try each candidate bucket directly
-    for &c in cands {
-        if buckets[c].is_none() {
-            buckets[c] = Some(qi);
-            return true;
-        }
-    }
-
-    // Eviction
-    let mut current_qi = qi;
-    let mut current_bucket = cand_buckets[current_qi][0];
-
-    for kick in 0..max_kicks {
-        let evicted_qi = buckets[current_bucket].unwrap();
-        buckets[current_bucket] = Some(current_qi);
-
-        let ev_cands = &cand_buckets[evicted_qi];
-
-        for offset in 0..NUM_HASHES {
-            let c = ev_cands[(kick + offset) % NUM_HASHES];
-            if c == current_bucket {
-                continue;
-            }
-            if buckets[c].is_none() {
-                buckets[c] = Some(evicted_qi);
-                return true;
-            }
-        }
-
-        let mut next_bucket = ev_cands[0];
-        for offset in 0..NUM_HASHES {
-            let c = ev_cands[(kick + offset) % NUM_HASHES];
-            if c != current_bucket {
-                next_bucket = c;
-                break;
-            }
-        }
-        current_qi = evicted_qi;
-        current_bucket = next_bucket;
-    }
-
-    false
-}
-
 /// Try to place candidate `qi`. On failure, restore buckets to their prior state.
 fn try_place(
     cand_buckets: &[[usize; NUM_HASHES]],
@@ -169,7 +117,7 @@ fn try_place(
     max_kicks: usize,
 ) -> bool {
     let saved = *buckets;
-    if cuckoo_place(cand_buckets, buckets, qi, max_kicks) {
+    if pbc_cuckoo_place(cand_buckets, &mut buckets[..], qi, max_kicks, NUM_HASHES) {
         true
     } else {
         *buckets = saved;

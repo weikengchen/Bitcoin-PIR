@@ -11,20 +11,6 @@ use memmap2::Mmap;
 use std::fs::File;
 use std::time::Instant;
 
-fn read_varint(data: &[u8]) -> (u64, usize) {
-    let mut value: u64 = 0;
-    let mut shift = 0;
-    let mut i = 0;
-    loop {
-        let byte = data[i];
-        value |= ((byte & 0x7F) as u64) << shift;
-        i += 1;
-        if byte & 0x80 == 0 { break; }
-        shift += 7;
-    }
-    (value, i)
-}
-
 fn main() {
     println!("=== Useful-Data Efficiency Analysis ===");
     println!();

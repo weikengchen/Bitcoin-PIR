@@ -122,59 +122,7 @@ fn server_process_batch(
     HarmonyBatchResult { level: query.level, round_id: query.round_id, sub_results_per_bucket: query.sub_queries_per_bucket, items }
 }
 
-/// Cuckoo placement for batch PIR round planning.
-fn cuckoo_place(cand_buckets: &[Vec<usize>], buckets: &mut [Option<usize>], qi: usize, max_kicks: usize) -> bool {
-    let cands = &cand_buckets[qi];
-    for &c in cands { if buckets[c].is_none() { buckets[c] = Some(qi); return true; } }
-    let mut cur_qi = qi;
-    let mut cur_bucket = cands[0];
-    for kick in 0..max_kicks {
-        let evicted = buckets[cur_bucket].unwrap();
-        buckets[cur_bucket] = Some(cur_qi);
-        let ev_cands = &cand_buckets[evicted];
-        for offset in 0..NUM_HASHES {
-            let c = ev_cands[(kick + offset) % NUM_HASHES];
-            if c == cur_bucket { continue; }
-            if buckets[c].is_none() { buckets[c] = Some(evicted); return true; }
-        }
-        let mut next = ev_cands[0];
-        for offset in 0..NUM_HASHES {
-            let c = ev_cands[(kick + offset) % NUM_HASHES];
-            if c != cur_bucket { next = c; break; }
-        }
-        cur_qi = evicted;
-        cur_bucket = next;
-    }
-    false
-}
-
-fn plan_rounds(item_buckets: &[Vec<usize>], num_buckets: usize) -> Vec<Vec<(usize, usize)>> {
-    let mut remaining: Vec<usize> = (0..item_buckets.len()).collect();
-    let mut rounds = Vec::new();
-    while !remaining.is_empty() {
-        let cands: Vec<Vec<usize>> = remaining.iter().map(|&i| item_buckets[i].clone()).collect();
-        let mut owner: Vec<Option<usize>> = vec![None; num_buckets];
-        let mut placed = Vec::new();
-        for li in 0..cands.len() {
-            if placed.len() >= num_buckets { break; }
-            let saved: Vec<Option<usize>> = owner.clone();
-            if cuckoo_place(&cands, &mut owner, li, 500) {
-                placed.push(li);
-            } else {
-                owner = saved;
-            }
-        }
-        let mut round = Vec::new();
-        for b in 0..num_buckets {
-            if let Some(li) = owner[b] { round.push((remaining[li], b)); }
-        }
-        if round.is_empty() { break; }
-        let placed_set: HashSet<usize> = placed.iter().map(|&li| remaining[li]).collect();
-        remaining.retain(|i| !placed_set.contains(i));
-        rounds.push(round);
-    }
-    rounds
-}
+// PBC cuckoo placement and round planning use shared build::common::{pbc_cuckoo_place, pbc_plan_rounds}
 
 fn main() {
     let (backend, backend_name) = choose_backend();
@@ -245,7 +193,7 @@ fn main() {
         println!("  addr[{}]: candidate INDEX buckets = {:?}", qi, cands);
     }
 
-    let index_rounds = plan_rounds(&index_cand_buckets, K);
+    let index_rounds = pbc_plan_rounds(&index_cand_buckets, K, NUM_HASHES, 500);
     println!("\n  planRounds result: {} round(s)", index_rounds.len());
     for (ri, round) in index_rounds.iter().enumerate() {
         println!("    round[{}]: {} assigned queries → {:?}", ri, round.len(),
@@ -427,7 +375,7 @@ fn main() {
             ci, cid, chunk_cand_buckets[ci]);
     }
 
-    let chunk_placement_rounds = plan_rounds(&chunk_cand_buckets, K_CHUNK);
+    let chunk_placement_rounds = pbc_plan_rounds(&chunk_cand_buckets, K_CHUNK, NUM_HASHES, 500);
     println!("\n  planRounds: {} placement round(s)", chunk_placement_rounds.len());
     for (ri, round) in chunk_placement_rounds.iter().enumerate() {
         println!("    placement_round[{}]: {:?}", ri,

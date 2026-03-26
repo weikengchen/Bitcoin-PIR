@@ -31,7 +31,10 @@ from .pir_hash import (
     derive_chunk_buckets, splitmix64,
 )
 from .pir_ws_client import PirConnection
-from .pir_client import QueryResult, UtxoEntry, BatchPirClient
+from .pir_client import QueryResult, UtxoEntry
+from .pir_common import (
+    cuckoo_place, plan_rounds, read_varint, decode_utxo_data, DummyRng,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -160,20 +163,6 @@ def _find_entry_in_cuckoo(
         if table[b] == entry_id:
             return b
     return None
-
-
-def _read_varint(data: bytes, pos: int) -> tuple[int, int]:
-    """Read a varint from data at pos. Returns (value, new_pos)."""
-    value = 0
-    shift = 0
-    while pos < len(data):
-        byte = data[pos]
-        value |= (byte & 0x7F) << shift
-        pos += 1
-        if byte & 0x80 == 0:
-            return value, pos
-        shift += 7
-    raise ValueError('Unexpected end of varint')
 
 
 class OnionPirClient:
@@ -340,7 +329,7 @@ class OnionPirClient:
         tags = [compute_tag(self.tag_seed, sh) for sh in script_hashes]
         all_groups = [derive_buckets(sh) for sh in script_hashes]
 
-        index_rounds = self._plan_pbc_rounds(all_groups, index_k)
+        index_rounds = plan_rounds(all_groups, index_k, NUM_HASHES)
         logger.info(f'Level 1: {N} queries -> {len(index_rounds)} round(s)')
 
         # IndexResult: {addr_idx: (entry_id, byte_offset, num_entries)}
@@ -422,7 +411,7 @@ class OnionPirClient:
 
             # PBC placement of entries into chunk groups
             entry_groups = [derive_chunk_buckets(eid) for eid in unique_entry_ids]
-            chunk_rounds = self._plan_pbc_rounds(entry_groups, chunk_k)
+            chunk_rounds = plan_rounds(entry_groups, chunk_k, NUM_HASHES)
             logger.info(f'Level 2: {len(unique_entry_ids)} entries -> {len(chunk_rounds)} round(s)')
 
             for ri, rnd in enumerate(chunk_rounds):
@@ -506,7 +495,7 @@ class OnionPirClient:
                 continue
 
             # Decode UTXOs using varint format
-            entries, total_sats = self._decode_utxo_data(bytes(full_data))
+            entries, total_sats = decode_utxo_data(bytes(full_data))
             results[addr_idx] = QueryResult(
                 entries=entries, total_sats=total_sats,
                 start_chunk_id=entry_id, num_chunks=num_entries,
@@ -564,97 +553,5 @@ class OnionPirClient:
                 return (entry_id, byte_offset, num_entries)
         return None
 
-    @staticmethod
-    def _decode_utxo_data(data: bytes) -> tuple[list[UtxoEntry], int]:
-        """Decode varint-encoded UTXO data."""
-        entries = []
-        total_sats = 0
-        pos = 0
-
-        num_utxos, pos = _read_varint(data, pos)
-        for _ in range(num_utxos):
-            if pos + 32 > len(data):
-                break
-            txid = data[pos:pos + 32]
-            pos += 32
-            vout, pos = _read_varint(data, pos)
-            amount, pos = _read_varint(data, pos)
-            total_sats += amount
-            entries.append(UtxoEntry(txid=txid, vout=vout, amount=amount))
-
-        return entries, total_sats
-
-    @staticmethod
-    def _plan_pbc_rounds(
-        candidate_groups: list,
-        k: int,
-    ) -> list[list[tuple[int, int]]]:
-        """PBC cuckoo placement of items into groups."""
-        remaining = list(range(len(candidate_groups)))
-        rounds = []
-
-        while remaining:
-            round_cands = [candidate_groups[orig] for orig in remaining]
-            buckets = [None] * k
-            placed_indices = []
-
-            for ri in range(len(round_cands)):
-                if len(placed_indices) >= k:
-                    break
-                saved = buckets[:]
-                if _pbc_cuckoo_place(round_cands, buckets, ri, 500):
-                    placed_indices.append(ri)
-                else:
-                    buckets[:] = saved
-
-            rnd = []
-            for g in range(k):
-                if buckets[g] is not None:
-                    rnd.append((remaining[buckets[g]], g))
-
-            if not rnd:
-                logger.error(f'PBC placement failed for {len(remaining)} items')
-                break
-
-            placed_originals = {remaining[ri] for ri in placed_indices}
-            remaining = [idx for idx in remaining if idx not in placed_originals]
-            rounds.append(rnd)
-
-        return rounds
-
-
-def _pbc_cuckoo_place(
-    cands: list, buckets: list, qi: int, max_kicks: int,
-) -> bool:
-    """Try to place item qi into buckets using cuckoo hashing."""
-    for c in cands[qi]:
-        if buckets[c] is None:
-            buckets[c] = qi
-            return True
-
-    current_qi = qi
-    current_bucket = cands[qi][0]
-
-    for kick in range(max_kicks):
-        evicted_qi = buckets[current_bucket]
-        buckets[current_bucket] = current_qi
-
-        for offset in range(NUM_HASHES):
-            c = cands[evicted_qi][(kick + offset) % NUM_HASHES]
-            if c == current_bucket:
-                continue
-            if buckets[c] is None:
-                buckets[c] = evicted_qi
-                return True
-
-        next_bucket = cands[evicted_qi][0]
-        for offset in range(NUM_HASHES):
-            c = cands[evicted_qi][(kick + offset) % NUM_HASHES]
-            if c != current_bucket:
-                next_bucket = c
-                break
-
-        current_qi = evicted_qi
-        current_bucket = next_bucket
-
-    return False
+    # _decode_utxo_data, _plan_pbc_rounds, and _pbc_cuckoo_place
+    # are provided by pir_common module.

@@ -25,7 +25,7 @@ from .pir_constants import (
     K, K_CHUNK, NUM_HASHES,
     CUCKOO_BUCKET_SIZE, INDEX_CUCKOO_NUM_HASHES,
     CHUNK_CUCKOO_BUCKET_SIZE, CHUNK_CUCKOO_NUM_HASHES,
-    INDEX_ENTRY_SIZE, CHUNK_SLOT_SIZE, CHUNK_SIZE, TAG_SIZE,
+    INDEX_ENTRY_SIZE, CHUNK_SLOT_SIZE,
     HARMONY_INDEX_W, HARMONY_CHUNK_W, HARMONY_EMPTY,
     REQ_HARMONY_GET_INFO, REQ_HARMONY_HINTS,
     REQ_HARMONY_BATCH_QUERY,
@@ -38,7 +38,11 @@ from .pir_hash import (
     hash160,
 )
 from .pir_ws_client import PirConnection
-from .pir_client import QueryResult, UtxoEntry, BatchPirClient
+from .pir_client import QueryResult, UtxoEntry
+from .pir_common import (
+    plan_rounds, decode_utxo_data,
+    find_entry_in_index_result, find_chunk_in_result,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -272,9 +276,7 @@ class HarmonyPirClient:
         progress('Level 1', f'Planning {N} index queries...')
 
         index_cand_buckets = [derive_buckets(sh) for sh in script_hashes]
-        # Use BatchPirClient's planRounds — same algorithm
-        _planner = BatchPirClient.__new__(BatchPirClient)
-        index_rounds = _planner._plan_rounds(index_cand_buckets, K)
+        index_rounds = plan_rounds(index_cand_buckets, K, NUM_HASHES)
 
         index_results: dict[int, tuple[int, int]] = {}
         whale_queries: set[int] = set()
@@ -318,7 +320,11 @@ class HarmonyPirClient:
                         answer = bytes(answer_raw) if not isinstance(answer_raw, bytes) else answer_raw
 
                         # Search for matching tag
-                        found = self._find_tag_in_bin(answer, script_hashes[qi])
+                        expected_tag = compute_tag(self.tag_seed, script_hashes[qi])
+                        found = find_entry_in_index_result(
+                            answer, expected_tag,
+                            num_slots=len(answer) // INDEX_ENTRY_SIZE,
+                        )
                         if found:
                             index_results[qi] = found
                             if found[1] == 0:  # num_chunks == 0
@@ -343,7 +349,7 @@ class HarmonyPirClient:
 
         all_chunk_ids = sorted(all_chunk_ids_set)
         chunk_cand_buckets = [derive_chunk_buckets(cid) for cid in all_chunk_ids]
-        chunk_rounds = _planner._plan_rounds(chunk_cand_buckets, K_CHUNK)
+        chunk_rounds = plan_rounds(chunk_cand_buckets, K_CHUNK, NUM_HASHES)
 
         recovered_chunks: dict[int, bytes] = {}
 
@@ -384,7 +390,10 @@ class HarmonyPirClient:
                         answer_raw = bucket.process_response(resp_entries[0])
                         answer = bytes(answer_raw) if not isinstance(answer_raw, bytes) else answer_raw
                         chunk_id = all_chunk_ids[cli]
-                        chunk_data = self._find_chunk_in_bin(answer, chunk_id)
+                        chunk_data = find_chunk_in_result(
+                            answer, chunk_id,
+                            num_slots=len(answer) // CHUNK_SLOT_SIZE,
+                        )
                         if chunk_data:
                             recovered_chunks[chunk_id] = chunk_data
 
@@ -407,8 +416,7 @@ class HarmonyPirClient:
                 if d:
                     full_data[u * UNIT_DATA_SIZE:(u + 1) * UNIT_DATA_SIZE] = d
 
-            _client = BatchPirClient.__new__(BatchPirClient)
-            entries, total_sats = _client._decode_utxo_data(bytes(full_data))
+            entries, total_sats = decode_utxo_data(bytes(full_data))
             results[qi] = QueryResult(
                 entries=entries, total_sats=total_sats,
                 start_chunk_id=start_chunk_id, num_chunks=num_chunks,
@@ -468,31 +476,8 @@ class HarmonyPirClient:
 
     # ── Result parsing helpers ────────────────────────────────────────
 
-    def _find_tag_in_bin(self, bin_data: bytes, script_hash: bytes) -> Optional[tuple[int, int]]:
-        """Search bin for matching tag. Returns (start_chunk_id, num_chunks) or None."""
-        expected_tag = compute_tag(self.tag_seed, script_hash)
-        num_slots = len(bin_data) // INDEX_ENTRY_SIZE
-        for slot in range(num_slots):
-            offset = slot * INDEX_ENTRY_SIZE
-            if offset + INDEX_ENTRY_SIZE > len(bin_data):
-                break
-            slot_tag = struct.unpack_from('<Q', bin_data, offset)[0]
-            if slot_tag == expected_tag:
-                start_chunk_id = struct.unpack_from('<I', bin_data, offset + TAG_SIZE)[0]
-                num_chunks = bin_data[offset + TAG_SIZE + 4]
-                return (start_chunk_id, num_chunks)
-        return None
-
-    @staticmethod
-    def _find_chunk_in_bin(bin_data: bytes, target_chunk_id: int) -> Optional[bytes]:
-        """Search chunk bin for matching chunk_id."""
-        target = struct.pack('<I', target_chunk_id)
-        num_slots = len(bin_data) // CHUNK_SLOT_SIZE
-        for slot in range(num_slots):
-            offset = slot * CHUNK_SLOT_SIZE
-            if bin_data[offset:offset + 4] == target:
-                return bin_data[offset + 4:offset + 4 + CHUNK_SIZE]
-        return None
+    # Tag and chunk scanning use shared pir_common.find_entry_in_index_result
+    # and pir_common.find_chunk_in_result.
 
     # ── Hint caching ──────────────────────────────────────────────────
 
