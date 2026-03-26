@@ -19,5 +19,16 @@ data/*.bin
 data/*.dat
 *.log
 
+# Node.js
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.dylib
+
 # Claude Code
 .claude/

@@ -71,6 +71,8 @@ interface HarmonyBucketWasm {
   build_request(q: number): HarmonyRequestWasm;
   build_synthetic_dummy(): Uint8Array;
   process_response(response: Uint8Array): Uint8Array;
+  process_response_xor_only(response: Uint8Array): Uint8Array;
+  finish_relocation(): void;
   queries_remaining(): number;
   queries_used(): number;
   real_n(): number;

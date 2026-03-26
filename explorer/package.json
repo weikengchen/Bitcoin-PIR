@@ -1,0 +1,29 @@
+{
+  "name": "bitcoin-pir-explorer",
+  "version": "1.0.0",
+  "description": "PIR-backed Explorer adapter for the bitcoinjs ecosystem",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "keywords": [
+    "bitcoin",
+    "pir",
+    "privacy",
+    "explorer",
+    "bitcoinjs"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "bitcoin-batch-pir-web-client": "file:../web"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.21.0",
+    "typescript": "^5.0.0",
+    "ws": "^8.20.0"
+  }
+}
