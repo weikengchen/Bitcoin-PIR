@@ -1,0 +1,35 @@
+plugins {
+    id 'java-library'
+}
+
+group = 'com.bitcoinpir'
+version = '0.1.0'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    api 'org.bitcoinj:bitcoinj-core:0.17'
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+test {
+    useJUnitPlatform()
+
+    // HarmonyPIR JNI native library path.
+    // Build with: cd bitcoin-pir/harmonypir-jni && cargo build --release
+    def nativeLibDir = findProperty('nativeLibDir')
+        ?: System.getenv('HARMONYPIR_LIB_DIR')
+        ?: "${rootDir}/../../bitcoin-pir/harmonypir-jni/target/release"
+    systemProperty 'java.library.path', nativeLibDir
+    jvmArgs '--enable-native-access=ALL-UNNAMED'
+}
