@@ -144,6 +144,10 @@ BitcoinPIR/
                                     #   HarmonyPIR, OnionPIR, comparison, deployment)
 ```
 
+## Live Demo
+
+A public demo is available at **https://pir.chenweikeng.com/** — you can test all three PIR protocols directly in the browser. Note: the servers are running on a home computer and load data into memory on-demand, so they may be intermittently unavailable or slow on first query. Please be patient!
+
 ## Quick Start
 
 ### 1. Build the Project
