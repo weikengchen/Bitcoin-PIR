@@ -114,6 +114,10 @@ path = "src/delta_gen_1_build_chunks.rs"
 name = "build_cuckoo_generic"
 path = "src/build_cuckoo_generic.rs"
 
+[[bin]]
+name = "gen_4_build_merkle"
+path = "src/gen_4_build_merkle.rs"
+
 [dependencies]
 pir-core = { path = "../pir-core" }
 bitcoin = "0.32.7"

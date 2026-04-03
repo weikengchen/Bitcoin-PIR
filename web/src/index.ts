@@ -99,6 +99,11 @@ export {
 } from './harmonypir_client.js';
 
 export {
+  initWasm,
+  isWasmReady,
+} from './wasm-bridge.js';
+
+export {
   cuckooPlace,
   planRounds,
 } from './pbc.js';
