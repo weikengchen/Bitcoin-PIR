@@ -2,8 +2,8 @@
 # Start PIR WebSocket servers for UTXO lookups
 #
 # This script starts two processes:
-#   - Primary server on port 8091: DPF + OnionPIR + HarmonyPIR (all protocols)
-#   - Secondary server on port 8092: DPF only (2nd server for 2-server protocol)
+#   - Primary server on port 8091: DPF server 0 + OnionPIR + HarmonyPIR query server
+#   - Secondary server on port 8092: DPF server 1 + HarmonyPIR hint server
 #
 # Usage:
 #   ./scripts/start_pir_servers.sh [--data-dir /path/to/data]
@@ -76,10 +76,10 @@ echo "========================================"
 echo "All servers started!"
 echo "========================================"
 echo ""
-echo "Primary server (DPF + OnionPIR + HarmonyPIR):"
+echo "Primary server (DPF-0 + OnionPIR + HarmonyPIR query):"
 echo "  ws://localhost:$PRIMARY_PORT (PID: $PRIMARY_PID)"
 echo ""
-echo "Secondary server (DPF only):"
+echo "Secondary server (DPF-1 + HarmonyPIR hint):"
 echo "  ws://localhost:$SECONDARY_PORT (PID: $SECONDARY_PID)"
 echo ""
 echo "Logs:"

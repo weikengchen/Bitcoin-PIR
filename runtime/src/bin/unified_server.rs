@@ -578,7 +578,10 @@ async fn main() {
     println!("  Index: K={}, bins_per_table={}", index_k, server.db.index.bins_per_table);
     println!("  Chunk: K={}, bins_per_table={}", chunk_k, server.db.chunk.bins_per_table);
     println!("  OnionPIR: {}", if server.onionpir_tx.is_some() { "enabled" } else { "disabled" });
-    println!("  HarmonyPIR: {}", if args.role == ServerRole::Primary { "enabled" } else { "disabled" });
+    match args.role {
+        ServerRole::Primary => println!("  HarmonyPIR: query server"),
+        ServerRole::Secondary => println!("  HarmonyPIR: hint server"),
+    }
     if server.db.has_merkle() { println!("  Merkle: available"); }
     println!();
 
@@ -663,13 +666,16 @@ async fn main() {
                         }
                     }
 
-                    // ── HarmonyPIR (primary only) ────────────────────────
+                    // ── HarmonyPIR ────────────────────────────────────────
+                    // Primary  = query server (REQ_HARMONY_QUERY, REQ_HARMONY_BATCH_QUERY)
+                    // Secondary = hint server (REQ_HARMONY_HINTS)
+                    // Both respond to REQ_HARMONY_GET_INFO
                     REQ_HARMONY_GET_INFO => {
                         let _ = sink.send(Message::Binary(
                             Response::HarmonyInfo(server.server_info()).encode().into()
                         )).await;
                     }
-                    REQ_HARMONY_HINTS if server.role == ServerRole::Primary => {
+                    REQ_HARMONY_HINTS if server.role == ServerRole::Secondary => {
                         if let Ok(Request::HarmonyHints(hint_req)) = Request::decode(payload) {
                             let t_start = Instant::now();
                             let level = hint_req.level;
