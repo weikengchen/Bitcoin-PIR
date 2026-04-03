@@ -118,6 +118,10 @@ path = "src/build_cuckoo_generic.rs"
 name = "gen_4_build_merkle"
 path = "src/gen_4_build_merkle.rs"
 
+[[bin]]
+name = "test_pir_core_crosscheck"
+path = "src/test_pir_core_crosscheck.rs"
+
 [dependencies]
 pir-core = { path = "../pir-core" }
 bitcoin = "0.32.7"
