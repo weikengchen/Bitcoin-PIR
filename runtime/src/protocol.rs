@@ -366,51 +366,16 @@ impl Response {
         match data[0] {
             RESP_PONG => Ok(Response::Pong),
             RESP_INFO => {
-                // Detect JSON (unified server) vs binary (legacy server)
-                if data.len() > 1 && data[1] == b'{' {
-                    // JSON format: parse the JSON string
-                    let json_str = std::str::from_utf8(&data[1..])
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                    // Minimal JSON parsing for the fields we need
-                    fn extract_u32(json: &str, key: &str) -> Option<u32> {
-                        let needle = format!("\"{}\":", key);
-                        let pos = json.find(&needle)? + needle.len();
-                        let rest = &json[pos..];
-                        let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
-                        rest[..end].parse().ok()
-                    }
-                    fn extract_u64_hex(json: &str, key: &str) -> Option<u64> {
-                        let needle = format!("\"{}\":\"0x", key);
-                        let pos = json.find(&needle)? + needle.len();
-                        let rest = &json[pos..];
-                        let end = rest.find('"').unwrap_or(rest.len());
-                        u64::from_str_radix(&rest[..end], 16).ok()
-                    }
-                    let index_bins = extract_u32(json_str, "index_bins_per_table").unwrap_or(0);
-                    let chunk_bins = extract_u32(json_str, "chunk_bins_per_table").unwrap_or(0);
-                    let index_k = extract_u32(json_str, "index_k").unwrap_or(0) as u8;
-                    let chunk_k = extract_u32(json_str, "chunk_k").unwrap_or(0) as u8;
-                    let tag_seed = extract_u64_hex(json_str, "tag_seed").unwrap_or(0);
-                    Ok(Response::Info(ServerInfo {
-                        index_bins_per_table: index_bins,
-                        chunk_bins_per_table: chunk_bins,
-                        index_k,
-                        chunk_k,
-                        tag_seed,
-                    }))
-                } else {
-                    // Legacy binary format
-                    if data.len() < 19 {
-                        return Err(io::Error::new(io::ErrorKind::InvalidData, "info too short"));
-                    }
-                    Ok(Response::Info(ServerInfo {
-                        index_bins_per_table: u32::from_le_bytes(data[1..5].try_into().unwrap()),
-                        chunk_bins_per_table: u32::from_le_bytes(data[5..9].try_into().unwrap()),
-                        index_k: data[9],
-                        chunk_k: data[10],
-                        tag_seed: u64::from_le_bytes(data[11..19].try_into().unwrap()),
-                    }))
+                if data.len() < 19 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "info too short"));
                 }
+                Ok(Response::Info(ServerInfo {
+                    index_bins_per_table: u32::from_le_bytes(data[1..5].try_into().unwrap()),
+                    chunk_bins_per_table: u32::from_le_bytes(data[5..9].try_into().unwrap()),
+                    index_k: data[9],
+                    chunk_k: data[10],
+                    tag_seed: u64::from_le_bytes(data[11..19].try_into().unwrap()),
+                }))
             }
             RESP_DB_CATALOG => {
                 let cat = decode_db_catalog(&data[1..])?;
@@ -430,43 +395,16 @@ impl Response {
                 Ok(Response::Error(msg))
             }
             RESP_HARMONY_INFO => {
-                // Detect JSON vs binary (same logic as RESP_INFO)
-                if data.len() > 1 && data[1] == b'{' {
-                    let json_str = std::str::from_utf8(&data[1..])
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                    fn extract_u32_h(json: &str, key: &str) -> Option<u32> {
-                        let needle = format!("\"{}\":", key);
-                        let pos = json.find(&needle)? + needle.len();
-                        let rest = &json[pos..];
-                        let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
-                        rest[..end].parse().ok()
-                    }
-                    fn extract_u64_hex_h(json: &str, key: &str) -> Option<u64> {
-                        let needle = format!("\"{}\":\"0x", key);
-                        let pos = json.find(&needle)? + needle.len();
-                        let rest = &json[pos..];
-                        let end = rest.find('"').unwrap_or(rest.len());
-                        u64::from_str_radix(&rest[..end], 16).ok()
-                    }
-                    Ok(Response::HarmonyInfo(ServerInfo {
-                        index_bins_per_table: extract_u32_h(json_str, "index_bins_per_table").unwrap_or(0),
-                        chunk_bins_per_table: extract_u32_h(json_str, "chunk_bins_per_table").unwrap_or(0),
-                        index_k: extract_u32_h(json_str, "index_k").unwrap_or(0) as u8,
-                        chunk_k: extract_u32_h(json_str, "chunk_k").unwrap_or(0) as u8,
-                        tag_seed: extract_u64_hex_h(json_str, "tag_seed").unwrap_or(0),
-                    }))
-                } else {
-                    if data.len() < 19 {
-                        return Err(io::Error::new(io::ErrorKind::InvalidData, "harmony info too short"));
-                    }
-                    Ok(Response::HarmonyInfo(ServerInfo {
-                        index_bins_per_table: u32::from_le_bytes(data[1..5].try_into().unwrap()),
-                        chunk_bins_per_table: u32::from_le_bytes(data[5..9].try_into().unwrap()),
-                        index_k: data[9],
-                        chunk_k: data[10],
-                        tag_seed: u64::from_le_bytes(data[11..19].try_into().unwrap()),
-                    }))
+                if data.len() < 19 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "harmony info too short"));
                 }
+                Ok(Response::HarmonyInfo(ServerInfo {
+                    index_bins_per_table: u32::from_le_bytes(data[1..5].try_into().unwrap()),
+                    chunk_bins_per_table: u32::from_le_bytes(data[5..9].try_into().unwrap()),
+                    index_k: data[9],
+                    chunk_k: data[10],
+                    tag_seed: u64::from_le_bytes(data[11..19].try_into().unwrap()),
+                }))
             }
             RESP_HARMONY_QUERY => {
                 if data.len() < 4 {

@@ -19,7 +19,6 @@ import {
 
 import { cuckooPlace, planRounds } from './pbc.js';
 import { readVarint, decodeUtxoData, DummyRng } from './codec.js';
-import { initWasm } from './wasm-bridge.js';
 
 import type { UtxoEntry, QueryResult, ConnectionState } from './client.js';
 
@@ -289,10 +288,7 @@ export class OnionPirWebClient {
   async connect(): Promise<void> {
     this.setState('connecting', 'Loading WASM + connecting...');
 
-    // Ensure pir-core WASM is loaded (required for hash functions)
-    await initWasm();
-
-    // Load OnionPIR WASM module (cached after first load)
+    // Load WASM module (cached after first load)
     this.wasmModule = await loadWasmModule();
     this.log('WASM module loaded');
 
@@ -383,37 +379,16 @@ export class OnionPirWebClient {
     const payload = raw.slice(4); // skip length prefix
     if (payload[0] !== RESP_INFO) throw new Error('Expected Info response');
     const body = payload.slice(1);
+    const dv = new DataView(body.buffer, body.byteOffset, body.length);
 
-    if (body[0] === 0x7B) {
-      // JSON format (unified server)
-      const j = JSON.parse(new TextDecoder().decode(body));
-      this.indexK = j.index_k;
-      this.chunkK = j.chunk_k;
-      this.indexBins = j.index_bins_per_table;
-      this.chunkBins = j.chunk_bins_per_table;
-      this.tagSeed = BigInt(j.tag_seed);
-      this.indexBucketSize = j.index_cuckoo_bucket_size;
-      this.indexSlotSize = j.index_slot_size;
-      if (j.onionpir) {
-        this.totalPacked = j.onionpir.total_packed_entries;
-        // OnionPIR has its own bins_per_table (different from DPF cuckoo)
-        this.indexBins = j.onionpir.index_bins_per_table;
-        this.chunkBins = j.onionpir.chunk_bins_per_table;
-      } else {
-        this.totalPacked = 0;
-      }
-    } else {
-      // Legacy binary format (OnionPIR v2 server)
-      const dv = new DataView(body.buffer, body.byteOffset, body.length);
-      this.indexK = body[0];
-      this.chunkK = body[1];
-      this.indexBins = dv.getUint32(2, true);
-      this.chunkBins = dv.getUint32(6, true);
-      this.tagSeed = dv.getBigUint64(10, true);
-      this.totalPacked = dv.getUint32(18, true);
-      this.indexBucketSize = dv.getUint16(22, true);
-      this.indexSlotSize = body[24];
-    }
+    this.indexK = body[0];
+    this.chunkK = body[1];
+    this.indexBins = dv.getUint32(2, true);
+    this.chunkBins = dv.getUint32(6, true);
+    this.tagSeed = dv.getBigUint64(10, true);
+    this.totalPacked = dv.getUint32(18, true);
+    this.indexBucketSize = dv.getUint16(22, true);
+    this.indexSlotSize = body[24];
 
     this.log(`Server: index K=${this.indexK} bins=${this.indexBins} bucket_size=${this.indexBucketSize}, chunk K=${this.chunkK} bins=${this.chunkBins}, total_packed=${this.totalPacked}`);
   }

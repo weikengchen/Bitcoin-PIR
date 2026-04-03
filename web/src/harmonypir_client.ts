@@ -29,7 +29,6 @@ import {
 
 import { cuckooPlace, planRounds } from './pbc.js';
 import { readVarint, decodeUtxoData } from './codec.js';
-import { initWasm } from './wasm-bridge.js';
 
 import { HarmonyWorkerPool, BuildItem, BuildResult, ProcessItem } from './harmonypir_worker_pool.js';
 
@@ -197,10 +196,8 @@ export class HarmonyPirClient {
     return dirs[backend] ?? dirs[0];
   }
 
-  /** Load the HarmonyPIR WASM module + pir-core WASM + worker pool. */
+  /** Load the HarmonyPIR WASM module + worker pool. */
   async loadWasm(): Promise<void> {
-    // Ensure pir-core WASM is loaded (required for hash functions)
-    await initWasm();
     if (this.pool && this.wasm) return; // already loaded
     const backend = this.config.prpBackend ?? 0;
     const backendName = ['Hoang', 'FastPRP', 'ALF'][backend] ?? 'Hoang';
@@ -268,20 +265,10 @@ export class HarmonyPirClient {
     if (info[0] === RESP_ERROR) {
       throw new Error('Server returned error for HarmonyGetInfo');
     }
-
-    if (info[1] === 0x7B) {
-      // JSON format (unified server)
-      const j = JSON.parse(new TextDecoder().decode(info.slice(1)));
-      this.indexBinsPerTable = j.index_bins_per_table;
-      this.chunkBinsPerTable = j.chunk_bins_per_table;
-      this.tagSeed = BigInt(j.tag_seed);
-    } else {
-      // Legacy binary format
-      const view = new DataView(info.buffer, info.byteOffset);
-      this.indexBinsPerTable = view.getUint32(1, true);
-      this.chunkBinsPerTable = view.getUint32(5, true);
-      this.tagSeed = view.getBigUint64(11, true);
-    }
+    const view = new DataView(info.buffer, info.byteOffset);
+    this.indexBinsPerTable = view.getUint32(1, true);
+    this.chunkBinsPerTable = view.getUint32(5, true);
+    this.tagSeed = view.getBigUint64(11, true);
     this.log(`Server info: indexBins=${this.indexBinsPerTable}, chunkBins=${this.chunkBinsPerTable}`);
   }
 

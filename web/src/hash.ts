@@ -1,13 +1,14 @@
 /**
  * Hash functions for the Batch PIR system.
  *
- * All core hash functions are implemented in WASM (pir-core-wasm).
- * initWasm() must be called before using any function in this module.
+ * Ports the splitmix64-based functions from build/src/common.rs.
+ * All 64-bit arithmetic uses BigInt to match the Rust implementation exactly.
  */
 
 import {
-  K, K_CHUNK,
+  K, K_CHUNK, NUM_HASHES,
   MASTER_SEED, CHUNK_MASTER_SEED,
+  SCRIPT_HASH_SIZE,
 } from './constants.js';
 
 import {
@@ -21,46 +22,162 @@ import {
   wasmCuckooHashInt,
 } from './wasm-bridge.js';
 
-// ─── Core functions (WASM) ─────────────────────────────────────────────────
+const MASK64 = 0xFFFFFFFFFFFFFFFFn;
 
-/** splitmix64 finalizer (via WASM, matches Rust exactly) */
+// ─── Core functions ────────────────────────────────────────────────────────
+
+/** splitmix64 finalizer (matches Rust exactly) */
 export function splitmix64(x: bigint): bigint {
-  return wasmSplitmix64(x);
+  const w = wasmSplitmix64(x);
+  if (w !== undefined) return w;
+  // Pure-TS fallback
+  x = (x ^ (x >> 30n)) & MASK64;
+  x = (x * 0xbf58476d1ce4e5b9n) & MASK64;
+  x = (x ^ (x >> 27n)) & MASK64;
+  x = (x * 0x94d049bb133111ebn) & MASK64;
+  x = (x ^ (x >> 31n)) & MASK64;
+  return x;
 }
+
+/** Read first 8 bytes of a script_hash as u64 LE */
+function shA(data: Uint8Array): bigint {
+  const dv = new DataView(data.buffer, data.byteOffset, 8);
+  return dv.getBigUint64(0, true);
+}
+
+/** Read bytes 8..16 of a script_hash as u64 LE */
+function shB(data: Uint8Array): bigint {
+  const dv = new DataView(data.buffer, data.byteOffset + 8, 8);
+  return dv.getBigUint64(0, true);
+}
+
+/** Read bytes 16..20 of a script_hash as u32 LE, zero-extended to u64 */
+function shC(data: Uint8Array): bigint {
+  const dv = new DataView(data.buffer, data.byteOffset + 16, 4);
+  return BigInt(dv.getUint32(0, true));
+}
+
+// ─── Fingerprint tag computation ────────────────────────────────────────────
 
 /** Compute an 8-byte fingerprint tag for a script_hash using a keyed hash */
 export function computeTag(tagSeed: bigint, scriptHash: Uint8Array): bigint {
-  return wasmComputeTag(tagSeed, scriptHash);
+  const w = wasmComputeTag(tagSeed, scriptHash);
+  if (w !== undefined) return w;
+  // Pure-TS fallback
+  let h = (shA(scriptHash) ^ tagSeed) & MASK64;
+  h = (h ^ shB(scriptHash)) & MASK64;
+  h = splitmix64((h ^ shC(scriptHash)) & MASK64);
+  return h;
+}
+
+// ─── Index-level bucket assignment ─────────────────────────────────────────
+
+/** Hash script_hash with a nonce for bucket assignment */
+function hashForBucket(scriptHash: Uint8Array, nonce: bigint): bigint {
+  let h = (shA(scriptHash) + ((nonce * 0x9e3779b97f4a7c15n) & MASK64)) & MASK64;
+  h = (h ^ shB(scriptHash)) & MASK64;
+  h = splitmix64((h ^ shC(scriptHash)) & MASK64);
+  return h;
 }
 
 /** Derive NUM_HASHES (3) distinct bucket indices for a script_hash */
 export function deriveBuckets(scriptHash: Uint8Array): number[] {
-  return wasmDeriveBuckets(scriptHash, K);
+  const w = wasmDeriveBuckets(scriptHash, K);
+  if (w !== undefined) return w;
+  // Pure-TS fallback
+  const buckets: number[] = [];
+  let nonce = 0n;
+
+  while (buckets.length < NUM_HASHES) {
+    const h = hashForBucket(scriptHash, nonce);
+    const bucket = Number(h % BigInt(K));
+    nonce += 1n;
+
+    if (!buckets.includes(bucket)) {
+      buckets.push(bucket);
+    }
+  }
+
+  return buckets;
 }
+
+// ─── Index-level cuckoo hashing ────────────────────────────────────────────
 
 /** Derive a cuckoo hash function key for (bucket_id, hash_fn) */
 export function deriveCuckooKey(bucketId: number, hashFn: number): bigint {
-  return wasmDeriveCuckooKey(MASTER_SEED, bucketId, hashFn);
+  const w = wasmDeriveCuckooKey(MASTER_SEED, bucketId, hashFn);
+  if (w !== undefined) return w;
+  // Pure-TS fallback
+  return splitmix64(
+    (MASTER_SEED
+      + ((BigInt(bucketId) * 0x9e3779b97f4a7c15n) & MASK64)
+      + ((BigInt(hashFn) * 0x517cc1b727220a95n) & MASK64)
+    ) & MASK64
+  );
 }
 
 /** Cuckoo hash: hash a script_hash with a derived key, return a bin index */
 export function cuckooHash(scriptHash: Uint8Array, key: bigint, numBins: number): number {
-  return wasmCuckooHash(scriptHash, key, numBins);
+  const w = wasmCuckooHash(scriptHash, key, numBins);
+  if (w !== undefined) return w;
+  // Pure-TS fallback
+  let h = (shA(scriptHash) ^ key) & MASK64;
+  h = (h ^ shB(scriptHash)) & MASK64;
+  h = splitmix64((h ^ shC(scriptHash)) & MASK64);
+  return Number(h % BigInt(numBins));
+}
+
+// ─── Chunk-level bucket assignment ─────────────────────────────────────────
+
+/** Hash a chunk_id with a nonce for chunk-level bucket assignment */
+function hashChunkForBucket(chunkId: number, nonce: bigint): bigint {
+  return splitmix64(
+    (BigInt(chunkId) + ((nonce * 0x9e3779b97f4a7c15n) & MASK64)) & MASK64
+  );
 }
 
 /** Derive 3 distinct chunk-level bucket indices for a chunk_id */
 export function deriveChunkBuckets(chunkId: number): number[] {
-  return wasmDeriveChunkBuckets(chunkId, K_CHUNK);
+  const w = wasmDeriveChunkBuckets(chunkId, K_CHUNK);
+  if (w !== undefined) return w;
+  // Pure-TS fallback
+  const buckets: number[] = [];
+  let nonce = 0n;
+
+  while (buckets.length < NUM_HASHES) {
+    const h = hashChunkForBucket(chunkId, nonce);
+    const bucket = Number(h % BigInt(K_CHUNK));
+    nonce += 1n;
+
+    if (!buckets.includes(bucket)) {
+      buckets.push(bucket);
+    }
+  }
+
+  return buckets;
 }
+
+// ─── Chunk-level cuckoo hashing ────────────────────────────────────────────
 
 /** Derive a cuckoo hash function key for chunk-level (bucket_id, hash_fn) */
 export function deriveChunkCuckooKey(bucketId: number, hashFn: number): bigint {
-  return wasmDeriveChunkCuckooKey(CHUNK_MASTER_SEED, bucketId, hashFn);
+  const w = wasmDeriveChunkCuckooKey(CHUNK_MASTER_SEED, bucketId, hashFn);
+  if (w !== undefined) return w;
+  // Pure-TS fallback
+  return splitmix64(
+    (CHUNK_MASTER_SEED
+      + ((BigInt(bucketId) * 0x9e3779b97f4a7c15n) & MASK64)
+      + ((BigInt(hashFn) * 0x517cc1b727220a95n) & MASK64)
+    ) & MASK64
+  );
 }
 
 /** Cuckoo hash for chunk_ids: map a chunk_id to a bin index using a derived key */
 export function cuckooHashInt(chunkId: number, key: bigint, numBins: number): number {
-  return wasmCuckooHashInt(chunkId, key, numBins);
+  const w = wasmCuckooHashInt(chunkId, key, numBins);
+  if (w !== undefined) return w;
+  // Pure-TS fallback
+  return Number(splitmix64((BigInt(chunkId) ^ key) & MASK64) % BigInt(numBins));
 }
 
 // ─── Script hash computation ───────────────────────────────────────────────

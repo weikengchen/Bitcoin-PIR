@@ -686,7 +686,7 @@ async fn main() {
                         let _ = sink.send(Message::Binary(Response::Pong.encode().into())).await;
                     }
                     REQ_GET_INFO => {
-                        let _ = sink.send(Message::Binary(server.encode_info_json_response(RESP_INFO).into())).await;
+                        let _ = sink.send(Message::Binary(Response::Info(server.server_info()).encode().into())).await;
                     }
                     REQ_GET_DB_CATALOG => {
                         let _ = sink.send(Message::Binary(Response::DbCatalog(server.build_catalog()).encode().into())).await;
@@ -728,7 +728,9 @@ async fn main() {
                     // Secondary = hint server (REQ_HARMONY_HINTS)
                     // Both respond to REQ_HARMONY_GET_INFO
                     REQ_HARMONY_GET_INFO => {
-                        let _ = sink.send(Message::Binary(server.encode_info_json_response(RESP_HARMONY_INFO).into())).await;
+                        let _ = sink.send(Message::Binary(
+                            Response::HarmonyInfo(server.server_info()).encode().into()
+                        )).await;
                     }
                     REQ_HARMONY_HINTS if server.role == ServerRole::Secondary => {
                         if let Ok(Request::HarmonyHints(hint_req)) = Request::decode(payload) {
