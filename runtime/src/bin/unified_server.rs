@@ -233,8 +233,15 @@ struct UnifiedServerData {
     role: ServerRole,
     /// OnionPIR worker channel (None if OnionPIR data not available or secondary role).
     onionpir_tx: Option<Arc<mpsc::Sender<PirCommand>>>,
-    /// OnionPIR-specific info for the info response.
-    onionpir_packed_entries: Option<u32>,
+    /// OnionPIR-specific parameters (if available).
+    onionpir_info: Option<OnionPirInfo>,
+}
+
+#[derive(Clone)]
+struct OnionPirInfo {
+    total_packed_entries: u32,
+    index_bins_per_table: u32,
+    chunk_bins_per_table: u32,
 }
 
 impl UnifiedServerData {
@@ -246,6 +253,52 @@ impl UnifiedServerData {
             chunk_k: self.db.chunk.params.k as u8,
             tag_seed: self.db.index.tag_seed,
         }
+    }
+
+    /// Build a JSON server info string covering all protocols.
+    fn server_info_json(&self) -> String {
+        let mut json = format!(
+            r#"{{"index_bins_per_table":{},"chunk_bins_per_table":{},"index_k":{},"chunk_k":{},"tag_seed":"0x{:016x}","index_dpf_n":{},"chunk_dpf_n":{},"index_cuckoo_bucket_size":{},"index_slot_size":{},"chunk_cuckoo_bucket_size":{},"chunk_slot_size":{},"role":"{}""#,
+            self.db.index.bins_per_table,
+            self.db.chunk.bins_per_table,
+            self.db.index.params.k,
+            self.db.chunk.params.k,
+            self.db.index.tag_seed,
+            params::compute_dpf_n(self.db.index.bins_per_table),
+            params::compute_dpf_n(self.db.chunk.bins_per_table),
+            self.db.index.params.cuckoo_bucket_size,
+            self.db.index.params.slot_size,
+            self.db.chunk.params.cuckoo_bucket_size,
+            self.db.chunk.params.slot_size,
+            match self.role { ServerRole::Primary => "primary", ServerRole::Secondary => "secondary" },
+        );
+
+        if let Some(ref opi) = self.onionpir_info {
+            json.push_str(&format!(
+                r#","onionpir":{{"total_packed_entries":{},"index_bins_per_table":{},"chunk_bins_per_table":{}}}"#,
+                opi.total_packed_entries, opi.index_bins_per_table, opi.chunk_bins_per_table,
+            ));
+        }
+
+        if self.db.has_merkle() {
+            json.push_str(r#","merkle":true"#);
+        }
+
+        json.push('}');
+        json
+    }
+
+    /// Encode a JSON info response as a length-prefixed binary message.
+    fn encode_info_json_response(&self) -> Vec<u8> {
+        let json = self.server_info_json();
+        let json_bytes = json.as_bytes();
+        // Wire: [4B length LE][1B RESP_INFO][json bytes]
+        let payload_len = 1 + json_bytes.len();
+        let mut msg = Vec::with_capacity(4 + payload_len);
+        msg.extend_from_slice(&(payload_len as u32).to_le_bytes());
+        msg.push(RESP_INFO);
+        msg.extend_from_slice(json_bytes);
+        msg
     }
 
     fn build_catalog(&self) -> DatabaseCatalog {
@@ -423,7 +476,7 @@ async fn main() {
     // ── Set up OnionPIR (primary only, if data available) ───────────────
 
     let mut onionpir_tx: Option<Arc<mpsc::Sender<PirCommand>>> = None;
-    let mut onionpir_packed_entries: Option<u32> = None;
+    let mut onionpir_info_data: Option<OnionPirInfo> = None;
 
     let ntt_path = args.data_dir.join(ONION_NTT_FILE);
     if args.role == ServerRole::Primary && ntt_path.exists() {
@@ -442,7 +495,11 @@ async fn main() {
         println!("  Chunk: K={}, bins={}, packed={}", ch.k_chunk, ch.bins_per_table, ch.num_packed_entries);
         println!("  Index: K={}, bins={}, bucket_size={}", im.k, im.bins_per_table, im.cuckoo_bucket_size);
 
-        onionpir_packed_entries = Some(ch.num_packed_entries as u32);
+        onionpir_info_data = Some(OnionPirInfo {
+            total_packed_entries: ch.num_packed_entries as u32,
+            index_bins_per_table: im.bins_per_table as u32,
+            chunk_bins_per_table: ch.bins_per_table as u32,
+        });
 
         // Parse chunk cuckoo tables
         let header_size = 36;
@@ -562,7 +619,7 @@ async fn main() {
         db,
         role: args.role,
         onionpir_tx,
-        onionpir_packed_entries,
+        onionpir_info: onionpir_info_data,
     });
 
     println!();
@@ -629,7 +686,8 @@ async fn main() {
                         let _ = sink.send(Message::Binary(Response::Pong.encode().into())).await;
                     }
                     REQ_GET_INFO => {
-                        let _ = sink.send(Message::Binary(Response::Info(server.server_info()).encode().into())).await;
+                        // Send JSON info — covers DPF, OnionPIR, and HarmonyPIR clients
+                        let _ = sink.send(Message::Binary(server.encode_info_json_response().into())).await;
                     }
                     REQ_GET_DB_CATALOG => {
                         let _ = sink.send(Message::Binary(Response::DbCatalog(server.build_catalog()).encode().into())).await;
@@ -671,9 +729,8 @@ async fn main() {
                     // Secondary = hint server (REQ_HARMONY_HINTS)
                     // Both respond to REQ_HARMONY_GET_INFO
                     REQ_HARMONY_GET_INFO => {
-                        let _ = sink.send(Message::Binary(
-                            Response::HarmonyInfo(server.server_info()).encode().into()
-                        )).await;
+                        // HarmonyPIR uses same JSON info format
+                        let _ = sink.send(Message::Binary(server.encode_info_json_response().into())).await;
                     }
                     REQ_HARMONY_HINTS if server.role == ServerRole::Secondary => {
                         if let Ok(Request::HarmonyHints(hint_req)) = Request::decode(payload) {

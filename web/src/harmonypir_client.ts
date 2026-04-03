@@ -268,10 +268,20 @@ export class HarmonyPirClient {
     if (info[0] === RESP_ERROR) {
       throw new Error('Server returned error for HarmonyGetInfo');
     }
-    const view = new DataView(info.buffer, info.byteOffset);
-    this.indexBinsPerTable = view.getUint32(1, true);
-    this.chunkBinsPerTable = view.getUint32(5, true);
-    this.tagSeed = view.getBigUint64(11, true);
+
+    if (info[1] === 0x7B) {
+      // JSON format (unified server)
+      const j = JSON.parse(new TextDecoder().decode(info.slice(1)));
+      this.indexBinsPerTable = j.index_bins_per_table;
+      this.chunkBinsPerTable = j.chunk_bins_per_table;
+      this.tagSeed = BigInt(j.tag_seed);
+    } else {
+      // Legacy binary format
+      const view = new DataView(info.buffer, info.byteOffset);
+      this.indexBinsPerTable = view.getUint32(1, true);
+      this.chunkBinsPerTable = view.getUint32(5, true);
+      this.tagSeed = view.getBigUint64(11, true);
+    }
     this.log(`Server info: indexBins=${this.indexBinsPerTable}, chunkBins=${this.chunkBinsPerTable}`);
   }
 

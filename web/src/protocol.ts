@@ -43,7 +43,7 @@ export type Request =
 
 export type Response =
   | { type: 'Pong' }
-  | { type: 'Info'; info: ServerInfo }
+  | { type: 'Info'; info: ServerInfo; rawJson?: any }
   | { type: 'IndexBatch'; result: BatchResult }
   | { type: 'ChunkBatch'; result: BatchResult }
   | { type: 'Error'; message: string };
@@ -137,6 +137,23 @@ export function decodeResponse(data: Uint8Array): Response {
       return { type: 'Pong' };
 
     case RESP_INFO: {
+      // Detect JSON (unified server) vs binary (legacy server)
+      if (data[1] === 0x7B) { // '{' = JSON
+        const jsonStr = new TextDecoder().decode(data.slice(1));
+        const j = JSON.parse(jsonStr);
+        return {
+          type: 'Info',
+          info: {
+            indexBinsPerTable: j.index_bins_per_table,
+            chunkBinsPerTable: j.chunk_bins_per_table,
+            indexK: j.index_k,
+            chunkK: j.chunk_k,
+            tagSeed: BigInt(j.tag_seed),
+          },
+          rawJson: j, // Full JSON available for OnionPIR/HarmonyPIR clients
+        };
+      }
+      // Legacy binary format
       if (data.length < 19) throw new Error('Info response too short');
       const dv = new DataView(data.buffer, data.byteOffset, data.length);
       return {
