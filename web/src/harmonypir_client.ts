@@ -31,7 +31,8 @@ import { cuckooPlace, planRounds } from './pbc.js';
 import { readVarint, decodeUtxoData } from './codec.js';
 import { findEntryInIndexResult, findChunkInResult } from './scan.js';
 import { ManagedWebSocket } from './ws.js';
-import { fetchServerInfoJson } from './server-info.js';
+import { fetchServerInfoJson, type ServerInfoJson } from './server-info.js';
+import { verifyMerkleDpf, clearTreeTopCache } from './merkle-verify-dpf.js';
 
 import { HarmonyWorkerPool, BuildItem, BuildResult, ProcessItem } from './harmonypir_worker_pool.js';
 
@@ -56,6 +57,16 @@ export interface HarmonyQueryResult {
   scriptHash: string;
   utxos: HarmonyUtxoEntry[];
   whale: boolean;
+  /** Merkle verification result (undefined if not verified yet) */
+  merkleVerified?: boolean;
+  /** Merkle root hash hex (from server, for display) */
+  merkleRootHex?: string;
+  /** tree_loc in the Merkle tree */
+  treeLoc?: number;
+  /** Raw chunk data (kept for Merkle verification) */
+  rawChunkData?: Uint8Array;
+  /** Script hash as bytes (for Merkle leaf hash) */
+  scriptHashBytes?: Uint8Array;
 }
 
 // ─── WASM module type (loaded dynamically) ──────────────────────────────────
@@ -152,10 +163,14 @@ export class HarmonyPirClient {
   private chunkBuckets: Map<number, HarmonyBucketWasm> = new Map();
 
   // Server params
+  private serverInfo: ServerInfoJson | null = null;
   private indexBinsPerTable = 0;
   private chunkBinsPerTable = 0;
   private tagSeed = 0n;
   private prpKey: Uint8Array;
+
+  // Lazy ManagedWebSocket to primary server (for Merkle DPF queries)
+  private primaryWs: ManagedWebSocket | null = null;
 
   // Actual hint bytes received during download.
   private totalHintBytes = 0;
@@ -263,6 +278,7 @@ export class HarmonyPirClient {
   /** Fetch server info (bins_per_table, tag_seed) from Query Server via JSON. */
   async fetchServerInfo(): Promise<void> {
     const info = await fetchServerInfoJson(this.queryWs!);
+    this.serverInfo = info;
     this.indexBinsPerTable = info.index_bins_per_table;
     this.chunkBinsPerTable = info.chunk_bins_per_table;
     this.tagSeed = info.tag_seed;
@@ -578,7 +594,7 @@ export class HarmonyPirClient {
       });
     }
 
-    const indexResults = new Map<number, { startChunkId: number; numChunks: number }>();
+    const indexResults = new Map<number, { startChunkId: number; numChunks: number; treeLoc: number }>();
     const whaleQueries = new Set<number>();
 
     for (let ir = 0; ir < indexRounds.length; ir++) {
@@ -716,14 +732,14 @@ export class HarmonyPirClient {
     // ══════════════════════════════════════════════════════════════════
     progress?.('Level 2', 'Collecting chunk IDs...');
 
-    const queryChunkInfo = new Map<number, { startChunk: number; numChunks: number }>();
+    const queryChunkInfo = new Map<number, { startChunk: number; numChunks: number; treeLoc: number }>();
     const allChunkIdsSet = new Set<number>();
 
     for (const [qi, info] of indexResults) {
       for (let ci = 0; ci < info.numChunks; ci++) {
         allChunkIdsSet.add(info.startChunkId + ci);
       }
-      queryChunkInfo.set(qi, { startChunk: info.startChunkId, numChunks: info.numChunks });
+      queryChunkInfo.set(qi, { startChunk: info.startChunkId, numChunks: info.numChunks, treeLoc: info.treeLoc });
     }
 
     const allChunkIds = Array.from(allChunkIdsSet).sort((a, b) => a - b);
@@ -859,8 +875,23 @@ export class HarmonyPirClient {
         const d = recoveredChunks.get(info.startChunk + ci);
         if (d) chunks.push(d);
       }
+      // Keep raw assembled data for Merkle verification
+      const totalLen = chunks.reduce((s, c) => s + c.length, 0);
+      const rawChunkData = new Uint8Array(totalLen);
+      let pos = 0;
+      for (const c of chunks) { rawChunkData.set(c, pos); pos += c.length; }
+
       const utxos = this.decodeUtxos(chunks);
-      results.set(qi, { address: addresses[qi], scriptHash: shHexes[qi], utxos, whale: false });
+      results.set(qi, {
+        address: addresses[qi],
+        scriptHash: shHexes[qi],
+        utxos,
+        whale: false,
+        merkleRootHex: this.serverInfo?.merkle?.root,
+        treeLoc: info.treeLoc,
+        rawChunkData,
+        scriptHashBytes: scriptHashes[qi],
+      });
     }
 
     const totalMs = performance.now() - tBatchStart;
@@ -1063,6 +1094,8 @@ export class HarmonyPirClient {
     this.queryWs?.disconnect();
     this.hintWs?.close();
     this.hintWs = null;
+    this.primaryWs?.disconnect();
+    this.primaryWs = null;
     if (this.pool) {
       this.pool.terminate();
       this.pool = null;
@@ -1094,6 +1127,60 @@ export class HarmonyPirClient {
   /** Update the PRP backend. Call before loadWasm() on PRP switch. */
   updatePrpBackend(backend: number): void {
     (this.config as any).prpBackend = backend;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Merkle verification (uses DPF sibling protocol via both servers)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /** Check if server supports DPF Merkle verification */
+  hasMerkle(): boolean {
+    return !!(this.serverInfo?.merkle && this.serverInfo.merkle.sibling_levels > 0);
+  }
+
+  /** Get the Merkle root hash hex (for display) */
+  getMerkleRootHex(): string | undefined {
+    return this.serverInfo?.merkle?.root;
+  }
+
+  /**
+   * Verify a HarmonyPIR query result against the DPF Merkle tree.
+   *
+   * Opens a temporary ManagedWebSocket to the primary server (hint server URL)
+   * since the hint server connection is not persistent. Uses both server connections
+   * for the 2-server DPF sibling queries.
+   */
+  async verifyMerkle(
+    result: HarmonyQueryResult,
+    onProgress?: (step: string, detail: string) => void,
+  ): Promise<boolean> {
+    const merkle = this.serverInfo?.merkle;
+    if (!merkle || merkle.sibling_levels === 0) throw new Error('Server does not support Merkle');
+    if (!result.scriptHashBytes || !result.rawChunkData || result.treeLoc === undefined) {
+      throw new Error('Result missing data for Merkle verification');
+    }
+    if (result.whale) throw new Error('Cannot verify whale addresses');
+    if (!this.queryWs) throw new Error('Not connected to query server');
+
+    // queryWs → secondary (server1), primaryWs → primary (server0)
+    if (!this.primaryWs) {
+      this.primaryWs = new ManagedWebSocket({
+        url: this.config.hintServerUrl,
+        label: 'harmony-merkle',
+        onLog: (msg) => this.log(msg),
+        onClose: () => { this.primaryWs = null; },
+      });
+      await this.primaryWs.connect();
+    }
+
+    const verified = await verifyMerkleDpf(
+      this.primaryWs, this.queryWs, merkle,
+      result.scriptHashBytes, result.rawChunkData, result.treeLoc,
+      onProgress,
+      (msg) => this.log(msg),
+    );
+    result.merkleVerified = verified;
+    return verified;
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
