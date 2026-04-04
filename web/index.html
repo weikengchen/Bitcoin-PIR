@@ -1132,12 +1132,59 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                 });
 
                 let found = 0;
+                const opQueryResults = [];
                 for (let qi = 0; qi < N; qi++) {
                     const spkHex = lines[qi];
                     const hashHex = bytesToHex(scriptHashes[qi]);
                     const result = results[qi];
                     if (result) found++;
                     renderResult(resultsContainer, spkHex, hashHex, result);
+                    opQueryResults.push(result);
+
+                    // Add Merkle verify button if result is verifiable
+                    if (result && !result.isWhale && result.treeLoc !== undefined && opClient.hasMerkle()) {
+                        const section = resultsContainer.lastElementChild;
+                        const merkleDiv = document.createElement('div');
+                        merkleDiv.style.cssText = 'margin-top: 10px; padding: 10px; border-top: 1px solid #eee;';
+                        merkleDiv.innerHTML = `
+                            <button class="op-merkle-btn small" style="background-color: #28a745;">&#128274; Verify Merkle Proof</button>
+                            <span class="op-merkle-status" style="margin-left: 10px; font-size: 13px; color: #888;"></span>
+                        `;
+                        section.appendChild(merkleDiv);
+
+                        const btn = merkleDiv.querySelector('.op-merkle-btn');
+                        const statusSpan = merkleDiv.querySelector('.op-merkle-status');
+                        const capturedResult = result;
+                        btn.addEventListener('click', async () => {
+                            btn.disabled = true;
+                            btn.textContent = '⏳ Verifying...';
+                            statusSpan.textContent = '';
+                            statusSpan.style.color = '#888';
+                            try {
+                                const verified = await opClient.verifyMerkle(capturedResult, (step, detail) => {
+                                    statusSpan.textContent = `${step}: ${detail}`;
+                                });
+                                if (verified) {
+                                    btn.textContent = '✅ Merkle Verified';
+                                    btn.style.backgroundColor = '#155724';
+                                    statusSpan.textContent = `Root: ${opClient.getMerkleRootHex().substring(0, 16)}…`;
+                                    statusSpan.style.color = '#28a745';
+                                } else {
+                                    btn.textContent = '❌ Verification Failed';
+                                    btn.style.backgroundColor = '#dc3545';
+                                    statusSpan.textContent = 'Root hash mismatch';
+                                    statusSpan.style.color = '#dc3545';
+                                }
+                            } catch (err) {
+                                btn.textContent = '❌ Error';
+                                btn.style.backgroundColor = '#dc3545';
+                                statusSpan.textContent = err.message;
+                                statusSpan.style.color = '#dc3545';
+                                console.error('Merkle verification error:', err);
+                            }
+                            btn.disabled = false;
+                        });
+                    }
                 }
 
                 opSetProgress(100, `Done! ${found}/${N} addresses found`);
