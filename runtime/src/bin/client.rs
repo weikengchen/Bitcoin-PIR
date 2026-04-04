@@ -438,86 +438,99 @@ async fn main() {
         let mut node_idx = tree_loc as usize;
         let mut merkle_ok = true;
 
+        // Batch sibling PIR: PBC-place groupIds at each level
         for level in 0..merkle_num_levels {
             let group_id = (node_idx / merkle_arity) as u32;
             let level_bins = merkle_level_bins[level];
             let level_dpf_n = compute_dpf_n(level_bins);
             let level_seed = 0xBA7C_51B1_0000_0000u64.wrapping_add(level as u64);
 
-            // Derive candidate PBC buckets for this group_id
-            let my_buckets = pir_hash::derive_int_buckets_3(group_id, merkle_k);
-            let assigned_bucket = my_buckets[0];
+            // PBC-place: for single address this is trivial (1 group, 1 round)
+            let unique_gids = vec![group_id];
+            let cand_buckets: Vec<[usize; 3]> = unique_gids.iter()
+                .map(|&gid| pir_hash::derive_int_buckets_3(gid, merkle_k))
+                .collect();
+            let pbc_rounds = pbc_plan_rounds(&cand_buckets, merkle_k, 3, 500);
 
-            // Compute cuckoo bin locations
-            let mut my_locs = Vec::new();
-            for h in 0..merkle_cuckoo_num_hashes {
-                let key = pir_hash::derive_cuckoo_key(level_seed, assigned_bucket, h);
-                my_locs.push(pir_hash::cuckoo_hash_int(group_id, key, level_bins) as u64);
-            }
-
-            // Generate DPF keys for all K=75 buckets
-            let mut s0_keys: Vec<Vec<Vec<u8>>> = Vec::with_capacity(merkle_k);
-            let mut s1_keys: Vec<Vec<Vec<u8>>> = Vec::with_capacity(merkle_k);
-
-            for b in 0..merkle_k {
-                let mut s0_bucket = Vec::new();
-                let mut s1_bucket = Vec::new();
-                for h in 0..merkle_cuckoo_num_hashes {
-                    let alpha = if b == assigned_bucket {
-                        my_locs[h]
-                    } else {
-                        rng.next_u64() % level_bins as u64
-                    };
-                    let (k0, k1) = dpf.gen(alpha, level_dpf_n);
-                    s0_bucket.push(k0.to_bytes());
-                    s1_bucket.push(k1.to_bytes());
-                }
-                s0_keys.push(s0_bucket);
-                s1_keys.push(s1_bucket);
-            }
-
-            // Send MerkleSiblingBatch (level=2, round_id=level)
-            let req0 = Request::MerkleSiblingBatch(BatchQuery {
-                level: 2, round_id: level as u16, db_id: 0, keys: s0_keys,
-            });
-            let req1 = Request::MerkleSiblingBatch(BatchQuery {
-                level: 2, round_id: level as u16, db_id: 0, keys: s1_keys,
-            });
-
-            sink0.send(Message::Binary(req0.encode().into())).await.expect("send s0");
-            sink1.send(Message::Binary(req1.encode().into())).await.expect("send s1");
-
-            let resp0 = recv_response(&mut stream0, &mut sink0).await;
-            let resp1 = recv_response(&mut stream1, &mut sink1).await;
-
-            let (sr0, sr1) = match (resp0, resp1) {
-                (Response::MerkleSiblingBatch(a), Response::MerkleSiblingBatch(b)) => (a, b),
-                (Response::Error(e), _) | (_, Response::Error(e)) => {
-                    println!("  Merkle not supported by server: {}", e);
-                    merkle_ok = false;
-                    break;
-                }
-                _ => { println!("  Unexpected response for merkle sibling batch"); merkle_ok = false; break; }
-            };
-
-            // XOR and find group
-            let b = assigned_bucket;
             let mut found_children: Option<Vec<[u8; 32]>> = None;
-            for h in 0..merkle_cuckoo_num_hashes {
-                let mut result = sr0.results[b][h].clone();
-                eval::xor_into(&mut result, &sr1.results[b][h]);
-                if let Some(children) = eval::find_group_in_sibling_result(
-                    &result, group_id, merkle_arity, merkle_bucket_size,
-                ) {
-                    found_children = Some(children);
-                    break;
+
+            for (ri, pbc_round) in pbc_rounds.iter().enumerate() {
+                // Map: bucket → (gid, cuckoo_locs)
+                let mut bucket_info: Vec<Option<(u32, Vec<u64>)>> = vec![None; merkle_k];
+                for &(ugi, bucket) in pbc_round {
+                    let gid = unique_gids[ugi];
+                    let mut locs = Vec::new();
+                    for h in 0..merkle_cuckoo_num_hashes {
+                        let key = pir_hash::derive_cuckoo_key(level_seed, bucket, h);
+                        locs.push(pir_hash::cuckoo_hash_int(gid, key, level_bins) as u64);
+                    }
+                    bucket_info[bucket] = Some((gid, locs));
+                }
+
+                let mut s0_keys: Vec<Vec<Vec<u8>>> = Vec::with_capacity(merkle_k);
+                let mut s1_keys: Vec<Vec<Vec<u8>>> = Vec::with_capacity(merkle_k);
+                for b in 0..merkle_k {
+                    let mut s0_bucket = Vec::new();
+                    let mut s1_bucket = Vec::new();
+                    for h in 0..merkle_cuckoo_num_hashes {
+                        let alpha = if let Some((_, ref locs)) = bucket_info[b] {
+                            locs[h]
+                        } else {
+                            rng.next_u64() % level_bins as u64
+                        };
+                        let (k0, k1) = dpf.gen(alpha, level_dpf_n);
+                        s0_bucket.push(k0.to_bytes());
+                        s1_bucket.push(k1.to_bytes());
+                    }
+                    s0_keys.push(s0_bucket);
+                    s1_keys.push(s1_bucket);
+                }
+
+                let round_id = (level * 100 + ri) as u16;
+                let req0 = Request::MerkleSiblingBatch(BatchQuery {
+                    level: 2, round_id, db_id: 0, keys: s0_keys,
+                });
+                let req1 = Request::MerkleSiblingBatch(BatchQuery {
+                    level: 2, round_id, db_id: 0, keys: s1_keys,
+                });
+
+                sink0.send(Message::Binary(req0.encode().into())).await.expect("send s0");
+                sink1.send(Message::Binary(req1.encode().into())).await.expect("send s1");
+
+                let resp0 = recv_response(&mut stream0, &mut sink0).await;
+                let resp1 = recv_response(&mut stream1, &mut sink1).await;
+
+                let (sr0, sr1) = match (resp0, resp1) {
+                    (Response::MerkleSiblingBatch(a), Response::MerkleSiblingBatch(b)) => (a, b),
+                    (Response::Error(e), _) | (_, Response::Error(e)) => {
+                        println!("  Merkle not supported by server: {}", e);
+                        merkle_ok = false;
+                        break;
+                    }
+                    _ => { println!("  Unexpected response for merkle sibling batch"); merkle_ok = false; break; }
+                };
+
+                // XOR and find group for each real bucket
+                for &(ugi, bucket) in pbc_round {
+                    let gid = unique_gids[ugi];
+                    for h in 0..merkle_cuckoo_num_hashes {
+                        let mut result = sr0.results[bucket][h].clone();
+                        eval::xor_into(&mut result, &sr1.results[bucket][h]);
+                        if let Some(children) = eval::find_group_in_sibling_result(
+                            &result, gid, merkle_arity, merkle_bucket_size,
+                        ) {
+                            found_children = Some(children);
+                            break;
+                        }
+                    }
                 }
             }
+
+            if !merkle_ok { break; }
 
             match found_children {
                 Some(children) => {
-                    let hash_refs: Vec<merkle::Hash256> = children;
-                    current_hash = merkle::compute_parent_n(&hash_refs);
+                    current_hash = merkle::compute_parent_n(&children);
                     node_idx = group_id as usize;
                 }
                 None => {
