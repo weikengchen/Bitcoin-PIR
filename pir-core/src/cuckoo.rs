@@ -7,7 +7,7 @@ use crate::hash;
 use crate::params::TableParams;
 
 /// Maximum number of eviction kicks before declaring insertion failure.
-pub const CUCKOO_MAX_KICKS: usize = 2000;
+pub const CUCKOO_MAX_KICKS: usize = 10000;
 
 /// Default load factor for sizing cuckoo tables.
 pub const CUCKOO_LOAD_FACTOR: f64 = 0.95;
@@ -58,41 +58,43 @@ where
         }
     }
 
-    // Eviction chain
+    // Eviction chain — vary eviction slot to avoid 2-cycles
     let mut current = entry_idx;
-    let mut current_hf = 0usize;
-    let mut current_bin = hash_fns(current, current_hf);
+    let mut current_bin = hash_fns(current, 0);
 
-    for _ in 0..max_kicks {
-        // Pick a random slot in the current bin to evict
+    for kick in 0..max_kicks {
         let base = current_bin * bucket_size;
-        let evict_slot = base; // Always evict slot 0 for determinism
-        let evicted = table[evict_slot];
-        table[evict_slot] = current;
+        let evict_slot = kick % bucket_size;
+        let evicted = table[base + evict_slot];
+        table[base + evict_slot] = current;
 
-        // Try to place the evicted entry in an alternate bin
+        // Find the alternative bin for the evicted entry
+        let mut alt_bin = current_bin;
         for hf in 0..num_hash_fns {
             let bin = hash_fns(evicted, hf);
-            if bin == current_bin {
-                continue;
-            }
-            let base = bin * bucket_size;
-            for s in 0..bucket_size {
-                if table[base + s] == EMPTY {
-                    table[base + s] = evicted;
-                    return true;
-                }
+            if bin != current_bin {
+                alt_bin = bin;
+                break;
             }
         }
 
-        // Move to an alternate bin for the evicted entry
-        current = evicted;
-        current_hf = 0;
-        let first_bin = hash_fns(current, 0);
-        if first_bin == current_bin && num_hash_fns > 1 {
-            current_hf = 1;
+        // Try to place evicted entry in its alternative bin
+        let alt_base = alt_bin * bucket_size;
+        let mut placed = false;
+        for s in 0..bucket_size {
+            if table[alt_base + s] == EMPTY {
+                table[alt_base + s] = evicted;
+                placed = true;
+                break;
+            }
         }
-        current_bin = hash_fns(current, current_hf);
+
+        if placed {
+            return true;
+        }
+
+        current = evicted;
+        current_bin = alt_bin;
     }
 
     false

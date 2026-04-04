@@ -299,8 +299,9 @@ pub fn verify_entry(
 
 // ─── MERKLE_DATA slot format ───────────────────────────────────────────────
 
-/// Size of a MERKLE_DATA slot: [8B tag][4B tree_loc][32B data_hash] = 44 bytes.
-pub const MERKLE_DATA_SLOT_SIZE: usize = 8 + 4 + 32;
+/// Size of a MERKLE_DATA slot: [8B tag][4B tree_loc][32B data_hash][32B L0_sibling] = 76 bytes.
+/// The L0 sibling hash is embedded to save one PIR round (no separate L0 sibling query).
+pub const MERKLE_DATA_SLOT_SIZE: usize = 8 + 4 + 32 + 32;
 
 /// Size of a MERKLE_SIBLING slot: [4B node_index][32B hash] = 36 bytes.
 pub const MERKLE_SIBLING_SLOT_SIZE: usize = 4 + 32;

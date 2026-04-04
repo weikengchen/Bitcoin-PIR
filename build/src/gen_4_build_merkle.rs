@@ -36,12 +36,12 @@ const TAG_SEED: u64 = 0xd4e5f6a7b8c91023;
 const TREE_TOP_CACHE_LEVELS: usize = 10;
 
 /// MERKLE_DATA table parameters: same K=75, bucket_size=4 as INDEX.
-/// slot_size = 44 bytes: [8B tag][4B tree_loc][32B data_hash]
+/// slot_size = 76 bytes: [8B tag][4B tree_loc][32B data_hash][32B L0_sibling]
 fn merkle_data_params() -> TableParams {
     TableParams {
         k: 75,
         num_hashes: 3,
-        master_seed: 0xBA7C_0EDA_0000_0000u64, // distinct from INDEX/CHUNK
+        master_seed: 0x71a2ef38b4c90d15, // same as INDEX — same scripthash entries, same cuckoo layout
         cuckoo_bucket_size: 4,
         cuckoo_num_hashes: 2,
         slot_size: MERKLE_DATA_SLOT_SIZE,
@@ -59,7 +59,7 @@ fn merkle_sibling_params(level: usize) -> TableParams {
         k: 75,
         num_hashes: 3,
         master_seed: 0xBA7C_51B1_0000_0000u64.wrapping_add(level as u64),
-        cuckoo_bucket_size: 3,
+        cuckoo_bucket_size: 4,
         cuckoo_num_hashes: 2,
         slot_size: MERKLE_SIBLING_SLOT_SIZE,
         dpf_n: 0, // computed per-level based on actual size
@@ -276,11 +276,19 @@ fn main() {
                     let orig_idx = entries[entry_local as usize];
                     let info = &leaf_infos[orig_idx];
 
-                    // [8B tag][4B tree_loc][32B data_hash]
+                    // [8B tag][4B tree_loc][32B data_hash][32B L0_sibling]
                     let tag = hash::compute_tag(TAG_SEED, &info.scripthash);
+                    let leaf_idx = tree_locs[orig_idx] as usize;
+                    let sibling_abs = (tree.num_leaves + leaf_idx) ^ 1;
+                    let l0_sibling = if sibling_abs < tree.nodes.len() {
+                        tree.nodes[sibling_abs]
+                    } else {
+                        merkle::ZERO_HASH
+                    };
                     w.write_all(&tag.to_le_bytes()).unwrap();
                     w.write_all(&tree_locs[orig_idx].to_le_bytes()).unwrap();
                     w.write_all(&info.data_hash).unwrap();
+                    w.write_all(&l0_sibling).unwrap();
                 }
             }
         }
@@ -298,9 +306,12 @@ fn main() {
         0
     };
 
-    println!("[6] Building {} sibling cuckoo tables...", num_sibling_levels);
+    // L0 siblings are embedded in MERKLE_DATA, so sibling tables start at L1
+    let actual_sibling_levels = if num_sibling_levels > 0 { num_sibling_levels - 1 } else { 0 };
+    println!("[6] Building {} sibling cuckoo tables (L1..L{}, L0 in MERKLE_DATA)...",
+        actual_sibling_levels, num_sibling_levels.saturating_sub(1));
 
-    for level in 0..num_sibling_levels {
+    for level in 1..num_sibling_levels {
         let t = Instant::now();
         let nodes_at_level = tree.num_leaves >> level;
         // Number of sibling pairs = nodes_at_level / 2
@@ -397,7 +408,7 @@ fn main() {
     println!("=== Summary ===");
     println!("Merkle tree:     {} leaves, depth {}", tree.num_real_leaves, tree.depth);
     println!("MERKLE_DATA:     {}", format!("{}/merkle_data_cuckoo.bin", data_dir));
-    println!("Sibling levels:  {} (L0..L{})", num_sibling_levels, num_sibling_levels.saturating_sub(1));
+    println!("Sibling levels:  {} (L1..L{}, L0 embedded in MERKLE_DATA)", actual_sibling_levels, num_sibling_levels.saturating_sub(1));
     println!("Tree-top cache:  {} levels ({} nodes)", cache_from_level, top_cache.len());
     println!("Root:            {}", format!("{}/merkle_root.bin", data_dir));
     println!("Total time:      {:.1}s", t_total.elapsed().as_secs_f64());

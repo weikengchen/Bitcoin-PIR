@@ -113,23 +113,23 @@ pub const CHUNK_PARAMS: TableParams = TableParams {
 
 // ─── File path constants (kept for backward compatibility) ──────────────────
 
-/// Path to the UTXO chunks index file.
-pub const INDEX_FILE: &str = "/Volumes/Bitcoin/data/utxo_chunks_index_nodust.bin";
+/// Path to the UTXO chunks index file (intermediate).
+pub const INDEX_FILE: &str = "/Volumes/Bitcoin/data/intermediate/utxo_chunks_index_nodust.bin";
 
-/// Path to the serialized INDEX-level Batch PIR cuckoo tables.
+/// Path to the serialized INDEX-level Batch PIR cuckoo tables (server).
 pub const CUCKOO_FILE: &str = "/Volumes/Bitcoin/data/batch_pir_cuckoo.bin";
 
-/// Path to the CHUNK-level cuckoo tables.
+/// Path to the CHUNK-level cuckoo tables (server).
 pub const CHUNK_CUCKOO_FILE: &str = "/Volumes/Bitcoin/data/chunk_pir_cuckoo.bin";
 
-/// Path to the UTXO chunks data file.
-pub const CHUNKS_DATA_FILE: &str = "/Volumes/Bitcoin/data/utxo_chunks_nodust.bin";
+/// Path to the UTXO chunks data file (intermediate).
+pub const CHUNKS_DATA_FILE: &str = "/Volumes/Bitcoin/data/intermediate/utxo_chunks_nodust.bin";
 
-/// Path to the batch PIR results (test output).
-pub const BATCH_PIR_RESULTS_FILE: &str = "/Volumes/Bitcoin/data/batch_pir_results.bin";
+/// Path to the batch PIR results (intermediate/test output).
+pub const BATCH_PIR_RESULTS_FILE: &str = "/Volumes/Bitcoin/data/intermediate/batch_pir_results.bin";
 
-/// Path to the chunk PIR execution plan.
-pub const CHUNK_PIR_PLAN_FILE: &str = "/Volumes/Bitcoin/data/chunk_pir_plan.bin";
+/// Path to the chunk PIR execution plan (intermediate).
+pub const CHUNK_PIR_PLAN_FILE: &str = "/Volumes/Bitcoin/data/intermediate/chunk_pir_plan.bin";
 
 /// Magic number for plan files.
 pub const PLAN_MAGIC: u64 = 0xBA7C_01A0_0000_0001;

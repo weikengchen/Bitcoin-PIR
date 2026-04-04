@@ -112,7 +112,8 @@ fn process_utxo_snapshot(snapshot_path: &Path) -> Result<(), String> {
     let mut total_utxos: u64 = 0;
     let mut total_amount: u64 = 0;
     let mut entry_count: u64 = 0;
-    let mut skipped_height: u64 = 0;
+    let mut max_height: u32 = 0;
+    let mut min_height: u32 = u32::MAX;
     let start_time = Instant::now();
 
     // Progress tracking (every 0.1%)
@@ -145,12 +146,6 @@ fn process_utxo_snapshot(snapshot_path: &Path) -> Result<(), String> {
             last_reported_permille = current_permille;
         }
 
-        // Skip entries with height >= 940_612
-        if txout.height >= 940_612 {
-            skipped_height += 1;
-            continue;
-        }
-
         // Get TXID bytes
         let txid_bytes = txout.out_point.txid.to_byte_array();
         let vout = txout.out_point.vout;
@@ -163,6 +158,8 @@ fn process_utxo_snapshot(snapshot_path: &Path) -> Result<(), String> {
         let script_hash_array: [u8; 20] = hash160.to_byte_array();
 
         let height = txout.height;
+        if height > max_height { max_height = height; }
+        if height < min_height { min_height = height; }
 
         // Write UTXO entry
         if let Err(e) = write_utxo_entry(&mut writer, &script_hash_array, &txid_bytes, vout, amount, height)
@@ -189,7 +186,7 @@ fn process_utxo_snapshot(snapshot_path: &Path) -> Result<(), String> {
     println!("=== Summary ===");
     println!("Total entries processed: {}", entry_count);
     println!("Total UTXOs written: {}", total_utxos);
-    println!("Skipped (height >= 940612): {}", skipped_height);
+    println!("Height range: {} .. {} (snapshot height: {})", min_height, max_height, max_height);
     println!(
         "Total amount: {:.8} BTC",
         total_amount as f64 / 100_000_000.0
