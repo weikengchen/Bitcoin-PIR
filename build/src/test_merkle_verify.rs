@@ -9,7 +9,10 @@
 //! 6. Walk the proof up to the root and verify it matches merkle_root.bin
 
 use memmap2::Mmap;
-use pir_core::merkle::{self, Hash256, MERKLE_DATA_SLOT_SIZE, MERKLE_SIBLING_SLOT_SIZE};
+use pir_core::merkle::{self, Hash256, MERKLE_SIBLING_SLOT_SIZE};
+
+/// Legacy MERKLE_DATA slot: [8B tag][4B tree_loc][32B data_hash][32B L0_sibling] = 76 bytes
+const MERKLE_DATA_SLOT_SIZE: usize = 76;
 use pir_core::hash;
 use pir_core::params::*;
 use std::fs::File;

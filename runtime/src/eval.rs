@@ -220,12 +220,64 @@ pub fn process_chunk_bucket(
     )
 }
 
+// ─── Merkle sibling evaluation ────────────────────────────────────────────
+
+/// Process one Merkle sibling bucket: evaluate 2 DPF keys, XOR-accumulate.
+/// `result_size` = cuckoo_bucket_size × slot_size (e.g. 4 × 260 = 1040 for arity=8).
+pub fn process_merkle_sibling_bucket(
+    keys: &[&DpfKey],
+    table_bytes: &[u8],
+    bins_per_table: usize,
+    result_size: usize,
+) -> (Vec<Vec<u8>>, BucketTiming) {
+    process_bucket_generic(
+        keys,
+        table_bytes,
+        bins_per_table,
+        result_size,
+        &|tbl, bin, out| {
+            let src = bin * result_size;
+            out.copy_from_slice(&tbl[src..src + result_size]);
+        },
+        None,
+    )
+}
+
+/// Find a group_id in a Merkle sibling result's slots.
+///
+/// Each slot: [4B group_id LE][arity × 32B child hashes].
+/// Returns the arity child hashes as a flat byte slice if found.
+pub fn find_group_in_sibling_result(
+    result: &[u8],
+    group_id: u32,
+    arity: usize,
+    bucket_size: usize,
+) -> Option<Vec<[u8; 32]>> {
+    let slot_size = 4 + arity * 32;
+    let target = group_id.to_le_bytes();
+    for slot in 0..bucket_size {
+        let base = slot * slot_size;
+        if base + 4 > result.len() { break; }
+        if result[base..base + 4] == target {
+            let mut children = Vec::with_capacity(arity);
+            for c in 0..arity {
+                let off = base + 4 + c * 32;
+                let mut h = [0u8; 32];
+                h.copy_from_slice(&result[off..off + 32]);
+                children.push(h);
+            }
+            return Some(children);
+        }
+    }
+    None
+}
+
 // ─── Result parsing helpers (client-side) ───────────────────────────────────
 
 /// Find a matching tag in an index-level result's slots.
 /// `expected_tag` is the 8-byte fingerprint computed by the client.
-/// Returns (start_chunk_id, num_chunks) if found.
-pub fn find_entry_in_index_result(result: &[u8], expected_tag: u64) -> Option<(u32, u32)> {
+/// Returns (start_chunk_id, num_chunks, tree_loc) if found.
+pub fn find_entry_in_index_result(result: &[u8], expected_tag: u64) -> Option<(u32, u32, u32)> {
     for slot in 0..INDEX_SLOTS {
         let base = slot * INDEX_SLOT_SIZE;
         let slot_tag = u64::from_le_bytes(result[base..base + TAG_SIZE].try_into().unwrap());
@@ -234,7 +286,10 @@ pub fn find_entry_in_index_result(result: &[u8], expected_tag: u64) -> Option<(u
                 result[base + TAG_SIZE..base + TAG_SIZE + 4].try_into().unwrap(),
             );
             let num_chunks = result[base + TAG_SIZE + 4] as u32;
-            return Some((start_chunk_id, num_chunks));
+            let tree_loc = u32::from_le_bytes(
+                result[base + TAG_SIZE + 5..base + TAG_SIZE + 9].try_into().unwrap(),
+            );
+            return Some((start_chunk_id, num_chunks, tree_loc));
         }
     }
     None

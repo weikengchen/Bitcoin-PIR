@@ -67,7 +67,19 @@ describe('parseServerInfoJson', () => {
         chunk_cuckoo_bucket_size: 1,
         chunk_slot_size: 3840,
       },
-      merkle: true,
+      merkle: {
+        arity: 8,
+        sibling_levels: 4,
+        sibling_k: 75,
+        sibling_bucket_size: 4,
+        sibling_slot_size: 260,
+        levels: [
+          { dpf_n: 18, bins_per_table: 200000 },
+        ],
+        root: 'abcd1234',
+        tree_top_hash: 'ef567890',
+        tree_top_size: 1024,
+      },
     });
 
     const info = parseServerInfoJson(full);
@@ -83,7 +95,9 @@ describe('parseServerInfoJson', () => {
     expect(info.onionpir!.index_slot_size).toBe(15);
     expect(info.onionpir!.chunk_cuckoo_bucket_size).toBe(1);
     expect(info.onionpir!.chunk_slot_size).toBe(3840);
-    expect(info.merkle).toBe(true);
+    expect(info.merkle).toBeDefined();
+    expect(info.merkle!.arity).toBe(8);
+    expect(info.merkle!.root).toBe('abcd1234');
   });
 
   it('parses secondary role', () => {

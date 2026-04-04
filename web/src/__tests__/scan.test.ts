@@ -40,7 +40,7 @@ describe('findEntryInIndexResult', () => {
     data[12] = 5;                   // numChunks = 5
 
     const result = findEntryInIndexResult(data, tag, BUCKET_SIZE, SLOT_SIZE);
-    expect(result).toEqual({ startChunkId: 42, numChunks: 5 });
+    expect(result).toEqual({ startChunkId: 42, numChunks: 5, treeLoc: 0 });
   });
 
   it('finds matching tag in third slot', () => {
@@ -52,7 +52,7 @@ describe('findEntryInIndexResult', () => {
     data[38] = 3;
 
     const result = findEntryInIndexResult(data, tag, BUCKET_SIZE, SLOT_SIZE);
-    expect(result).toEqual({ startChunkId: 1000, numChunks: 3 });
+    expect(result).toEqual({ startChunkId: 1000, numChunks: 3, treeLoc: 0 });
   });
 
   it('returns null when tag not found', () => {
@@ -82,7 +82,7 @@ describe('findEntryInIndexResult', () => {
     data[SLOT_SIZE + 12] = 10;
 
     const result = findEntryInIndexResult(data, tag, bucketSize, SLOT_SIZE);
-    expect(result).toEqual({ startChunkId: 777, numChunks: 10 });
+    expect(result).toEqual({ startChunkId: 777, numChunks: 10, treeLoc: 0 });
   });
 });
 
@@ -107,7 +107,7 @@ describe('findEntryInOnionPirIndexResult', () => {
     data[off + 14] = 7;               // numEntries
 
     const result = findEntryInOnionPirIndexResult(data, tag, testBucketSize, SLOT_SIZE);
-    expect(result).toEqual({ entryId: 12345, byteOffset: 320, numEntries: 7 });
+    expect(result).toEqual({ entryId: 12345, byteOffset: 320, numEntries: 7, treeLoc: 0 });
   });
 
   it('skips zero tags', () => {

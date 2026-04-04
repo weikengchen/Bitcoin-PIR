@@ -47,6 +47,7 @@ export {
 export {
   genDpfKeys,
   genChunkDpfKeys,
+  genDpfKeysN,
   type DpfKeyPair,
 } from './dpf.js';
 
@@ -59,6 +60,8 @@ export {
   deriveChunkBuckets,
   deriveChunkCuckooKey,
   cuckooHashInt,
+  deriveIntBuckets3,
+  deriveCuckooKeyGeneric,
   sha256,
   ripemd160,
   scriptHash,
@@ -82,7 +85,19 @@ export {
   HARMONY_INDEX_W, HARMONY_CHUNK_W, HARMONY_EMPTY,
   DEFAULT_SERVER0_URL,
   DEFAULT_SERVER1_URL,
+  MERKLE_ARITY, MERKLE_SIBLING_K, MERKLE_SIBLING_BUCKET_SIZE,
+  MERKLE_SIBLING_SLOT_SIZE, MERKLE_SIBLING_RESULT_SIZE,
+  REQ_MERKLE_SIBLING_BATCH, RESP_MERKLE_SIBLING_BATCH,
 } from './constants.js';
+
+export {
+  computeLeafHash,
+  computeDataHash,
+  computeParentN,
+  parseTreeTopCache,
+  verifyMerkleProof,
+  type TreeTopCache,
+} from './merkle.js';
 
 export {
   OnionPirWebClient,

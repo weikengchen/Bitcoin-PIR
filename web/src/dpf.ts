@@ -35,3 +35,14 @@ export async function genChunkDpfKeys(index: number): Promise<DpfKeyPair> {
     key1: k1.toBytes(),
   };
 }
+
+/**
+ * Generate DPF keys for a specific index with a custom domain exponent.
+ */
+export async function genDpfKeysN(index: number, dpfN: number): Promise<DpfKeyPair> {
+  const [k0, k1] = await dpf.gen(BigInt(index), dpfN);
+  return {
+    key0: k0.toBytes(),
+    key1: k1.toBytes(),
+  };
+}

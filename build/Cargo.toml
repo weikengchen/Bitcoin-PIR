@@ -119,8 +119,24 @@ name = "gen_4_build_merkle"
 path = "src/gen_4_build_merkle.rs"
 
 [[bin]]
+name = "gen_4_build_merkle_dpf"
+path = "src/gen_4_build_merkle_dpf.rs"
+
+[[bin]]
+name = "gen_4_build_merkle_onion"
+path = "src/gen_4_build_merkle_onion.rs"
+
+[[bin]]
 name = "test_merkle_verify"
 path = "src/test_merkle_verify.rs"
+
+[[bin]]
+name = "test_merkle_verify_n"
+path = "src/test_merkle_verify_n.rs"
+
+[[bin]]
+name = "test_merkle_verify_onion"
+path = "src/test_merkle_verify_onion.rs"
 
 [[bin]]
 name = "test_pir_core_crosscheck"

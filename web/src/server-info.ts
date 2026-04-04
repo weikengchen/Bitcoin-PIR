@@ -37,7 +37,24 @@ export interface ServerInfoJson {
   chunk_slot_size: number;
   role: 'primary' | 'secondary';
   onionpir?: OnionPirInfoJson;
-  merkle?: boolean;
+  merkle?: MerkleInfoJson;
+}
+
+export interface MerkleLevelInfo {
+  dpf_n: number;
+  bins_per_table: number;
+}
+
+export interface MerkleInfoJson {
+  arity: number;
+  sibling_levels: number;
+  sibling_k: number;
+  sibling_bucket_size: number;
+  sibling_slot_size: number;
+  levels: MerkleLevelInfo[];
+  root: string;             // hex (32 bytes)
+  tree_top_hash: string;   // SHA256 of tree-top cache blob (hex, 32 bytes)
+  tree_top_size: number;   // byte size of tree-top cache
 }
 
 // ─── JSON request message ────────────────────────────────────────────────────
@@ -84,8 +101,18 @@ export function parseServerInfoJson(jsonStr: string): ServerInfoJson {
     };
   }
 
-  if (raw.merkle) {
-    info.merkle = true;
+  if (raw.merkle && typeof raw.merkle === 'object') {
+    info.merkle = {
+      arity: raw.merkle.arity,
+      sibling_levels: raw.merkle.sibling_levels,
+      sibling_k: raw.merkle.sibling_k,
+      sibling_bucket_size: raw.merkle.sibling_bucket_size,
+      sibling_slot_size: raw.merkle.sibling_slot_size,
+      levels: raw.merkle.levels,
+      root: raw.merkle.root ?? '',
+      tree_top_hash: raw.merkle.tree_top_hash ?? '',
+      tree_top_size: raw.merkle.tree_top_size ?? 0,
+    };
   }
 
   return info;

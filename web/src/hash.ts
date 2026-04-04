@@ -180,6 +180,33 @@ export function cuckooHashInt(chunkId: number, key: bigint, numBins: number): nu
   return Number(splitmix64((BigInt(chunkId) ^ key) & MASK64) % BigInt(numBins));
 }
 
+// ─── Merkle sibling integer-keyed hashing ─────────────────────────────────
+
+/** Derive 3 distinct bucket indices for an integer ID (generic K). */
+export function deriveIntBuckets3(id: number, k: number): [number, number, number] {
+  const buckets: number[] = [];
+  let nonce = 0n;
+  while (buckets.length < 3) {
+    const h = hashChunkForBucket(id, nonce);
+    const bucket = Number(h % BigInt(k));
+    nonce += 1n;
+    if (!buckets.includes(bucket)) {
+      buckets.push(bucket);
+    }
+  }
+  return buckets as [number, number, number];
+}
+
+/** Derive a cuckoo hash function key for a given (masterSeed, bucketId, hashFn). */
+export function deriveCuckooKeyGeneric(masterSeed: bigint, bucketId: number, hashFn: number): bigint {
+  return splitmix64(
+    (masterSeed
+      + ((BigInt(bucketId) * 0x9e3779b97f4a7c15n) & MASK64)
+      + ((BigInt(hashFn) * 0x517cc1b727220a95n) & MASK64)
+    ) & MASK64
+  );
+}
+
 // ─── Script hash computation ───────────────────────────────────────────────
 
 // @ts-ignore

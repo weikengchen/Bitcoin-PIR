@@ -1252,8 +1252,9 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
         }
 
         let hpConnecting = false;
+        let hpSwitchingPrp = false;
         async function hpConnect() {
-            if (hpConnecting) return; // prevent double-click
+            if (hpConnecting || hpSwitchingPrp) return; // prevent double-click or race with PRP switch
             const hintServerUrl = document.getElementById('hp-hintServerUrl').value.trim();
             const queryServerUrl = document.getElementById('hp-queryServerUrl').value.trim();
             if (!hintServerUrl || !queryServerUrl) {
@@ -1375,6 +1376,10 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
         }
 
         async function hpQueryUtxos() {
+            if (hpSwitchingPrp) {
+                log('HarmonyPIR: PRP switch in progress, please wait.', 'error');
+                return;
+            }
             if (!hpClient || !hpHintsLoaded) {
                 log('HarmonyPIR: Auto-connecting...', 'info');
                 await hpConnect();
@@ -1464,8 +1469,10 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
             log(`HarmonyPIR: PRP changed to ${names[newPrp]}.`, 'info');
 
             if (!hpClient) return;
+            if (hpSwitchingPrp) return; // already switching
 
             const statusDiv = document.getElementById('hp-status');
+            hpSwitchingPrp = true;
             try {
                 // Save current hints to cache before switching.
                 if (hpHintsLoaded) {
@@ -1515,6 +1522,8 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                 statusDiv.className = 'status disconnected';
                 hpClient = null;
                 hpHintsLoaded = false;
+            } finally {
+                hpSwitchingPrp = false;
             }
         });
 

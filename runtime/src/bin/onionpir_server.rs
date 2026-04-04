@@ -114,33 +114,39 @@ enum PirCommand {
     },
 }
 
-// ─── Server info for clients ────────────────────────────────────────────────
+// ─── Server info for clients (JSON) ─────────────────────────────────────────
 
-struct ServerInfoV2 {
-    index_k: u8,
-    chunk_k: u8,
-    index_bins_per_table: u32,
-    chunk_bins_per_table: u32,
+struct ServerInfoData {
+    index_k: usize,
+    chunk_k: usize,
+    index_bins_per_table: usize,
+    chunk_bins_per_table: usize,
     tag_seed: u64,
-    total_packed_entries: u32,
-    index_cuckoo_bucket_size: u16,
-    index_slot_size: u8,
+    total_packed_entries: usize,
+    index_cuckoo_bucket_size: usize,
+    index_slot_size: usize,
 }
 
-impl ServerInfoV2 {
-    fn encode(&self) -> Vec<u8> {
-        let payload_len = 1 + 1 + 1 + 4 + 4 + 8 + 4 + 2 + 1; // 26
+impl ServerInfoData {
+    /// Encode as JSON info response: [4B len LE][1B variant=0x03][JSON bytes...]
+    fn encode_json(&self) -> Vec<u8> {
+        let json = format!(
+            r#"{{"index_bins_per_table":{},"chunk_bins_per_table":{},"index_k":{},"chunk_k":{},"tag_seed":"0x{:016x}","index_cuckoo_bucket_size":{},"index_slot_size":{},"chunk_cuckoo_bucket_size":1,"chunk_slot_size":3840,"role":"primary","onionpir":{{"total_packed_entries":{},"index_bins_per_table":{},"chunk_bins_per_table":{},"tag_seed":"0x{:016x}","index_k":{},"chunk_k":{},"index_cuckoo_bucket_size":{},"index_slot_size":{},"chunk_cuckoo_bucket_size":1,"chunk_slot_size":3840}}}}"#,
+            self.index_bins_per_table, self.chunk_bins_per_table,
+            self.index_k, self.chunk_k, self.tag_seed,
+            self.index_cuckoo_bucket_size, self.index_slot_size,
+            // onionpir sub-object (same values — this is an OnionPIR-only server)
+            self.total_packed_entries,
+            self.index_bins_per_table, self.chunk_bins_per_table,
+            self.tag_seed, self.index_k, self.chunk_k,
+            self.index_cuckoo_bucket_size, self.index_slot_size,
+        );
+        let json_bytes = json.as_bytes();
+        let payload_len = 1 + json_bytes.len();
         let mut buf = Vec::with_capacity(4 + payload_len);
         buf.extend_from_slice(&(payload_len as u32).to_le_bytes());
-        buf.push(protocol::RESP_INFO);
-        buf.push(self.index_k);
-        buf.push(self.chunk_k);
-        buf.extend_from_slice(&self.index_bins_per_table.to_le_bytes());
-        buf.extend_from_slice(&self.chunk_bins_per_table.to_le_bytes());
-        buf.extend_from_slice(&self.tag_seed.to_le_bytes());
-        buf.extend_from_slice(&self.total_packed_entries.to_le_bytes());
-        buf.extend_from_slice(&self.index_cuckoo_bucket_size.to_le_bytes());
-        buf.push(self.index_slot_size);
+        buf.push(0x03); // REQ_GET_INFO_JSON response variant
+        buf.extend_from_slice(json_bytes);
         buf
     }
 }
@@ -331,15 +337,15 @@ async fn main() {
         }
     });
 
-    let info = Arc::new(ServerInfoV2 {
-        index_k: k_index as u8,
-        chunk_k: k_chunk as u8,
-        index_bins_per_table: index_bins as u32,
-        chunk_bins_per_table: chunk_bins as u32,
+    let info = Arc::new(ServerInfoData {
+        index_k: k_index,
+        chunk_k: k_chunk,
+        index_bins_per_table: index_bins,
+        chunk_bins_per_table: chunk_bins,
         tag_seed: im.tag_seed,
-        total_packed_entries: ch.num_packed_entries as u32,
-        index_cuckoo_bucket_size: im.cuckoo_bucket_size as u16,
-        index_slot_size: im.slot_size as u8,
+        total_packed_entries: ch.num_packed_entries,
+        index_cuckoo_bucket_size: im.cuckoo_bucket_size,
+        index_slot_size: im.slot_size,
     });
     let pir_tx = Arc::new(pir_tx);
 
@@ -399,8 +405,8 @@ async fn main() {
                         resp.push(protocol::RESP_PONG);
                         let _ = sink.send(Message::Binary(resp.into())).await;
                     }
-                    protocol::REQ_GET_INFO => {
-                        let encoded = info.encode();
+                    protocol::REQ_GET_INFO | 0x03 /* REQ_GET_INFO_JSON */ => {
+                        let encoded = info.encode_json();
                         let _ = sink.send(Message::Binary(encoded.into())).await;
                     }
                     REQ_REGISTER_KEYS => {

@@ -235,6 +235,23 @@ struct UnifiedServerData {
     onionpir_tx: Option<Arc<mpsc::Sender<PirCommand>>>,
     /// OnionPIR-specific parameters (if available).
     onionpir_info: Option<OnionPirInfo>,
+    /// OnionPIR Merkle sibling info (if available).
+    onionpir_merkle: Option<OnionPirMerkleInfo>,
+}
+
+#[derive(Clone)]
+struct OnionPirMerkleLevelInfo {
+    k: usize,
+    bins_per_table: usize,
+    num_groups: usize,
+}
+
+#[derive(Clone)]
+struct OnionPirMerkleInfo {
+    arity: usize,
+    levels: Vec<OnionPirMerkleLevelInfo>,
+    root_hex: String,
+    tree_top: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -260,33 +277,6 @@ impl UnifiedServerData {
         }
     }
 
-    /// Encode server info in the format expected by the OnionPIR web client.
-    ///
-    /// This is the ServerInfoV2 format which includes extra fields
-    /// (total_packed_entries, index_cuckoo_bucket_size, index_slot_size)
-    /// needed by the OnionPIR client. Falls back to standard ServerInfo
-    /// encoding if OnionPIR is not available.
-    fn encode_info_response(&self) -> Vec<u8> {
-        if let Some(ref opi) = self.onionpir_info {
-            // ServerInfoV2 format (matches onionpir_server.rs)
-            let payload_len: usize = 1 + 1 + 1 + 4 + 4 + 8 + 4 + 2 + 1; // 26
-            let mut buf = Vec::with_capacity(4 + payload_len);
-            buf.extend_from_slice(&(payload_len as u32).to_le_bytes());
-            buf.push(RESP_INFO);
-            buf.push(opi.index_k);
-            buf.push(opi.chunk_k);
-            buf.extend_from_slice(&opi.index_bins_per_table.to_le_bytes());
-            buf.extend_from_slice(&opi.chunk_bins_per_table.to_le_bytes());
-            buf.extend_from_slice(&opi.tag_seed.to_le_bytes());
-            buf.extend_from_slice(&opi.total_packed_entries.to_le_bytes());
-            buf.extend_from_slice(&opi.index_cuckoo_bucket_size.to_le_bytes());
-            buf.push(opi.index_slot_size);
-            buf
-        } else {
-            // Standard ServerInfo for DPF/HarmonyPIR clients
-            Response::Info(self.server_info()).encode()
-        }
-    }
 
     /// Build a JSON server info string covering all protocols.
     fn server_info_json(&self) -> String {
@@ -316,8 +306,59 @@ impl UnifiedServerData {
             ));
         }
 
+        if let Some(ref om) = self.onionpir_merkle {
+            json.push_str(&format!(
+                r#","onionpir_merkle":{{"arity":{},"sibling_levels":{},"levels":["#,
+                om.arity, om.levels.len(),
+            ));
+            for (i, lv) in om.levels.iter().enumerate() {
+                if i > 0 { json.push(','); }
+                json.push_str(&format!(
+                    r#"{{"k":{},"bins_per_table":{},"num_groups":{}}}"#,
+                    lv.k, lv.bins_per_table, lv.num_groups,
+                ));
+            }
+            json.push_str("]");
+            json.push_str(&format!(r#","root":"{}""#, om.root_hex));
+            let top_hash = pir_core::merkle::sha256(&om.tree_top);
+            json.push_str(&format!(r#","tree_top_hash":"{}""#,
+                top_hash.iter().map(|b| format!("{:02x}", b)).collect::<String>()));
+            json.push_str(&format!(r#","tree_top_size":{}}}"#, om.tree_top.len()));
+        }
+
         if self.db.has_merkle() {
-            json.push_str(r#","merkle":true"#);
+            let arity = self.db.merkle_arity;
+            let num_levels = self.db.merkle_siblings.len();
+            json.push_str(&format!(
+                r#","merkle":{{"arity":{},"sibling_levels":{},"sibling_k":{},"sibling_bucket_size":{},"sibling_slot_size":{},"levels":["#,
+                arity, num_levels,
+                75, // K for sibling tables
+                4,  // cuckoo_bucket_size
+                pir_core::merkle::merkle_sibling_slot_size(arity),
+            ));
+            for (i, sib) in self.db.merkle_siblings.iter().enumerate() {
+                if i > 0 { json.push(','); }
+                json.push_str(&format!(
+                    r#"{{"dpf_n":{},"bins_per_table":{}}}"#,
+                    params::compute_dpf_n(sib.bins_per_table),
+                    sib.bins_per_table,
+                ));
+            }
+            json.push_str("]");
+            // Root hash as hex
+            if let Some(ref root) = self.db.merkle_root {
+                json.push_str(&format!(r#","root":"{}""#,
+                    root.iter().map(|b| format!("{:02x}", b)).collect::<String>()));
+            }
+            // Tree-top: send SHA256 hash of the cache blob (32 bytes hex) for compact verification.
+            // Client fetches the full cache separately if needed (or trusts the hash).
+            if let Some(ref top) = self.db.merkle_tree_top {
+                let top_hash = pir_core::merkle::sha256(top);
+                json.push_str(&format!(r#","tree_top_hash":"{}""#,
+                    top_hash.iter().map(|b| format!("{:02x}", b)).collect::<String>()));
+                json.push_str(&format!(r#","tree_top_size":{}"#, top.len()));
+            }
+            json.push('}');
         }
 
         json.push('}');
@@ -414,6 +455,42 @@ impl UnifiedServerData {
             results.push(r);
         }
         (BatchResult { level: 1, round_id: query.round_id, results }, total_dpf, total_fetch)
+    }
+
+    fn process_merkle_sibling_batch(&self, query: &BatchQuery) -> (BatchResult, std::time::Duration, std::time::Duration) {
+        let level = query.round_id as usize;
+        let sib_table = &self.db.merkle_siblings[level];
+        let k = sib_table.params.k;
+        let result_size = sib_table.params.bin_size(); // bucket_size × slot_size
+        let num_buckets = query.keys.len().min(k);
+
+        let bucket_results: Vec<(Vec<Vec<u8>>, BucketTiming)> = (0..num_buckets)
+            .into_par_iter()
+            .map(|b| {
+                let dpf_keys: Vec<DpfKey> = query.keys[b].iter()
+                    .map(|k| DpfKey::from_bytes(k).expect("bad dpf key"))
+                    .collect();
+                let key_refs: Vec<&DpfKey> = dpf_keys.iter().collect();
+                let table_bytes = sib_table.bucket_bytes(b);
+                let (r, timing) = eval::process_merkle_sibling_bucket(
+                    &key_refs,
+                    table_bytes,
+                    sib_table.bins_per_table,
+                    result_size,
+                );
+                (r, timing)
+            })
+            .collect();
+
+        let mut total_dpf = std::time::Duration::ZERO;
+        let mut total_fetch = std::time::Duration::ZERO;
+        let mut results = Vec::with_capacity(num_buckets);
+        for (r, t) in bucket_results {
+            total_dpf += t.dpf_eval;
+            total_fetch += t.fetch_xor;
+            results.push(r);
+        }
+        (BatchResult { level: 2, round_id: query.round_id, results }, total_dpf, total_fetch)
     }
 
     fn handle_harmony_query(&self, query: &HarmonyQuery) -> Response {
@@ -513,6 +590,10 @@ async fn main() {
 
     let mut onionpir_tx: Option<Arc<mpsc::Sender<PirCommand>>> = None;
     let mut onionpir_info_data: Option<OnionPirInfo> = None;
+    let mut num_sibling_levels: usize = 0;
+    let mut sibling_level_infos: Vec<OnionPirMerkleLevelInfo> = Vec::new();
+    let mut onion_merkle_root: Option<Vec<u8>> = None;
+    let mut onion_merkle_tree_top: Option<Vec<u8>> = None;
 
     let ntt_path = args.data_dir.join(ONION_NTT_FILE);
     if args.role == ServerRole::Primary && ntt_path.exists() {
@@ -560,6 +641,65 @@ async fn main() {
         let ntt_file = std::fs::File::open(&ntt_path).expect("open NTT store");
         let ntt_mmap = unsafe { Mmap::map(&ntt_file) }.expect("mmap NTT store");
         println!("  NTT store: {:.2} GB", ntt_mmap.len() as f64 / 1e9);
+
+        // Load OnionPIR Merkle sibling databases (if available)
+        struct SiblingLevelData {
+            k: usize,
+            bins_per_table: usize,
+            num_groups: usize,
+            cuckoo_tables: Vec<Vec<u32>>,
+            ntt_mmap: Mmap,
+        }
+        let mut sibling_levels: Vec<SiblingLevelData> = Vec::new();
+
+        for level in 0..10 {
+            let ntt_path = args.data_dir.join(format!("merkle_onion_sib_L{}_ntt.bin", level));
+            let cuckoo_path = args.data_dir.join(format!("merkle_onion_sib_L{}_cuckoo.bin", level));
+            if !ntt_path.exists() || !cuckoo_path.exists() { break; }
+
+            let cuckoo_data = std::fs::read(&cuckoo_path).expect("read sibling cuckoo");
+            let k = u32::from_le_bytes(cuckoo_data[8..12].try_into().unwrap()) as usize;
+            let bins_per_table = u32::from_le_bytes(cuckoo_data[16..20].try_into().unwrap()) as usize;
+            let num_groups = u32::from_le_bytes(cuckoo_data[28..32].try_into().unwrap()) as usize;
+
+            let header_size = 36;
+            let mut tables: Vec<Vec<u32>> = Vec::with_capacity(k);
+            for g in 0..k {
+                let offset = header_size + g * bins_per_table * 4;
+                let mut table = Vec::with_capacity(bins_per_table);
+                for b in 0..bins_per_table {
+                    let pos = offset + b * 4;
+                    let eid = u32::from_le_bytes(cuckoo_data[pos..pos + 4].try_into().unwrap());
+                    table.push(eid);
+                }
+                tables.push(table);
+            }
+
+            let ntt_file = std::fs::File::open(&ntt_path).expect("open sibling NTT");
+            let ntt_mm = unsafe { Mmap::map(&ntt_file) }.expect("mmap sibling NTT");
+
+            println!("  Sibling L{}: K={}, bins={}, groups={}, NTT={:.2} GB",
+                level, k, bins_per_table, num_groups, ntt_mm.len() as f64 / 1e9);
+
+            sibling_levels.push(SiblingLevelData { k, bins_per_table, num_groups, cuckoo_tables: tables, ntt_mmap: ntt_mm });
+        }
+
+        // Load Merkle root and tree-top cache for OnionPIR
+        let root_path = args.data_dir.join("merkle_root_onion.bin");
+        if root_path.exists() {
+            onion_merkle_root = Some(std::fs::read(&root_path).expect("read merkle root"));
+        }
+        let tree_top_path = args.data_dir.join("merkle_tree_top_onion.bin");
+        if tree_top_path.exists() {
+            onion_merkle_tree_top = Some(std::fs::read(&tree_top_path).expect("read merkle tree-top"));
+        }
+
+        num_sibling_levels = sibling_levels.len();
+
+        // Extract level info before sibling_levels is moved into the PIR worker thread
+        sibling_level_infos = sibling_levels.iter().map(|s| {
+            OnionPirMerkleLevelInfo { k: s.k, bins_per_table: s.bins_per_table, num_groups: s.num_groups }
+        }).collect();
 
         let k_index = im.k;
         let k_chunk = ch.k_chunk;
@@ -610,6 +750,41 @@ async fn main() {
             }
             println!("  [OnionPIR] {} index servers ready", k_index);
 
+            // Set up sibling servers (per level, per PBC group)
+            // Each level has its own NTT store and cuckoo tables.
+            // sibling_all_index_tables must live as long as the servers.
+            let mut sibling_all_index_tables: Vec<Vec<Vec<u32>>> = Vec::new();
+            let mut sibling_all_servers: Vec<Vec<PirServer>> = Vec::new();
+
+            for (li, sib) in sibling_levels.iter().enumerate() {
+                let p_sib = onionpir::params_info(sib.bins_per_table as u64);
+                let padded = p_sib.num_entries as usize;
+                let sib_ntt_ptr = sib.ntt_mmap.as_ptr() as *const u64;
+
+                let mut level_index_tables: Vec<Vec<u32>> = Vec::with_capacity(sib.k);
+                let mut level_servers: Vec<PirServer> = Vec::with_capacity(sib.k);
+
+                for g in 0..sib.k {
+                    let mut server = PirServer::new(sib.bins_per_table as u64);
+                    let mut index_table = vec![0u32; padded];
+                    for bin in 0..sib.bins_per_table {
+                        let eid = sib.cuckoo_tables[g][bin];
+                        if eid != u32::MAX {
+                            index_table[bin] = eid;
+                        }
+                    }
+                    unsafe {
+                        server.set_shared_database(sib_ntt_ptr, sib.num_groups, &index_table);
+                        server.set_key_store(&key_store);
+                    }
+                    level_index_tables.push(index_table);
+                    level_servers.push(server);
+                }
+                println!("  [OnionPIR] sibling L{}: {} servers ready (bins={})", li, sib.k, sib.bins_per_table);
+                sibling_all_index_tables.push(level_index_tables);
+                sibling_all_servers.push(level_servers);
+            }
+
             // Event loop
             while let Some(cmd) = pir_rx.blocking_recv() {
                 match cmd {
@@ -622,28 +797,46 @@ async fn main() {
                     }
                     PirCommand::AnswerBatch { client_id, level, round_id, queries, reply } => {
                         let t = Instant::now();
-                        let servers = if level == 0 { &mut index_servers } else { &mut chunk_servers };
-                        let results: Vec<Vec<u8>> = if level == 0 {
-                            queries.iter().enumerate().map(|(i, q)| {
+                        let (name, results): (&str, Vec<Vec<u8>>) = if level == 0 {
+                            // Index: 2 queries per group (hash0 + hash1)
+                            let results = queries.iter().enumerate().map(|(i, q)| {
                                 let g = i / 2;
                                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    servers[g].answer_query(client_id, q)
+                                    index_servers[g].answer_query(client_id, q)
                                 })) {
                                     Ok(r) => r,
                                     Err(e) => { eprintln!("[OnionPIR] panic in index group {}: {:?}", g, e); Vec::new() }
                                 }
-                            }).collect()
-                        } else {
-                            queries.iter().enumerate().map(|(b, q)| {
+                            }).collect();
+                            ("index", results)
+                        } else if level == 1 {
+                            // Chunk: 1 query per group
+                            let results = queries.iter().enumerate().map(|(b, q)| {
                                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    servers[b].answer_query(client_id, q)
+                                    chunk_servers[b].answer_query(client_id, q)
                                 })) {
                                     Ok(r) => r,
                                     Err(e) => { eprintln!("[OnionPIR] panic in chunk group {}: {:?}", b, e); Vec::new() }
                                 }
-                            }).collect()
+                            }).collect();
+                            ("chunk", results)
+                        } else if level >= 10 && (level as usize - 10) < sibling_all_servers.len() {
+                            // Merkle sibling: 1 query per group
+                            let sib_level = level as usize - 10;
+                            let servers = &mut sibling_all_servers[sib_level];
+                            let results = queries.iter().enumerate().map(|(b, q)| {
+                                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    servers[b].answer_query(client_id, q)
+                                })) {
+                                    Ok(r) => r,
+                                    Err(e) => { eprintln!("[OnionPIR] panic in sibling L{} group {}: {:?}", sib_level, b, e); Vec::new() }
+                                }
+                            }).collect();
+                            ("sibling", results)
+                        } else {
+                            eprintln!("[OnionPIR] unknown level {}", level);
+                            ("unknown", Vec::new())
                         };
-                        let name = if level == 0 { "index" } else { "chunk" };
                         println!("  [OnionPIR] {} r{} {} queries in {:.2?}", name, round_id, queries.len(), t.elapsed());
                         let _ = reply.send(results);
                     }
@@ -656,11 +849,24 @@ async fn main() {
 
     // ── Build server state ──────────────────────────────────────────────
 
+    // Build OnionPIR Merkle info if sibling levels were loaded
+    let onionpir_merkle_data = if num_sibling_levels > 0 {
+        let levels = sibling_level_infos;
+        let root_hex = onion_merkle_root.as_ref()
+            .map(|r| r.iter().map(|b| format!("{:02x}", b)).collect::<String>())
+            .unwrap_or_default();
+        let tree_top = onion_merkle_tree_top.unwrap_or_default();
+        Some(OnionPirMerkleInfo { arity: 120, levels, root_hex, tree_top })
+    } else {
+        None
+    };
+
     let server = Arc::new(UnifiedServerData {
         db,
         role: args.role,
         onionpir_tx,
         onionpir_info: onionpir_info_data,
+        onionpir_merkle: onionpir_merkle_data,
     });
 
     println!();
@@ -732,9 +938,8 @@ async fn main() {
                     0x03 /* REQ_GET_INFO_JSON */ => {
                         let _ = sink.send(Message::Binary(server.encode_info_json_response(0x03).into())).await;
                     }
-                    0x33 /* REQ_ONIONPIR_GET_INFO */ if server.onionpir_info.is_some() => {
-                        let _ = sink.send(Message::Binary(server.encode_info_response().into())).await;
-                    }
+                    // 0x33 was REQ_ONIONPIR_GET_INFO (binary ServerInfoV2), now removed.
+                    // All clients should use 0x03 (JSON) instead.
                     REQ_GET_DB_CATALOG => {
                         let _ = sink.send(Message::Binary(Response::DbCatalog(server.build_catalog()).encode().into())).await;
                     }
@@ -768,6 +973,36 @@ async fn main() {
                             }).await.unwrap();
                             let _ = sink.send(Message::Binary(resp.encode().into())).await;
                         }
+                    }
+
+                    // ── Merkle sibling batch queries ──────────────────────
+                    REQ_MERKLE_SIBLING_BATCH if !server.db.merkle_siblings.is_empty() => {
+                        if let Ok(Request::MerkleSiblingBatch(q)) = Request::decode(payload) {
+                            let s = Arc::clone(&server);
+                            let resp = tokio::task::spawn_blocking(move || {
+                                let t = Instant::now();
+                                let n = q.keys.len();
+                                let level = q.round_id;
+                                let (batch, dpf_sum, fetch_sum) = s.process_merkle_sibling_batch(&q);
+                                let wall = t.elapsed();
+                                println!("[merkle-sib] L{} {} buckets {:.2?} | dpf {:.2?} fetch+xor {:.2?}", level, n, wall, dpf_sum, fetch_sum);
+                                Response::MerkleSiblingBatch(batch)
+                            }).await.unwrap();
+                            let _ = sink.send(Message::Binary(resp.encode().into())).await;
+                        }
+                    }
+
+                    // ── Merkle tree-top cache fetch ──────────────────────
+                    REQ_MERKLE_TREE_TOP if server.db.merkle_tree_top.is_some() => {
+                        // Send: [4B len][1B RESP_MERKLE_TREE_TOP][tree_top_bytes...]
+                        let top = server.db.merkle_tree_top.as_ref().unwrap();
+                        let payload_len = 1 + top.len();
+                        let mut msg = Vec::with_capacity(4 + payload_len);
+                        msg.extend_from_slice(&(payload_len as u32).to_le_bytes());
+                        msg.push(RESP_MERKLE_TREE_TOP);
+                        msg.extend_from_slice(top);
+                        let _ = sink.send(Message::Binary(msg.into())).await;
+                        println!("[merkle-top] sent {} bytes", top.len());
                     }
 
                     // ── HarmonyPIR ────────────────────────────────────────
@@ -880,6 +1115,32 @@ async fn main() {
                             let results = reply_rx.await.unwrap();
                             let result_msg = OnionPirBatchResult { round_id: batch.round_id, results };
                             let _ = sink.send(Message::Binary(result_msg.encode(RESP_ONIONPIR_CHUNK_RESULT).into())).await;
+                        }
+                    }
+                    REQ_ONIONPIR_MERKLE_TREE_TOP if server.onionpir_merkle.is_some() => {
+                        let om = server.onionpir_merkle.as_ref().unwrap();
+                        let payload_len = 1 + om.tree_top.len();
+                        let mut msg = Vec::with_capacity(4 + payload_len);
+                        msg.extend_from_slice(&(payload_len as u32).to_le_bytes());
+                        msg.push(RESP_ONIONPIR_MERKLE_TREE_TOP);
+                        msg.extend_from_slice(&om.tree_top);
+                        let _ = sink.send(Message::Binary(msg.into())).await;
+                        println!("[onion-merkle-top] sent {} bytes", om.tree_top.len());
+                    }
+                    REQ_ONIONPIR_MERKLE_SIBLING if server.onionpir_tx.is_some() => {
+                        // round_id encodes the sibling level; queries = K per level
+                        if let Ok(batch) = OnionPirBatchQuery::decode(body) {
+                            let tx = server.onionpir_tx.as_ref().unwrap();
+                            let (reply_tx, reply_rx) = oneshot::channel();
+                            let _ = tx.send(PirCommand::AnswerBatch {
+                                client_id,
+                                level: 10 + batch.round_id as u8, // encode sibling level
+                                round_id: batch.round_id,
+                                queries: batch.queries, reply: reply_tx,
+                            }).await;
+                            let results = reply_rx.await.unwrap();
+                            let result_msg = OnionPirBatchResult { round_id: batch.round_id, results };
+                            let _ = sink.send(Message::Binary(result_msg.encode(RESP_ONIONPIR_MERKLE_SIBLING).into())).await;
                         }
                     }
 

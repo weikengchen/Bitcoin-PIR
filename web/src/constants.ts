@@ -33,8 +33,8 @@ export const SCRIPT_HASH_SIZE = 20;
 /** Size of the fingerprint tag in the final cuckoo table */
 export const TAG_SIZE = 8;
 
-/** Size of each tagged index entry: 8B tag + 4B start_chunk_id + 1B num_chunks */
-export const INDEX_ENTRY_SIZE = 13;
+/** Size of each tagged index entry: 8B tag + 4B start_chunk_id + 1B num_chunks + 4B tree_loc */
+export const INDEX_ENTRY_SIZE = 17;
 
 /** Index result size: 4 slots * 13 bytes = 52 bytes */
 export const INDEX_RESULT_SIZE = CUCKOO_BUCKET_SIZE * INDEX_ENTRY_SIZE;
@@ -107,6 +107,31 @@ export const RESP_HARMONY_INFO = 0x40;
 export const RESP_HARMONY_HINTS = 0x41;
 export const RESP_HARMONY_QUERY = 0x42;
 export const RESP_HARMONY_BATCH_QUERY = 0x43;
+
+// ─── Merkle sibling constants (DPF, arity=8) ─────────────────────────────
+
+export const REQ_MERKLE_SIBLING_BATCH = 0x31;
+export const RESP_MERKLE_SIBLING_BATCH = 0x31;
+export const REQ_MERKLE_TREE_TOP = 0x32;
+export const RESP_MERKLE_TREE_TOP = 0x32;
+
+/** Merkle tree branching factor for DPF */
+export const MERKLE_ARITY = 8;
+
+/** K for Merkle sibling PBC groups (same as INDEX) */
+export const MERKLE_SIBLING_K = 75;
+
+/** Cuckoo bucket size for sibling tables (same as INDEX) */
+export const MERKLE_SIBLING_BUCKET_SIZE = 4;
+
+/** Cuckoo hash functions for sibling tables */
+export const MERKLE_SIBLING_CUCKOO_NUM_HASHES = 2;
+
+/** Sibling slot: [4B group_id][arity x 32B hashes] */
+export const MERKLE_SIBLING_SLOT_SIZE = 4 + MERKLE_ARITY * 32; // 260
+
+/** Sibling result: bucket_size x slot_size */
+export const MERKLE_SIBLING_RESULT_SIZE = MERKLE_SIBLING_BUCKET_SIZE * MERKLE_SIBLING_SLOT_SIZE; // 1040
 
 // ─── Default server URLs ───────────────────────────────────────────────────
 

@@ -12,6 +12,8 @@
 use runtime::eval;
 use runtime::protocol::{BatchQuery, Request, Response};
 use build::common::*;
+use pir_core::hash as pir_hash;
+use pir_core::merkle;
 use pir_core::params::compute_dpf_n;
 use futures_util::{SinkExt, StreamExt};
 use libdpf::Dpf;
@@ -253,7 +255,7 @@ async fn main() {
 
     // XOR results for the assigned bucket (each cuckoo hash gives one result)
     let b = assigned_bucket;
-    let mut found_entry: Option<(u32, u32)> = None;
+    let mut found_entry: Option<(u32, u32, u32)> = None;
     for h in 0..INDEX_CUCKOO_NUM_HASHES {
         let mut result = r0.results[b][h].clone();
         eval::xor_into(&mut result, &r1.results[b][h]);
@@ -264,7 +266,7 @@ async fn main() {
     }
 
     // Find our entry
-    let (start_chunk, num_chunks) = found_entry
+    let (start_chunk, num_chunks, tree_loc) = found_entry
         .unwrap_or_else(|| {
             eprintln!("ERROR: script hash not found in index PIR result!");
             std::process::exit(1);
@@ -272,7 +274,7 @@ async fn main() {
 
     let num_units = (num_chunks as usize + CHUNKS_PER_UNIT - 1) / CHUNKS_PER_UNIT;
 
-    println!("  Found: start_chunk={}, num_chunks={}", start_chunk, num_chunks);
+    println!("  Found: start_chunk={}, num_chunks={}, tree_loc={}", start_chunk, num_chunks, tree_loc);
     println!("  Units to fetch: {} (CHUNKS_PER_UNIT={})", num_units, CHUNKS_PER_UNIT);
     println!("  Level 1 time: {:.2?}", l1_start.elapsed());
     println!();
@@ -389,6 +391,206 @@ async fn main() {
 
     println!("  Level 2 time: {:.2?}", l2_start.elapsed());
     println!();
+
+    // Build raw data for Merkle data_hash computation (ordered chunk bytes)
+    let full_data_for_merkle: Vec<u8> = {
+        let mut data = Vec::new();
+        for &cid in &chunk_ids {
+            if let Some(d) = recovered_chunks.get(&cid) {
+                data.extend_from_slice(d);
+            }
+        }
+        data
+    };
+
+    // ══════════════════════════════════════════════════════════════════════
+    // LEVEL 3: Merkle sibling PIR (optional verification)
+    // ══════════════════════════════════════════════════════════════════════
+    //
+    // TODO: Get Merkle metadata from server (JSON info endpoint) instead of hardcoding.
+    // For now, hardcode arity=8, K=75, 6 sibling levels with per-level dpf_n/bins.
+    // This section is skipped if the server doesn't support Merkle sibling queries.
+
+    let merkle_arity: usize = 8;
+    let merkle_k: usize = 75;
+    let merkle_cuckoo_num_hashes: usize = 2;
+    let merkle_bucket_size: usize = 4;
+
+    // Per-level sibling table parameters (from gen_4_build_merkle_dpf output).
+    // L0-L3 are PIR-queried; L4+ are in the tree-top cache (groups ≤ 4096).
+    // These should come from the server JSON info endpoint in production.
+    let merkle_level_bins: Vec<usize> = vec![177345, 22234, 2820, 371];
+    let merkle_num_levels = merkle_level_bins.len();
+
+    if tree_loc > 0 || num_chunks > 0 { // Always try if we have a valid entry
+        println!("[4b] Level 3: Merkle sibling PIR ({} levels, arity={})...", merkle_num_levels, merkle_arity);
+        let l3_start = Instant::now();
+
+        // Compute data_hash from the chunks we just fetched
+        let data_hash = if !full_data_for_merkle.is_empty() {
+            merkle::sha256(&full_data_for_merkle)
+        } else {
+            merkle::ZERO_HASH
+        };
+        let leaf_hash = merkle::compute_leaf_hash(&args.script_hash, tree_loc, &data_hash);
+
+        let mut current_hash = leaf_hash;
+        let mut node_idx = tree_loc as usize;
+        let mut merkle_ok = true;
+
+        for level in 0..merkle_num_levels {
+            let group_id = (node_idx / merkle_arity) as u32;
+            let level_bins = merkle_level_bins[level];
+            let level_dpf_n = compute_dpf_n(level_bins);
+            let level_seed = 0xBA7C_51B1_0000_0000u64.wrapping_add(level as u64);
+
+            // Derive candidate PBC buckets for this group_id
+            let my_buckets = pir_hash::derive_int_buckets_3(group_id, merkle_k);
+            let assigned_bucket = my_buckets[0];
+
+            // Compute cuckoo bin locations
+            let mut my_locs = Vec::new();
+            for h in 0..merkle_cuckoo_num_hashes {
+                let key = pir_hash::derive_cuckoo_key(level_seed, assigned_bucket, h);
+                my_locs.push(pir_hash::cuckoo_hash_int(group_id, key, level_bins) as u64);
+            }
+
+            // Generate DPF keys for all K=75 buckets
+            let mut s0_keys: Vec<Vec<Vec<u8>>> = Vec::with_capacity(merkle_k);
+            let mut s1_keys: Vec<Vec<Vec<u8>>> = Vec::with_capacity(merkle_k);
+
+            for b in 0..merkle_k {
+                let mut s0_bucket = Vec::new();
+                let mut s1_bucket = Vec::new();
+                for h in 0..merkle_cuckoo_num_hashes {
+                    let alpha = if b == assigned_bucket {
+                        my_locs[h]
+                    } else {
+                        rng.next_u64() % level_bins as u64
+                    };
+                    let (k0, k1) = dpf.gen(alpha, level_dpf_n);
+                    s0_bucket.push(k0.to_bytes());
+                    s1_bucket.push(k1.to_bytes());
+                }
+                s0_keys.push(s0_bucket);
+                s1_keys.push(s1_bucket);
+            }
+
+            // Send MerkleSiblingBatch (level=2, round_id=level)
+            let req0 = Request::MerkleSiblingBatch(BatchQuery {
+                level: 2, round_id: level as u16, db_id: 0, keys: s0_keys,
+            });
+            let req1 = Request::MerkleSiblingBatch(BatchQuery {
+                level: 2, round_id: level as u16, db_id: 0, keys: s1_keys,
+            });
+
+            sink0.send(Message::Binary(req0.encode().into())).await.expect("send s0");
+            sink1.send(Message::Binary(req1.encode().into())).await.expect("send s1");
+
+            let resp0 = recv_response(&mut stream0, &mut sink0).await;
+            let resp1 = recv_response(&mut stream1, &mut sink1).await;
+
+            let (sr0, sr1) = match (resp0, resp1) {
+                (Response::MerkleSiblingBatch(a), Response::MerkleSiblingBatch(b)) => (a, b),
+                (Response::Error(e), _) | (_, Response::Error(e)) => {
+                    println!("  Merkle not supported by server: {}", e);
+                    merkle_ok = false;
+                    break;
+                }
+                _ => { println!("  Unexpected response for merkle sibling batch"); merkle_ok = false; break; }
+            };
+
+            // XOR and find group
+            let b = assigned_bucket;
+            let mut found_children: Option<Vec<[u8; 32]>> = None;
+            for h in 0..merkle_cuckoo_num_hashes {
+                let mut result = sr0.results[b][h].clone();
+                eval::xor_into(&mut result, &sr1.results[b][h]);
+                if let Some(children) = eval::find_group_in_sibling_result(
+                    &result, group_id, merkle_arity, merkle_bucket_size,
+                ) {
+                    found_children = Some(children);
+                    break;
+                }
+            }
+
+            match found_children {
+                Some(children) => {
+                    let hash_refs: Vec<merkle::Hash256> = children;
+                    current_hash = merkle::compute_parent_n(&hash_refs);
+                    node_idx = group_id as usize;
+                }
+                None => {
+                    println!("  L{}: group {} not found!", level, group_id);
+                    merkle_ok = false;
+                    break;
+                }
+            }
+        }
+
+        if merkle_ok {
+            // Walk tree-top cache to root
+            // Load tree-top cache and root (in production, these come from server JSON info)
+            let top_data = std::fs::read("/Volumes/Bitcoin/data/merkle_tree_top_dpf.bin")
+                .expect("read tree-top cache");
+            let root_data = std::fs::read("/Volumes/Bitcoin/data/merkle_root_dpf.bin")
+                .expect("read merkle root");
+            let mut expected_root = [0u8; 32];
+            expected_root.copy_from_slice(&root_data);
+
+            // Parse tree-top: [1B cache_from_level][4B total LE][2B arity LE][1B num_levels]
+            // then per level: [4B num_nodes LE][nodes × 32B]
+            let cache_from_level = top_data[0] as usize;
+            let cache_arity = u16::from_le_bytes(top_data[5..7].try_into().unwrap()) as usize;
+            let num_cached_levels = top_data[7] as usize;
+            let mut off = 8usize;
+            let mut cached_levels: Vec<Vec<[u8; 32]>> = Vec::new();
+            for _ in 0..num_cached_levels {
+                let n = u32::from_le_bytes(top_data[off..off+4].try_into().unwrap()) as usize;
+                off += 4;
+                let mut level = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(&top_data[off..off+32]);
+                    level.push(h);
+                    off += 32;
+                }
+                cached_levels.push(level);
+            }
+
+            // Walk cached levels (all except the last, which is the root)
+            for ci in 0..cached_levels.len().saturating_sub(1) {
+                let level_nodes = &cached_levels[ci];
+                let parent_start = (node_idx / cache_arity) * cache_arity;
+                let mut children = Vec::with_capacity(cache_arity);
+                for c in 0..cache_arity {
+                    let idx = parent_start + c;
+                    if idx < level_nodes.len() {
+                        children.push(level_nodes[idx]);
+                    } else {
+                        children.push(merkle::ZERO_HASH);
+                    }
+                }
+                current_hash = merkle::compute_parent_n(&children);
+                node_idx /= cache_arity;
+            }
+
+            // Final root check
+            if current_hash == expected_root {
+                println!("  Merkle VERIFIED: proof valid to root {:02x}{:02x}{:02x}{:02x}...",
+                    expected_root[0], expected_root[1], expected_root[2], expected_root[3]);
+            } else {
+                println!("  Merkle FAILED: root mismatch!");
+                println!("    Expected: {:02x}{:02x}{:02x}{:02x}...",
+                    expected_root[0], expected_root[1], expected_root[2], expected_root[3]);
+                println!("    Got:      {:02x}{:02x}{:02x}{:02x}...",
+                    current_hash[0], current_hash[1], current_hash[2], current_hash[3]);
+            }
+        }
+
+        println!("  Level 3 time: {:.2?}", l3_start.elapsed());
+        println!();
+    }
 
     // ══════════════════════════════════════════════════════════════════════
     // Reassemble and output

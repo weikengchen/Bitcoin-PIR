@@ -390,6 +390,10 @@ async fn main() {
                                 dpf_sum / n as u32, fetch_sum / n as u32);
                             Response::ChunkBatch(batch)
                         }
+                        Request::MerkleSiblingBatch(_) => {
+                            // Legacy server does not support Merkle sibling queries
+                            Response::Error("merkle sibling queries not supported by legacy server".into())
+                        }
                         Request::HarmonyGetInfo => Response::HarmonyInfo(ServerInfo {
                             index_bins_per_table: data_ref.tables.index_bins_per_table as u32,
                             chunk_bins_per_table: data_ref.tables.chunk_bins_per_table as u32,

@@ -16,10 +16,11 @@ import {
 import {
   deriveBuckets, deriveCuckooKey, cuckooHash,
   deriveChunkBuckets, deriveChunkCuckooKey, cuckooHashInt,
-  computeTag,
+  deriveIntBuckets3, deriveCuckooKeyGeneric,
+  computeTag, sha256,
 } from './hash.js';
 
-import { genDpfKeys, genChunkDpfKeys } from './dpf.js';
+import { genDpfKeys, genChunkDpfKeys, genDpfKeysN } from './dpf.js';
 
 import {
   encodeRequest, decodeResponse,
@@ -28,9 +29,10 @@ import {
 
 import { cuckooPlace, planRounds } from './pbc.js';
 import { readVarint, decodeUtxoData, DummyRng } from './codec.js';
-import { findEntryInIndexResult, findChunkInResult } from './scan.js';
+import { findEntryInIndexResult, findChunkInResult, findGroupInSiblingResult } from './scan.js';
 import { ManagedWebSocket } from './ws.js';
-import { fetchServerInfoJson, type ServerInfoJson } from './server-info.js';
+import { fetchServerInfoJson, type ServerInfoJson, type MerkleInfoJson } from './server-info.js';
+import { computeDataHash, computeLeafHash, computeParentN, parseTreeTopCache, type TreeTopCache, ZERO_HASH } from './merkle.js';
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -48,6 +50,16 @@ export interface QueryResult {
   numRounds: number;
   /** True if this address was excluded from the database due to too many UTXOs */
   isWhale: boolean;
+  /** Merkle verification result (undefined if not verified yet) */
+  merkleVerified?: boolean;
+  /** Merkle root hash hex (from server, for display) */
+  merkleRootHex?: string;
+  /** tree_loc in the Merkle tree */
+  treeLoc?: number;
+  /** Raw chunk data (kept for Merkle verification) */
+  rawChunkData?: Uint8Array;
+  /** Script hash used for this query */
+  scriptHash?: Uint8Array;
 }
 
 export type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
@@ -197,6 +209,14 @@ export class BatchPirClient {
     return result;
   }
 
+  private hexToBytes(hex: string): Uint8Array {
+    const bytes = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < bytes.length; i++) {
+      bytes[i] = parseInt(hex.substring(i * 2, i * 2 + 2), 16);
+    }
+    return bytes;
+  }
+
   // ─── Index result parsing ─────────────────────────────────────────────
 
   // ─── Index/chunk result parsing (delegates to shared scan.ts) ──────────
@@ -253,8 +273,8 @@ export class BatchPirClient {
     const indexRounds = planRounds(indexCandBuckets, K, NUM_HASHES, (msg) => this.log(msg, 'error'));
     this.log(`Level 1: ${N} queries → ${indexRounds.length} index round(s)`);
 
-    // Per-query results from Level 1: query index → { startChunkId, numChunks }
-    const indexResults: Map<number, { startChunkId: number; numChunks: number }> = new Map();
+    // Per-query results from Level 1
+    const indexResults: Map<number, { startChunkId: number; numChunks: number; treeLoc: number }> = new Map();
 
     for (let ir = 0; ir < indexRounds.length; ir++) {
       const round = indexRounds[ir];
@@ -313,7 +333,7 @@ export class BatchPirClient {
         const r0 = resp0.result.results[bucketId];
         const r1 = resp1.result.results[bucketId];
 
-        let found: { startChunkId: number; numChunks: number } | null = null;
+        let found: { startChunkId: number; numChunks: number; treeLoc: number } | null = null;
         const expectedTag = computeTag(this.tagSeed, scriptHashes[queryIdx]);
         for (let h = 0; h < INDEX_CUCKOO_NUM_HASHES; h++) {
           const result = this.xorBuffers(r0[h], r1[h]);
@@ -338,7 +358,7 @@ export class BatchPirClient {
 
     // Build a global list of unique chunk IDs needed, and track which
     // query needs which chunks
-    const queryChunkInfo: Map<number, { startChunk: number; numUnits: number; startChunkId: number; numChunks: number }> = new Map();
+    const queryChunkInfo: Map<number, { startChunk: number; numUnits: number; startChunkId: number; numChunks: number; treeLoc: number }> = new Map();
     const allChunkIdsSet = new Set<number>();
 
     // Track whale-excluded queries separately
@@ -360,7 +380,7 @@ export class BatchPirClient {
         chunkIds.push(cid);
         allChunkIdsSet.add(cid);
       }
-      queryChunkInfo.set(qi, { startChunk, numUnits, startChunkId: info.startChunkId, numChunks: info.numChunks });
+      queryChunkInfo.set(qi, { startChunk, numUnits, startChunkId: info.startChunkId, numChunks: info.numChunks, treeLoc: info.treeLoc });
     }
 
     const allChunkIds = Array.from(allChunkIdsSet).sort((a, b) => a - b);
@@ -508,6 +528,10 @@ export class BatchPirClient {
         numChunks,
         numRounds: totalChunkRounds,
         isWhale: false,
+        merkleRootHex: this.serverInfo?.merkle?.root,
+        treeLoc: info.treeLoc,
+        rawChunkData: fullData,
+        scriptHash: scriptHashes[qi],
       };
     }
 
@@ -515,6 +539,179 @@ export class BatchPirClient {
     this.log(`=== Batch complete: ${found}/${N} queries returned results ===`, 'success');
 
     return results;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // MERKLE VERIFICATION — separate from query (user-triggered)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /** Check if server supports Merkle verification */
+  hasMerkle(): boolean {
+    return !!(this.serverInfo?.merkle && this.serverInfo.merkle.sibling_levels > 0);
+  }
+
+  /** Get the Merkle root hash hex (for display) */
+  getMerkleRootHex(): string | undefined {
+    return this.serverInfo?.merkle?.root;
+  }
+
+  /**
+   * Verify a single query result against the Merkle tree.
+   * Fetches the tree-top cache from the server, runs sibling PIR rounds,
+   * and verifies the full proof to the root.
+   *
+   * Call this after query() / queryBatch() with the result you want to verify.
+   */
+  async verifyMerkle(
+    result: QueryResult,
+    onProgress?: (step: string, detail: string) => void,
+  ): Promise<boolean> {
+    if (!this.isConnected()) throw new Error('Not connected');
+    const merkle = this.serverInfo?.merkle;
+    if (!merkle || merkle.sibling_levels === 0) throw new Error('Server does not support Merkle');
+    if (!result.scriptHash || !result.rawChunkData || result.treeLoc === undefined) {
+      throw new Error('Result missing data for Merkle verification (scriptHash, rawChunkData, treeLoc)');
+    }
+    if (result.isWhale) throw new Error('Cannot verify whale addresses');
+
+    const progress = onProgress || (() => {});
+    progress('Merkle', 'Fetching tree-top cache...');
+
+    // Fetch tree-top cache from server
+    const treeTop = await this.fetchTreeTopCache();
+    const expectedRoot = this.hexToBytes(merkle.root);
+
+    // Verify tree-top cache integrity: SHA256(blob) must match tree_top_hash
+    const treeTopHash = sha256(treeTop.rawBytes);
+    const expectedTopHash = this.hexToBytes(merkle.tree_top_hash);
+    if (!treeTopHash.every((b, i) => b === expectedTopHash[i])) {
+      this.log('Tree-top cache integrity check FAILED', 'error');
+      return false;
+    }
+    this.log('Tree-top cache integrity: OK', 'success');
+
+    const dataHash = computeDataHash(result.rawChunkData);
+    const leafHash = computeLeafHash(result.scriptHash, result.treeLoc, dataHash);
+
+    let currentHash = leafHash;
+    let nodeIdx = result.treeLoc;
+
+    // Query sibling levels via PIR
+    for (let level = 0; level < merkle.sibling_levels; level++) {
+      progress('Merkle', `Sibling level ${level + 1}/${merkle.sibling_levels}...`);
+      const levelInfo = merkle.levels[level];
+      const groupId = Math.floor(nodeIdx / merkle.arity);
+      const levelSeed = BigInt('0xBA7C51B100000000') + BigInt(level);
+
+      const myBuckets = deriveIntBuckets3(groupId, merkle.sibling_k);
+      const assignedBucket = myBuckets[0];
+
+      const myLocs: number[] = [];
+      for (let h = 0; h < 2; h++) {
+        const ck = deriveCuckooKeyGeneric(levelSeed, assignedBucket, h);
+        myLocs.push(cuckooHashInt(groupId, ck, levelInfo.bins_per_table));
+      }
+
+      const s0Keys: Uint8Array[][] = [];
+      const s1Keys: Uint8Array[][] = [];
+      for (let b = 0; b < merkle.sibling_k; b++) {
+        const s0B: Uint8Array[] = [];
+        const s1B: Uint8Array[] = [];
+        for (let h = 0; h < 2; h++) {
+          const alpha = b === assignedBucket
+            ? myLocs[h]
+            : Number(this.rng.nextU64() % BigInt(levelInfo.bins_per_table));
+          const keys = await genDpfKeysN(alpha, levelInfo.dpf_n);
+          s0B.push(keys.key0);
+          s1B.push(keys.key1);
+        }
+        s0Keys.push(s0B);
+        s1Keys.push(s1B);
+      }
+
+      const mReq0 = encodeRequest({ type: 'MerkleSiblingBatch', query: { level: 2, roundId: level, keys: s0Keys } });
+      const mReq1 = encodeRequest({ type: 'MerkleSiblingBatch', query: { level: 2, roundId: level, keys: s1Keys } });
+
+      const [mraw0, mraw1] = await this.sendBoth(mReq0, mReq1);
+      const mresp0 = decodeResponse(mraw0.slice(4));
+      const mresp1 = decodeResponse(mraw1.slice(4));
+
+      if (mresp0.type !== 'MerkleSiblingBatch' || mresp1.type !== 'MerkleSiblingBatch') {
+        this.log(`Merkle L${level}: unexpected response`, 'error');
+        result.merkleVerified = false;
+        return false;
+      }
+
+      const mr0 = mresp0.result.results[assignedBucket];
+      const mr1 = mresp1.result.results[assignedBucket];
+      let children: Uint8Array[] | null = null;
+      for (let h = 0; h < 2; h++) {
+        const xored = this.xorBuffers(mr0[h], mr1[h]);
+        children = findGroupInSiblingResult(xored, groupId, merkle.arity, merkle.sibling_bucket_size, merkle.sibling_slot_size);
+        if (children) break;
+      }
+
+      if (!children) {
+        this.log(`Merkle L${level}: group ${groupId} not found`, 'error');
+        result.merkleVerified = false;
+        return false;
+      }
+
+      currentHash = computeParentN(children);
+      nodeIdx = groupId;
+    }
+
+    // Walk tree-top cache
+    progress('Merkle', 'Walking tree-top cache to root...');
+    const cache = treeTop.parsed;
+    for (let ci = 0; ci < cache.levels.length - 1; ci++) {
+      const levelNodes = cache.levels[ci];
+      const parentStart = Math.floor(nodeIdx / merkle.arity) * merkle.arity;
+      const childHashes: Uint8Array[] = [];
+      for (let c = 0; c < merkle.arity; c++) {
+        const idx = parentStart + c;
+        childHashes.push(idx < levelNodes.length ? levelNodes[idx] : ZERO_HASH);
+      }
+      currentHash = computeParentN(childHashes);
+      nodeIdx = Math.floor(nodeIdx / merkle.arity);
+    }
+
+    // Check root
+    const verified = currentHash.length === expectedRoot.length &&
+      currentHash.every((b, i) => b === expectedRoot[i]);
+    result.merkleVerified = verified;
+
+    if (verified) {
+      this.log(`Merkle VERIFIED: proof valid to root ${merkle.root.substring(0, 16)}...`, 'success');
+    } else {
+      this.log('Merkle FAILED: root mismatch', 'error');
+    }
+
+    return verified;
+  }
+
+  /**
+   * Fetch the tree-top cache blob from the server.
+   * Caches the result so subsequent verifications don't re-fetch.
+   */
+  private treeTopCacheData: { rawBytes: Uint8Array; parsed: TreeTopCache } | null = null;
+
+  private async fetchTreeTopCache(): Promise<{ rawBytes: Uint8Array; parsed: TreeTopCache }> {
+    if (this.treeTopCacheData) return this.treeTopCacheData;
+
+    // Send REQ_MERKLE_TREE_TOP to server 0
+    const req = new Uint8Array([1, 0, 0, 0, 0x32]); // [4B len=1][1B variant=0x32]
+    const raw = await this.ws0!.sendRaw(req);
+
+    // Response: [4B len][1B variant=0x32][tree_top_bytes...]
+    const variant = raw[4];
+    if (variant !== 0x32) throw new Error(`Unexpected tree-top response variant: 0x${variant.toString(16)}`);
+    const treeTopBytes = raw.slice(5);
+    const parsed = parseTreeTopCache(treeTopBytes);
+
+    this.treeTopCacheData = { rawBytes: treeTopBytes, parsed };
+    this.log(`Fetched tree-top cache: ${treeTopBytes.length} bytes, ${parsed.levels.length} levels`, 'info');
+    return this.treeTopCacheData;
   }
 }
 

@@ -41,13 +41,15 @@ const MASK64 = 0xFFFFFFFFFFFFFFFFn;
 // Protocol constants still used for OnionPIR-specific requests
 // (Ping/pong/info handled by ManagedWebSocket + fetchServerInfoJson)
 
-const REQ_REGISTER_KEYS         = 0x30;
-const REQ_ONIONPIR_INDEX_QUERY  = 0x31;
-const REQ_ONIONPIR_CHUNK_QUERY  = 0x32;
+// NOTE: moved from 0x30-0x32 to 0x50-0x52 to avoid collision with
+// REQ_MERKLE_SIBLING_BATCH (0x31) and REQ_MERKLE_TREE_TOP (0x32).
+const REQ_REGISTER_KEYS         = 0x50;
+const REQ_ONIONPIR_INDEX_QUERY  = 0x51;
+const REQ_ONIONPIR_CHUNK_QUERY  = 0x52;
 
-const RESP_KEYS_ACK             = 0x30;
-const RESP_ONIONPIR_INDEX_RESULT  = 0x31;
-const RESP_ONIONPIR_CHUNK_RESULT  = 0x32;
+const RESP_KEYS_ACK             = 0x50;
+const RESP_ONIONPIR_INDEX_RESULT  = 0x51;
+const RESP_ONIONPIR_CHUNK_RESULT  = 0x52;
 
 // ─── WASM module types ────────────────────────────────────────────────────
 
@@ -378,10 +380,11 @@ export class OnionPirWebClient {
     this.log(`=== Batch query: ${N} script hashes ===`);
 
     // ── Generate keys and create per-level clients ─────────────────────
-    // Keys are independent of num_entries. We generate once, export the
-    // secret key, then create per-level clients with correct num_entries.
+    // Generate keys with a real num_entries (not 0) — keys generated with
+    // num_entries=0 can produce incorrect decryptions due to mismatched
+    // BFV parameters. Keys are reusable across different num_entries values.
     progress('Setup', 'Creating PIR client...');
-    const keygenClient = new this.wasmModule.OnionPirClient(0);
+    const keygenClient = new this.wasmModule.OnionPirClient(this.indexBins);
     const clientId = keygenClient.id();
     const galoisKeys = keygenClient.generateGaloisKeys();
     const gswKeys = keygenClient.generateGswKeys();
@@ -494,6 +497,12 @@ export class OnionPirWebClient {
 
       const foundCount = indexResults.filter(r => r !== null).length;
       this.log(`Level 1 complete: ${foundCount}/${N} found in ${totalIndexRounds} rounds`);
+      for (let i = 0; i < N; i++) {
+        const ir = indexResults[i];
+        if (ir) {
+          this.log(`  [${i}] entryId=${ir.entryId} byteOffset=${ir.byteOffset} numEntries=${ir.numEntries}`);
+        }
+      }
 
       // ════════════════════════════════════════════════════════════════
       // LEVEL 2: Chunk PIR
@@ -605,7 +614,11 @@ export class OnionPirWebClient {
 
           let chunkDecrypted = 0;
           for (const qi of queryInfos) {
+            this.log(`  chunk query: entryId=${qi.entryId} group=${qi.group} bin=${qi.bin}`);
             const entryBytes = chunkClient!.decryptResponse(qi.bin, results[qi.group]);
+            // Log first 16 bytes of the raw decrypted entry (before byteOffset slicing)
+            const rawPreview = Array.from(entryBytes.slice(0, 16)).map(b => b.toString(16).padStart(2, '0')).join(' ');
+            this.log(`  raw decrypted[0..16]: ${rawPreview} (total ${entryBytes.length} bytes)`);
             decryptedEntries.set(qi.entryId, entryBytes.slice(0, PACKED_ENTRY_SIZE));
             chunkDecrypted++;
             progress('Level 2', `Chunk round ${ri + 1}/${chunkRounds.length}: decrypted ${chunkDecrypted}/${queryInfos.length}...`);
@@ -647,6 +660,11 @@ export class OnionPirWebClient {
         const fullData = new Uint8Array(totalLen);
         let pos = 0;
         for (const p of parts) { fullData.set(p, pos); pos += p.length; }
+
+        this.log(`  [${qi}] assembled ${totalLen} bytes from ${parts.length} entries (byteOffset=${ir.byteOffset})`);
+        // Log first few bytes for debugging
+        const preview = Array.from(fullData.slice(0, 16)).map(b => b.toString(16).padStart(2, '0')).join(' ');
+        this.log(`  [${qi}] data preview: ${preview}`);
 
         const { entries, totalSats } = this.decodeUtxoData(fullData);
         results[qi] = {

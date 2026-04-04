@@ -464,16 +464,15 @@ pub fn verify_entry(
     verify_proof(&leaf_hash, tree_loc as usize, siblings, root)
 }
 
-// ─── MERKLE_DATA slot format ───────────────────────────────────────────────
+// ─── Sibling group slot format ────────────────────────────────────────────
 
-/// Size of a MERKLE_DATA slot: [8B tag][4B tree_loc][32B data_hash] = 44 bytes.
-/// Same regardless of tree arity. Sibling hashes are in separate per-level tables.
-pub const MERKLE_DATA_SLOT_SIZE: usize = 8 + 4 + 32;
-
-/// Compute sibling slot size for a given arity.
-/// Layout: [4B node_index][(arity-1) × 32B sibling_hashes]
+/// Compute sibling group slot size for a given arity.
+/// Layout: [4B group_index][arity × 32B child_hashes]
+/// One entry per parent group (N/arity entries per level, not N).
+/// The client queries group_id = node_idx / arity, then uses position
+/// node_idx % arity to identify itself among the A children.
 pub fn merkle_sibling_slot_size(arity: usize) -> usize {
-    4 + (arity - 1) * HASH_SIZE
+    4 + arity * HASH_SIZE
 }
 
 /// Legacy binary sibling slot size (arity=2): [4B node_index][32B hash] = 36 bytes.

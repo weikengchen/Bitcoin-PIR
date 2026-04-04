@@ -19,8 +19,8 @@ const CUCKOO_FILE: &str = "/Volumes/Bitcoin/data/batch_pir_cuckoo.bin";
 
 const INDEX_ENTRY_SIZE: usize = 25;
 const SCRIPT_HASH_SIZE: usize = 20;
-const MAGIC: u64 = 0xBA7C_C000_C000_0001;
-const HEADER_SIZE: usize = 32;
+const MAGIC: u64 = 0xBA7C_C000_C000_0004;
+const HEADER_SIZE: usize = 40; // includes tag_seed
 const EMPTY: u32 = u32::MAX;
 
 /// Number of random lookups for verification
@@ -94,6 +94,13 @@ fn cuckoo_hash(script_hash: &[u8], key: u64, num_bins: usize) -> usize {
     (h % num_bins as u64) as usize
 }
 
+#[inline]
+fn compute_tag(tag_seed: u64, script_hash: &[u8]) -> u64 {
+    let mut h = sh_a(script_hash) ^ tag_seed;
+    h ^= sh_b(script_hash);
+    splitmix64(h ^ sh_c(script_hash))
+}
+
 // ─── Cuckoo table accessor ──────────────────────────────────────────────────
 
 /// Read a u32 from a byte slice at the given byte offset (little-endian).
@@ -121,46 +128,38 @@ fn read_u64(data: &[u8], offset: usize) -> u64 {
     ])
 }
 
-/// Look up an entry_index in a specific bucket's cuckoo table.
-/// Returns true if found.
+/// Look up a script_hash in a specific bucket's cuckoo table by tag match.
+/// Slot layout: [8B tag LE][4B start_chunk_id LE][1B num_chunks][4B tree_loc LE] = 17B.
+/// Returns true if found (tag matches).
 fn lookup_in_bucket(
     cuckoo_data: &[u8],
     bucket_id: usize,
     script_hash: &[u8],
-    entry_idx: u32,
+    _entry_idx: u32,
     bins_per_table: usize,
     cuckoo_bucket_size: usize,
     master_seed: u64,
+    tag_seed: u64,
 ) -> bool {
+    let slot_size = 17;
     let slots_per_table = bins_per_table * cuckoo_bucket_size;
-    let table_offset = HEADER_SIZE + bucket_id * slots_per_table * 4;
+    let table_offset = HEADER_SIZE + bucket_id * slots_per_table * slot_size;
+    let expected_tag = compute_tag(tag_seed, script_hash);
 
     let key0 = derive_cuckoo_key(master_seed, bucket_id, 0);
     let key1 = derive_cuckoo_key(master_seed, bucket_id, 1);
 
-    // Check bin 0
-    let bin0 = cuckoo_hash(script_hash, key0, bins_per_table);
-    let base0 = table_offset + bin0 * cuckoo_bucket_size * 4;
-    for s in 0..cuckoo_bucket_size {
-        let val = read_u32(cuckoo_data, base0 + s * 4);
-        if val == entry_idx {
-            return true;
-        }
-        if val == EMPTY {
-            break;
-        }
-    }
-
-    // Check bin 1
-    let bin1 = cuckoo_hash(script_hash, key1, bins_per_table);
-    let base1 = table_offset + bin1 * cuckoo_bucket_size * 4;
-    for s in 0..cuckoo_bucket_size {
-        let val = read_u32(cuckoo_data, base1 + s * 4);
-        if val == entry_idx {
-            return true;
-        }
-        if val == EMPTY {
-            break;
+    for &bin in &[
+        cuckoo_hash(script_hash, key0, bins_per_table),
+        cuckoo_hash(script_hash, key1, bins_per_table),
+    ] {
+        let base = table_offset + bin * cuckoo_bucket_size * slot_size;
+        for s in 0..cuckoo_bucket_size {
+            let slot_off = base + s * slot_size;
+            let tag = read_u64(cuckoo_data, slot_off);
+            if tag == expected_tag && tag != 0 {
+                return true;
+            }
         }
     }
 
@@ -205,8 +204,10 @@ fn main() {
         std::process::exit(1);
     }
 
+    let slot_size = 17; // [8B tag][4B chunk_id][1B num_chunks][4B tree_loc]
+    let tag_seed = read_u64(&cuckoo_mmap, 32);
     let slots_per_table = bins_per_table * cuckoo_bucket_size;
-    let expected_body = k * slots_per_table * 4;
+    let expected_body = k * slots_per_table * slot_size;
     let expected_size = HEADER_SIZE + expected_body;
 
     println!("  Header OK:");
@@ -237,11 +238,12 @@ fn main() {
     let mut max_occ = 0usize;
 
     for b in 0..k {
-        let table_offset = HEADER_SIZE + b * slots_per_table * 4;
+        let table_offset = HEADER_SIZE + b * slots_per_table * slot_size;
         let mut occ = 0usize;
         for s in 0..slots_per_table {
-            let val = read_u32(&cuckoo_mmap, table_offset + s * 4);
-            if val != EMPTY {
+            let slot_off = table_offset + s * slot_size;
+            let tag = read_u64(&cuckoo_mmap, slot_off);
+            if tag != 0 {
                 occ += 1;
             }
         }
@@ -316,6 +318,7 @@ fn main() {
                 bins_per_table,
                 cuckoo_bucket_size,
                 master_seed,
+                tag_seed,
             ) {
                 entry_found = true;
                 break;
@@ -378,6 +381,7 @@ fn main() {
                 bins_per_table,
                 cuckoo_bucket_size,
                 master_seed,
+                tag_seed,
             ) {
                 entry_found = true;
                 break;

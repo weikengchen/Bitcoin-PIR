@@ -66,7 +66,8 @@ fn build_index_cuckoo(index_file: &str, output_file: &str) {
     println!("=== Generic Index Cuckoo Builder ===");
     println!("Input:  {}", index_file);
     println!("Output: {}", output_file);
-    println!("K={}, bucket_size={}, num_hashes={}", params.k, params.cuckoo_bucket_size, params.num_hashes);
+    println!("K={}, bucket_size={}, slot_size={}, num_hashes={}",
+        params.k, params.cuckoo_bucket_size, params.slot_size, params.num_hashes);
     println!();
 
     // Memory-map input
@@ -74,6 +75,16 @@ fn build_index_cuckoo(index_file: &str, output_file: &str) {
     let mmap = unsafe { Mmap::map(&f) }.expect("mmap index file");
     let n = mmap.len() / INDEX_ENTRY_SIZE;
     println!("[1] Loaded {} index entries ({:.1} MB)", n, mmap.len() as f64 / 1e6);
+
+    // Load tree_locs.bin sidecar (produced by gen_4_build_merkle)
+    let tree_locs_path = index_file.replace("utxo_chunks_index_nodust.bin", "tree_locs.bin");
+    let tree_locs_data = std::fs::read(&tree_locs_path)
+        .unwrap_or_else(|_| panic!("open tree_locs.bin (run gen_4 first): {}", tree_locs_path));
+    assert_eq!(tree_locs_data.len(), n * 4, "tree_locs.bin size mismatch");
+    let tree_locs: Vec<u32> = (0..n)
+        .map(|i| u32::from_le_bytes(tree_locs_data[i * 4..i * 4 + 4].try_into().unwrap()))
+        .collect();
+    println!("    Loaded tree_locs.bin ({} entries)", n);
 
     // Step 2: Assign entries to buckets
     println!("[2] Assigning entries to {} buckets...", params.k);
@@ -137,8 +148,8 @@ fn build_index_cuckoo(index_file: &str, output_file: &str) {
         for slot_idx in 0..(bins_per_table * params.cuckoo_bucket_size) {
             let entry_local = table[slot_idx];
             if entry_local == cuckoo::EMPTY {
-                // Empty slot: write zeros
-                w.write_all(&[0u8; 13]).unwrap(); // INDEX_SLOT_SIZE = 13
+                // Empty slot: write zeros (17 bytes)
+                w.write_all(&[0u8; 17]).unwrap(); // INDEX_SLOT_SIZE = 17
             } else {
                 let global_idx = entries[entry_local as usize];
                 let offset = global_idx * INDEX_ENTRY_SIZE;
@@ -149,12 +160,14 @@ fn build_index_cuckoo(index_file: &str, output_file: &str) {
                         .unwrap(),
                 );
                 let num_chunks = mmap[offset + SCRIPT_HASH_SIZE + 4];
+                let tree_loc = tree_locs[global_idx];
 
-                // Write tagged entry: [8B tag][4B start_chunk_id][1B num_chunks]
+                // Write tagged entry: [8B tag][4B start_chunk_id][1B num_chunks][4B tree_loc]
                 let tag = hash::compute_tag(TAG_SEED, script_hash);
                 w.write_all(&tag.to_le_bytes()).unwrap();
                 w.write_all(&start_chunk_id.to_le_bytes()).unwrap();
                 w.write_all(&[num_chunks]).unwrap();
+                w.write_all(&tree_loc.to_le_bytes()).unwrap();
             }
         }
     }

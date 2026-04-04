@@ -17,13 +17,21 @@ use std::time::Instant;
 
 // ─── Wire protocol constants for OnionPIR messages ──────────────────────────
 
-pub const REQ_REGISTER_KEYS: u8 = 0x30;
-pub const REQ_ONIONPIR_INDEX_QUERY: u8 = 0x31;
-pub const REQ_ONIONPIR_CHUNK_QUERY: u8 = 0x32;
+// NOTE: 0x30-0x32 were the original OnionPIR codes but collide with
+// REQ_MERKLE_SIBLING_BATCH (0x31) and REQ_MERKLE_TREE_TOP (0x32).
+// Moved to 0x50-0x52 to avoid conflicts.
+pub const REQ_REGISTER_KEYS: u8 = 0x50;
+pub const REQ_ONIONPIR_INDEX_QUERY: u8 = 0x51;
+pub const REQ_ONIONPIR_CHUNK_QUERY: u8 = 0x52;
 
-pub const RESP_KEYS_ACK: u8 = 0x30;
-pub const RESP_ONIONPIR_INDEX_RESULT: u8 = 0x31;
-pub const RESP_ONIONPIR_CHUNK_RESULT: u8 = 0x32;
+pub const REQ_ONIONPIR_MERKLE_SIBLING: u8 = 0x53;
+pub const REQ_ONIONPIR_MERKLE_TREE_TOP: u8 = 0x54;
+
+pub const RESP_KEYS_ACK: u8 = 0x50;
+pub const RESP_ONIONPIR_INDEX_RESULT: u8 = 0x51;
+pub const RESP_ONIONPIR_CHUNK_RESULT: u8 = 0x52;
+pub const RESP_ONIONPIR_MERKLE_SIBLING: u8 = 0x53;
+pub const RESP_ONIONPIR_MERKLE_TREE_TOP: u8 = 0x54;
 
 // ─── OnionPIR database population ───────────────────────────────────────────
 
@@ -335,46 +343,5 @@ impl OnionPirBatchResult {
     }
 }
 
-/// Server info response for OnionPIR protocol.
-pub struct OnionPirServerInfo {
-    pub index_bins_per_table: u32,
-    pub chunk_bins_per_table: u32,
-    pub index_k: u8,
-    pub chunk_k: u8,
-    pub tag_seed: u64,
-    pub onionpir_entry_size: u32,
-    pub onionpir_num_entries: u32, // padded count from params_info
-}
-
-impl OnionPirServerInfo {
-    pub fn encode(&self) -> Vec<u8> {
-        let payload_len = 1 + 4 + 4 + 1 + 1 + 8 + 4 + 4;
-        let mut buf = Vec::with_capacity(4 + payload_len);
-        buf.extend_from_slice(&(payload_len as u32).to_le_bytes());
-        buf.push(crate::protocol::RESP_INFO);
-        buf.extend_from_slice(&self.index_bins_per_table.to_le_bytes());
-        buf.extend_from_slice(&self.chunk_bins_per_table.to_le_bytes());
-        buf.push(self.index_k);
-        buf.push(self.chunk_k);
-        buf.extend_from_slice(&self.tag_seed.to_le_bytes());
-        buf.extend_from_slice(&self.onionpir_entry_size.to_le_bytes());
-        buf.extend_from_slice(&self.onionpir_num_entries.to_le_bytes());
-        buf
-    }
-
-    pub fn decode(data: &[u8]) -> std::io::Result<Self> {
-        // data starts after the variant byte
-        if data.len() < 26 {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "info too short"));
-        }
-        Ok(OnionPirServerInfo {
-            index_bins_per_table: u32::from_le_bytes(data[0..4].try_into().unwrap()),
-            chunk_bins_per_table: u32::from_le_bytes(data[4..8].try_into().unwrap()),
-            index_k: data[8],
-            chunk_k: data[9],
-            tag_seed: u64::from_le_bytes(data[10..18].try_into().unwrap()),
-            onionpir_entry_size: u32::from_le_bytes(data[18..22].try_into().unwrap()),
-            onionpir_num_entries: u32::from_le_bytes(data[22..26].try_into().unwrap()),
-        })
-    }
-}
+// Note: OnionPirServerInfo (binary format) removed — all clients now use JSON (0x03).
+// The Java client (bitcoinj-pir) has its own copy and will need a similar migration.

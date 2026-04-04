@@ -91,14 +91,14 @@ pub struct MappedDatabase {
     pub index: MappedSubTable,
     /// CHUNK-level cuckoo table.
     pub chunk: MappedSubTable,
-    /// MERKLE_DATA cuckoo table (optional).
-    pub merkle_data: Option<MappedSubTable>,
     /// Per-level sibling cuckoo tables (empty if Merkle not built).
     pub merkle_siblings: Vec<MappedSubTable>,
     /// Cached top of the Merkle tree (node hashes).
     pub merkle_tree_top: Option<Vec<u8>>,
     /// Merkle root hash (32 bytes).
     pub merkle_root: Option<Vec<u8>>,
+    /// Merkle tree arity (e.g. 8 for DPF, 120 for OnionPIR). 0 if no Merkle.
+    pub merkle_arity: usize,
 }
 
 impl MappedDatabase {
@@ -117,59 +117,59 @@ impl MappedDatabase {
             descriptor.chunk_params.clone(),
         );
 
-        // Try to load Merkle data table
-        let merkle_data_path = base_dir.join("merkle_data_cuckoo.bin");
-        let merkle_data = if merkle_data_path.exists() {
-            println!("  Loading MERKLE_DATA...");
-            Some(MappedSubTable::load(
-                &merkle_data_path,
-                pir_core::params::TableParams {
-                    k: 75,
-                    num_hashes: 3,
-                    master_seed: 0xBA7C_0EDA_0000_0000,
-                    cuckoo_bucket_size: 4,
-                    cuckoo_num_hashes: 2,
-                    slot_size: pir_core::merkle::MERKLE_DATA_SLOT_SIZE,
-                    dpf_n: 20,
-                    magic: 0xBA7C_0EDA_0000_0001,
-                    header_size: 40,
-                    has_tag_seed: true,
-                },
-            ))
+        // Try to load Merkle sibling tables (DPF: _dpf suffix, then fallback to no suffix)
+        let mut merkle_siblings = Vec::new();
+        let mut merkle_arity = 0usize;
+
+        // Detect arity from tree-top cache header (byte 5-6 = arity LE u16)
+        let top_dpf = base_dir.join("merkle_tree_top_dpf.bin");
+        let top_plain = base_dir.join("merkle_tree_top.bin");
+        let (top_path, sib_prefix) = if top_dpf.exists() {
+            (top_dpf, "merkle_sibling_dpf")
+        } else if top_plain.exists() {
+            (top_plain, "merkle_sibling")
         } else {
-            None
+            (top_plain, "") // no Merkle
         };
 
-        // Try to load sibling tables (L0, L1, L2, ...)
-        let mut merkle_siblings = Vec::new();
-        for level in 0.. {
-            let sib_path = base_dir.join(format!("merkle_sibling_L{}.bin", level));
-            if !sib_path.exists() {
-                break;
+        let merkle_tree_top = std::fs::read(&top_path).ok();
+        if let Some(ref top_data) = merkle_tree_top {
+            if top_data.len() >= 8 {
+                merkle_arity = u16::from_le_bytes(top_data[5..7].try_into().unwrap()) as usize;
             }
-            println!("  Loading MERKLE_SIBLING L{}...", level);
-            let params = pir_core::params::TableParams {
-                k: 75,
-                num_hashes: 3,
-                master_seed: 0xBA7C_51B1_0000_0000u64.wrapping_add(level as u64),
-                cuckoo_bucket_size: 3,
-                cuckoo_num_hashes: 2,
-                slot_size: pir_core::merkle::MERKLE_SIBLING_SLOT_SIZE,
-                dpf_n: 0, // read from header
-                magic: 0xBA7C_51B1_0000_0000u64 | (level as u64),
-                header_size: 32,
-                has_tag_seed: false,
-            };
-            merkle_siblings.push(MappedSubTable::load(&sib_path, params));
         }
 
-        // Try to load tree-top cache and root
-        let merkle_tree_top = std::fs::read(base_dir.join("merkle_tree_top.bin")).ok();
-        let merkle_root = std::fs::read(base_dir.join("merkle_root.bin")).ok();
+        if merkle_arity > 0 && !sib_prefix.is_empty() {
+            let sib_slot_size = pir_core::merkle::merkle_sibling_slot_size(merkle_arity);
+            for level in 0.. {
+                let sib_path = base_dir.join(format!("{}_L{}.bin", sib_prefix, level));
+                if !sib_path.exists() { break; }
+                println!("  Loading {} L{} (arity={}, slot={}B)...", sib_prefix, level, merkle_arity, sib_slot_size);
+                let params = pir_core::params::TableParams {
+                    k: 75,
+                    num_hashes: 3,
+                    master_seed: 0xBA7C_51B1_0000_0000u64.wrapping_add(level as u64),
+                    cuckoo_bucket_size: 4,
+                    cuckoo_num_hashes: 2,
+                    slot_size: sib_slot_size,
+                    dpf_n: 0, // read from file header
+                    magic: 0xBA7C_51B1_0000_0000u64 | (level as u64),
+                    header_size: 32,
+                    has_tag_seed: false,
+                };
+                merkle_siblings.push(MappedSubTable::load(&sib_path, params));
+            }
+        }
 
-        if merkle_data.is_some() {
-            println!("  Merkle: {} sibling levels, tree-top={}, root={}",
-                merkle_siblings.len(),
+        // Load Merkle root
+        let root_dpf = base_dir.join("merkle_root_dpf.bin");
+        let root_plain = base_dir.join("merkle_root.bin");
+        let merkle_root = std::fs::read(&root_dpf).ok()
+            .or_else(|| std::fs::read(&root_plain).ok());
+
+        if !merkle_siblings.is_empty() {
+            println!("  Merkle: arity={}, {} sibling levels, tree-top={}, root={}",
+                merkle_arity, merkle_siblings.len(),
                 if merkle_tree_top.is_some() { "yes" } else { "no" },
                 if merkle_root.is_some() { "yes" } else { "no" },
             );
@@ -177,13 +177,13 @@ impl MappedDatabase {
 
         MappedDatabase {
             descriptor, index, chunk,
-            merkle_data, merkle_siblings, merkle_tree_top, merkle_root,
+            merkle_siblings, merkle_tree_top, merkle_root, merkle_arity,
         }
     }
 
     /// Whether this database has Merkle verification data.
     pub fn has_merkle(&self) -> bool {
-        self.merkle_data.is_some()
+        !self.merkle_siblings.is_empty()
     }
 }
 

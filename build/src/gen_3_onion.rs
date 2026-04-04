@@ -29,6 +29,7 @@ use std::time::Instant;
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const INDEX_FILE: &str = "/Volumes/Bitcoin/data/intermediate/onion_index.bin";
+const TREE_LOCS_FILE: &str = "/Volumes/Bitcoin/data/intermediate/tree_locs.bin";
 const OUTPUT_DIR: &str = "/Volumes/Bitcoin/data/onion_index_pir";
 const META_FILE: &str = "/Volumes/Bitcoin/data/onion_index_meta.bin";
 
@@ -36,8 +37,8 @@ const META_FILE: &str = "/Volumes/Bitcoin/data/onion_index_meta.bin";
 const ONION_INDEX_ENTRY_SIZE: usize = 27;
 const SCRIPT_HASH_SIZE: usize = 20;
 
-/// Index slot in the cuckoo table: 8B tag + 4B entry_id + 2B offset + 1B num_entries
-const INDEX_SLOT_SIZE: usize = 15;
+/// Index slot in the cuckoo table: 8B tag + 4B entry_id + 2B offset + 1B num_entries + 4B tree_loc
+const INDEX_SLOT_SIZE: usize = 19;
 
 /// PBC parameters
 const K: usize = 75;
@@ -46,7 +47,7 @@ const MASTER_SEED: u64 = 0x71a2ef38b4c90d15;
 
 /// Cuckoo parameters for index level
 const CUCKOO_NUM_HASHES: usize = 2;
-const CUCKOO_BUCKET_SIZE: usize = 256;
+const CUCKOO_BUCKET_SIZE: usize = 202; // 202 × 19B = 3838B ≤ 3840B
 const CUCKOO_LOAD_FACTOR: f64 = 0.95;
 const CUCKOO_MAX_KICKS: usize = 5000;
 const EMPTY: u32 = u32::MAX;
@@ -235,11 +236,12 @@ fn build_index_cuckoo(
 }
 
 /// Serialize a cuckoo table into OnionPIR entries.
-/// Each bin (256 slots × 15 bytes) becomes one 3840-byte OnionPIR entry.
+/// Each bin (202 slots × 19 bytes) becomes one 3840-byte OnionPIR entry.
 fn serialize_cuckoo_bin(
     table: &[u32],
     bin: usize,
     mmap: &[u8],
+    tree_locs: &[u8],
 ) -> [u8; ONIONPIR_ENTRY_SIZE] {
     let mut entry = [0u8; ONIONPIR_ENTRY_SIZE];
     let base = bin * CUCKOO_BUCKET_SIZE;
@@ -264,6 +266,11 @@ fn serialize_cuckoo_bin(
         // These are at bytes 20..27 of the onion index entry
         entry[slot_offset + 8..slot_offset + 15]
             .copy_from_slice(&mmap[entry_base + 20..entry_base + 27]);
+
+        // tree_loc (4 bytes) — from tree_locs.bin sidecar (indexed by onion_index position)
+        let tl_off = idx as usize * 4;
+        entry[slot_offset + 15..slot_offset + 19]
+            .copy_from_slice(&tree_locs[tl_off..tl_off + 4]);
     }
 
     entry
@@ -272,9 +279,11 @@ fn serialize_cuckoo_bin(
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 fn main() {
-    assert_eq!(
+    assert!(
+        CUCKOO_BUCKET_SIZE * INDEX_SLOT_SIZE <= ONIONPIR_ENTRY_SIZE,
+        "bucket_size * slot_size must fit within OnionPIR entry size ({}*{}={} > {})",
+        CUCKOO_BUCKET_SIZE, INDEX_SLOT_SIZE,
         CUCKOO_BUCKET_SIZE * INDEX_SLOT_SIZE, ONIONPIR_ENTRY_SIZE,
-        "bucket_size * slot_size must equal OnionPIR entry size"
     );
 
     println!("=== gen_3_onion: Build OnionPIR Index Database ===\n");
@@ -301,6 +310,12 @@ fn main() {
         }
     }
     println!("  Non-whale entries: {} (whale: {})", non_whale, n - non_whale);
+
+    // Load tree_locs sidecar (4 bytes per entry, indexed by onion_index position)
+    let tree_locs_file = File::open(TREE_LOCS_FILE).expect("open tree_locs.bin");
+    let tree_locs = unsafe { Mmap::map(&tree_locs_file) }.expect("mmap tree_locs");
+    assert_eq!(tree_locs.len(), n * 4, "tree_locs.bin size mismatch (expected {} entries)", n);
+    println!("  tree_locs.bin: {} entries loaded", n);
 
     // ── 2. Assign entries to PBC groups ─────────────────────────────────
     println!("\n[2] Assigning entries to {} PBC groups...", K);
@@ -338,6 +353,7 @@ fn main() {
     let t_cuckoo = Instant::now();
 
     let mmap_slice: &[u8] = &mmap;
+    let tree_locs_slice: &[u8] = &tree_locs;
     let completed = AtomicUsize::new(0);
 
     let cuckoo_results: Vec<(usize, Vec<u32>, bool)> = groups
@@ -408,7 +424,7 @@ fn main() {
             for i in 0..fst_dim {
                 let global_bin = chunk_idx * fst_dim + i;
                 if global_bin < bins_per_table {
-                    let entry_bytes = serialize_cuckoo_bin(table, global_bin, mmap_slice);
+                    let entry_bytes = serialize_cuckoo_bin(table, global_bin, mmap_slice, tree_locs_slice);
                     let offset = i * entry_size;
                     chunk_data[offset..offset + entry_size].copy_from_slice(&entry_bytes);
                 }
@@ -510,19 +526,21 @@ fn main() {
             let entry_id = u32::from_le_bytes(decrypted[offset + 8..offset + 12].try_into().unwrap());
             let byte_offset = u16::from_le_bytes(decrypted[offset + 12..offset + 14].try_into().unwrap());
             let num_entries = decrypted[offset + 14];
-            println!("  Tag match at slot {}: entry_id={}, offset={}, num_entries={}",
-                slot, entry_id, byte_offset, num_entries);
+            let tree_loc = u32::from_le_bytes(decrypted[offset + 15..offset + 19].try_into().unwrap());
+            println!("  Tag match at slot {}: entry_id={}, offset={}, num_entries={}, tree_loc={}",
+                slot, entry_id, byte_offset, num_entries, tree_loc);
 
             // Verify against original index entry
             let orig_entry_id = u32::from_le_bytes(mmap[test_base + 20..test_base + 24].try_into().unwrap());
             let orig_offset = u16::from_le_bytes(mmap[test_base + 24..test_base + 26].try_into().unwrap());
             let orig_num = mmap[test_base + 26];
+            let orig_tree_loc = u32::from_le_bytes(tree_locs[test_idx * 4..(test_idx + 1) * 4].try_into().unwrap());
 
-            if entry_id == orig_entry_id && byte_offset == orig_offset && num_entries == orig_num {
+            if entry_id == orig_entry_id && byte_offset == orig_offset && num_entries == orig_num && tree_loc == orig_tree_loc {
                 println!("  Verification: PASS (matches original index entry)");
             } else {
                 println!("  Verification: MISMATCH!");
-                println!("    Expected: entry_id={}, offset={}, num={}", orig_entry_id, orig_offset, orig_num);
+                println!("    Expected: entry_id={}, offset={}, num={}, tree_loc={}", orig_entry_id, orig_offset, orig_num, orig_tree_loc);
             }
             tag_found = true;
             break;
