@@ -458,7 +458,10 @@ impl UnifiedServerData {
     }
 
     fn process_merkle_sibling_batch(&self, query: &BatchQuery) -> (BatchResult, std::time::Duration, std::time::Duration) {
-        let level = query.round_id as usize;
+        // round_id encoding: `level * 100 + pbc_round_index`
+        // The server only cares about the sibling level (which table to query).
+        // The PBC round index is just echoed back for client-side correlation.
+        let level = (query.round_id as usize) / 100;
         let sib_table = &self.db.merkle_siblings[level];
         let k = sib_table.params.k;
         let result_size = sib_table.params.bin_size(); // bucket_size × slot_size
@@ -982,10 +985,13 @@ async fn main() {
                             let resp = tokio::task::spawn_blocking(move || {
                                 let t = Instant::now();
                                 let n = q.keys.len();
-                                let level = q.round_id;
+                                // round_id = level * 100 + pbc_round_index
+                                let level = q.round_id / 100;
+                                let pbc_round = q.round_id % 100;
                                 let (batch, dpf_sum, fetch_sum) = s.process_merkle_sibling_batch(&q);
                                 let wall = t.elapsed();
-                                println!("[merkle-sib] L{} {} buckets {:.2?} | dpf {:.2?} fetch+xor {:.2?}", level, n, wall, dpf_sum, fetch_sum);
+                                println!("[merkle-sib] L{} r{} {} buckets {:.2?} | dpf {:.2?} fetch+xor {:.2?}",
+                                    level, pbc_round, n, wall, dpf_sum, fetch_sum);
                                 Response::MerkleSiblingBatch(batch)
                             }).await.unwrap();
                             let _ = sink.send(Message::Binary(resp.encode().into())).await;
@@ -1128,13 +1134,16 @@ async fn main() {
                         println!("[onion-merkle-top] sent {} bytes", om.tree_top.len());
                     }
                     REQ_ONIONPIR_MERKLE_SIBLING if server.onionpir_tx.is_some() => {
-                        // round_id encodes the sibling level; queries = K per level
+                        // round_id encoding: `sibling_level * 100 + pbc_round_index`
+                        // Server only needs the sibling level to pick which table to query;
+                        // the PBC round index is echoed back for client correlation.
                         if let Ok(batch) = OnionPirBatchQuery::decode(body) {
+                            let sibling_level = (batch.round_id / 100) as u8;
                             let tx = server.onionpir_tx.as_ref().unwrap();
                             let (reply_tx, reply_rx) = oneshot::channel();
                             let _ = tx.send(PirCommand::AnswerBatch {
                                 client_id,
-                                level: 10 + batch.round_id as u8, // encode sibling level
+                                level: 10 + sibling_level, // worker expects level >= 10 for sibling
                                 round_id: batch.round_id,
                                 queries: batch.queries, reply: reply_tx,
                             }).await;
