@@ -127,6 +127,10 @@ name = "gen_4_build_merkle_onion"
 path = "src/gen_4_build_merkle_onion.rs"
 
 [[bin]]
+name = "gen_4_build_merkle_bucket"
+path = "src/gen_4_build_merkle_bucket.rs"
+
+[[bin]]
 name = "test_merkle_verify"
 path = "src/test_merkle_verify.rs"
 

@@ -38,6 +38,7 @@ export interface ServerInfoJson {
   role: 'primary' | 'secondary';
   onionpir?: OnionPirInfoJson;
   merkle?: MerkleInfoJson;
+  merkle_bucket?: BucketMerkleInfoJson;
   onionpir_merkle?: OnionPirMerkleInfoJson;
 }
 
@@ -56,6 +57,24 @@ export interface MerkleInfoJson {
   root: string;             // hex (32 bytes)
   tree_top_hash: string;   // SHA256 of tree-top cache blob (hex, 32 bytes)
   tree_top_size: number;   // byte size of tree-top cache
+}
+
+// ─── Per-bucket bin Merkle info ──────────────────────────────────────────
+
+export interface BucketMerkleLevelInfo {
+  dpf_n: number;
+  bins_per_table: number;
+}
+
+export interface BucketMerkleInfoJson {
+  arity: number;
+  index_levels: BucketMerkleLevelInfo[];
+  chunk_levels: BucketMerkleLevelInfo[];
+  index_roots: string[];   // 75 hex roots
+  chunk_roots: string[];   // 80 hex roots
+  super_root: string;      // hex super-root
+  tree_tops_hash: string;  // SHA256 of tree-tops blob
+  tree_tops_size: number;
 }
 
 export interface OnionPirMerkleLevelInfo {
@@ -151,6 +170,20 @@ export function parseServerInfoJson(jsonStr: string): ServerInfoJson {
       root: raw.merkle.root ?? '',
       tree_top_hash: raw.merkle.tree_top_hash ?? '',
       tree_top_size: raw.merkle.tree_top_size ?? 0,
+    };
+  }
+
+  if (raw.merkle_bucket && typeof raw.merkle_bucket === 'object') {
+    const mb = raw.merkle_bucket;
+    info.merkle_bucket = {
+      arity: mb.arity ?? 8,
+      index_levels: mb.index_levels ?? [],
+      chunk_levels: mb.chunk_levels ?? [],
+      index_roots: mb.index_roots ?? [],
+      chunk_roots: mb.chunk_roots ?? [],
+      super_root: mb.super_root ?? '',
+      tree_tops_hash: mb.tree_tops_hash ?? '',
+      tree_tops_size: mb.tree_tops_size ?? 0,
     };
   }
 

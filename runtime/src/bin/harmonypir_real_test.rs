@@ -40,13 +40,12 @@ fn hex_short(bytes: &[u8]) -> String {
     }
 }
 
-/// Decode a 17-byte index slot: [8B tag][4B start_chunk_id LE][1B num_chunks][4B tree_loc LE]
-fn decode_index_slot(slot: &[u8]) -> (u64, u32, u8, u32) {
+/// Decode a 13-byte index slot: [8B tag][4B start_chunk_id LE][1B num_chunks]
+fn decode_index_slot(slot: &[u8]) -> (u64, u32, u8) {
     let tag = u64::from_le_bytes(slot[0..8].try_into().unwrap());
     let start_chunk = u32::from_le_bytes(slot[8..12].try_into().unwrap());
     let num_chunks = slot[12];
-    let tree_loc = u32::from_le_bytes(slot[13..17].try_into().unwrap());
-    (tag, start_chunk, num_chunks, tree_loc)
+    (tag, start_chunk, num_chunks)
 }
 
 /// Decode a 44-byte chunk slot: [4B chunk_id LE][40B data]
@@ -319,7 +318,7 @@ fn run_narrative(
             println!("    Decoded {} slots:", slots_per_bin);
             for s in 0..slots_per_bin {
                 let slot = &expected[s * slot_size..(s + 1) * slot_size];
-                let (tag, chunk_start, num_chunks, _tree_loc) = decode_index_slot(slot);
+                let (tag, chunk_start, num_chunks) = decode_index_slot(slot);
                 let is_empty = tag == 0 && chunk_start == 0 && num_chunks == 0;
                 if is_empty {
                     println!("      slot[{}]: (empty)", s);
@@ -399,7 +398,7 @@ fn run_narrative(
             println!("\n    [Client] Decoded answer (3 index slots):");
             for s in 0..slots_per_bin {
                 let slot = &answer[s * slot_size..(s + 1) * slot_size];
-                let (tag, chunk_start, num_chunks, _tree_loc) = decode_index_slot(slot);
+                let (tag, chunk_start, num_chunks) = decode_index_slot(slot);
                 let is_empty = tag == 0 && chunk_start == 0 && num_chunks == 0;
                 if !is_empty {
                     println!("      slot[{}]: tag=0x{:016x} start_chunk={} num_chunks={}",

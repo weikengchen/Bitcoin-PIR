@@ -33,6 +33,19 @@ export function computeDataHash(chunkData: Uint8Array): Uint8Array {
 }
 
 /**
+ * Per-bucket bin Merkle: leaf = SHA256(binIndex_u32_LE || binContent).
+ *
+ * Each leaf in a per-PBC-group Merkle tree commits to the bin index and
+ * all slot data at that bin.
+ */
+export function computeBinLeafHash(binIndex: number, binContent: Uint8Array): Uint8Array {
+  const preimage = new Uint8Array(4 + binContent.length);
+  new DataView(preimage.buffer).setUint32(0, binIndex, true);
+  preimage.set(binContent, 4);
+  return sha256(preimage);
+}
+
+/**
  * Compute an N-ary parent hash: SHA256(child_0 || child_1 || ... || child_{N-1}).
  *
  * @param children - Array of 32-byte child hashes (length = arity)

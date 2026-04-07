@@ -30,8 +30,8 @@ import { cuckooPlace, planRounds } from './pbc.js';
 import { readVarint, decodeUtxoData, DummyRng } from './codec.js';
 import { findEntryInIndexResult, findChunkInResult } from './scan.js';
 import { ManagedWebSocket } from './ws.js';
-import { fetchServerInfoJson, type ServerInfoJson, type MerkleInfoJson } from './server-info.js';
-import { verifyMerkleBatchDpf } from './merkle-verify-dpf.js';
+import { fetchServerInfoJson, type ServerInfoJson } from './server-info.js';
+import { verifyBucketMerkleBatchDpf, type BucketMerkleItem } from './merkle-verify-bucket.js';
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -51,14 +51,25 @@ export interface QueryResult {
   isWhale: boolean;
   /** Merkle verification result (undefined if not verified yet) */
   merkleVerified?: boolean;
-  /** Merkle root hash hex (from server, for display — DPF) */
+  /** Merkle root hash hex (from server, for display) */
   merkleRootHex?: string;
-  /** tree_loc in the Merkle tree (DPF per-entry Merkle) */
-  treeLoc?: number;
-  /** Raw chunk data (kept for DPF Merkle verification) */
+  /** Raw chunk data (kept for Merkle verification) */
   rawChunkData?: Uint8Array;
   /** Script hash used for this query */
   scriptHash?: Uint8Array;
+  // ── Per-bucket bin Merkle ─────────────────────────────────────────
+  /** PBC group index for the INDEX query */
+  indexPbcGroup?: number;
+  /** Cuckoo bin index within the INDEX group */
+  indexBinIndex?: number;
+  /** Raw INDEX bin content (slotsPerBin × slotSize bytes) */
+  indexBinContent?: Uint8Array;
+  /** PBC group indices for each CHUNK query */
+  chunkPbcGroups?: number[];
+  /** Cuckoo bin indices for each CHUNK query */
+  chunkBinIndices?: number[];
+  /** Raw CHUNK bin contents */
+  chunkBinContents?: Uint8Array[];
   // ── Per-bin Merkle (OnionPIR) ─────────────────────────────────────
   /** INDEX-MERKLE root hex (OnionPIR per-bin) */
   merkleIndexRoot?: string;
@@ -294,7 +305,7 @@ export class BatchPirClient {
     this.log(`Level 1: ${N} queries → ${indexRounds.length} index round(s)`);
 
     // Per-query results from Level 1
-    const indexResults: Map<number, { startChunkId: number; numChunks: number; treeLoc: number }> = new Map();
+    const indexResults: Map<number, { startChunkId: number; numChunks: number; pbcGroup: number; binIndex: number; binContent: Uint8Array }> = new Map();
 
     for (let ir = 0; ir < indexRounds.length; ir++) {
       const round = indexRounds[ir];
@@ -353,16 +364,29 @@ export class BatchPirClient {
         const r0 = resp0.result.results[groupId];
         const r1 = resp1.result.results[groupId];
 
-        let found: { startChunkId: number; numChunks: number; treeLoc: number } | null = null;
+        let found: { startChunkId: number; numChunks: number } | null = null;
+        let matchedBinContent: Uint8Array | undefined;
+        let matchedBinIndex = 0;
         const expectedTag = computeTag(this.tagSeed, scriptHashes[queryIdx]);
         for (let h = 0; h < INDEX_CUCKOO_NUM_HASHES; h++) {
           const result = this.xorBuffers(r0[h], r1[h]);
           found = findEntryInIndexResult(result, expectedTag, this.serverInfo!.index_slots_per_bin, this.serverInfo!.index_slot_size);
-          if (found) break;
+          if (found) {
+            matchedBinContent = result;
+            // The bin index is the cuckoo hash of the script hash into this group's table
+            const ck = deriveCuckooKey(groupId, h);
+            matchedBinIndex = cuckooHash(scriptHashes[queryIdx], ck, this.indexBins);
+            break;
+          }
         }
 
         if (found) {
-          indexResults.set(queryIdx, found);
+          indexResults.set(queryIdx, {
+            ...found,
+            pbcGroup: groupId,
+            binIndex: matchedBinIndex,
+            binContent: matchedBinContent!,
+          });
         } else {
           this.log(`  Query ${queryIdx}: not found in index`, 'error');
         }
@@ -378,7 +402,7 @@ export class BatchPirClient {
 
     // Build a global list of unique chunk IDs needed, and track which
     // query needs which chunks
-    const queryChunkInfo: Map<number, { startChunk: number; numUnits: number; startChunkId: number; numChunks: number; treeLoc: number }> = new Map();
+    const queryChunkInfo: Map<number, { startChunk: number; numUnits: number; startChunkId: number; numChunks: number }> = new Map();
     const allChunkIdsSet = new Set<number>();
 
     // Track whale-excluded queries separately
@@ -400,7 +424,7 @@ export class BatchPirClient {
         chunkIds.push(cid);
         allChunkIdsSet.add(cid);
       }
-      queryChunkInfo.set(qi, { startChunk, numUnits, startChunkId: info.startChunkId, numChunks: info.numChunks, treeLoc: info.treeLoc });
+      queryChunkInfo.set(qi, { startChunk, numUnits, startChunkId: info.startChunkId, numChunks: info.numChunks });
     }
 
     const allChunkIds = Array.from(allChunkIdsSet).sort((a, b) => a - b);
@@ -419,6 +443,8 @@ export class BatchPirClient {
 
     // Execute chunk rounds
     const recoveredChunks = new Map<number, Uint8Array>();
+    // Track per-chunk Merkle info: chunkId → { pbcGroup, binIndex, binContent }
+    const chunkMerkleInfo = new Map<number, { pbcGroup: number; binIndex: number; binContent: Uint8Array }>();
 
     for (let ri = 0; ri < chunkRounds.length; ri++) {
       const roundPlan = chunkRounds[ri];
@@ -481,7 +507,13 @@ export class BatchPirClient {
         for (let h = 0; h < numResults; h++) {
           const result = this.xorBuffers(cr0[h], cr1[h]);
           data = findChunkInResult(result, chunkId, this.serverInfo!.chunk_slots_per_bin, this.serverInfo!.chunk_slot_size);
-          if (data) break;
+          if (data) {
+            // Save bin content + bin index for bucket Merkle verification
+            const ck = deriveChunkCuckooKey(groupId, h);
+            const binIndex = cuckooHashInt(chunkId, ck, this.chunkBins);
+            chunkMerkleInfo.set(chunkId, { pbcGroup: groupId, binIndex, binContent: result });
+            break;
+          }
         }
 
         if (data) {
@@ -541,6 +573,24 @@ export class BatchPirClient {
       }
 
       const { entries, totalSats } = decodeUtxoData(fullData, (msg) => this.log(msg, 'error'));
+
+      // Collect chunk-level Merkle info for this query
+      const qChunkPbcGroups: number[] = [];
+      const qChunkBinIndices: number[] = [];
+      const qChunkBinContents: Uint8Array[] = [];
+      for (let u = 0; u < numUnits; u++) {
+        const cid = startChunk + u * CHUNKS_PER_UNIT;
+        const cmi = chunkMerkleInfo.get(cid);
+        if (cmi) {
+          qChunkPbcGroups.push(cmi.pbcGroup);
+          qChunkBinIndices.push(cmi.binIndex);
+          qChunkBinContents.push(cmi.binContent);
+        }
+      }
+
+      // Get INDEX-level Merkle info
+      const idxInfo = indexResults.get(qi);
+
       results[qi] = {
         entries,
         totalSats,
@@ -548,10 +598,15 @@ export class BatchPirClient {
         numChunks,
         numRounds: totalChunkRounds,
         isWhale: false,
-        merkleRootHex: this.serverInfo?.merkle?.root,
-        treeLoc: info.treeLoc,
+        merkleRootHex: this.serverInfo?.merkle_bucket?.super_root ?? this.serverInfo?.merkle?.root,
         rawChunkData: fullData,
         scriptHash: scriptHashes[qi],
+        indexPbcGroup: idxInfo?.pbcGroup,
+        indexBinIndex: idxInfo?.binIndex,
+        indexBinContent: idxInfo?.binContent,
+        chunkPbcGroups: qChunkPbcGroups,
+        chunkBinIndices: qChunkBinIndices,
+        chunkBinContents: qChunkBinContents,
       };
     }
 
@@ -567,51 +622,50 @@ export class BatchPirClient {
 
   /** Check if server supports Merkle verification */
   hasMerkle(): boolean {
-    return !!(this.serverInfo?.merkle && this.serverInfo.merkle.sibling_levels > 0);
+    return !!(this.serverInfo?.merkle_bucket && this.serverInfo.merkle_bucket.index_levels.length > 0);
   }
 
   /** Get the Merkle root hash hex (for display) */
   getMerkleRootHex(): string | undefined {
-    return this.serverInfo?.merkle?.root;
+    return this.serverInfo?.merkle_bucket?.super_root ?? this.serverInfo?.merkle?.root;
   }
 
   /**
-   * Verify a single query result against the Merkle tree.
-   * Fetches the tree-top cache from the server, runs sibling PIR rounds,
-   * and verifies the full proof to the root.
-   *
-   * Call this after query() / queryBatch() with the result you want to verify.
-   */
-  /**
-   * Batch-verify Merkle proofs for multiple query results.
-   * Packs all addresses' sibling groupIds into PBC batches per level.
+   * Batch-verify per-bucket bin Merkle proofs for multiple query results.
+   * Uses DPF sibling queries against flat per-group sibling tables.
    */
   async verifyMerkleBatch(
     results: QueryResult[],
     onProgress?: (step: string, detail: string) => void,
   ): Promise<boolean[]> {
     if (!this.isConnected()) throw new Error('Not connected');
-    const merkle = this.serverInfo?.merkle;
-    if (!merkle || merkle.sibling_levels === 0) throw new Error('Server does not support Merkle');
+    const merkle = this.serverInfo?.merkle_bucket;
+    if (!merkle) throw new Error('Server does not support bucket Merkle');
 
-    // Filter verifiable results, build items array
-    const items: { scriptHash: Uint8Array; rawChunkData: Uint8Array; treeLoc: number }[] = [];
-    const itemToResult: number[] = []; // items[j] came from results[itemToResult[j]]
+    // Build BucketMerkleItem[] from verifiable results
+    const items: BucketMerkleItem[] = [];
+    const itemToResult: number[] = [];
     for (let i = 0; i < results.length; i++) {
       const r = results[i];
-      if (r.isWhale || !r.scriptHash || !r.rawChunkData || r.treeLoc === undefined) continue;
-      items.push({ scriptHash: r.scriptHash, rawChunkData: r.rawChunkData, treeLoc: r.treeLoc });
+      if (r.isWhale || r.indexPbcGroup === undefined || !r.indexBinContent) continue;
+      items.push({
+        indexPbcGroup: r.indexPbcGroup,
+        indexBinIndex: r.indexBinIndex!,
+        indexBinContent: r.indexBinContent,
+        chunkPbcGroups: r.chunkPbcGroups ?? [],
+        chunkBinIndices: r.chunkBinIndices ?? [],
+        chunkBinContents: r.chunkBinContents ?? [],
+      });
       itemToResult.push(i);
     }
 
     if (items.length === 0) return results.map(() => false);
 
-    const batchResults = await verifyMerkleBatchDpf(
+    const batchResults = await verifyBucketMerkleBatchDpf(
       this.ws0!, this.ws1!, merkle, items, onProgress,
-      (msg, level) => this.log(msg, level),
+      (msg) => this.log(msg),
     );
 
-    // Map back to original results array
     const out: boolean[] = new Array(results.length).fill(false);
     for (let j = 0; j < batchResults.length; j++) {
       const ri = itemToResult[j];

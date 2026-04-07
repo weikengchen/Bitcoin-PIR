@@ -74,8 +74,8 @@ pub const TAG_SIZE: usize = 8;
 /// Size of one chunk of UTXO data.
 pub const CHUNK_SIZE: usize = 40;
 
-/// INDEX-level slot size: 8B tag + 4B start_chunk_id + 1B num_chunks + 4B tree_loc.
-pub const INDEX_SLOT_SIZE: usize = TAG_SIZE + 4 + 1 + 4; // 17
+/// INDEX-level slot size: 8B tag + 4B start_chunk_id + 1B num_chunks.
+pub const INDEX_SLOT_SIZE: usize = TAG_SIZE + 4 + 1; // 13
 
 /// CHUNK-level slot size: 4B chunk_id + 40B data.
 pub const CHUNK_SLOT_SIZE: usize = 4 + CHUNK_SIZE; // 44

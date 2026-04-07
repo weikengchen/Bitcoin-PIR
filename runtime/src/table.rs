@@ -99,6 +99,18 @@ pub struct MappedDatabase {
     pub merkle_root: Option<Vec<u8>>,
     /// Merkle tree arity (e.g. 8 for DPF, 120 for OnionPIR). 0 if no Merkle.
     pub merkle_arity: usize,
+
+    // ── Per-bucket bin Merkle ────────────────────────────────────────────
+    /// Flat sibling tables for INDEX-level per-bucket Merkle (L0, L1, ...).
+    pub bucket_merkle_index_siblings: Vec<MappedSubTable>,
+    /// Flat sibling tables for CHUNK-level per-bucket Merkle (L0, L1, ...).
+    pub bucket_merkle_chunk_siblings: Vec<MappedSubTable>,
+    /// Tree-top caches for all 155 per-bucket trees.
+    pub bucket_merkle_tree_tops: Option<Vec<u8>>,
+    /// Per-group roots: 155 × 32B (75 index + 80 chunk).
+    pub bucket_merkle_roots: Option<Vec<u8>>,
+    /// Super-root: SHA256 of all 155 roots concatenated.
+    pub bucket_merkle_root: Option<Vec<u8>>,
 }
 
 impl MappedDatabase {
@@ -175,15 +187,81 @@ impl MappedDatabase {
             );
         }
 
+        // ── Load per-bucket bin Merkle files ──────────────────────────────
+        let mut bucket_merkle_index_siblings = Vec::new();
+        let mut bucket_merkle_chunk_siblings = Vec::new();
+
+        // INDEX sibling tables: merkle_bucket_index_sib_L0.bin, L1.bin, ...
+        for level in 0.. {
+            let path = base_dir.join(format!("merkle_bucket_index_sib_L{}.bin", level));
+            if !path.exists() { break; }
+            let magic = 0xBA7C_B000_0000_0000u64 | ((level as u64) << 16);
+            let params = pir_core::params::TableParams {
+                k: descriptor.index_params.k,
+                num_hashes: 0,
+                master_seed: 0,
+                slots_per_bin: 1,
+                cuckoo_num_hashes: 0,
+                slot_size: 8 * 32, // 256B per row (arity=8 × 32B hashes)
+                dpf_n: 0,
+                magic,
+                header_size: 32,
+                has_tag_seed: false,
+            };
+            println!("  Loading bucket Merkle INDEX sib L{} (slot=256B)...", level);
+            bucket_merkle_index_siblings.push(MappedSubTable::load(&path, params));
+        }
+
+        // CHUNK sibling tables: merkle_bucket_chunk_sib_L0.bin, L1.bin, ...
+        for level in 0.. {
+            let path = base_dir.join(format!("merkle_bucket_chunk_sib_L{}.bin", level));
+            if !path.exists() { break; }
+            let magic = 0xBA7C_B000_0000_0000u64 | (1u64 << 40) | ((level as u64) << 16);
+            let params = pir_core::params::TableParams {
+                k: descriptor.chunk_params.k,
+                num_hashes: 0,
+                master_seed: 0,
+                slots_per_bin: 1,
+                cuckoo_num_hashes: 0,
+                slot_size: 8 * 32,
+                dpf_n: 0,
+                magic,
+                header_size: 32,
+                has_tag_seed: false,
+            };
+            println!("  Loading bucket Merkle CHUNK sib L{} (slot=256B)...", level);
+            bucket_merkle_chunk_siblings.push(MappedSubTable::load(&path, params));
+        }
+
+        let bucket_merkle_tree_tops = std::fs::read(base_dir.join("merkle_bucket_tree_tops.bin")).ok();
+        let bucket_merkle_roots = std::fs::read(base_dir.join("merkle_bucket_roots.bin")).ok();
+        let bucket_merkle_root = std::fs::read(base_dir.join("merkle_bucket_root.bin")).ok();
+
+        if !bucket_merkle_index_siblings.is_empty() {
+            println!("  Bucket Merkle: {} INDEX sib levels, {} CHUNK sib levels, tree-tops={}, super-root={}",
+                bucket_merkle_index_siblings.len(),
+                bucket_merkle_chunk_siblings.len(),
+                if bucket_merkle_tree_tops.is_some() { "yes" } else { "no" },
+                if bucket_merkle_root.is_some() { "yes" } else { "no" },
+            );
+        }
+
         MappedDatabase {
             descriptor, index, chunk,
             merkle_siblings, merkle_tree_top, merkle_root, merkle_arity,
+            bucket_merkle_index_siblings, bucket_merkle_chunk_siblings,
+            bucket_merkle_tree_tops, bucket_merkle_roots, bucket_merkle_root,
         }
     }
 
-    /// Whether this database has Merkle verification data.
+    /// Whether this database has (legacy) global Merkle verification data.
     pub fn has_merkle(&self) -> bool {
         !self.merkle_siblings.is_empty()
+    }
+
+    /// Whether this database has per-bucket bin Merkle verification data.
+    pub fn has_bucket_merkle(&self) -> bool {
+        !self.bucket_merkle_index_siblings.is_empty()
     }
 }
 

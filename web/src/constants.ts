@@ -33,8 +33,8 @@ export const SCRIPT_HASH_SIZE = 20;
 /** Size of the fingerprint tag in the final cuckoo table */
 export const TAG_SIZE = 8;
 
-/** INDEX cuckoo slot: 8B tag + 4B start_chunk_id + 1B num_chunks + 4B tree_loc */
-export const INDEX_SLOT_SIZE = 17;
+/** INDEX cuckoo slot: 8B tag + 4B start_chunk_id + 1B num_chunks */
+export const INDEX_SLOT_SIZE = 13;
 
 /** Index result size: INDEX_SLOTS_PER_BIN * INDEX_SLOT_SIZE bytes */
 export const INDEX_RESULT_SIZE = INDEX_SLOTS_PER_BIN * INDEX_SLOT_SIZE;
@@ -110,7 +110,7 @@ export const RESP_HARMONY_HINTS = 0x41;
 export const RESP_HARMONY_QUERY = 0x42;
 export const RESP_HARMONY_BATCH_QUERY = 0x43;
 
-// ─── Merkle sibling constants (DPF, arity=8) ─────────────────────────────
+// ─── Legacy global Merkle protocol codes (deprecated, kept for server compat) ─
 
 export const REQ_MERKLE_SIBLING_BATCH = 0x31;
 export const RESP_MERKLE_SIBLING_BATCH = 0x31;
@@ -131,23 +131,18 @@ export const RESP_ONIONPIR_MERKLE_DATA_TREE_TOP = 0x56;
 /** OnionPIR sibling cuckoo: 6 hash functions, group_size=1 */
 export const ONIONPIR_MERKLE_SIBLING_CUCKOO_NUM_HASHES = 6;
 
-/** Merkle tree branching factor for DPF */
-export const MERKLE_ARITY = 8;
+// ─── Per-bucket bin Merkle constants (arity=8, flat tables) ────────────────
 
-/** K for Merkle sibling PBC groups (same as INDEX) */
-export const MERKLE_SIBLING_K = 75;
+export const REQ_BUCKET_MERKLE_SIB_BATCH = 0x33;
+export const RESP_BUCKET_MERKLE_SIB_BATCH = 0x33;
+export const REQ_BUCKET_MERKLE_TREE_TOPS = 0x34;
+export const RESP_BUCKET_MERKLE_TREE_TOPS = 0x34;
 
-/** Slots per bin for sibling tables (same as INDEX) */
-export const MERKLE_SIBLING_SLOTS_PER_BIN = 4;
+/** Branching factor for per-bucket bin Merkle */
+export const BUCKET_MERKLE_ARITY = 8;
 
-/** Cuckoo hash functions for sibling tables */
-export const MERKLE_SIBLING_CUCKOO_NUM_HASHES = 2;
-
-/** Sibling slot: [4B group_id][arity x 32B hashes] */
-export const MERKLE_SIBLING_SLOT_SIZE = 4 + MERKLE_ARITY * 32; // 260
-
-/** Sibling result: slots_per_bin x slot_size */
-export const MERKLE_SIBLING_RESULT_SIZE = MERKLE_SIBLING_SLOTS_PER_BIN * MERKLE_SIBLING_SLOT_SIZE; // 1040
+/** Each flat sibling row: arity × 32B child hashes */
+export const BUCKET_MERKLE_SIB_ROW_SIZE = BUCKET_MERKLE_ARITY * 32; // 256
 
 // ─── Default server URLs ───────────────────────────────────────────────────
 

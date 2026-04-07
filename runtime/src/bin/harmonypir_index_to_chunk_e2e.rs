@@ -40,13 +40,12 @@ fn hex_short(bytes: &[u8]) -> String {
     }
 }
 
-/// Decode a 17-byte index slot: [8B tag][4B start_chunk_id LE][1B num_chunks][4B tree_loc LE]
-fn decode_index_slot(slot: &[u8]) -> (u64, u32, u8, u32) {
+/// Decode a 13-byte index slot: [8B tag][4B start_chunk_id LE][1B num_chunks]
+fn decode_index_slot(slot: &[u8]) -> (u64, u32, u8) {
     let tag = u64::from_le_bytes(slot[0..8].try_into().unwrap());
     let start_chunk = u32::from_le_bytes(slot[8..12].try_into().unwrap());
     let num_chunks = slot[12];
-    let tree_loc = u32::from_le_bytes(slot[13..17].try_into().unwrap());
-    (tag, start_chunk, num_chunks, tree_loc)
+    (tag, start_chunk, num_chunks)
 }
 
 /// Decode a 44-byte chunk slot: [4B chunk_id LE][40B data]
@@ -202,7 +201,7 @@ fn main() {
 
     println!("  INDEX cuckoo: {} bins × {}B = {:.2} GB",
         index_bins, index_w, idx_mmap.len() as f64 / (1024.0*1024.0*1024.0));
-    println!("    Slot layout: [8B tag][4B start_chunk_id][1B num_chunks] × {} slots", INDEX_SLOTS_PER_BIN);
+    println!("    Slot layout: [8B tag][4B start_chunk_id][1B num_chunks] = {}B × {} slots", INDEX_SLOT_SIZE, INDEX_SLOTS_PER_BIN);
     println!("    tag_seed = 0x{:016x}", tag_seed);
     println!("  CHUNK cuckoo: {} bins × {}B = {:.2} GB",
         chunk_bins, chunk_w, chunk_mmap.len() as f64 / (1024.0*1024.0*1024.0));
@@ -227,7 +226,7 @@ fn main() {
         let bin_start = index_table_offset + bin * index_w;
         for slot in 0..INDEX_SLOTS_PER_BIN {
             let s = bin_start + slot * INDEX_SLOT_SIZE;
-            let (tag, start_chunk, num_chunks, _tree_loc) = decode_index_slot(&idx_mmap[s..s + INDEX_SLOT_SIZE]);
+            let (tag, start_chunk, num_chunks) = decode_index_slot(&idx_mmap[s..s + INDEX_SLOT_SIZE]);
             if tag != 0 && num_chunks > 0 && num_chunks < 20 {
                 // Valid non-whale entry with a reasonable number of chunks.
                 target_bin = Some(bin);
@@ -255,7 +254,7 @@ fn main() {
     let bin_data = &idx_mmap[bin_data_start..bin_data_start + index_w];
     for slot in 0..INDEX_SLOTS_PER_BIN {
         let s = slot * INDEX_SLOT_SIZE;
-        let (tag, start_chunk, num_chunks, _tree_loc) = decode_index_slot(&bin_data[s..s + INDEX_SLOT_SIZE]);
+        let (tag, start_chunk, num_chunks) = decode_index_slot(&bin_data[s..s + INDEX_SLOT_SIZE]);
         if tag == 0 && start_chunk == 0 && num_chunks == 0 {
             println!("      slot[{}]: (empty)", slot);
         } else {
@@ -335,7 +334,7 @@ fn main() {
     for slot in 0..INDEX_SLOTS_PER_BIN {
         let s = slot * INDEX_SLOT_SIZE;
         let slot_data = &answer[s..s + INDEX_SLOT_SIZE];
-        let (tag, start_chunk, num_chunks, _tree_loc) = decode_index_slot(slot_data);
+        let (tag, start_chunk, num_chunks) = decode_index_slot(slot_data);
         if tag == 0 && start_chunk == 0 && num_chunks == 0 {
             println!("    slot[{}]: (empty)", slot);
         } else {

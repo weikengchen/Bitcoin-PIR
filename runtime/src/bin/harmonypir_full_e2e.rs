@@ -37,12 +37,12 @@ fn hex_short(bytes: &[u8]) -> String {
     }
 }
 
-fn decode_index_slot(slot: &[u8]) -> (u64, u32, u8, u32) {
+/// Decode a 13-byte index slot: [8B tag][4B start_chunk_id LE][1B num_chunks]
+fn decode_index_slot(slot: &[u8]) -> (u64, u32, u8) {
     let tag = u64::from_le_bytes(slot[0..8].try_into().unwrap());
     let start_chunk = u32::from_le_bytes(slot[8..12].try_into().unwrap());
     let num_chunks = slot[12];
-    let tree_loc = u32::from_le_bytes(slot[13..17].try_into().unwrap());
-    (tag, start_chunk, num_chunks, tree_loc)
+    (tag, start_chunk, num_chunks)
 }
 
 fn decode_chunk_slot(slot: &[u8]) -> (u32, &[u8]) {
@@ -148,7 +148,7 @@ fn find_target_in_index_group(
         let bin_start = table_offset + bin * w;
         for slot in 0..INDEX_SLOTS_PER_BIN {
             let s = bin_start + slot * INDEX_SLOT_SIZE;
-            let (tag, start_chunk, num_chunks, _tree_loc) = decode_index_slot(&table_mmap[s..s + INDEX_SLOT_SIZE]);
+            let (tag, start_chunk, num_chunks) = decode_index_slot(&table_mmap[s..s + INDEX_SLOT_SIZE]);
             if tag != 0 && num_chunks > 0 && num_chunks < 50 {
                 return Some((bin, slot, tag, start_chunk, num_chunks));
             }

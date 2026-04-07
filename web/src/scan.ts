@@ -12,20 +12,20 @@
 /**
  * Scan an index result (cuckoo bin) for a matching tag.
  *
- * Slot layout: [8B tag LE][4B startChunkId LE][1B numChunks][4B treeLoc LE]
+ * Slot layout: [8B tag LE][4B startChunkId LE][1B numChunks]
  * Used by DPF (XOR'd result from 2 servers) and HarmonyPIR (reconstructed bin).
  *
  * @param data        - Raw bin bytes (slotsPerBin * slotSize bytes)
  * @param expectedTag - 8-byte tag as bigint to match against
  * @param slotsPerBin - Number of slots in the bin (e.g. 4 for DPF index)
- * @param slotSize    - Bytes per slot (e.g. 17 for DPF/HarmonyPIR index)
+ * @param slotSize    - Bytes per slot (e.g. 13 for DPF/HarmonyPIR index)
  */
 export function findEntryInIndexResult(
   data: Uint8Array,
   expectedTag: bigint,
   slotsPerBin: number,
   slotSize: number,
-): { startChunkId: number; numChunks: number; treeLoc: number } | null {
+): { startChunkId: number; numChunks: number } | null {
   const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
   for (let slot = 0; slot < slotsPerBin; slot++) {
     const off = slot * slotSize;
@@ -34,8 +34,7 @@ export function findEntryInIndexResult(
     if (slotTag === expectedTag) {
       const startChunkId = dv.getUint32(off + 8, true);
       const numChunks = data[off + 12];
-      const treeLoc = (off + 17 <= data.length) ? dv.getUint32(off + 13, true) : 0;
-      return { startChunkId, numChunks, treeLoc };
+      return { startChunkId, numChunks };
     }
   }
   return null;

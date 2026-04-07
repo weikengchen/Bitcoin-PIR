@@ -15,6 +15,8 @@ pub const REQ_INDEX_BATCH: u8 = 0x11;
 pub const REQ_CHUNK_BATCH: u8 = 0x21;
 pub const REQ_MERKLE_SIBLING_BATCH: u8 = 0x31;
 pub const REQ_MERKLE_TREE_TOP: u8 = 0x32;
+pub const REQ_BUCKET_MERKLE_SIB_BATCH: u8 = 0x33;
+pub const REQ_BUCKET_MERKLE_TREE_TOPS: u8 = 0x34;
 
 // ─── HarmonyPIR request variants ────────────────────────────────────────────
 
@@ -40,6 +42,8 @@ pub const RESP_INDEX_BATCH: u8 = 0x11;
 pub const RESP_CHUNK_BATCH: u8 = 0x21;
 pub const RESP_MERKLE_SIBLING_BATCH: u8 = 0x31;
 pub const RESP_MERKLE_TREE_TOP: u8 = 0x32;
+pub const RESP_BUCKET_MERKLE_SIB_BATCH: u8 = 0x33;
+pub const RESP_BUCKET_MERKLE_TREE_TOPS: u8 = 0x34;
 pub const RESP_RESIDENCY: u8 = 0x04;
 pub const RESP_ERROR: u8 = 0xFF;
 
@@ -151,6 +155,7 @@ pub enum Request {
     IndexBatch(BatchQuery),
     ChunkBatch(BatchQuery),
     MerkleSiblingBatch(BatchQuery),
+    BucketMerkleSibBatch(BatchQuery),
     HarmonyGetInfo,
     HarmonyHints(HarmonyHintRequest),
     HarmonyQuery(HarmonyQuery),
@@ -214,6 +219,7 @@ pub enum Response {
     IndexBatch(BatchResult),
     ChunkBatch(BatchResult),
     MerkleSiblingBatch(BatchResult),
+    BucketMerkleSibBatch(BatchResult),
     Error(String),
     HarmonyInfo(ServerInfo),
     HarmonyQueryResult(HarmonyQueryResult),
@@ -245,6 +251,10 @@ impl Request {
             }
             Request::MerkleSiblingBatch(q) => {
                 payload.push(REQ_MERKLE_SIBLING_BATCH);
+                encode_batch_query(&mut payload, q);
+            }
+            Request::BucketMerkleSibBatch(q) => {
+                payload.push(REQ_BUCKET_MERKLE_SIB_BATCH);
                 encode_batch_query(&mut payload, q);
             }
             Request::HarmonyGetInfo => {
@@ -299,6 +309,10 @@ impl Request {
                 let q = decode_batch_query(&data[1..])?;
                 Ok(Request::MerkleSiblingBatch(q))
             }
+            REQ_BUCKET_MERKLE_SIB_BATCH => {
+                let q = decode_batch_query(&data[1..])?;
+                Ok(Request::BucketMerkleSibBatch(q))
+            }
             REQ_HARMONY_GET_INFO => Ok(Request::HarmonyGetInfo),
             REQ_HARMONY_HINTS => {
                 let h = decode_harmony_hint_request(&data[1..])?;
@@ -349,6 +363,10 @@ impl Response {
             }
             Response::MerkleSiblingBatch(r) => {
                 payload.push(RESP_MERKLE_SIBLING_BATCH);
+                encode_batch_result(&mut payload, r);
+            }
+            Response::BucketMerkleSibBatch(r) => {
+                payload.push(RESP_BUCKET_MERKLE_SIB_BATCH);
                 encode_batch_result(&mut payload, r);
             }
             Response::Error(msg) => {
@@ -415,6 +433,10 @@ impl Response {
             RESP_MERKLE_SIBLING_BATCH => {
                 let r = decode_batch_result(&data[1..])?;
                 Ok(Response::MerkleSiblingBatch(r))
+            }
+            RESP_BUCKET_MERKLE_SIB_BATCH => {
+                let r = decode_batch_result(&data[1..])?;
+                Ok(Response::BucketMerkleSibBatch(r))
             }
             RESP_ERROR => {
                 let len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;

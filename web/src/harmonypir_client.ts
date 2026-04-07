@@ -18,6 +18,8 @@ import {
   REQ_HARMONY_HINTS,
   REQ_HARMONY_BATCH_QUERY, RESP_HARMONY_BATCH_QUERY,
   RESP_HARMONY_HINTS, RESP_ERROR,
+  BUCKET_MERKLE_ARITY, BUCKET_MERKLE_SIB_ROW_SIZE,
+  REQ_BUCKET_MERKLE_TREE_TOPS, RESP_BUCKET_MERKLE_TREE_TOPS,
 } from './constants.js';
 
 import {
@@ -32,7 +34,8 @@ import { readVarint, decodeUtxoData } from './codec.js';
 import { findEntryInIndexResult, findChunkInResult } from './scan.js';
 import { ManagedWebSocket } from './ws.js';
 import { fetchServerInfoJson, type ServerInfoJson } from './server-info.js';
-import { verifyMerkleBatchDpf } from './merkle-verify-dpf.js';
+import { computeBinLeafHash, computeParentN, ZERO_HASH } from './merkle.js';
+import { sha256 } from './hash.js';
 
 import { HarmonyWorkerPool, BuildItem, BuildResult, ProcessItem } from './harmonypir_worker_pool.js';
 
@@ -61,12 +64,23 @@ export interface HarmonyQueryResult {
   merkleVerified?: boolean;
   /** Merkle root hash hex (from server, for display) */
   merkleRootHex?: string;
-  /** tree_loc in the Merkle tree */
-  treeLoc?: number;
   /** Raw chunk data (kept for Merkle verification) */
   rawChunkData?: Uint8Array;
   /** Script hash as bytes (for Merkle leaf hash) */
   scriptHashBytes?: Uint8Array;
+  // ── Per-bucket bin Merkle ─────────────────────────────────────────
+  /** PBC group index for the INDEX query */
+  indexPbcGroup?: number;
+  /** Cuckoo bin index within the INDEX group */
+  indexBinIndex?: number;
+  /** Raw INDEX bin content (slotsPerBin × slotSize bytes) */
+  indexBinContent?: Uint8Array;
+  /** PBC group indices for each CHUNK query */
+  chunkPbcGroups?: number[];
+  /** Cuckoo bin indices for each CHUNK query */
+  chunkBinIndices?: number[];
+  /** Raw CHUNK bin contents */
+  chunkBinContents?: Uint8Array[];
 }
 
 // ─── WASM module type (loaded dynamically) ──────────────────────────────────
@@ -169,9 +183,6 @@ export class HarmonyPirClient {
   private chunkBinsPerTable = 0;
   private tagSeed = 0n;
   private prpKey: Uint8Array;
-
-  // Lazy ManagedWebSocket to primary server (for Merkle DPF queries)
-  private primaryWs: ManagedWebSocket | null = null;
 
   // Actual hint bytes received during download.
   private totalHintBytes = 0;
@@ -595,7 +606,7 @@ export class HarmonyPirClient {
       });
     }
 
-    const indexResults = new Map<number, { startChunkId: number; numChunks: number; treeLoc: number }>();
+    const indexResults = new Map<number, { startChunkId: number; numChunks: number; pbcGroup: number; binIndex: number; binContent: Uint8Array }>();
     const whaleQueries = new Set<number>();
 
     for (let ir = 0; ir < indexRounds.length; ir++) {
@@ -618,6 +629,7 @@ export class HarmonyPirClient {
 
         // Determine which groups get real vs dummy queries.
         const realGroups = new Map<number, number>(); // groupId → qi
+        const realBinIndices = new Map<number, number>(); // groupId → binIndex (for Merkle)
         const buildItems: BuildItem[] = [];
 
         for (let b = 0; b < K; b++) {
@@ -627,6 +639,7 @@ export class HarmonyPirClient {
             const binIndex = cuckooHash(scriptHashes[qi], ck, this.indexBinsPerTable);
             buildItems.push({ groupId: b, binIndex });
             realGroups.set(b, qi);
+            realBinIndices.set(b, binIndex);
             // Inspector: record which binIndex this query used.
             const qd = inspectorMap.get(qi);
             if (qd && qd.indexBinIndex === undefined) {
@@ -695,7 +708,12 @@ export class HarmonyPirClient {
                 qd.tagHex = computeTag(this.tagSeed, scriptHashes[qi]).toString(16).padStart(16, '0');
               }
             } else {
-              indexResults.set(qi, found);
+              indexResults.set(qi, {
+                ...found,
+                pbcGroup: groupId,
+                binIndex: realBinIndices.get(groupId) ?? 0,
+                binContent: answer,
+              });
               // Inspector: record tag match details.
               const qd = inspectorMap.get(qi);
               if (qd) {
@@ -733,14 +751,14 @@ export class HarmonyPirClient {
     // ══════════════════════════════════════════════════════════════════
     progress?.('Level 2', 'Collecting chunk IDs...');
 
-    const queryChunkInfo = new Map<number, { startChunk: number; numChunks: number; treeLoc: number }>();
+    const queryChunkInfo = new Map<number, { startChunk: number; numChunks: number }>();
     const allChunkIdsSet = new Set<number>();
 
     for (const [qi, info] of indexResults) {
       for (let ci = 0; ci < info.numChunks; ci++) {
         allChunkIdsSet.add(info.startChunkId + ci);
       }
-      queryChunkInfo.set(qi, { startChunk: info.startChunkId, numChunks: info.numChunks, treeLoc: info.treeLoc });
+      queryChunkInfo.set(qi, { startChunk: info.startChunkId, numChunks: info.numChunks });
     }
 
     const allChunkIds = Array.from(allChunkIdsSet).sort((a, b) => a - b);
@@ -748,6 +766,8 @@ export class HarmonyPirClient {
     const tL2Start = performance.now();
 
     const recoveredChunks = new Map<number, Uint8Array>();
+    // Track per-chunk Merkle info: chunkId → { pbcGroup, binIndex, binContent }
+    const chunkMerkleInfo = new Map<number, { pbcGroup: number; binIndex: number; binContent: Uint8Array }>();
 
     if (allChunkIds.length > 0) {
       const chunkCandGroups = allChunkIds.map(cid => deriveChunkGroups(cid));
@@ -766,7 +786,7 @@ export class HarmonyPirClient {
         for (let h = 0; h < CHUNK_CUCKOO_NUM_HASHES; h++) {
           progress?.('Level 2', `Chunk placement ${ri + 1}/${chunkRounds.length}, h=${h}...`);
 
-          const realGroups = new Map<number, { chunkListIdx: number; chunkId: number }>();
+          const realGroups = new Map<number, { chunkListIdx: number; chunkId: number; binIndex: number }>();
           const buildItems: BuildItem[] = [];
 
           for (let b = 0; b < K_CHUNK; b++) {
@@ -777,7 +797,7 @@ export class HarmonyPirClient {
                 const ck = deriveChunkCuckooKey(b, h);
                 const binIndex = cuckooHashInt(chunkId, ck, this.chunkBinsPerTable);
                 buildItems.push({ groupId: K + b, binIndex }); // global ID = K + b
-                realGroups.set(b, { chunkListIdx, chunkId });
+                realGroups.set(b, { chunkListIdx, chunkId, binIndex });
               } else {
                 buildItems.push({ groupId: K + b }); // dummy
               }
@@ -812,12 +832,13 @@ export class HarmonyPirClient {
           const answers = await this.doProcessBatch(processItems, 'chunk');
           const procMs = performance.now() - tProc;
 
-          for (const [localB, { chunkId }] of realGroups) {
+          for (const [localB, { chunkId, binIndex }] of realGroups) {
             const answer = answers.get(K + localB); // global ID
             if (!answer) continue;
             const found = findChunkInResult(answer, chunkId, answer.length / CHUNK_SLOT_SIZE, CHUNK_SLOT_SIZE);
             if (found) {
               recoveredChunks.set(chunkId, found);
+              chunkMerkleInfo.set(chunkId, { pbcGroup: localB, binIndex, binContent: answer });
               foundThisPlacement.add(chunkId);
               // Inspector: record chunk recovery details.
               const br = reqBytesMap.get(K + localB);
@@ -883,15 +904,35 @@ export class HarmonyPirClient {
       for (const c of chunks) { rawChunkData.set(c, pos); pos += c.length; }
 
       const utxos = this.decodeUtxos(chunks);
+      // Collect chunk-level Merkle info for this query
+      const qChunkPbcGroups: number[] = [];
+      const qChunkBinIndices: number[] = [];
+      const qChunkBinContents: Uint8Array[] = [];
+      for (let ci = 0; ci < info.numChunks; ci++) {
+        const cid = info.startChunk + ci;
+        const cmi = chunkMerkleInfo.get(cid);
+        if (cmi) {
+          qChunkPbcGroups.push(cmi.pbcGroup);
+          qChunkBinIndices.push(cmi.binIndex);
+          qChunkBinContents.push(cmi.binContent);
+        }
+      }
+
+      const idxInfo = indexResults.get(qi);
       results.set(qi, {
         address: addresses[qi],
         scriptHash: shHexes[qi],
         utxos,
         whale: false,
-        merkleRootHex: this.serverInfo?.merkle?.root,
-        treeLoc: info.treeLoc,
+        merkleRootHex: this.serverInfo?.merkle_bucket?.super_root ?? this.serverInfo?.merkle?.root,
         rawChunkData,
         scriptHashBytes: scriptHashes[qi],
+        indexPbcGroup: idxInfo?.pbcGroup,
+        indexBinIndex: idxInfo?.binIndex,
+        indexBinContent: idxInfo?.binContent,
+        chunkPbcGroups: qChunkPbcGroups,
+        chunkBinIndices: qChunkBinIndices,
+        chunkBinContents: qChunkBinContents,
       });
     }
 
@@ -1093,7 +1134,6 @@ export class HarmonyPirClient {
   getConnectedSockets(): { label: string; ws: ManagedWebSocket }[] {
     const out: { label: string; ws: ManagedWebSocket }[] = [];
     if (this.queryWs?.isOpen()) out.push({ label: 'HarmonyPIR Query Server', ws: this.queryWs });
-    if (this.primaryWs?.isOpen()) out.push({ label: 'HarmonyPIR Primary Server', ws: this.primaryWs });
     return out;
   }
 
@@ -1103,8 +1143,6 @@ export class HarmonyPirClient {
     this.queryWs?.disconnect();
     this.hintWs?.close();
     this.hintWs = null;
-    this.primaryWs?.disconnect();
-    this.primaryWs = null;
     if (this.pool) {
       this.pool.terminate();
       this.pool = null;
@@ -1142,66 +1180,358 @@ export class HarmonyPirClient {
   // Merkle verification (uses DPF sibling protocol via both servers)
   // ═══════════════════════════════════════════════════════════════════════════
 
-  /** Check if server supports DPF Merkle verification */
+  /** Check if server supports per-bucket bin Merkle verification */
   hasMerkle(): boolean {
-    return !!(this.serverInfo?.merkle && this.serverInfo.merkle.sibling_levels > 0);
+    return !!(this.serverInfo?.merkle_bucket && this.serverInfo.merkle_bucket.index_levels.length > 0);
   }
 
   /** Get the Merkle root hash hex (for display) */
   getMerkleRootHex(): string | undefined {
-    return this.serverInfo?.merkle?.root;
+    return this.serverInfo?.merkle_bucket?.super_root ?? this.serverInfo?.merkle?.root;
   }
 
+  /** Whether sibling hints have been downloaded for bucket Merkle. */
+  siblingHintsLoaded = false;
+
   /**
-   * Batch-verify Merkle proofs for multiple HarmonyPIR query results.
+   * Batch-verify per-bucket bin Merkle proofs using native HarmonyPIR.
    *
-   * Opens a ManagedWebSocket to the primary server (hint server URL)
-   * for the 2-server DPF sibling queries. Packs all addresses' groupIds
-   * into PBC batches per sibling level.
+   * On first call, downloads sibling hints from the Hint Server (lazy init).
+   * Then issues HarmonyPIR batch queries to flat sibling tables, walks
+   * tree-top cache to per-group root, and verifies super-root.
    */
   async verifyMerkleBatch(
     results: HarmonyQueryResult[],
     onProgress?: (step: string, detail: string) => void,
   ): Promise<boolean[]> {
-    const merkle = this.serverInfo?.merkle;
-    if (!merkle || merkle.sibling_levels === 0) throw new Error('Server does not support Merkle');
+    const merkle = this.serverInfo?.merkle_bucket;
+    if (!merkle) throw new Error('Server does not support bucket Merkle');
     if (!this.queryWs) throw new Error('Not connected to query server');
 
-    // Build items array from verifiable results
-    const items: { scriptHash: Uint8Array; rawChunkData: Uint8Array; treeLoc: number }[] = [];
-    const itemToResult: number[] = [];
+    // Build verifiable items
+    const items: Array<{
+      qi: number;
+      indexPbcGroup: number; indexBinIndex: number; indexBinContent: Uint8Array;
+      chunkPbcGroups: number[]; chunkBinIndices: number[]; chunkBinContents: Uint8Array[];
+    }> = [];
     for (let i = 0; i < results.length; i++) {
       const r = results[i];
-      if (r.whale || !r.scriptHashBytes || !r.rawChunkData || r.treeLoc === undefined) continue;
-      items.push({ scriptHash: r.scriptHashBytes, rawChunkData: r.rawChunkData, treeLoc: r.treeLoc });
-      itemToResult.push(i);
+      if (r.whale || r.indexPbcGroup === undefined || !r.indexBinContent) continue;
+      items.push({
+        qi: i,
+        indexPbcGroup: r.indexPbcGroup,
+        indexBinIndex: r.indexBinIndex!,
+        indexBinContent: r.indexBinContent,
+        chunkPbcGroups: r.chunkPbcGroups ?? [],
+        chunkBinIndices: r.chunkBinIndices ?? [],
+        chunkBinContents: r.chunkBinContents ?? [],
+      });
     }
-
     if (items.length === 0) return results.map(() => false);
 
-    // queryWs → secondary (server1), primaryWs → primary (server0)
-    if (!this.primaryWs) {
-      this.primaryWs = new ManagedWebSocket({
-        url: this.config.hintServerUrl,
-        label: 'harmony-merkle',
-        onLog: (msg) => this.log(msg),
-        onClose: () => { this.primaryWs = null; },
-      });
-      await this.primaryWs.connect();
+    // ── Step 1: Init sibling groups + hints (lazy, first call only) ──
+    if (!this.siblingHintsLoaded) {
+      onProgress?.('Merkle', 'Downloading sibling hints (one-time)...');
+      await this.initAndFetchSiblingHints(merkle);
     }
 
-    const batchResults = await verifyMerkleBatchDpf(
-      this.primaryWs, this.queryWs, merkle, items, onProgress,
-      (msg) => this.log(msg),
+    // ── Step 2: Fetch tree-top caches ──
+    onProgress?.('Merkle', 'Fetching tree-top caches...');
+    this.log('Fetching bucket Merkle tree-tops...');
+
+    const topsReq = new Uint8Array(5);
+    new DataView(topsReq.buffer).setUint32(0, 1, true);
+    topsReq[4] = REQ_BUCKET_MERKLE_TREE_TOPS;
+    const topsRaw = await this.queryWs.sendRaw(topsReq);
+    if (topsRaw.length < 6 || topsRaw[4] !== RESP_BUCKET_MERKLE_TREE_TOPS) {
+      this.log('Failed to fetch bucket Merkle tree-tops');
+      return results.map(() => false);
+    }
+    const topsData = topsRaw.slice(5);
+
+    // Verify tree-tops integrity
+    const topsHash = sha256(topsData);
+    const expectedHash = hexToBytes(merkle.tree_tops_hash);
+    if (!bytesEqual(topsHash, expectedHash)) {
+      this.log('Tree-tops integrity check FAILED');
+      return results.map(() => false);
+    }
+    this.log('Tree-top cache integrity: OK');
+
+    const parsedTops = parseBucketTreeTops(topsData);
+
+    // ── Step 3: Verify INDEX bins ──
+    onProgress?.('Merkle', 'Verifying INDEX Merkle...');
+    const indexVerified = await this.verifySiblingLevelsHarmony(
+      items.map(it => ({ pbcGroup: it.indexPbcGroup, binIndex: it.indexBinIndex, binContent: it.indexBinContent })),
+      merkle.index_levels, merkle.index_roots,
+      parsedTops.slice(0, K),
+      K, 10, // level offset 10 = INDEX siblings
     );
 
-    const out: boolean[] = new Array(results.length).fill(false);
-    for (let j = 0; j < batchResults.length; j++) {
-      const ri = itemToResult[j];
-      out[ri] = batchResults[j];
-      results[ri].merkleVerified = batchResults[j];
+    // ── Step 4: Verify CHUNK bins ──
+    onProgress?.('Merkle', 'Verifying CHUNK Merkle...');
+    const chunkFlat: Array<{ pbcGroup: number; binIndex: number; binContent: Uint8Array }> = [];
+    const chunkMap: Array<{ addrIdx: number }> = [];
+    for (let i = 0; i < items.length; i++) {
+      for (let c = 0; c < items[i].chunkPbcGroups.length; c++) {
+        chunkFlat.push({
+          pbcGroup: items[i].chunkPbcGroups[c],
+          binIndex: items[i].chunkBinIndices[c],
+          binContent: items[i].chunkBinContents[c],
+        });
+        chunkMap.push({ addrIdx: i });
+      }
     }
+    const chunkVerified = chunkFlat.length > 0
+      ? await this.verifySiblingLevelsHarmony(
+          chunkFlat, merkle.chunk_levels, merkle.chunk_roots,
+          parsedTops.slice(K, K + K_CHUNK),
+          K_CHUNK, 20, // level offset 20 = CHUNK siblings
+        )
+      : [];
+
+    // ── Step 5: Combine results ──
+    const out: boolean[] = new Array(results.length).fill(false);
+    for (let i = 0; i < items.length; i++) {
+      out[items[i].qi] = indexVerified[i];
+    }
+    for (let j = 0; j < chunkMap.length; j++) {
+      if (!chunkVerified[j]) out[items[chunkMap[j].addrIdx].qi] = false;
+    }
+    // Mark results
+    for (let i = 0; i < results.length; i++) {
+      results[i].merkleVerified = out[i];
+    }
+
+    const passed = out.filter(v => v).length;
+    this.log(`Merkle: ${passed}/${items.length} verified, ${items.length - passed} failed`);
     return out;
+  }
+
+  /**
+   * Initialize HarmonyPIR groups and download hints for sibling tables.
+   * Called lazily on first verifyMerkleBatch() call.
+   */
+  private async initAndFetchSiblingHints(
+    merkle: import('./server-info.js').BucketMerkleInfoJson,
+  ): Promise<void> {
+    if (!this.pool && !this.wasm) throw new Error('WASM not loaded');
+    const backend = this.config.prpBackend ?? 0;
+    const A = BUCKET_MERKLE_ARITY;
+    const SIB_W = BUCKET_MERKLE_SIB_ROW_SIZE; // 256
+
+    // Compute the PRP group ID offsets for sibling groups.
+    // Main groups: 0..K-1 (INDEX), K..K+K_CHUNK-1 (CHUNK)
+    // Sibling groups start at K + K_CHUNK = 155.
+    let nextGroupId = K + K_CHUNK;
+
+    // Create groups for INDEX sibling levels
+    const indexSibGroupIds: number[][] = []; // [level][localGroup] → globalGroupId
+    for (let level = 0; level < merkle.index_levels.length; level++) {
+      const n = merkle.index_levels[level].bins_per_table;
+      const ids: number[] = [];
+      if (this.pool) {
+        const promises: Promise<void>[] = [];
+        for (let g = 0; g < K; g++) {
+          const gid = nextGroupId + g;
+          ids.push(gid);
+          promises.push(this.pool.createGroup(gid, n, SIB_W, 0, this.prpKey, backend));
+        }
+        await Promise.all(promises);
+      }
+      indexSibGroupIds.push(ids);
+      nextGroupId += K;
+    }
+
+    // Create groups for CHUNK sibling levels
+    const chunkSibGroupIds: number[][] = [];
+    for (let level = 0; level < merkle.chunk_levels.length; level++) {
+      const n = merkle.chunk_levels[level].bins_per_table;
+      const ids: number[] = [];
+      if (this.pool) {
+        const promises: Promise<void>[] = [];
+        for (let g = 0; g < K_CHUNK; g++) {
+          const gid = nextGroupId + g;
+          ids.push(gid);
+          promises.push(this.pool.createGroup(gid, n, SIB_W, 0, this.prpKey, backend));
+        }
+        await Promise.all(promises);
+      }
+      chunkSibGroupIds.push(ids);
+      nextGroupId += K_CHUNK;
+    }
+
+    // Download hints for sibling groups
+    this.log('Downloading sibling hints...');
+    const hintWs = await this.connectHintServer();
+
+    // INDEX sibling hints: level codes 10, 11, ...
+    for (let level = 0; level < merkle.index_levels.length; level++) {
+      const t = performance.now();
+      await this.requestHints(hintWs, 10 + level, K, indexSibGroupIds[level][0], new Map(), SIB_W);
+      this.log(`  INDEX sib L${level} hints: ${K} groups in ${((performance.now() - t) / 1000).toFixed(1)}s`);
+    }
+
+    // CHUNK sibling hints: level codes 20, 21, ...
+    for (let level = 0; level < merkle.chunk_levels.length; level++) {
+      const t = performance.now();
+      await this.requestHints(hintWs, 20 + level, K_CHUNK, chunkSibGroupIds[level][0], new Map(), SIB_W);
+      this.log(`  CHUNK sib L${level} hints: ${K_CHUNK} groups in ${((performance.now() - t) / 1000).toFixed(1)}s`);
+    }
+
+    hintWs.close();
+
+    // Store group IDs for later use
+    this._indexSibGroupIds = indexSibGroupIds;
+    this._chunkSibGroupIds = chunkSibGroupIds;
+    this.siblingHintsLoaded = true;
+    this.log('Sibling hints loaded');
+  }
+
+  // Stored sibling group IDs (set by initAndFetchSiblingHints)
+  private _indexSibGroupIds: number[][] = [];
+  private _chunkSibGroupIds: number[][] = [];
+
+  /**
+   * Verify one table type (INDEX or CHUNK) via native HarmonyPIR sibling queries.
+   */
+  private async verifySiblingLevelsHarmony(
+    items: Array<{ pbcGroup: number; binIndex: number; binContent: Uint8Array }>,
+    levelInfos: Array<{ dpf_n: number; bins_per_table: number }>,
+    rootsHex: string[],
+    treeTops: Array<{ cacheFromLevel: number; levels: Uint8Array[][] }>,
+    tableK: number,
+    levelOffset: number, // 10 for INDEX, 20 for CHUNK
+  ): Promise<boolean[]> {
+    const A = BUCKET_MERKLE_ARITY;
+    const SIB_W = BUCKET_MERKLE_SIB_ROW_SIZE;
+    const N = items.length;
+
+    // Per-item state
+    const currentHash: Uint8Array[] = new Array(N);
+    const nodeIdx: number[] = new Array(N);
+
+    // Compute leaf hashes
+    for (let i = 0; i < N; i++) {
+      currentHash[i] = computeBinLeafHash(items[i].binIndex, items[i].binContent);
+      nodeIdx[i] = items[i].binIndex;
+    }
+
+    const sibGroupIds = levelOffset === 10 ? this._indexSibGroupIds : this._chunkSibGroupIds;
+
+    // For each sibling level, query via HarmonyPIR batch
+    for (let level = 0; level < levelInfos.length; level++) {
+      const groupIds = sibGroupIds[level];
+      if (!groupIds || groupIds.length === 0) continue;
+
+      // Determine target group_id = floor(nodeIdx / arity) for each item
+      const itemGroupIds = items.map((_, i) => Math.floor(nodeIdx[i] / A));
+
+      // Build batch: one query per PBC group (tableK groups)
+      const groupToItem = new Map<number, number>(); // pbcGroup → item index
+      for (let i = 0; i < N; i++) {
+        groupToItem.set(items[i].pbcGroup, i);
+      }
+
+      const buildItems: BuildItem[] = [];
+      for (let g = 0; g < tableK; g++) {
+        const globalId = groupIds[g];
+        const itemIdx = groupToItem.get(g);
+        if (itemIdx !== undefined) {
+          buildItems.push({ groupId: globalId, binIndex: itemGroupIds[itemIdx] });
+        } else {
+          buildItems.push({ groupId: globalId }); // dummy
+        }
+      }
+
+      // Build HarmonyPIR requests
+      const reqBytesMap = await this.doBuildBatch(buildItems, 'index'); // level doesn't matter for pool
+
+      // Encode and send batch
+      const batchItems = buildItems.map((item, g) => ({
+        groupId: g, // local group ID for wire protocol
+        subQueryBytes: [(reqBytesMap.get(item.groupId)?.bytes) ?? new Uint8Array(0)],
+      }));
+      const wireLevel = levelOffset + level;
+      const reqMsg = this.encodeHarmonyBatchRequest(wireLevel, 0, 1, batchItems);
+      const respData = await this.sendQueryRequest(reqMsg);
+      const batchResp = this.decodeHarmonyBatchResponse(respData);
+
+      // Process responses
+      const processItems: ProcessItem[] = [];
+      for (let g = 0; g < tableK; g++) {
+        const itemIdx = groupToItem.get(g);
+        if (itemIdx === undefined) continue;
+        const respItem = batchResp.get(g);
+        if (respItem && respItem.length > 0) {
+          processItems.push({ groupId: groupIds[g], response: respItem[0] });
+        }
+      }
+      const answers = await this.doProcessBatch(processItems, 'index');
+
+      // Update per-item state with recovered sibling rows
+      for (let i = 0; i < N; i++) {
+        const g = items[i].pbcGroup;
+        const globalId = groupIds[g];
+        const row = answers.get(globalId);
+        if (!row || row.length < SIB_W) {
+          this.log(`Merkle L${level}: no sibling row for group ${g}`);
+          currentHash[i] = ZERO_HASH;
+          continue;
+        }
+
+        const childPos = nodeIdx[i] % A;
+        const children: Uint8Array[] = [];
+        for (let c = 0; c < A; c++) {
+          if (c === childPos) {
+            children.push(currentHash[i]);
+          } else {
+            children.push(row.slice(c * 32, (c + 1) * 32));
+          }
+        }
+        currentHash[i] = computeParentN(children);
+        nodeIdx[i] = Math.floor(nodeIdx[i] / A);
+      }
+    }
+
+    // Walk tree-top cache to root for each item
+    const verified: boolean[] = new Array(N);
+    for (let i = 0; i < N; i++) {
+      const g = items[i].pbcGroup;
+      const top = treeTops[g];
+      if (!top) { verified[i] = false; continue; }
+
+      let hash = currentHash[i];
+      let idx = nodeIdx[i];
+
+      for (let cl = 0; cl < top.levels.length - 1; cl++) {
+        const levelNodes = top.levels[cl];
+        const parentStart = Math.floor(idx / A) * A;
+        const childPos = idx % A;
+        const children: Uint8Array[] = [];
+        for (let c = 0; c < A; c++) {
+          const nodeI = parentStart + c;
+          if (c === childPos) {
+            children.push(hash);
+          } else if (nodeI < levelNodes.length) {
+            children.push(levelNodes[nodeI]);
+          } else {
+            children.push(ZERO_HASH);
+          }
+        }
+        hash = computeParentN(children);
+        idx = Math.floor(idx / A);
+      }
+
+      const expectedRoot = hexToBytes(rootsHex[g]);
+      verified[i] = bytesEqual(hash, expectedRoot);
+      if (!verified[i]) {
+        this.log(`Merkle: group ${g} root mismatch`);
+      }
+    }
+
+    return verified;
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -1265,4 +1595,40 @@ export class HarmonyPirClient {
 /** Factory function to create a HarmonyPIR client. */
 export function createHarmonyPirClient(config: HarmonyPirClientConfig): HarmonyPirClient {
   return new HarmonyPirClient(config);
+}
+
+// ─── Bucket Merkle helpers ──────────────────────────────────────────────────
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+/** Parse the per-bucket tree-top cache blob. */
+function parseBucketTreeTops(data: Uint8Array): Array<{ cacheFromLevel: number; levels: Uint8Array[][] }> {
+  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const numTrees = dv.getUint32(0, true);
+  let off = 4;
+  const tops: Array<{ cacheFromLevel: number; levels: Uint8Array[][] }> = [];
+  for (let t = 0; t < numTrees; t++) {
+    const cacheFromLevel = data[off]; off += 1;
+    off += 4; // totalNodes
+    off += 2; // arity
+    const numCachedLevels = data[off]; off += 1;
+    const levels: Uint8Array[][] = [];
+    for (let l = 0; l < numCachedLevels; l++) {
+      const numNodes = dv.getUint32(off, true); off += 4;
+      const nodes: Uint8Array[] = [];
+      for (let n = 0; n < numNodes; n++) {
+        nodes.push(data.slice(off, off + 32));
+        off += 32;
+      }
+      levels.push(nodes);
+    }
+    tops.push({ cacheFromLevel, levels });
+  }
+  return tops;
 }

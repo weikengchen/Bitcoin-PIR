@@ -998,7 +998,7 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                 }
 
                 // Batch Merkle verify button
-                const verifiable = dpfQueryResults.filter(r => r && !r.isWhale && r.treeLoc !== undefined);
+                const verifiable = dpfQueryResults.filter(r => r && !r.isWhale && r.indexPbcGroup !== undefined);
                 if (verifiable.length > 0 && client.hasMerkle()) {
                     addBatchMerkleButton(resultsContainer, verifiable, 'dpf',
                         (results, onProg) => client.verifyMerkleBatch(results, onProg),
@@ -1598,7 +1598,7 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                 }
 
                 // Batch Merkle verify button (HarmonyPIR uses HarmonyQueryResult)
-                const hpVerifiable = hpAllHResults.filter(r => r && !r.whale && r.treeLoc !== undefined && r.rawChunkData);
+                const hpVerifiable = hpAllHResults.filter(r => r && !r.whale && r.indexPbcGroup !== undefined && r.rawChunkData);
                 if (hpVerifiable.length > 0 && hpClient.hasMerkle()) {
                     addBatchMerkleButton(resultsContainer, hpVerifiable, 'harmonypir',
                         (results, onProg) => hpClient.verifyMerkleBatch(results, onProg),

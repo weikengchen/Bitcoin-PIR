@@ -33,9 +33,9 @@ pub const CHUNK_DPF_N: u8 = 21;
 
 // ─── Index-level constants ──────────────────────────────────────────────────
 
-/// Each cuckoo bin has INDEX_SLOTS_PER_BIN (4) slots, each INDEX_SLOT_SIZE (17) bytes.
+/// Each cuckoo bin has INDEX_SLOTS_PER_BIN (4) slots, each INDEX_SLOT_SIZE (13) bytes.
 pub const INDEX_SLOTS: usize = INDEX_SLOTS_PER_BIN; // 4
-pub const INDEX_RESULT_SIZE: usize = INDEX_SLOTS * INDEX_SLOT_SIZE; // 4 * 17 = 68
+pub const INDEX_RESULT_SIZE: usize = INDEX_SLOTS * INDEX_SLOT_SIZE; // 4 * 13 = 52
 
 // ─── Chunk-level constants ──────────────────────────────────────────────────
 
@@ -276,8 +276,8 @@ pub fn find_group_in_sibling_result(
 
 /// Find a matching tag in an index-level result's slots.
 /// `expected_tag` is the 8-byte fingerprint computed by the client.
-/// Returns (start_chunk_id, num_chunks, tree_loc) if found.
-pub fn find_entry_in_index_result(result: &[u8], expected_tag: u64) -> Option<(u32, u32, u32)> {
+/// Returns (start_chunk_id, num_chunks) if found.
+pub fn find_entry_in_index_result(result: &[u8], expected_tag: u64) -> Option<(u32, u32)> {
     for slot in 0..INDEX_SLOTS {
         let base = slot * INDEX_SLOT_SIZE;
         let slot_tag = u64::from_le_bytes(result[base..base + TAG_SIZE].try_into().unwrap());
@@ -286,10 +286,7 @@ pub fn find_entry_in_index_result(result: &[u8], expected_tag: u64) -> Option<(u
                 result[base + TAG_SIZE..base + TAG_SIZE + 4].try_into().unwrap(),
             );
             let num_chunks = result[base + TAG_SIZE + 4] as u32;
-            let tree_loc = u32::from_le_bytes(
-                result[base + TAG_SIZE + 5..base + TAG_SIZE + 9].try_into().unwrap(),
-            );
-            return Some((start_chunk_id, num_chunks, tree_loc));
+            return Some((start_chunk_id, num_chunks));
         }
     }
     None

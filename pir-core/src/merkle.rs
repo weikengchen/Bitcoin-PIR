@@ -106,6 +106,17 @@ pub fn compute_data_hash(chunk_data: &[u8]) -> Hash256 {
     sha256(chunk_data)
 }
 
+/// Per-bucket bin Merkle: leaf = SHA256(bin_index_u32_LE || bin_content).
+///
+/// Each leaf in a per-PBC-group Merkle tree commits to the bin index and
+/// all slot data at that bin. This binds the cuckoo placement to the tree.
+pub fn compute_bin_leaf_hash(bin_index: u32, bin_content: &[u8]) -> Hash256 {
+    let mut preimage = Vec::with_capacity(4 + bin_content.len());
+    preimage.extend_from_slice(&bin_index.to_le_bytes());
+    preimage.extend_from_slice(bin_content);
+    sha256(&preimage)
+}
+
 /// Compute an internal node (binary): SHA256(left || right).
 pub fn compute_parent(left: &Hash256, right: &Hash256) -> Hash256 {
     let mut preimage = [0u8; 64];

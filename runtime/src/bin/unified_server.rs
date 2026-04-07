@@ -179,10 +179,35 @@ fn compute_hints_for_group(
     level: u8,
     group_id: u8,
 ) -> (u8, u32, u32, u32, Vec<u8>) {
-    let (sub_table, entry_size, k_offset) = match level {
-        0 => (&db.index, db.index.params.bin_size(), 0u32),
-        1 => (&db.chunk, db.chunk.params.bin_size(), db.index.params.k as u32),
-        _ => panic!("invalid level"),
+    // Level mapping:
+    //   0 = INDEX, 1 = CHUNK
+    //   10..10+N = bucket Merkle INDEX sibling L0, L1, ...
+    //   20..20+N = bucket Merkle CHUNK sibling L0, L1, ...
+    let (sub_table, entry_size, k_offset) = if level == 0 {
+        (&db.index, db.index.params.bin_size(), 0u32)
+    } else if level == 1 {
+        (&db.chunk, db.chunk.params.bin_size(), db.index.params.k as u32)
+    } else if level >= 10 && level < 20 {
+        let sib_level = (level - 10) as usize;
+        if sib_level >= db.bucket_merkle_index_siblings.len() {
+            panic!("invalid bucket merkle index sibling level {}", sib_level);
+        }
+        let sib = &db.bucket_merkle_index_siblings[sib_level];
+        // k_offset: after INDEX (75) + CHUNK (80) = 155, plus level offset
+        let offset = (db.index.params.k + db.chunk.params.k) as u32 + sib_level as u32 * db.index.params.k as u32;
+        (sib, sib.params.bin_size(), offset)
+    } else if level >= 20 && level < 30 {
+        let sib_level = (level - 20) as usize;
+        if sib_level >= db.bucket_merkle_chunk_siblings.len() {
+            panic!("invalid bucket merkle chunk sibling level {}", sib_level);
+        }
+        let sib = &db.bucket_merkle_chunk_siblings[sib_level];
+        let index_sib_levels = db.bucket_merkle_index_siblings.len();
+        let offset = (db.index.params.k + db.chunk.params.k) as u32
+            + (index_sib_levels * db.index.params.k + sib_level * db.chunk.params.k) as u32;
+        (sib, sib.params.bin_size(), offset)
+    } else {
+        panic!("invalid hint level {}", level);
     };
 
     let real_n = sub_table.bins_per_table;
@@ -394,6 +419,77 @@ impl UnifiedServerData {
             json.push('}');
         }
 
+        // Per-bucket bin Merkle info
+        if self.db.has_bucket_merkle() {
+            json.push_str(r#","merkle_bucket":{"arity":8,"#);
+
+            // INDEX sibling levels
+            json.push_str(r#""index_levels":["#);
+            for (i, sib) in self.db.bucket_merkle_index_siblings.iter().enumerate() {
+                if i > 0 { json.push(','); }
+                json.push_str(&format!(
+                    r#"{{"dpf_n":{},"bins_per_table":{}}}"#,
+                    params::compute_dpf_n(sib.bins_per_table),
+                    sib.bins_per_table,
+                ));
+            }
+            json.push_str("],");
+
+            // CHUNK sibling levels
+            json.push_str(r#""chunk_levels":["#);
+            for (i, sib) in self.db.bucket_merkle_chunk_siblings.iter().enumerate() {
+                if i > 0 { json.push(','); }
+                json.push_str(&format!(
+                    r#"{{"dpf_n":{},"bins_per_table":{}}}"#,
+                    params::compute_dpf_n(sib.bins_per_table),
+                    sib.bins_per_table,
+                ));
+            }
+            json.push_str("],");
+
+            // Per-group roots as hex arrays
+            if let Some(ref roots_data) = self.db.bucket_merkle_roots {
+                let index_k = self.db.index.params.k;
+                let chunk_k = self.db.chunk.params.k;
+
+                json.push_str(r#""index_roots":["#);
+                for g in 0..index_k {
+                    if g > 0 { json.push(','); }
+                    let root = &roots_data[g * 32..(g + 1) * 32];
+                    json.push('"');
+                    for b in root { json.push_str(&format!("{:02x}", b)); }
+                    json.push('"');
+                }
+                json.push_str("],");
+
+                json.push_str(r#""chunk_roots":["#);
+                for g in 0..chunk_k {
+                    if g > 0 { json.push(','); }
+                    let root = &roots_data[(index_k + g) * 32..(index_k + g + 1) * 32];
+                    json.push('"');
+                    for b in root { json.push_str(&format!("{:02x}", b)); }
+                    json.push('"');
+                }
+                json.push_str("],");
+            }
+
+            // Super-root
+            if let Some(ref sr) = self.db.bucket_merkle_root {
+                json.push_str(&format!(r#""super_root":"{}","#,
+                    sr.iter().map(|b| format!("{:02x}", b)).collect::<String>()));
+            }
+
+            // Tree-tops hash and size
+            if let Some(ref tops) = self.db.bucket_merkle_tree_tops {
+                let tops_hash = pir_core::merkle::sha256(tops);
+                json.push_str(&format!(r#""tree_tops_hash":"{}","tree_tops_size":{}"#,
+                    tops_hash.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+                    tops.len()));
+            }
+
+            json.push('}');
+        }
+
         json.push('}');
         json
     }
@@ -529,6 +625,43 @@ impl UnifiedServerData {
         (BatchResult { level: 2, round_id: query.round_id, results }, total_dpf, total_fetch)
     }
 
+    /// Generic DPF batch evaluation against any MappedSubTable.
+    fn process_generic_batch(&self, query: &BatchQuery, table: &MappedSubTable)
+        -> (BatchResult, std::time::Duration, std::time::Duration)
+    {
+        let k = table.params.k;
+        let result_size = table.params.bin_size();
+        let num_groups = query.keys.len().min(k);
+
+        let group_results: Vec<(Vec<Vec<u8>>, GroupTiming)> = (0..num_groups)
+            .into_par_iter()
+            .map(|b| {
+                let dpf_keys: Vec<DpfKey> = query.keys[b].iter()
+                    .map(|k| DpfKey::from_bytes(k).expect("bad dpf key"))
+                    .collect();
+                let key_refs: Vec<&DpfKey> = dpf_keys.iter().collect();
+                let table_bytes = table.group_bytes(b);
+                let (r, timing) = eval::process_merkle_sibling_group(
+                    &key_refs,
+                    table_bytes,
+                    table.bins_per_table,
+                    result_size,
+                );
+                (r, timing)
+            })
+            .collect();
+
+        let mut total_dpf = std::time::Duration::ZERO;
+        let mut total_fetch = std::time::Duration::ZERO;
+        let mut results = Vec::with_capacity(num_groups);
+        for (r, t) in group_results {
+            total_dpf += t.dpf_eval;
+            total_fetch += t.fetch_xor;
+            results.push(r);
+        }
+        (BatchResult { level: query.level, round_id: query.round_id, results }, total_dpf, total_fetch)
+    }
+
     fn handle_harmony_query(&self, query: &HarmonyQuery) -> Response {
         let (sub_table, entry_size) = match query.level {
             0 => (&self.db.index, self.db.index.params.bin_size()),
@@ -557,10 +690,30 @@ impl UnifiedServerData {
     }
 
     fn handle_harmony_batch_query(&self, query: &HarmonyBatchQuery) -> Response {
-        let (sub_table, entry_size) = match query.level {
-            0 => (&self.db.index, self.db.index.params.bin_size()),
-            1 => (&self.db.chunk, self.db.chunk.params.bin_size()),
-            _ => return Response::Error("invalid level".into()),
+        // Level mapping (same as hint levels):
+        //   0 = INDEX, 1 = CHUNK
+        //   10..10+N = bucket Merkle INDEX sibling L0, L1, ...
+        //   20..20+N = bucket Merkle CHUNK sibling L0, L1, ...
+        let (sub_table, entry_size) = if query.level == 0 {
+            (&self.db.index, self.db.index.params.bin_size())
+        } else if query.level == 1 {
+            (&self.db.chunk, self.db.chunk.params.bin_size())
+        } else if query.level >= 10 && query.level < 20 {
+            let sib_level = (query.level - 10) as usize;
+            if sib_level >= self.db.bucket_merkle_index_siblings.len() {
+                return Response::Error(format!("invalid bucket merkle index sib level {}", sib_level));
+            }
+            let sib = &self.db.bucket_merkle_index_siblings[sib_level];
+            (sib, sib.params.bin_size())
+        } else if query.level >= 20 && query.level < 30 {
+            let sib_level = (query.level - 20) as usize;
+            if sib_level >= self.db.bucket_merkle_chunk_siblings.len() {
+                return Response::Error(format!("invalid bucket merkle chunk sib level {}", sib_level));
+            }
+            let sib = &self.db.bucket_merkle_chunk_siblings[sib_level];
+            (sib, sib.params.bin_size())
+        } else {
+            return Response::Error(format!("invalid level {}", query.level));
         };
 
         let result_items: Vec<HarmonyBatchResultItem> = query.items
@@ -1116,6 +1269,47 @@ async fn main() {
                         msg.extend_from_slice(top);
                         let _ = sink.send(Message::Binary(msg.into())).await;
                         println!("[merkle-top] sent {} bytes", top.len());
+                    }
+
+                    // ── Per-bucket bin Merkle sibling batch queries ──────
+                    REQ_BUCKET_MERKLE_SIB_BATCH if server.db.has_bucket_merkle() => {
+                        if let Ok(Request::BucketMerkleSibBatch(q)) = Request::decode(payload) {
+                            let s = Arc::clone(&server);
+                            let resp = tokio::task::spawn_blocking(move || {
+                                let t = Instant::now();
+                                let n = q.keys.len();
+                                // round_id encodes: table_type * 100 + level
+                                let table_type = q.round_id / 100;
+                                let level = (q.round_id % 100) as usize;
+                                let sib_tables = if table_type == 0 {
+                                    &s.db.bucket_merkle_index_siblings
+                                } else {
+                                    &s.db.bucket_merkle_chunk_siblings
+                                };
+                                if level >= sib_tables.len() {
+                                    return Response::Error(format!("bucket merkle: invalid level {}", level));
+                                }
+                                let sib = &sib_tables[level];
+                                let (batch, dpf_sum, fetch_sum) = s.process_generic_batch(&q, sib);
+                                let wall = t.elapsed();
+                                println!("[bkt-merkle-sib] T{} L{} {} groups {:.2?} | dpf {:.2?} fetch {:.2?}",
+                                    table_type, level, n, wall, dpf_sum, fetch_sum);
+                                Response::BucketMerkleSibBatch(batch)
+                            }).await.unwrap();
+                            let _ = sink.send(Message::Binary(resp.encode().into())).await;
+                        }
+                    }
+
+                    // ── Per-bucket Merkle tree-tops fetch ────────────────
+                    REQ_BUCKET_MERKLE_TREE_TOPS if server.db.bucket_merkle_tree_tops.is_some() => {
+                        let tops = server.db.bucket_merkle_tree_tops.as_ref().unwrap();
+                        let payload_len = 1 + tops.len();
+                        let mut msg = Vec::with_capacity(4 + payload_len);
+                        msg.extend_from_slice(&(payload_len as u32).to_le_bytes());
+                        msg.push(RESP_BUCKET_MERKLE_TREE_TOPS);
+                        msg.extend_from_slice(tops);
+                        let _ = sink.send(Message::Binary(msg.into())).await;
+                        println!("[bkt-merkle-tops] sent {} bytes", tops.len());
                     }
 
                     // ── HarmonyPIR ────────────────────────────────────────

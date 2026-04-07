@@ -9,8 +9,9 @@
 import {
   REQ_PING, REQ_GET_INFO, REQ_INDEX_BATCH, REQ_CHUNK_BATCH,
   REQ_MERKLE_SIBLING_BATCH,
+  REQ_BUCKET_MERKLE_SIB_BATCH,
   RESP_PONG, RESP_INFO, RESP_INDEX_BATCH, RESP_CHUNK_BATCH,
-  RESP_MERKLE_SIBLING_BATCH, RESP_ERROR,
+  RESP_MERKLE_SIBLING_BATCH, RESP_BUCKET_MERKLE_SIB_BATCH, RESP_ERROR,
 } from './constants.js';
 
 // ─── Types ─────────────────────────────────────────────────────────────────
@@ -42,7 +43,8 @@ export type Request =
   | { type: 'GetInfo' }
   | { type: 'IndexBatch'; query: BatchQuery }
   | { type: 'ChunkBatch'; query: BatchQuery }
-  | { type: 'MerkleSiblingBatch'; query: BatchQuery };
+  | { type: 'MerkleSiblingBatch'; query: BatchQuery }
+  | { type: 'BucketMerkleSibBatch'; query: BatchQuery };
 
 export type Response =
   | { type: 'Pong' }
@@ -50,6 +52,7 @@ export type Response =
   | { type: 'IndexBatch'; result: BatchResult }
   | { type: 'ChunkBatch'; result: BatchResult }
   | { type: 'MerkleSiblingBatch'; result: BatchResult }
+  | { type: 'BucketMerkleSibBatch'; result: BatchResult }
   | { type: 'Error'; message: string };
 
 // ─── Encoding ──────────────────────────────────────────────────────────────
@@ -91,6 +94,10 @@ export function encodeRequest(request: Request): Uint8Array {
       break;
     case 'MerkleSiblingBatch':
       payload.push(REQ_MERKLE_SIBLING_BATCH);
+      encodeBatchQuery(payload, request.query);
+      break;
+    case 'BucketMerkleSibBatch':
+      payload.push(REQ_BUCKET_MERKLE_SIB_BATCH);
       encodeBatchQuery(payload, request.query);
       break;
   }
@@ -172,6 +179,11 @@ export function decodeResponse(data: Uint8Array): Response {
     case RESP_MERKLE_SIBLING_BATCH: {
       const { result } = decodeBatchResult(data, 1);
       return { type: 'MerkleSiblingBatch', result };
+    }
+
+    case RESP_BUCKET_MERKLE_SIB_BATCH: {
+      const { result } = decodeBatchResult(data, 1);
+      return { type: 'BucketMerkleSibBatch', result };
     }
 
     case RESP_ERROR: {
