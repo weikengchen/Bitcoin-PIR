@@ -83,6 +83,76 @@ export function decodeUtxoData(
   return { entries, totalSats };
 }
 
+// ─── Delta data types ──────────────────────────────────────────────────────
+
+/** A spent UTXO reference in a delta (no amount needed). */
+export interface SpentRef {
+  txid: Uint8Array;   // 32-byte raw TXID (internal byte order)
+  vout: number;
+}
+
+/** Decoded delta data for a single scripthash. */
+export interface DeltaData {
+  spent: SpentRef[];
+  newUtxos: UtxoEntryRaw[];
+}
+
+// ─── Delta data decoder ────────────────────────────────────────────────────
+
+/**
+ * Decode delta data from concatenated chunk bytes.
+ *
+ * Format:
+ *   [varint num_spent]
+ *     per spent: [32B txid][varint vout]
+ *   [varint num_new]
+ *     per new:   [32B txid][varint vout][varint amount]
+ */
+export function decodeDeltaData(
+  fullData: Uint8Array,
+  onError?: (msg: string) => void,
+): DeltaData {
+  let pos = 0;
+
+  // Spent UTXOs
+  const { value: numSpent, bytesRead: spentCountBytes } = readVarint(fullData, pos);
+  pos += spentCountBytes;
+
+  const spent: SpentRef[] = [];
+  for (let i = 0; i < Number(numSpent); i++) {
+    if (pos + 32 > fullData.length) {
+      onError?.(`Delta data truncated at spent entry ${i}`);
+      break;
+    }
+    const txid = fullData.slice(pos, pos + 32);
+    pos += 32;
+    const { value: vout, bytesRead: vr } = readVarint(fullData, pos);
+    pos += vr;
+    spent.push({ txid: new Uint8Array(txid), vout: Number(vout) });
+  }
+
+  // New UTXOs
+  const { value: numNew, bytesRead: newCountBytes } = readVarint(fullData, pos);
+  pos += newCountBytes;
+
+  const newUtxos: UtxoEntryRaw[] = [];
+  for (let i = 0; i < Number(numNew); i++) {
+    if (pos + 32 > fullData.length) {
+      onError?.(`Delta data truncated at new entry ${i}`);
+      break;
+    }
+    const txid = fullData.slice(pos, pos + 32);
+    pos += 32;
+    const { value: vout, bytesRead: vr } = readVarint(fullData, pos);
+    pos += vr;
+    const { value: amount, bytesRead: ar } = readVarint(fullData, pos);
+    pos += ar;
+    newUtxos.push({ txid: new Uint8Array(txid), vout: Number(vout), amount });
+  }
+
+  return { spent, newUtxos };
+}
+
 // ─── PRNG for dummy queries ──────────────────────────────────────────────────
 
 /** Splitmix64-based PRNG for generating deterministic dummy query data. */

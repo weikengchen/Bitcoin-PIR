@@ -28,9 +28,9 @@ function writeU16LE(buf: Uint8Array, offset: number, val: number): void {
 // ─── findEntryInIndexResult (DPF / HarmonyPIR layout) ────────────────────────
 
 describe('findEntryInIndexResult', () => {
-  // DPF layout: 4 slots * 17 bytes = 68 bytes per bin
+  // DPF layout: 4 slots * 13 bytes = 52 bytes per bin
   const SLOTS_PER_BIN = 4;
-  const SLOT_SIZE = 17; // 8B tag + 4B startChunkId + 1B numChunks + 4B treeLoc
+  const SLOT_SIZE = 13; // 8B tag + 4B startChunkId + 1B numChunks
 
   it('finds matching tag in first slot', () => {
     const data = new Uint8Array(SLOTS_PER_BIN * SLOT_SIZE);
@@ -38,30 +38,28 @@ describe('findEntryInIndexResult', () => {
     writeU64LE(data, 0, tag);       // tag in slot 0
     writeU32LE(data, 8, 42);        // startChunkId = 42
     data[12] = 5;                   // numChunks = 5
-    writeU32LE(data, 13, 99);       // treeLoc = 99
 
     const result = findEntryInIndexResult(data, tag, SLOTS_PER_BIN, SLOT_SIZE);
-    expect(result).toEqual({ startChunkId: 42, numChunks: 5, treeLoc: 99 });
+    expect(result).toEqual({ startChunkId: 42, numChunks: 5 });
   });
 
   it('finds matching tag in third slot', () => {
     const data = new Uint8Array(SLOTS_PER_BIN * SLOT_SIZE);
     const tag = 0x1234567890ABCDEFn;
-    // Write to slot 2 (offset = 2 * 17 = 34)
-    writeU64LE(data, 34, tag);
-    writeU32LE(data, 42, 1000);
-    data[46] = 3;
-    writeU32LE(data, 47, 200);      // treeLoc = 200
+    // Write to slot 2 (offset = 2 * 13 = 26)
+    writeU64LE(data, 26, tag);
+    writeU32LE(data, 34, 1000);
+    data[38] = 3;
 
     const result = findEntryInIndexResult(data, tag, SLOTS_PER_BIN, SLOT_SIZE);
-    expect(result).toEqual({ startChunkId: 1000, numChunks: 3, treeLoc: 200 });
+    expect(result).toEqual({ startChunkId: 1000, numChunks: 3 });
   });
 
   it('returns null when tag not found', () => {
     const data = new Uint8Array(SLOTS_PER_BIN * SLOT_SIZE);
     // Fill with some other tags
     writeU64LE(data, 0, 0x1111111111111111n);
-    writeU64LE(data, 17, 0x2222222222222222n);
+    writeU64LE(data, 13, 0x2222222222222222n);
 
     const result = findEntryInIndexResult(data, 0x9999999999999999n, SLOTS_PER_BIN, SLOT_SIZE);
     expect(result).toBeNull();
@@ -74,7 +72,7 @@ describe('findEntryInIndexResult', () => {
   });
 
   it('works with different bin sizes (HarmonyPIR-style)', () => {
-    // HarmonyPIR: HARMONY_INDEX_W = 68, so slotsPerBin = 68 / 17 = 4
+    // HarmonyPIR: HARMONY_INDEX_W = 52, so slotsPerBin = 52 / 13 = 4
     // Same as DPF in this case, but let's test with a different size
     const slotsPerBin = 2;
     const data = new Uint8Array(slotsPerBin * SLOT_SIZE);
@@ -84,7 +82,7 @@ describe('findEntryInIndexResult', () => {
     data[SLOT_SIZE + 12] = 10;
 
     const result = findEntryInIndexResult(data, tag, slotsPerBin, SLOT_SIZE);
-    expect(result).toEqual({ startChunkId: 777, numChunks: 10, treeLoc: 0 });
+    expect(result).toEqual({ startChunkId: 777, numChunks: 10 });
   });
 });
 

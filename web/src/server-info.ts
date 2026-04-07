@@ -5,7 +5,7 @@
  * All backends extract their parameters from the same JSON structure.
  */
 
-import { REQ_GET_INFO_JSON, REQ_RESIDENCY } from './constants.js';
+import { REQ_GET_INFO_JSON, REQ_RESIDENCY, REQ_GET_DB_CATALOG } from './constants.js';
 import type { ManagedWebSocket } from './ws.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -256,4 +256,87 @@ export async function fetchResidency(ws: ManagedWebSocket): Promise<ResidencyInf
   const jsonBytes = raw.slice(5);
   const jsonStr = new TextDecoder().decode(jsonBytes);
   return JSON.parse(jsonStr) as ResidencyInfo;
+}
+
+// ─── Database Catalog ──────────────────────────────────────────────────────
+
+export interface DatabaseCatalogEntry {
+  dbId: number;
+  name: string;
+  height: number;
+  indexBinsPerTable: number;
+  chunkBinsPerTable: number;
+  indexK: number;
+  chunkK: number;
+  tagSeed: bigint;
+  dpfNIndex: number;
+  dpfNChunk: number;
+}
+
+export interface DatabaseCatalog {
+  databases: DatabaseCatalogEntry[];
+}
+
+/** Pre-built request: [4B len=1 LE][1B variant=REQ_GET_DB_CATALOG] */
+const CATALOG_REQUEST = new Uint8Array([1, 0, 0, 0, REQ_GET_DB_CATALOG]);
+
+/**
+ * Decode a database catalog response.
+ *
+ * Wire format:
+ *   [1B num_databases]
+ *   Per database:
+ *     [1B db_id][1B name_len][name bytes][4B height LE]
+ *     [4B index_bins LE][4B chunk_bins LE]
+ *     [1B index_k][1B chunk_k][8B tag_seed LE]
+ *     [1B dpf_n_index][1B dpf_n_chunk]
+ */
+function decodeDatabaseCatalog(data: Uint8Array): DatabaseCatalog {
+  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  let pos = 0;
+  const numDatabases = data[pos++];
+  const databases: DatabaseCatalogEntry[] = [];
+
+  for (let i = 0; i < numDatabases; i++) {
+    const dbId = data[pos++];
+    const nameLen = data[pos++];
+    const name = new TextDecoder().decode(data.slice(pos, pos + nameLen));
+    pos += nameLen;
+    const height = dv.getUint32(pos, true); pos += 4;
+    const indexBinsPerTable = dv.getUint32(pos, true); pos += 4;
+    const chunkBinsPerTable = dv.getUint32(pos, true); pos += 4;
+    const indexK = data[pos++];
+    const chunkK = data[pos++];
+    const tagSeed = dv.getBigUint64(pos, true); pos += 8;
+    const dpfNIndex = data[pos++];
+    const dpfNChunk = data[pos++];
+
+    databases.push({
+      dbId, name, height,
+      indexBinsPerTable, chunkBinsPerTable,
+      indexK, chunkK, tagSeed,
+      dpfNIndex, dpfNChunk,
+    });
+  }
+
+  return { databases };
+}
+
+/**
+ * Fetch the database catalog from a connected server.
+ *
+ * Wire format:
+ *   Request:  [4B len=1 LE][1B 0x02]
+ *   Response: [4B len LE][1B 0x02][catalog bytes...]
+ */
+export async function fetchDatabaseCatalog(ws: ManagedWebSocket): Promise<DatabaseCatalog> {
+  const raw = await ws.sendRaw(CATALOG_REQUEST);
+  if (raw.length < 6) {
+    throw new Error('Database catalog response too short');
+  }
+  const variant = raw[4];
+  if (variant === 0xFF) {
+    throw new Error('Server returned error for database catalog request');
+  }
+  return decodeDatabaseCatalog(raw.slice(5));
 }

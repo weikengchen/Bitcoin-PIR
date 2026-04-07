@@ -704,6 +704,7 @@ async fn main() {
                     bin,
                     &result_batch.results[qi],
                 );
+
                 if let Some(ir) = scan_index_bin(&entry_bytes, addr_infos[addr_idx].tag, index_slots_per_bin, index_slot_size) {
                     // Per-bin Merkle: hash the full decrypted bin, record leaf position
                     index_bin_hashes[addr_idx] = Some(merkle::sha256(&entry_bytes[..PACKED_ENTRY_SIZE]));
@@ -975,7 +976,7 @@ async fn main() {
         let mut total_index_verified = 0usize;
         let mut total_data_verified = 0usize;
 
-        for (tree_kind, sub_tree, leaves, req_top, resp_top, req_sib, resp_sib) in &trees {
+        for (tree_kind, sub_tree, leaves, req_top, _resp_top, req_sib, resp_sib) in &trees {
             if leaves.is_empty() { continue; }
 
             // Fetch tree-top cache

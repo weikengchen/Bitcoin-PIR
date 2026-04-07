@@ -21,6 +21,8 @@ export interface BatchQuery {
   roundId: number;
   /** Per-group: list of DPF keys (2 for index, 3 for chunks) */
   keys: Uint8Array[][];
+  /** Database ID (0 = main UTXO, 1+ = delta databases). Defaults to 0. */
+  dbId?: number;
 }
 
 export interface ServerInfo {
@@ -70,6 +72,10 @@ function encodeBatchQuery(buf: number[], q: BatchQuery): void {
       buf.push(k.length & 0xFF, (k.length >> 8) & 0xFF);
       for (let i = 0; i < k.length; i++) buf.push(k[i]);
     }
+  }
+  // Trailing db_id byte: only appended when non-zero for backward compatibility.
+  if (q.dbId && q.dbId !== 0) {
+    buf.push(q.dbId & 0xFF);
   }
 }
 

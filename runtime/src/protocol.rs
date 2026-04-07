@@ -495,6 +495,10 @@ fn encode_batch_query(buf: &mut Vec<u8>, q: &BatchQuery) {
             buf.extend_from_slice(k);
         }
     }
+    // Trailing db_id byte: only appended when non-zero for backward compatibility.
+    if q.db_id != 0 {
+        buf.push(q.db_id);
+    }
 }
 
 fn decode_batch_query(data: &[u8]) -> io::Result<BatchQuery> {
@@ -525,10 +529,12 @@ fn decode_batch_query(data: &[u8]) -> io::Result<BatchQuery> {
         }
         keys.push(group_keys);
     }
+    // Read trailing db_id if present (backward compatible: old clients don't send it).
+    let db_id = if pos < data.len() { data[pos] } else { 0 };
     Ok(BatchQuery {
         level: 0,
         round_id,
-        db_id: 0,
+        db_id,
         keys,
     })
 }

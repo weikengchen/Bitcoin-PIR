@@ -127,6 +127,15 @@ export {
 export {
   readVarint,
   decodeUtxoData,
+  decodeDeltaData,
   DummyRng,
   type UtxoEntryRaw,
+  type DeltaData,
+  type SpentRef,
 } from './codec.js';
+
+export {
+  fetchDatabaseCatalog,
+  type DatabaseCatalog,
+  type DatabaseCatalogEntry,
+} from './server-info.js';

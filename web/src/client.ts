@@ -19,7 +19,7 @@ import {
   computeTag,
 } from './hash.js';
 
-import { genDpfKeys, genChunkDpfKeys } from './dpf.js';
+import { genDpfKeys, genChunkDpfKeys, genDpfKeysN } from './dpf.js';
 
 import {
   encodeRequest, decodeResponse,
@@ -30,7 +30,7 @@ import { cuckooPlace, planRounds } from './pbc.js';
 import { readVarint, decodeUtxoData, DummyRng } from './codec.js';
 import { findEntryInIndexResult, findChunkInResult } from './scan.js';
 import { ManagedWebSocket } from './ws.js';
-import { fetchServerInfoJson, type ServerInfoJson } from './server-info.js';
+import { fetchServerInfoJson, fetchDatabaseCatalog, type ServerInfoJson, type DatabaseCatalog, type DatabaseCatalogEntry } from './server-info.js';
 import { verifyBucketMerkleBatchDpf, type BucketMerkleItem } from './merkle-verify-bucket.js';
 
 // ─── Types ─────────────────────────────────────────────────────────────────
@@ -108,6 +108,7 @@ export class BatchPirClient {
   private indexBins = 0;
   private chunkBins = 0;
   private tagSeed = 0n;
+  private catalog: DatabaseCatalog | null = null;
 
   constructor(config: BatchPirClientConfig) {
     this.config = config;
@@ -222,12 +223,35 @@ export class BatchPirClient {
     this.tagSeed = info.tag_seed;
     this.log(`Server info (JSON): index_bins=${this.indexBins}, chunk_bins=${this.chunkBins}, index_K=${info.index_k}, chunk_K=${info.chunk_k}, tag_seed=0x${this.tagSeed.toString(16)}`);
 
+    // Fetch database catalog
+    try {
+      this.catalog = await fetchDatabaseCatalog(this.ws0!);
+      if (this.catalog.databases.length > 1) {
+        this.log(`Database catalog: ${this.catalog.databases.length} databases available`);
+        for (const db of this.catalog.databases) {
+          this.log(`  [${db.dbId}] ${db.name} (height=${db.height}, index_bins=${db.indexBinsPerTable}, chunk_bins=${db.chunkBinsPerTable}, dpf_n=${db.dpfNIndex}/${db.dpfNChunk})`);
+        }
+      }
+    } catch {
+      this.log('Database catalog not available (older server)', 'info');
+    }
+
     // Also fetch from server 1 to keep connection in sync
     await fetchServerInfoJson(this.ws1!);
   }
 
   getServerInfo(): { indexBins: number; chunkBins: number } {
     return { indexBins: this.indexBins, chunkBins: this.chunkBins };
+  }
+
+  /** Return the database catalog (fetched on connect). */
+  getCatalog(): DatabaseCatalog | null {
+    return this.catalog;
+  }
+
+  /** Find a catalog entry by db_id. */
+  getCatalogEntry(dbId: number): DatabaseCatalogEntry | undefined {
+    return this.catalog?.databases.find(d => d.dbId === dbId);
   }
 
   // ─── XOR utility ──────────────────────────────────────────────────────
@@ -266,6 +290,20 @@ export class BatchPirClient {
     return results[0];
   }
 
+  /**
+   * Query the delta database for multiple script hashes.
+   * Returns raw chunk data which should be decoded with decodeDeltaData().
+   */
+  async queryDelta(
+    scriptHashes: Uint8Array[],
+    dbId: number = 1,
+    onProgress?: (step: string, detail: string) => void,
+  ): Promise<(QueryResult | null)[]> {
+    const entry = this.getCatalogEntry(dbId);
+    if (!entry) throw new Error(`Delta database dbId=${dbId} not available`);
+    return this.queryBatch(scriptHashes, onProgress, dbId);
+  }
+
   // ═══════════════════════════════════════════════════════════════════════
   // TRUE BATCH QUERY — multiple script hashes in one batch
   // ═══════════════════════════════════════════════════════════════════════
@@ -283,9 +321,26 @@ export class BatchPirClient {
   async queryBatch(
     scriptHashes: Uint8Array[],
     onProgress?: (step: string, detail: string) => void,
+    dbId: number = 0,
   ): Promise<(QueryResult | null)[]> {
     if (!this.isConnected()) throw new Error('Not connected');
     if (this.indexBins === 0) throw new Error('Server info not loaded');
+
+    // Resolve database parameters: use catalog entry for non-zero dbId
+    let indexBins = this.indexBins;
+    let chunkBins = this.chunkBins;
+    let tagSeed = this.tagSeed;
+    let indexDpfN = this.serverInfo!.index_dpf_n;
+    let chunkDpfN = this.serverInfo!.chunk_dpf_n;
+    if (dbId !== 0) {
+      const entry = this.getCatalogEntry(dbId);
+      if (!entry) throw new Error(`Unknown database dbId=${dbId}`);
+      indexBins = entry.indexBinsPerTable;
+      chunkBins = entry.chunkBinsPerTable;
+      tagSeed = entry.tagSeed;
+      indexDpfN = entry.dpfNIndex;
+      chunkDpfN = entry.dpfNChunk;
+    }
 
     const N = scriptHashes.length;
     const progress = onProgress || (() => {});
@@ -333,11 +388,11 @@ export class BatchPirClient {
           if (qi !== undefined) {
             const sh = scriptHashes[qi];
             const ck = deriveCuckooKey(b, h);
-            alpha = cuckooHash(sh, ck, this.indexBins);
+            alpha = cuckooHash(sh, ck, indexBins);
           } else {
-            alpha = Number(this.rng.nextU64() % BigInt(this.indexBins));
+            alpha = Number(this.rng.nextU64() % BigInt(indexBins));
           }
-          const keys = await genDpfKeys(alpha);
+          const keys = await genDpfKeysN(alpha, indexDpfN);
           s0Group.push(keys.key0);
           s1Group.push(keys.key1);
         }
@@ -348,8 +403,8 @@ export class BatchPirClient {
 
       // Send to both servers
       progress('Level 1', `Round ${ir + 1}: querying servers...`);
-      const req0 = encodeRequest({ type: 'IndexBatch', query: { level: 0, roundId: ir, keys: s0Keys } });
-      const req1 = encodeRequest({ type: 'IndexBatch', query: { level: 0, roundId: ir, keys: s1Keys } });
+      const req0 = encodeRequest({ type: 'IndexBatch', query: { level: 0, roundId: ir, keys: s0Keys, dbId } });
+      const req1 = encodeRequest({ type: 'IndexBatch', query: { level: 0, roundId: ir, keys: s1Keys, dbId } });
 
       const [raw0, raw1] = await this.sendBoth(req0, req1);
       const resp0 = decodeResponse(raw0.slice(4));
@@ -367,7 +422,7 @@ export class BatchPirClient {
         let found: { startChunkId: number; numChunks: number } | null = null;
         let matchedBinContent: Uint8Array | undefined;
         let matchedBinIndex = 0;
-        const expectedTag = computeTag(this.tagSeed, scriptHashes[queryIdx]);
+        const expectedTag = computeTag(tagSeed, scriptHashes[queryIdx]);
         for (let h = 0; h < INDEX_CUCKOO_NUM_HASHES; h++) {
           const result = this.xorBuffers(r0[h], r1[h]);
           found = findEntryInIndexResult(result, expectedTag, this.serverInfo!.index_slots_per_bin, this.serverInfo!.index_slot_size);
@@ -375,7 +430,7 @@ export class BatchPirClient {
             matchedBinContent = result;
             // The bin index is the cuckoo hash of the script hash into this group's table
             const ck = deriveCuckooKey(groupId, h);
-            matchedBinIndex = cuckooHash(scriptHashes[queryIdx], ck, this.indexBins);
+            matchedBinIndex = cuckooHash(scriptHashes[queryIdx], ck, indexBins);
             break;
           }
         }
@@ -457,7 +512,7 @@ export class BatchPirClient {
         const locs: number[] = [];
         for (let h = 0; h < CHUNK_CUCKOO_NUM_HASHES; h++) {
           const ck = deriveChunkCuckooKey(groupId, h);
-          locs.push(cuckooHashInt(chunkId, ck, this.chunkBins));
+          locs.push(cuckooHashInt(chunkId, ck, chunkBins));
         }
         groupTargets.set(groupId, locs);
       }
@@ -474,8 +529,8 @@ export class BatchPirClient {
         for (let h = 0; h < CHUNK_CUCKOO_NUM_HASHES; h++) {
           const alpha = target
             ? target[h]
-            : Number(this.rng.nextU64() % BigInt(this.chunkBins));
-          const keys = await genChunkDpfKeys(alpha);
+            : Number(this.rng.nextU64() % BigInt(chunkBins));
+          const keys = await genDpfKeysN(alpha, chunkDpfN);
           s0Group.push(keys.key0);
           s1Group.push(keys.key1);
         }
@@ -485,8 +540,8 @@ export class BatchPirClient {
       }
 
       // Send
-      const cReq0 = encodeRequest({ type: 'ChunkBatch', query: { level: 1, roundId: ri, keys: s0Keys } });
-      const cReq1 = encodeRequest({ type: 'ChunkBatch', query: { level: 1, roundId: ri, keys: s1Keys } });
+      const cReq0 = encodeRequest({ type: 'ChunkBatch', query: { level: 1, roundId: ri, keys: s0Keys, dbId } });
+      const cReq1 = encodeRequest({ type: 'ChunkBatch', query: { level: 1, roundId: ri, keys: s1Keys, dbId } });
 
       const [craw0, craw1] = await this.sendBoth(cReq0, cReq1);
       const cresp0 = decodeResponse(craw0.slice(4));
@@ -510,7 +565,7 @@ export class BatchPirClient {
           if (data) {
             // Save bin content + bin index for bucket Merkle verification
             const ck = deriveChunkCuckooKey(groupId, h);
-            const binIndex = cuckooHashInt(chunkId, ck, this.chunkBins);
+            const binIndex = cuckooHashInt(chunkId, ck, chunkBins);
             chunkMerkleInfo.set(chunkId, { pbcGroup: groupId, binIndex, binContent: result });
             break;
           }

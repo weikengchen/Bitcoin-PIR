@@ -43,6 +43,8 @@ Bitcoin PIR plugs into the existing Bitcoin ecosystem rather than replacing it:
 ### Cryptographic result verification
 Each UTXO lookup can be paired with a Merkle proof query that verifies the result against a published root hash. The server can refuse to answer, but it cannot lie about your balance. Verification is **batched** across all addresses in a wallet sync — one proof round covers the whole batch.
 
+> **Privacy note on Merkle verification.** Within each PIR round, queries are padded to a fixed count (e.g. 75 for index, 80 for chunk, 25 for Merkle siblings) so the server cannot tell which group is real. However, the current implementation does not pad the *number of rounds*: the server can observe whether chunk and Merkle-sibling rounds are sent at all, and how many. This reveals whether the address was found and roughly how many UTXOs it has. Fixing this requires sending dummy chunk and Merkle rounds even when no results were found. This is a known trade-off — the lookup itself remains private, but the coarse shape of the result (found/not-found, small/large) is visible to the server.
+
 ### Batch queries
 Wallet sync typically touches dozens of addresses at once. Bitcoin PIR packs multiple addresses into a single PIR round using probabilistic batch codes, so syncing a wallet with 50 addresses takes roughly the same time as syncing one.
 

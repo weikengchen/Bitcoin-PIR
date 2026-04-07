@@ -349,15 +349,15 @@ fn build_tree(
 ) {
     let t_total = Instant::now();
 
-    // Pad to next power of ARITY
-    let num_padded = merkle_builder::next_power_of(num_real, ARITY);
+    // No power-of-arity padding needed: compute_next_level handles partial
+    // last groups by implicitly padding with ZERO_HASH. This avoids
+    // creating millions of empty NTT entries (120^4 = 207M vs 2.6M real).
     let mut current_level = leaf_hashes;
-    current_level.resize(num_padded, ZERO_HASH);
 
     let mut depth = 0;
-    { let mut v = num_padded; while v > 1 { v = (v + ARITY - 1) / ARITY; depth += 1; } }
+    { let mut v = num_real; while v > 1 { v = (v + ARITY - 1) / ARITY; depth += 1; } }
 
-    println!("  {} leaves ({}→{} padded), depth {}", num_real, num_real, num_padded, depth);
+    println!("  {} leaves, depth {}", num_real, depth);
 
     let mut cached_levels: Vec<Vec<Hash256>> = Vec::new();
     let mut cache_from_level = depth;

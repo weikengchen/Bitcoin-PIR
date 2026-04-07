@@ -85,6 +85,9 @@ export const RESP_INFO_JSON = 0x03;
 export const RESP_RESIDENCY = 0x04;
 export const RESP_INDEX_BATCH = 0x11;
 export const RESP_CHUNK_BATCH = 0x21;
+export const REQ_GET_DB_CATALOG = 0x02;
+export const RESP_DB_CATALOG = 0x02;
+
 export const RESP_ERROR = 0xFF;
 
 // ─── HarmonyPIR constants ─────────────────────────────────────────────────
