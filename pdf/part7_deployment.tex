@@ -18,31 +18,30 @@ We have implemented a complete, unified system supporting all three PIR protocol
 \node[box, fill=green!15, right=1.5cm of webclient] (electrum) {Electrum Plugin\\{\tiny Python + FFI}};
 \node[box, fill=green!15, left=1.5cm of webclient] (cli) {Rust CLI};
 
-\node[box, fill=orange!15, below=1.5cm of cli] (dpfserver) {DPF / Harmony\\Query Server};
-\node[box, fill=orange!15, below=1.5cm of webclient] (hintserver) {HarmonyPIR\\Hint Server};
-\node[box, fill=orange!15, below=1.5cm of electrum] (onionserver) {OnionPIR\\Server};
+\node[box, fill=orange!15, below=1.8cm of webclient, minimum width=4.5cm] (primary)
+  {Primary Server\\{\tiny DPF-0 + OnionPIR + HarmonyPIR}};
+\node[box, fill=orange!15, left=1cm of primary] (secondary) {Secondary Server\\{\tiny DPF-1}};
 
-\draw[arrow] (cli) -- (dpfserver);
-\draw[arrow] (webclient) -- (dpfserver);
-\draw[arrow] (webclient) -- (hintserver);
-\draw[arrow] (webclient) -- (onionserver);
-\draw[arrow] (electrum) -- (dpfserver);
-\draw[arrow] (electrum) -- (hintserver);
-\draw[arrow] (electrum) -- (onionserver);
+\draw[arrow] (cli) -- (primary);
+\draw[arrow] (cli) -- (secondary);
+\draw[arrow] (webclient) -- (primary);
+\draw[arrow] (webclient) -- (secondary);
+\draw[arrow] (electrum) -- (primary);
+\draw[arrow] (electrum) -- (secondary);
 
 \end{tikzpicture}
-\caption{System architecture. Three client implementations connect to three server types. The DPF/HarmonyPIR query server handles both DPF and HarmonyPIR online queries via protocol dispatch on request type codes.}
+\caption{System architecture. A single \texttt{unified\_server} binary serves all three protocols, deployed as two instances: the primary hosts DPF server~0, OnionPIR, and both HarmonyPIR hint and query roles; the secondary hosts DPF server~1. A client connects to both instances for DPF-PIR, to the primary only for OnionPIR, and to either instance for HarmonyPIR (any two non-colluding nodes work).}
 \label{fig:deployment}
 \end{figure}
 
-\textbf{Unified wire protocol.} All communication uses WebSocket with a compact binary protocol. Each request begins with a 1-byte type code that determines the protocol variant: DPF batch queries (\texttt{0x11}, \texttt{0x21}), HarmonyPIR hint/query requests (\texttt{0x40}--\texttt{0x43}), and OnionPIR key registration/queries (\texttt{0x30}--\texttt{0x32}). This allows the DPF and HarmonyPIR query server to share a single binary, dispatching based on the request type.
+\textbf{Unified wire protocol.} All communication uses WebSocket with a compact binary protocol of the form \texttt{[4B length][1B request type][payload]}. The type code dispatches to one of the protocol handlers: generic requests (\texttt{0x01} \texttt{GET\_INFO}, \texttt{0x02} \texttt{GET\_DB\_CATALOG}, \texttt{0x04} \texttt{RESIDENCY}), DPF batch queries (\texttt{0x11} INDEX, \texttt{0x21} CHUNK), per-group Merkle verification (\texttt{0x33} sibling batch, \texttt{0x34} tree-top cache), HarmonyPIR (\texttt{0x40}--\texttt{0x43}: info, hints, single query, batch query), and OnionPIR (\texttt{0x51}--\texttt{0x56} for index/chunk queries and their Merkle variants). Legacy global-Merkle codes \texttt{0x31}/\texttt{0x32} are reserved for the earlier whole-table Merkle scheme and are not used by the current per-group implementation. The trailing byte on DPF batch queries optionally carries a database identifier for multi-database routing (Section~\ref{sec:deployment-catalog}).
 
-\textbf{Server binaries.} Three Rust server binaries handle different protocol roles:
+\textbf{Unified server binary.} A single Rust binary, \texttt{unified\_server}, implements all three protocols and selects a role at startup:
 \begin{itemize}[nolistsep,leftmargin=*]
-    \item \textbf{DPF/HarmonyPIR query server:} Handles DPF batch queries (expanding DPF keys and computing XOR sums) and HarmonyPIR online queries (returning XOR of requested indices). Databases are memory-mapped via \texttt{memmap2}. Runs as two instances (one per server in the 2-server model).
-    \item \textbf{HarmonyPIR hint server:} Computes PRP-based hints using the selected backend (Hoang, FastPRP, or ALF) with \texttt{rayon} for batch parallelism. Streams hints to the client via WebSocket.
-    \item \textbf{OnionPIR server:} Manages 155 OnionPIR instances (75 index + 80 chunk) with a shared key store and shared NTT data. FHE evaluation uses the SEAL library \cite{seal} via Rust FFI.
+    \item \textbf{Primary role:} Serves DPF batch queries (one of the two DPF shares), OnionPIR queries, and both HarmonyPIR hint streaming and HarmonyPIR online queries. Loads every database declared in its configuration file, the shared OnionPIR NTT store, and the per-group Merkle sibling tables. All databases and NTT data are memory-mapped via \texttt{memmap2}, so server startup is fast even for multi-gigabyte datasets. OnionPIR evaluation uses the SEAL library~\cite{seal} via Rust FFI. HarmonyPIR hint generation uses \texttt{rayon} for batch parallelism with the selected PRP backend (Hoang, FastPRP, or ALF).
+    \item \textbf{Secondary role:} Serves the other DPF share only. A client connects to one primary and one secondary for the 2-server DPF-PIR protocol, ensuring that the two servers do not need to trust each other.
 \end{itemize}
+A production deployment typically runs one primary and one secondary on separate hosts, both exposing WebSocket endpoints. Because HarmonyPIR's hint and query roles can be split across any two non-colluding nodes, a client is free to pick any available primary as its HarmonyPIR query server and another as the hint server. For OnionPIR, the single server can be either instance, since OnionPIR does not rely on non-collusion.
 
 \subsection{Browser Deployment via WebAssembly}
 
@@ -55,11 +54,11 @@ The browser client supports all three protocols through WebAssembly \cite{wasm} 
     \item \texttt{harmonypir-alf/}: ALF backend with WASM SIMD128---fastest in browsers with SIMD support ($4$--$8\times$ over Hoang).
 \end{itemize}
 
-Each WASM module exports a \texttt{HarmonyBucket} class with methods for hint loading, request building, response processing, and state serialization.
+Each WASM module exports a \texttt{HarmonyGroup} class (whose original name in the codebase, \texttt{HarmonyBucket}, predates the bucket-to-group rename) with methods for hint loading, request building, response processing, and state serialization.
 
 \textbf{OnionPIR WASM.} A $\sim$516~KB WASM module provides FHE key generation, query encryption, and response decryption. The client's secret key can be exported and reused across different OnionPIR instances with different database sizes, avoiding redundant key generation.
 
-\textbf{Web Workers.} For HarmonyPIR, the client distributes the 155 bucket instances across 4 Web Workers, each running its own WASM instance. This parallelizes the request-building and response-processing phases, providing up to $4\times$ speedup on multi-core devices. Workers communicate via \texttt{Transferable} \texttt{ArrayBuffer}s to avoid serialization overhead.
+\textbf{Web Workers.} For HarmonyPIR, the client distributes the 155 group instances across 4 Web Workers, each running its own WASM instance. This parallelizes the request-building and response-processing phases, providing up to $4\times$ speedup on multi-core devices. Workers communicate via \texttt{Transferable} \texttt{ArrayBuffer}s to avoid serialization overhead.
 
 \textbf{DPF-PIR in the browser.} DPF key generation and cuckoo hashing are implemented in pure TypeScript without WASM, as the operations (AES-based PRG expansion and XOR accumulation) are lightweight enough for JavaScript.
 
@@ -81,12 +80,30 @@ We provide a plugin for the Electrum Bitcoin wallet \cite{electrum} that replace
     \item ``OnionPIRv2 1-Server'': Uses \texttt{ctypes} FFI to a pre-built native library (\texttt{libonionpir}) for FHE operations.
 \end{itemize}
 
-\textbf{Shared utilities.} All three backends share Python implementations of cuckoo hashing, PBC bucket derivation, VarInt decoding, and UTXO data parsing---mirroring the Rust and TypeScript implementations to ensure cross-platform consistency.
+\textbf{Shared utilities.} All three backends share Python implementations of cuckoo hashing, PBC group derivation, VarInt decoding, and UTXO data parsing---mirroring the Rust and TypeScript implementations to ensure cross-platform consistency.
+
+\subsection{Database Catalog and Client Sync}
+\label{sec:deployment-catalog}
+
+A single unified server can host multiple logically distinct databases at once. The canonical deployment combines one \emph{full} checkpoint (a complete UTXO snapshot at some block height) with a family of \emph{delta} databases that encode the diffs between successive checkpoints (Section~\ref{sec:delta-db}). The server loads all databases at startup from a \texttt{databases.toml} configuration file that declares, for each entry, a name, type (\texttt{full} or \texttt{delta}), base and tip block heights, on-disk path, and a warmup priority.
+
+\textbf{Wire-level routing.} Each loaded database is assigned a small integer \texttt{db\_id}, with the main checkpoint at \texttt{db\_id=0}. To query a specific database, the client appends a one-byte \texttt{db\_id} to its \texttt{INDEX\_BATCH}/\texttt{CHUNK\_BATCH} request. Requests without the trailing byte are routed to \texttt{db\_id=0}, preserving backward compatibility with single-database clients. The same routing is used for Merkle sibling and tree-top requests.
+
+\textbf{Catalog endpoint.} A new request \texttt{GET\_DB\_CATALOG} (\texttt{0x02}) returns the full list of databases currently served. Each catalog entry contains the \texttt{db\_id}, type, base height, tip height, cuckoo parameters (index and chunk bin counts, tag seed), and a flag indicating whether per-group Merkle verification data is available for that database. The top-level \texttt{GET\_INFO} (\texttt{0x01}) response additionally embeds a \texttt{"databases"} array with per-database Merkle metadata (arity, level sizes, per-group roots, super-root, and tree-top hash), so that a client can verify Merkle proofs against the correct database without a second round trip.
+
+\textbf{Client sync planning.} Given the catalog and the client's last synced height $h_\text{last}$, the client computes a \emph{sync plan}: an ordered sequence of database queries that advances from $h_\text{last}$ to the latest available tip. The plan is chosen by the following rule:
+\begin{enumerate}[nolistsep,leftmargin=*]
+    \item If $h_\text{last}$ is absent or $0$, pick the highest-tip full checkpoint as a single-step fresh sync.
+    \item If $h_\text{last}$ already equals the latest tip, the plan is empty.
+    \item Otherwise, search for a chain of deltas whose base/tip heights connect $h_\text{last}$ to the tip. The search is breadth-first over the delta graph, capped at a configurable maximum chain length (currently 5).
+    \item If no suitable chain exists, or it exceeds the cap, fall back to the latest full checkpoint.
+\end{enumerate}
+The sync plan is a pure function of the catalog and $h_\text{last}$: it performs no I/O and can be computed entirely on the client. The client then executes each step by replaying its standard DPF/HarmonyPIR/OnionPIR query pipeline against the appropriate \texttt{db\_id}.
 
 \subsection{Practical Considerations}
 
 \textbf{Server deployment.} Production servers are deployed behind reverse proxies (e.g., nginx) with TLS termination via Cloudflare Tunnel, providing WSS (WebSocket Secure) transport without exposing server IP addresses.
 
-\textbf{Database updates.} When the Bitcoin UTXO set changes (approximately every 10 minutes with each new block), the server operator re-runs the database generation pipeline. For DPF-PIR and HarmonyPIR, the update only affects the cuckoo hash tables. For OnionPIR, the NTT preprocessing must also be recomputed, which takes approximately 95 seconds. Clients automatically detect database version changes via the \texttt{GET\_INFO} handshake.
+\textbf{Database updates.} When the Bitcoin UTXO set changes (approximately every 10 minutes with each new block), the server operator re-runs the database generation pipeline for the relevant checkpoint and, optionally, publishes a new delta keyed to the previous checkpoint. For DPF-PIR and HarmonyPIR, an update only affects the cuckoo hash tables and sibling/tree-top files. For OnionPIR, the NTT preprocessing must also be recomputed, which takes approximately 95 seconds. The \texttt{databases.toml} file is updated to declare the new database, and clients discover it at their next \texttt{GET\_DB\_CATALOG} call.
 
-\textbf{Dust filtering.} UTXOs below 576 satoshis and addresses with more than 100 UTXOs are filtered during database generation. This removes dust outputs and whale addresses (who should run full nodes), reducing the database size and improving PIR efficiency for typical light-client queries. See Section~\ref{sec:extension} for the rationale.
+\textbf{Dust filtering.} UTXOs of $576$ satoshis or less, and addresses with more than $100$ UTXOs, are filtered during database generation. This removes dust outputs and whale addresses (who should run full nodes), reducing the database size and improving PIR efficiency for typical light-client queries. See Section~\ref{sec:extension} for the rationale.

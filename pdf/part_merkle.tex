@@ -1,0 +1,76 @@
+\section{Integrity via Per-Group Merkle Trees}
+\label{sec:merkle}
+
+All three PIR backends described so far provide \emph{privacy}: neither a single server (OnionPIR) nor a pair of non-colluding servers (DPF-PIR, HarmonyPIR) learns which address a client queried. Privacy alone, however, does not guarantee that the returned UTXO data is correct. A malicious server could silently substitute entries and the client would never notice. Worse, a carefully chosen substitution pattern could implement a \emph{selective failure attack} (Section~\ref{sec:landscape}) that leaks information about the query through the client's later behavior.
+
+This section describes the integrity layer that we build on top of the PIR protocols. The construction is a family of per-group SHA-256 Merkle trees over the cuckoo bins of the live database; verification is itself driven through the same PIR primitives used for data retrieval, so integrity inherits the privacy of the underlying protocol.
+
+\subsection{Design Goals}
+
+We deliberately avoid schemes that depend on a trusted setup or on asymmetric cryptography (e.g., KZG~\cite{kzg10}), for three reasons. First, post-quantum security: the underlying PIR protocols are already post-quantum (DPF, HarmonyPIR) or based on lattice hardness (OnionPIR), and we would like integrity to match. Second, parameter agility: a new checkpoint is published roughly every few hours, and recomputing a KZG commitment over the entire database at each update would be expensive and painful to re-distribute. Third, reusability: we prefer a construction that needs nothing from the client beyond the primitives it already has---a hash function and the ability to issue PIR queries. SHA-256 Merkle trees satisfy all three requirements.
+
+We also need integrity that is compatible with \emph{batch PIR}. The natural place to verify an entry is at the cuckoo-bin level, because a single PIR query retrieves exactly one bin per PBC group. We therefore build a Merkle tree whose leaves are cuckoo bins, not individual UTXO records. This keeps the verification proof at the same granularity as the PIR response, avoiding any correlation between what was verified and what was actually accessed.
+
+\subsection{Construction}
+
+Recall from Section~\ref{sec:data} that our data layout is organized into two PIR levels (INDEX and CHUNK), each sharded across a fixed number of PBC groups (\mbox{$K{=}75$} for INDEX, \mbox{$K_\text{chunk}{=}80$} for CHUNK). Each group is a separate cuckoo hash table whose rows (``bins'') are the atomic unit retrieved by one PIR query.
+
+We build an independent Merkle tree for each group, giving $K + K_\text{chunk} = 155$ trees in total. Every tree has arity $A = 8$ and covers all $B_g$ bins of its group.
+
+\textbf{Leaf hashing.} For bin index $i$ in group $g$, the leaf hash is
+$$L_{g,i} = \mathsf{SHA256}\bigl(\mathsf{u32le}(i) \,\|\, \mathsf{bin}_{g,i}\bigr),$$
+where $\mathsf{bin}_{g,i}$ is the raw byte contents of the bin ($\texttt{slots\_per\_bin} \cdot \texttt{slot\_size}$ bytes) and $\mathsf{u32le}(i)$ is $i$ encoded as a little-endian 32-bit integer. Prepending the index prevents a server from swapping bins between positions.
+
+\textbf{Internal nodes.} Internal nodes combine $A = 8$ children: if $c_0, \ldots, c_7$ are the 32-byte child hashes (padded with $\mathsf{0}^{32}$ if fewer), the parent is $\mathsf{SHA256}(c_0 \,\|\, c_1 \,\|\, \cdots \,\|\, c_7)$. A higher arity means fewer levels: a group with $\sim\!10^6$ bins has only $\lceil \log_8 10^6 \rceil = 7$ levels, so a single Merkle proof costs roughly 7 sibling fetches.
+
+\textbf{Per-group root.} The root of group $g$'s tree is $R_g$, a 32-byte hash.
+
+\textbf{Super-root.} Concatenating all 155 per-group roots in a canonical order (75 index roots followed by 80 chunk roots) and hashing with SHA-256 yields a single 32-byte \emph{super-root} that commits the entire database:
+$$R^* = \mathsf{SHA256}\bigl(R_1 \,\|\, R_2 \,\|\, \cdots \,\|\, R_{155}\bigr).$$
+The super-root, together with the database version, is what clients compare across servers or against an out-of-band trust anchor. One 32-byte value covers every bin of every group at both levels.
+
+\subsection{Storage Layout}
+\label{sec:merkle-storage}
+
+Merkle sibling hashes are stored on the server in files that are themselves structured as PBC-queryable tables, so that the client can fetch proofs through ordinary PIR queries.
+
+\textbf{Flat sibling tables.} For each table type (INDEX or CHUNK) and each tree level $\ell$, we maintain a single file whose row $(g, j)$ stores all $A = 8$ children of the $j$-th internal node in group $g$'s level-$\ell$ nodes. Each row is exactly $A \cdot 32 = 256$ bytes. This is the ``flat'' layout: sibling data is indexed directly by group id and node position, with no cuckoo hashing or tag matching---the client already knows the position and group of every sibling it needs.
+
+\textbf{Tree-top cache.} The top of every group's tree (levels close to the root, where there are only a handful of nodes) is cached server-side in a single blob, \texttt{merkle\_bucket\_tree\_tops.bin}, along with all 155 per-group roots and the super-root. For the current database this blob is about $9.1$ MB.
+
+\textbf{Total footprint.} The dominant cost is the sibling tables: about $4.6$ GB for the full database. (An earlier variant of this scheme used global Merkle trees and required roughly $14.8$ GB; partitioning per group and switching to a flat layout cut sibling storage by more than $3\times$.) All sibling data is memory-mapped and never loaded in full.
+
+\subsection{Verification Flow}
+\label{sec:merkle-verify}
+
+A client that has just retrieved a bin via DPF-PIR or HarmonyPIR verifies it as follows.
+
+\begin{enumerate}[nolistsep,leftmargin=*]
+    \item \textbf{Anchor the tree-top cache.} On the first verification of a session, the client fetches the tree-top cache (request \texttt{0x34}) and computes its SHA-256. The expected hash is included in the top-level \texttt{GET\_INFO} response (Section~\ref{sec:deployment-catalog}); if it matches, the client has a locally trusted copy of all per-group roots and of the super-root.
+
+    \item \textbf{Compute the leaf.} For the retrieved bin at index $i$ in group $g$, the client computes $L_{g,i}$ as above. This is the Merkle leaf it needs to connect to the per-group root $R_g$.
+
+    \item \textbf{Walk the tree, one level at a time.} For each sibling level $\ell = 0, 1, 2, \ldots$, the client needs the $A - 1 = 7$ sibling hashes of its current node at that level. Because siblings are stored in the flat level-$\ell$ table indexed by (group, node position), the client already knows exactly which row of which file it needs to read---but reading that row in cleartext would reveal the query. Instead, the client treats each sibling table as just another PIR database and issues a batch DPF-PIR query (request \texttt{0x33}) against it, piggybacking on the regular 2-server DPF primitive.
+
+    \item \textbf{Combine and climb.} Using the retrieved row of 8 child hashes, the client replaces the slot at its own position with its current hash, hashes the concatenation with SHA-256, and advances to the next level with $\lfloor i / A \rfloor$ as the new node index. After the final level it reaches a hash that should be present in the cached tree-top for group $g$; if so, the leaf is successfully connected to $R_g$.
+
+    \item \textbf{Check against the super-root.} Because $R_g$ was part of the tree-top blob whose SHA-256 the client verified in step~1, reaching $R_g$ closes the proof. Equivalently, the client has shown that the retrieved bin is included in the committed database under the known super-root.
+\end{enumerate}
+
+Because every sibling fetch is itself a DPF-PIR query, the server learns nothing about which bin was being verified beyond what it already learned from the data query---and because DPF-PIR is information-theoretic, that ``learned nothing'' is exactly zero. Verification therefore does not weaken the privacy guarantees of the data-retrieval phase.
+
+\textbf{Batching.} In practice the client verifies \emph{all} addresses in a batch at once. For each sibling level, the client places one DPF-PIR query per address into a $K$-group PBC structure (with synthetic dummies for unused groups, exactly as in the main protocol), so that a single round of the Merkle walk verifies every address in parallel. The communication cost of Merkle verification is one DPF-PIR batch per sibling level ($\sim\!7$ levels for INDEX and CHUNK) plus a single tree-top fetch that is amortized across the whole session.
+
+\subsection{Integration with the Protocols}
+
+\textbf{DPF-PIR.} Both data queries and Merkle sibling queries use the same DPF-PIR primitive and are issued against the same pair of servers. A full \emph{verified} DPF-PIR batch thus consists of: (i) the INDEX-level batch, (ii) the CHUNK-level batch, (iii) one tree-top fetch, and (iv) one DPF-PIR sibling batch per Merkle level. In our measurements the Merkle verification adds a small constant number of extra rounds and does not dominate total latency.
+
+\textbf{HarmonyPIR.} Per-bucket Merkle integrates cleanly because the HarmonyPIR data response already retrieves a full cuckoo bin, which is exactly the Merkle leaf unit. The sibling tables themselves are verified via DPF-PIR regardless of which backend was used for the primary data query: we use DPF as the uniform integrity primitive because sibling tables are small compared to the main UTXO tables, and layering a second stateful protocol on top would add engineering surface area with no real benefit.
+
+\textbf{OnionPIR.} The current deployment serves per-group Merkle for DPF and HarmonyPIR. OnionPIR has its own (global-tree) Merkle scheme using dedicated wire codes (\texttt{0x53}--\texttt{0x56}); bringing OnionPIR onto the same per-group Merkle pipeline is straightforward and planned for a future revision.
+
+\textbf{Delta databases.} The sibling tables, tree-top cache, super-root, and catalog flag are per-database, so the scheme extends to delta databases (Section~\ref{sec:delta-db}) without any protocol changes---a client issues its sibling requests with the same \texttt{db\_id} byte that routed its data query. Building Merkle data for small delta databases is optional and deferred by default, controlled by the \texttt{has\_bucket\_merkle} field in the catalog. (The flag's name predates the terminology unification: in implementation files, all per-group Merkle artifacts are named \texttt{merkle\_bucket\_*}.)
+
+\subsection{Build Pipeline}
+
+The sibling tables, tree-tops, per-group roots, and super-root are produced by a dedicated build step that runs after the cuckoo tables are assembled. For each group, the step walks the cuckoo bins, hashes leaves, and emits one flat sibling file per level. The step is embarrassingly parallel across the 155 groups and across levels, and takes a few minutes on a modern multi-core server for the full UTXO database. Because Merkle data is an additive layer on top of the cuckoo tables, generating or skipping it is a runtime choice---a freshly built database is immediately usable for PIR queries and acquires verifiability as soon as the Merkle step completes.

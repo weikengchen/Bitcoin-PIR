@@ -28,9 +28,9 @@ In the offline phase, the hint server computes a compact representation of the d
 
 \textbf{Hint computation.} The server computes $M$ hint values, each of $w$ bytes, via a scatter-XOR operation:
 $$H[s] = \bigoplus_{\substack{k \in [N] \\ \lfloor P(k)/T \rfloor = s}} \mathsf{DB}[k], \quad s \in [M].$$
-That is, each database row $k$ is assigned to segment $s = \lfloor P(k)/T \rfloor$ by the PRP, and the hint for segment $s$ is the XOR of all rows assigned to it. Rows in the range $[N, N')$ are virtual zero-rows and do not affect the XOR. The total hint size is $M \times w$ bytes per bucket.
+That is, each database row $k$ is assigned to segment $s = \lfloor P(k)/T \rfloor$ by the PRP, and the hint for segment $s$ is the XOR of all rows assigned to it. Rows in the range $[N, N')$ are virtual zero-rows and do not affect the XOR. The total hint size is $M \times w$ bytes per group.
 
-\textbf{Per-bucket hints.} The system maintains 155 independent HarmonyPIR instances---one per PBC bucket (75 index-level + 80 chunk-level). Each instance uses a distinct PRP key derived from a shared master key by XORing the bucket identifier into bytes 12--15 of the key. The hint server computes and streams hints for all 155 buckets, using batch parallelism for efficiency.
+\textbf{Per-group hints.} The system maintains 155 independent HarmonyPIR instances---one per PBC group (75 index-level + 80 chunk-level). Each instance uses a distinct PRP key derived from a shared master key by XORing the group identifier into bytes 12--15 of the key. The hint server computes and streams hints for all 155 groups, using batch parallelism for efficiency.
 
 \subsection{Online Phase: Querying}
 \label{sec:harmony-online}
@@ -58,30 +58,30 @@ Each online query involves sending $O(T) = O(\sqrt{N})$ indices and receiving $w
 \subsection{Dummy Queries}
 \label{sec:harmony-dummies}
 
-To prevent the server from distinguishing real queries from padding, the client generates \emph{synthetic dummy} queries for PBC buckets that do not hold a real query in a given round.
+To prevent the server from distinguishing real queries from padding, the client generates \emph{synthetic dummy} queries for PBC groups that do not hold a real query in a given round.
 
 A synthetic dummy is constructed by sampling a count $c \sim \text{Binomial}(T, 0.5)$ and then choosing $c$ indices uniformly at random from $[N]$. The resulting request has the same format as a real query but does not modify the client's hint state. This ensures that the distribution of request sizes and content is statistically indistinguishable from real queries to the server.
 
 \subsection{Integration with Batch PIR}
 \label{sec:harmony-batch}
 
-HarmonyPIR plugs into the same PBC framework described in Section~\ref{sec:batching}. The client maintains 155 independent HarmonyPIR bucket instances:
+HarmonyPIR plugs into the same PBC framework described in Section~\ref{sec:batching}. The client maintains 155 independent HarmonyPIR group instances:
 \begin{itemize}[nolistsep,leftmargin=*]
-    \item \textbf{Index level:} $K{=}75$ buckets, each with entry size $w = 52$ bytes (4 cuckoo slots $\times$ 13 bytes per index entry).
-    \item \textbf{Chunk level:} $K_\text{chunk}{=}80$ buckets, each with entry size $w = 132$ bytes (3 cuckoo slots $\times$ 44 bytes per chunk slot).
+    \item \textbf{Index level:} $K{=}75$ groups, each with entry size $w = 52$ bytes (one cuckoo bin = 4 slots $\times$ 13 bytes per index slot).
+    \item \textbf{Chunk level:} $K_\text{chunk}{=}80$ groups, each with entry size $w = 132$ bytes (one cuckoo bin = 3 slots $\times$ 44 bytes per chunk slot).
 \end{itemize}
 
 The query protocol proceeds in rounds, analogous to DPF-PIR:
 \begin{enumerate}[nolistsep,leftmargin=*]
-    \item The client places $m$ ScriptPubKey queries into $K$ PBC buckets via cuckoo hashing (same as Section~\ref{sec:batching}).
+    \item The client places $m$ ScriptPubKey queries into $K$ PBC groups via cuckoo hashing (same as Section~\ref{sec:batching}).
     \item For each of the 2 cuckoo hash function rounds at the index level:
     \begin{itemize}[nolistsep,leftmargin=*]
-        \item Buckets with a real query generate a HarmonyPIR request targeting the assigned cuckoo bin.
-        \item Buckets without a real query generate a synthetic dummy.
+        \item Groups with a real query generate a HarmonyPIR request targeting the assigned cuckoo bin.
+        \item Groups without a real query generate a synthetic dummy.
     \end{itemize}
     \item All $K$ requests are sent to the query server in a single batch. The server responds with $K$ XOR results.
-    \item The client processes responses: real queries recover index entries via the hint XOR; dummy responses are discarded.
-    \item The process repeats for the chunk level with $K_\text{chunk}$ buckets.
+    \item The client processes responses: real queries recover index slots via the hint XOR; dummy responses are discarded.
+    \item The process repeats for the chunk level with $K_\text{chunk}$ groups.
 \end{enumerate}
 
 \subsection{PRP Backend Selection}
@@ -102,11 +102,11 @@ The PRP backend is selected at session initialization and must be consistent bet
 \subsection{Hint Caching and Query Budget}
 \label{sec:harmony-caching}
 
-Each HarmonyPIR bucket instance supports approximately $M \approx N/T \approx \sqrt{N/2}$ queries before its hints are exhausted. For a typical bucket with $N \approx 755{,}000$ rows, this gives $M \approx 616$ queries per bucket.
+Each HarmonyPIR group instance supports approximately $M \approx N/T \approx \sqrt{N/2}$ queries before its hints are exhausted, where $N$ here refers to the number of cuckoo bins in the group's table. For the current main database this gives roughly $530$ queries per group at the INDEX level (where $N \approx 565{,}000$ bins, DPF domain $2^{20}$) and roughly $730$ queries per group at the CHUNK level (where $N \approx 1{,}064{,}000$ bins, DPF domain $2^{21}$). Both levels comfortably exceed typical wallet query volumes.
 
 To avoid re-downloading hints unnecessarily, the client caches hint state:
 \begin{itemize}[nolistsep,leftmargin=*]
-    \item \textbf{State serialization:} Each bucket's full state (hints, PRP key, relocation structure, query counter) can be serialized and stored in the browser's \texttt{localStorage} or on disk.
-    \item \textbf{Exhaustion detection:} Before each batch query, the client checks the minimum remaining query budget across all active buckets. If any bucket is exhausted, the client triggers a hint refresh from the hint server.
+    \item \textbf{State serialization:} Each group's full state (hints, PRP key, relocation structure, query counter) can be serialized and stored in the browser's \texttt{localStorage} or on disk.
+    \item \textbf{Exhaustion detection:} Before each batch query, the client checks the minimum remaining query budget across all active groups. If any group is exhausted, the client triggers a hint refresh from the hint server.
     \item \textbf{Resilient reconnection:} If the WebSocket connection drops mid-session, the client reconnects with exponential backoff and resumes using cached state, avoiding a full hint re-download.
 \end{itemize}

@@ -7,15 +7,17 @@ A light client typically needs to look up multiple ScriptPubKeys simultaneously.
 
 \textbf{Batch PIR} \cite{IKOS04} addresses the problem of retrieving $m$ entries simultaneously. The naive approach---issuing $m$ independent PIR queries---costs $m$ times the single-query cost. Batch PIR aims to reduce this by amortizing work across queries.
 
-\textbf{Probabilistic Batch Codes (PBC)} achieve batch PIR by distributing $m$ queries across $K$ ``buckets'' (with $K > m$) such that each bucket contains at most one real query. The construction uses cuckoo hashing:
+\textbf{Probabilistic Batch Codes (PBC)} achieve batch PIR by distributing $m$ queries across $K$ \emph{groups} (with $K > m$) such that each group contains at most one real query. The construction uses cuckoo hashing:
 \begin{enumerate}[nolistsep,leftmargin=*]
-    \item For each of the $m$ queries, compute $h$ candidate buckets using cuckoo hash functions.
-    \item Place queries into buckets via cuckoo insertion with eviction chains.
-    \item Pad all empty buckets with random dummy queries.
-    \item Issue $K$ independent PIR queries in parallel---one per bucket.
+    \item For each of the $m$ queries, compute $h$ candidate groups using cuckoo hash functions.
+    \item Place queries into groups via cuckoo insertion with eviction chains.
+    \item Pad all empty groups with random dummy queries.
+    \item Issue $K$ independent PIR queries in parallel---one per group.
 \end{enumerate}
 
-Since each bucket holds at most one real query, the server processes $K$ single-entry PIR queries. For DPF-PIR, this means generating $K$ DPF key pairs and having each server perform $K$ XOR-sum computations. The effective cost per query drops from $O(NB)$ to $O(NB \cdot K/m)$ when the server can share work across the $K$ evaluations.
+Since each group holds at most one real query, the server processes $K$ single-entry PIR queries. For DPF-PIR, this means generating $K$ DPF key pairs and having each server perform $K$ XOR-sum computations. The effective cost per query drops from $O(NB)$ to $O(NB \cdot K/m)$ when the server can share work across the $K$ evaluations.
+
+Each of the $K$ groups is itself a cuckoo hash table in the sense of Section~\ref{sec:data}, where the inner rows are called \emph{bins}. We consistently use ``group'' for the outer PBC sharding and ``bin'' for the inner cuckoo row; this matches the terminology used throughout our codebase.
 
 \subsection{Two-Level Query Architecture}
 
@@ -33,9 +35,9 @@ Our system uses a two-level architecture: an \emph{index map} that locates data,
 ]
 
 \node[data, fill=green!15] (user) {User's\\ScriptPubKey(s)};
-\node[box, fill=orange!20, right=2.5cm of user] (map1) {Index Map\\{\tiny ($K{=}75$ batch PIR)}};
+\node[box, fill=orange!20, right=2.5cm of user] (map1) {Index Map\\{\tiny ($K{=}75$ groups)}};
 \node[data, fill=yellow!20, right=of map1] (chunkinfo) {Chunk ID\\+ Data Length};
-\node[box, fill=orange!20, below=1cm of map1] (map2) {Chunk Map\\{\tiny ($K_\text{chunk}{=}80$ batch PIR)}};
+\node[box, fill=orange!20, below=1cm of map1] (map2) {Chunk Map\\{\tiny ($K_\text{chunk}{=}80$ groups)}};
 \node[data, fill=yellow!20, right=of map2] (utxo) {UTXO Data\\{\tiny (32B TXID, vout, amount)}};
 
 \draw[arrow] (user) -- (map1) node[midway, above, pirlabel] {PBC + Cuckoo};
@@ -53,9 +55,9 @@ Our system uses a two-level architecture: an \emph{index map} that locates data,
 \label{fig:two-maps}
 \end{figure}
 
-\textbf{Level 1: Index lookup.} The client computes RIPEMD-160 hashes of all queried ScriptPubKeys, derives $h$ candidate buckets per query via cuckoo hash functions, and places them into $K$ PBC buckets. For each bucket, the client generates a PIR query targeting the assigned row in the index table and sends it to the server(s). The responses are combined to recover index entries containing chunk IDs and data lengths.
+\textbf{Level 1: Index lookup.} The client computes RIPEMD-160 hashes of all queried ScriptPubKeys, derives $h$ candidate groups per query via cuckoo hash functions, and places them into $K$ PBC groups. For each group, the client generates a PIR query targeting the assigned bin in the group's index cuckoo table and sends it to the server(s). The responses are combined to recover index slots containing starting chunk ids and chunk counts.
 
-\textbf{Level 2: Chunk retrieval.} Using the chunk locations from Level~1, the client repeats the process with $K_\text{chunk}$ PBC buckets over the chunk database. The recovered chunks contain full UTXO records: 32-byte TXIDs, vout indices, and amounts in satoshis---everything needed to construct a spending transaction. Each chunk is 40 bytes; each slot in the chunk cuckoo table is 44 bytes (4-byte chunk identifier plus 40-byte payload).
+\textbf{Level 2: Chunk retrieval.} Using the chunk locations from Level~1, the client repeats the process with $K_\text{chunk}$ PBC groups over the chunk database. The recovered chunks contain full UTXO records: 32-byte TXIDs, vout indices, and amounts in satoshis---everything needed to construct a spending transaction. Each chunk is 40 bytes; each slot in the chunk cuckoo table is 44 bytes (4-byte chunk identifier plus 40-byte payload).
 
 \textbf{Distributional PIR.} We can apply distributional PIR \cite{lehmkuhl25} to optimize for the common case: most light clients hold few UTXOs under common script types, while whale addresses with thousands of UTXOs likely run full nodes. By tuning the PIR parameters for the more likely queries, the average server cost decreases without eliminating the ability to query less common entries.
 
@@ -63,12 +65,12 @@ Our system uses a two-level architecture: an \emph{index map} that locates data,
 \centering
 \begin{tabular}{|l|c|c|c|c|c|}
 \hline
-\textbf{Database} & \textbf{Slot Size} & \textbf{Buckets ($K$)} & \textbf{Cuckoo} & \textbf{DPF queries/bucket} & \textbf{PIR domain} \\
+\textbf{Database} & \textbf{Slot Size} & \textbf{Groups ($K$)} & \textbf{Cuckoo} & \textbf{DPF queries/group} & \textbf{PIR domain} \\
 \hline
-Index (Level 1) & 13 B & 75 & 2-hash, bs=4 & 2 & $2^{20}$ \\
-Chunks (Level 2) & 44 B & 80 & 2-hash, bs=3 & 2 & $2^{21}$ \\
+Index (Level 1) & 13 B & 75 & 2-hash, 4 slots/bin & 2 & $2^{20}$ \\
+Chunks (Level 2) & 44 B & 80 & 2-hash, 3 slots/bin & 2 & $2^{21}$ \\
 \hline
 \end{tabular}
-\caption{Batch PIR parameters. Each level uses $K$ parallel PIR queries over cuckoo hash tables. Each DPF query retrieves one cuckoo bin: 4 slots $\times$ 13 B = 52 B for the index level, and 3 slots $\times$ 44 B = 132 B for the chunk level.}
+\caption{Batch PIR parameters. Each level uses $K$ parallel PIR queries over cuckoo hash tables, one table per group. Each DPF query retrieves one cuckoo bin: 4 slots $\times$ 13 B = 52 B for the index level, and 3 slots $\times$ 44 B = 132 B for the chunk level.}
 \label{tab:databases}
 \end{table}

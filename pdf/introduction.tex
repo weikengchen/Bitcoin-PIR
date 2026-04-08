@@ -83,6 +83,8 @@ To address selective failure attacks, we can choose protocols with this addition
     \item \textbf{2-server:} Plinko, RMS24, or Piano with Merkle proofs, or verifiable BALANCED-PIR with outsourced hint generation
 \end{itemize}
 
+Our own implementation takes a more direct route: we build SHA-256 Merkle trees over the cuckoo bins of the live database and verify retrieved bins by issuing the proof queries through the same PIR primitive the client already uses for data. This keeps the entire system post-quantum, avoids a trusted setup, and lets the same verification layer serve both the DPF and HarmonyPIR backends without protocol changes. We describe the construction in full in Section~\ref{sec:merkle}.
+
 \subsection{Our Contributions}
 
 We implement three distinct PIR protocols for Bitcoin UTXO lookups, each offering different trade-offs between trust assumptions, communication cost, and server computation:
@@ -94,8 +96,10 @@ We implement three distinct PIR protocols for Bitcoin UTXO lookups, each offerin
 
 All three protocols share the same data representation (Section~\ref{sec:data}) and batch PIR framework (Section~\ref{sec:batching}), enabling a unified system where clients can choose the protocol best suited to their threat model and network conditions.
 
-We also provide a practical deployment (Section~\ref{sec:deployment}) including browser-based clients via WebAssembly \cite{wasm} and an Electrum wallet plugin \cite{electrum} with all three backends.
+We complement the three backends with two cross-cutting features. First, an integrity layer (Section~\ref{sec:merkle}) that builds per-group SHA-256 Merkle trees over cuckoo bins and verifies retrieved data by running the proof queries through the same PIR primitive, preserving post-quantum security and avoiding trusted setup. Second, support for \emph{delta databases} (Section~\ref{sec:delta-db}) that encode the diff between successive UTXO snapshots, letting a returning client incrementally sync by retrieving a small delta instead of re-downloading an entire snapshot.
+
+We also provide a practical deployment (Section~\ref{sec:deployment}) including browser-based clients via WebAssembly \cite{wasm} and an Electrum wallet plugin \cite{electrum} with all three backends, a multi-database server architecture, and a client-side sync planner that chooses between full and delta databases.
 
 \subsection{Paper Organization}
 
-Section~\ref{sec:data} describes the Bitcoin UTXO model, our data representation, and techniques for reducing the UTXO set size. Section~\ref{sec:batching} presents the PIR-variant-agnostic batch PIR framework using Probabilistic Batch Codes. Sections~\ref{sec:2server},~\ref{sec:harmonypir}, and~\ref{sec:onionpir} detail the three protocol instantiations: DPF-PIR, HarmonyPIR, and OnionPIR, respectively. Section~\ref{sec:comparison} compares the three protocols across multiple dimensions. Section~\ref{sec:deployment} describes the implementation and deployment, including browser and wallet integration.
+Section~\ref{sec:data} describes the Bitcoin UTXO model, our data representation, and techniques for reducing the UTXO set size. Section~\ref{sec:batching} presents the PIR-variant-agnostic batch PIR framework using Probabilistic Batch Codes. Sections~\ref{sec:2server},~\ref{sec:harmonypir}, and~\ref{sec:onionpir} detail the three protocol instantiations: DPF-PIR, HarmonyPIR, and OnionPIR, respectively. Section~\ref{sec:merkle} describes the per-group Merkle integrity layer, and Section~\ref{sec:delta-db} describes delta databases and incremental sync. Section~\ref{sec:comparison} compares the three protocols across multiple dimensions. Section~\ref{sec:deployment} describes the implementation and deployment, including the multi-database catalog, browser and wallet integration.

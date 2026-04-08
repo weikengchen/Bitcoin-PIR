@@ -39,7 +39,7 @@ UTXO data is greedily packed into 3840-byte entries:
     \item Multiple addresses share a single entry via greedy bin-packing. If an address's serialized UTXO data does not fit in the remaining space of the current entry, padding is inserted and a new entry begins.
     \item From approximately 53.6 million addresses, the packing produces $\sim$815,000 unique entries with $\sim$95.9\% packing efficiency.
     \item Each entry is assigned to 3 of the 80 PBC groups (triplication for batch PIR).
-    \item Within each group, entries are placed into a cuckoo hash table with 6 hash functions, bucket size 1, and $\sim$32,000 bins per group.
+    \item Within each group, entries are placed into a cuckoo hash table with 6 hash functions, 1 slot per bin, and $\sim$32,000 bins per group.
 \end{itemize}
 
 The client computes the 6 candidate bin indices in each assigned group and determines which bin holds its target entry by performing client-side cuckoo table reconstruction.

@@ -58,7 +58,7 @@ DPF-PIR's server work is a simple XOR scan over the database, making it the fast
 \begin{itemize}[nolistsep,leftmargin=*]
     \item \textbf{DPF-PIR:} Stateless. The client only needs to generate DPF keys (a few hundred bytes each) and XOR the two server responses. Minimal compute, no persistent state, no WASM dependency.
 
-    \item \textbf{HarmonyPIR:} Stateful. The client must store hint data ($M \times w$ bytes per bucket, totaling hundreds of megabytes) and maintain the relocation data structure across queries. Requires a PRP implementation, provided via WebAssembly in the browser. Supports three PRP backends with varying performance.
+    \item \textbf{HarmonyPIR:} Stateful. The client must store hint data ($M \times w$ bytes per group, totaling hundreds of megabytes across all 155 groups) and maintain the relocation data structure across queries. Requires a PRP implementation, provided via WebAssembly in the browser. Supports three PRP backends with varying performance.
 
     \item \textbf{OnionPIR:} Stateless per session (keys are generated fresh), but requires an FHE library for encryption and decryption. The WASM module is $\sim$516~KB. The client must also reconstruct cuckoo hash tables locally to determine which bins to query.
 \end{itemize}
@@ -70,7 +70,7 @@ The choice of protocol depends on the client's threat model, query volume, and n
 \begin{itemize}[nolistsep,leftmargin=*]
     \item \textbf{One-time lookups} (e.g., importing a seed phrase with a few addresses): \textbf{DPF-PIR} is ideal. No offline cost, minimal communication, and the two-server assumption is reasonable when the client can freely choose two Bitcoin full nodes from the P2P network.
 
-    \item \textbf{Repeated queries} (e.g., a wallet that periodically syncs): \textbf{HarmonyPIR} excels once the offline hint download is amortized. Each subsequent query costs only $\sim$10~KB of communication and $O(\sqrt{N})$ server work. The hint budget of $\sim$600 queries per bucket is more than sufficient for typical wallet usage.
+    \item \textbf{Repeated queries} (e.g., a wallet that periodically syncs): \textbf{HarmonyPIR} excels once the offline hint download is amortized. Each subsequent query costs only $\sim$10~KB of communication and $O(\sqrt{N})$ server work. The hint budget of several hundred queries per group is more than sufficient for typical wallet usage.
 
     \item \textbf{Maximum privacy} (e.g., the client cannot trust any two servers to not collude): \textbf{OnionPIR} is the only option. It requires a single server and provides computational privacy under standard lattice assumptions. The higher communication and computation costs are the price of eliminating the non-colluding assumption.
 \end{itemize}

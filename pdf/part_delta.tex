@@ -1,0 +1,56 @@
+\section{Incremental Sync via Delta Databases}
+\label{sec:delta-db}
+
+A light client that has already synchronized up to some height $h_A$ and then comes back later wants to learn which of its UTXOs have changed since $h_A$, not to re-download the entire snapshot. We support this with \emph{delta databases}: a new kind of PIR-queryable database that encodes only the differences between two consecutive checkpoints.
+
+\subsection{What a Delta Contains}
+
+Given two checkpoint heights $h_A < h_B$, the delta $\Delta_{A \to B}$ records, for each script hash $s$ whose set of spendable outputs changed in $(h_A, h_B]$:
+\begin{itemize}[nolistsep,leftmargin=*]
+    \item The set of \emph{spent} UTXOs belonging to $s$: references $(\text{TXID}, \mathsf{vout})$ to outputs that existed at $h_A$ and no longer exist at $h_B$. Amounts are not included because the client already learned them when it synced to $h_A$.
+    \item The set of \emph{new} UTXOs belonging to $s$: full records $(\text{TXID}, \mathsf{vout}, \mathsf{amount})$ for outputs that did not exist at $h_A$ and exist at $h_B$.
+\end{itemize}
+A script hash that saw no change simply does not appear in the delta; a query for such an address returns an empty result. A client that retrieves $\Delta_{A \to B}$ for all of its addresses can mechanically update its local UTXO set from state $h_A$ to state $h_B$: remove the spent entries, add the new ones.
+
+\subsection{Wire Format}
+
+The per-entry payload returned by a delta PIR query has the following layout, where $\text{varint}$ denotes an LEB128 unsigned varint:
+\begin{align*}
+&[\text{varint } n_\text{spent}]\\
+&\quad\bigl[\text{32B txid},\; \text{varint vout}\bigr] \times n_\text{spent} \\
+&[\text{varint } n_\text{new}]\\
+&\quad\bigl[\text{32B txid},\; \text{varint vout},\; \text{varint amount}\bigr] \times n_\text{new}.
+\end{align*}
+This is a straightforward extension of the full-database payload format from Section~\ref{sec:data}: a full-database entry is a list of $(\text{TXID}, \text{vout}, \text{amount})$ triples preceded by a count, and a delta entry is a pair of such lists, one for spent and one for new, where the spent list omits the amount field. Using LEB128 varints keeps the payload small for the common case where $n_\text{spent}$ and $n_\text{new}$ are both single digits.
+
+\subsection{Storage and PIR Layout}
+
+A delta database is, structurally, just another instance of the same two-level cuckoo layout used by the main UTXO database (Section~\ref{sec:data}): an INDEX table that maps script hashes to chunk locations and a CHUNK table that stores the actual delta payloads. The cuckoo parameters (number of PBC groups $K, K_\text{chunk}$; slots per bin; slot size) are identical to the main database, which means that every piece of build machinery, server code, and client code that already works on the main database works on a delta database with no protocol changes.
+
+Delta databases are typically much smaller than full snapshots: for a delta covering a few thousand blocks, the number of affected script hashes is on the order of a few million at most, versus tens of millions for the full set. Smaller tables mean smaller DPF domains (lower \texttt{dpf\_n}), which in turn means cheaper per-query server work and smaller Merkle sibling tables when Merkle data is built.
+
+\subsection{Build Pipeline}
+
+Delta construction is a diff of two UTXO snapshots:
+\begin{enumerate}[nolistsep,leftmargin=*]
+    \item \textbf{Compute the raw diff.} Walk the two snapshots and emit, per script hash, the sets of UTXOs present in exactly one of them. A UTXO present only at $h_A$ is spent; a UTXO present only at $h_B$ is new. The same dust filter used for full snapshots is applied to both sides (Section~\ref{sec:extension}).
+    \item \textbf{Pack delta records into chunks.} For each script hash, serialize its spent and new lists with the varint format above, and greedily pack the resulting records into fixed-size chunks using the same chunking code as the main database.
+    \item \textbf{Cuckoo-hash the INDEX and CHUNK tables.} Use the same \texttt{build\_cuckoo\_generic} pipeline as the main database.
+    \item \textbf{(Optional) Build per-group Merkle data.} Run \texttt{gen\_4\_build\_merkle\_bucket} on the delta tables to produce sibling files, tree tops, per-group roots, and a super-root, exactly as for the main database (Section~\ref{sec:merkle}).
+\end{enumerate}
+The result is a directory of files that the server can memory-map and register as a new database at any \texttt{db\_id} via its \texttt{databases.toml} configuration.
+
+\subsection{Serving Deltas}
+
+Because a delta is structurally the same shape as the main database, the server's DPF, HarmonyPIR, OnionPIR, and Merkle handlers all work on it unchanged. The only thing that varies is \emph{which} database the server should read from to answer a given request. This is controlled by the \texttt{db\_id} byte described in Section~\ref{sec:deployment-catalog}: a DPF batch query tagged with \texttt{db\_id=7}, for example, is routed to the seventh loaded database, which might be a specific delta. Merkle sibling and tree-top requests carry the same byte, so a verified delta query verifies against that delta's own per-bucket Merkle tree.
+
+\subsection{Incremental Sync Workflow}
+
+A complete incremental sync from local height $h_\text{last}$ to the server's tip $h_\text{tip}$ proceeds as follows:
+\begin{enumerate}[nolistsep,leftmargin=*]
+    \item The client fetches the database catalog (Section~\ref{sec:deployment-catalog}) and computes a sync plan.
+    \item For each step of the plan (either a full checkpoint or a delta), the client runs its standard batch PIR pipeline against the corresponding \texttt{db\_id}, retrieving results for all of its addresses.
+    \item For a delta step, the client applies the decoded spent/new sets to its local UTXO state; for a full step, it replaces its local state with the retrieved snapshot.
+    \item If per-group Merkle is available for that database, the client verifies the retrieved bins against the delta's own super-root (which the client in turn compares against whatever out-of-band anchor it trusts) before applying the updates.
+\end{enumerate}
+The end result is that a returning client does not need to re-download its entire UTXO view. In the common case where only a handful of new blocks have been added since the last sync, only a small delta's worth of PIR work is required.

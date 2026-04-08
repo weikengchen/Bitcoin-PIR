@@ -59,7 +59,7 @@ Each server maintains identical copies of the index and chunk databases, loaded 
 \draw[arrow, blue!60!black, dashed] ($(server2.north west)+(-0.3, 0.5)$) -- (xor);
 
 \end{tikzpicture}
-\caption{Two-server batch DPF-PIR architecture. The client generates $K$ DPF key pairs (one per PBC bucket) and sends the shares to each server. Each server computes $K$ XOR sums in parallel; the client combines responses to recover all queried entries.}
+\caption{Two-server batch DPF-PIR architecture. The client generates $K$ DPF key pairs (one per PBC group) and sends the shares to each server. Each server computes $K$ XOR sums in parallel; the client combines responses to recover all queried entries.}
 \label{fig:architecture}
 \end{figure}
 
@@ -71,20 +71,21 @@ The offline pipeline transforms raw Bitcoin blockchain data into two PIR-queryab
 \begin{enumerate}[nolistsep,leftmargin=*]
     \item \textbf{UTXO extraction:} Parse the UTXO snapshot (\texttt{dumptxoutset}) to extract ScriptPubKey hashes, full 32-byte TXIDs, vout indices, and amounts.
     \item \textbf{Chunk generation:} Group UTXOs by ScriptPubKey, serialize with VarInt encoding, and pack into fixed-size 40-byte blocks. Each block stores complete records including full TXIDs.
-    \item \textbf{Index construction:} Build an index mapping each ScriptPubKey hash to its chunk location and count. Each index entry is 13 bytes: an 8-byte fingerprint tag (derived from the script hash) + 4-byte chunk offset + 1-byte chunk count.
-    \item \textbf{Cuckoo hashing:} Organize both databases into cuckoo hash tables for PBC-compatible batch retrieval. The index database uses 2-hash cuckoo with bucket size 4 and the chunk database uses bucket size 3, both achieving $>$95\% load factor with zero stash.
+    \item \textbf{Index construction:} Build an index mapping each ScriptPubKey hash to its chunk location and count. Each index slot is 13 bytes: an 8-byte fingerprint tag (derived from the script hash) + 4-byte starting chunk id + 1-byte chunk count.
+    \item \textbf{Cuckoo hashing:} Organize both databases into cuckoo hash tables for PBC-compatible batch retrieval. Both use 2 cuckoo hash functions; the index database has 4 slots per bin and the chunk database has 3 slots per bin, both achieving $>$95\% load factor with zero stash.
+    \item \textbf{(Optional) Per-group Merkle:} Build per-group SHA-256 Merkle trees over the cuckoo bins, emit flat sibling tables (one file per level), a tree-top cache, and a super-root, enabling integrity verification through the same DPF primitive (Section~\ref{sec:merkle}).
     \item \textbf{Verification:} Validate that all entries are retrievable from the cuckoo tables.
 \end{enumerate}
 
-\textbf{Dual role of cuckoo hashing.} Cuckoo hashing serves two purposes in our system. First, it provides PIR-by-keyword: given a ScriptPubKey, the client computes candidate bucket indices to locate data without scanning. Second, it implements PBC for batch PIR: when querying $m$ entries, each query maps to 3 candidate buckets; the client places queries into $K$ total buckets via cuckoo insertion, and all $K$ DPF queries execute in parallel. The index level uses 2 cuckoo hash functions with bucket size 4, and the chunk level uses bucket size 3. Each DPF query returns one cuckoo bin: 4 slots $\times$ 13~bytes = 52~bytes for the index level, and 3 slots $\times$ 44~bytes = 132~bytes for the chunk level.
+\textbf{Dual role of cuckoo hashing.} Cuckoo hashing serves two purposes in our system. First, it provides PIR-by-keyword: given a ScriptPubKey, the client computes candidate bin indices to locate data without scanning. Second, it implements PBC for batch PIR: when querying $m$ entries, each query maps to $3$ candidate groups; the client places queries into $K$ total groups via cuckoo insertion, and all $K$ DPF queries execute in parallel. The index level uses 2 cuckoo hash functions with $4$ slots per bin, and the chunk level uses 2 cuckoo hash functions with $3$ slots per bin. Each DPF query returns one cuckoo bin: $4 \times 13 = 52$ bytes for the index level, and $3 \times 44 = 132$ bytes for the chunk level.
 
 \subsubsection{Query Protocol}
 
 A complete UTXO lookup requires two rounds of batch PIR:
 
-\textbf{Level 1: Index lookup.} The client computes RIPEMD-160 hashes of all queried ScriptPubKeys, derives 3 candidate buckets per query via cuckoo hash functions (\texttt{splitmix64}-based), and places them into $K{=}75$ PBC buckets. For each bucket, the client generates 2 DPF key pairs (one per cuckoo hash function in the 2-hash index cuckoo) and sends one share of each to each server. The servers expand all DPF keys and return XOR sums. The client combines responses to recover 13-byte index entries containing fingerprint tags, chunk offsets, and chunk counts. The client matches the recovered tag against the expected tag for its ScriptPubKey to identify the correct slot within the 4-slot cuckoo bin.
+\textbf{Level 1: Index lookup.} The client computes RIPEMD-160 hashes of all queried ScriptPubKeys, derives 3 candidate groups per query via cuckoo hash functions (\texttt{splitmix64}-based), and places them into $K{=}75$ PBC groups. For each group, the client generates 2 DPF key pairs (one per cuckoo hash function in the 2-hash index cuckoo) and sends one share of each to each server. The servers expand all DPF keys and return XOR sums. The client combines responses to recover 13-byte index slots containing fingerprint tags, starting chunk ids, and chunk counts. The client matches the recovered tag against the expected tag for its ScriptPubKey to identify the correct slot within the 4-slot cuckoo bin.
 
-\textbf{Level 2: Chunk retrieval.} Using the chunk locations from Level~1, the client repeats the process with $K_\text{chunk}{=}80$ PBC buckets over the chunk database. The chunk cuckoo uses 2 hash functions with bucket size 3, so the client generates 2 DPF key pairs per bucket. The recovered 132-byte results (3 slots $\times$ 44 bytes each) contain chunk identifiers and full UTXO records: 32-byte TXIDs, vout indices, and amounts in satoshis---everything needed to construct a spending transaction.
+\textbf{Level 2: Chunk retrieval.} Using the chunk locations from Level~1, the client repeats the process with $K_\text{chunk}{=}80$ PBC groups over the chunk database. The chunk cuckoo uses 2 hash functions with 3 slots per bin, so the client generates 2 DPF key pairs per group. The recovered 132-byte results (3 slots $\times$ 44 bytes each) contain chunk identifiers and full UTXO records: 32-byte TXIDs, vout indices, and amounts in satoshis---everything needed to construct a spending transaction.
 
 \subsubsection{Client Implementations}
 

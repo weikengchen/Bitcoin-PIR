@@ -19,19 +19,21 @@ A \emph{light client} knows its own private keys (and thus its addresses and Scr
 
 \subsection{Data Organization}
 
-\textbf{Sort and group.} The server sorts UTXOs by ScriptPubKey hash, then groups them into fixed-size chunks. Each chunk stores complete UTXO records including full 32-byte TXIDs, vout indices, and amounts. Multiple ScriptPubKeys may share a chunk via bin-packing.
+\textbf{Sort and group.} The server sorts UTXOs by ScriptPubKey hash, then packs them into fixed-size chunks. Each chunk stores complete UTXO records including full 32-byte TXIDs, vout indices, and amounts. Multiple ScriptPubKeys may share a chunk via bin-packing.
 
-\textbf{Index map.} Maps each ScriptPubKey (via its RIPEMD-160 hash) to the chunk location and data length. This is organized as a cuckoo hash table for $O(1)$ keyword-to-index lookup \cite{PR01}. Each index entry is 13 bytes: an 8-byte fingerprint tag (derived from the script hash, used for verification), a 4-byte chunk offset, and a 1-byte chunk count.
+\textbf{Index map.} Maps each ScriptPubKey (via its RIPEMD-160 hash) to the chunk location and data length. This is organized as a cuckoo hash table for $O(1)$ keyword-to-index lookup \cite{PR01}. Each index slot is 13 bytes: an 8-byte fingerprint tag (derived from the script hash, used to select the correct slot within a retrieved bin), a 4-byte starting chunk identifier, and a 1-byte chunk count.
 
 \textbf{Chunk map.} Stores the actual UTXO data in fixed-size 40-byte blocks. Full 32-byte TXIDs are stored directly in the chunks, eliminating a separate TXID resolution step. Each chunk slot is 44 bytes: a 4-byte chunk identifier followed by 40 bytes of UTXO data. The chunk map is also organized as a cuckoo hash table for PIR-compatible retrieval.
 
 \subsection{Cuckoo Hashing for Keyword Lookup}
 
-Cuckoo hashing \cite{PR01} is a hashing scheme that provides worst-case $O(1)$ lookup time. To store $n$ items, we maintain a table of $T$ slots organized into $\lceil T/s \rceil$ buckets of size $s$, with $h$ independent hash functions $H_1, \ldots, H_h$.
+Cuckoo hashing \cite{PR01} is a hashing scheme that provides worst-case $O(1)$ lookup time. To store $n$ items, we maintain a table of $T$ bins, each holding $s$ slots, with $h$ independent hash functions $H_1, \ldots, H_h$.
 
-Each item $x$ can reside in any of its $h$ candidate buckets $H_1(x), \ldots, H_h(x)$. To insert $x$: if any candidate bucket has a free slot, place $x$ there. Otherwise, evict a random existing item from one candidate bucket, insert $x$, and re-insert the evicted item recursively. With appropriate choices of $h$ and $s$ (e.g., $h{=}2, s{=}3$ or $h{=}3, s{=}2$), load factors above 95\% are achievable.
+Each item $x$ can reside in any of its $h$ candidate bins $H_1(x), \ldots, H_h(x)$. To insert $x$: if any candidate bin has a free slot, place $x$ there. Otherwise, evict a random existing item from one candidate bin, insert $x$, and re-insert the evicted item recursively. With appropriate choices of $h$ and $s$ (e.g., $h{=}2, s{=}3$ or $h{=}3, s{=}2$), load factors above 95\% are achievable.
 
-\textbf{PIR by keyword.} Cuckoo hashing enables PIR by keyword (as opposed to PIR by index). Given a keyword $w$, the client computes its $h$ candidate bucket indices and issues PIR queries for those buckets. Upon retrieving the bucket contents, the client checks which slot (if any) contains an entry matching $w$. This transforms the problem of searching an unordered key-value store into a constant number of PIR-by-index queries.
+\textbf{PIR by keyword.} Cuckoo hashing enables PIR by keyword (as opposed to PIR by index). Given a keyword $w$, the client computes its $h$ candidate bin indices and issues PIR queries for those bins. Upon retrieving the bin contents, the client checks which slot (if any) contains an entry matching $w$. This transforms the problem of searching an unordered key-value store into a constant number of PIR-by-index queries.
+
+We use two distinct terms throughout the rest of the paper to avoid collisions. A \emph{bin} is a location in one of these keyword-lookup cuckoo tables: a row of $s$ slots that a PIR query retrieves atomically. A \emph{group} refers to the outer sharding used by batch PIR (Section~\ref{sec:batching}): the database is partitioned into $K$ groups, one cuckoo table per group, and a batch of client queries is distributed across the $K$ groups so that each group answers at most one real query per round.
 
 \subsection{Reducing the UTXO Set}
 \label{sec:extension}
