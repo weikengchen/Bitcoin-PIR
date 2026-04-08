@@ -147,3 +147,9 @@ export {
   type SyncPlan,
   type SyncStep,
 } from './sync.js';
+
+export {
+  mergeDeltaIntoSnapshot,
+  applyDeltaData,
+  mergeDeltaBatch,
+} from './sync-merge.js';

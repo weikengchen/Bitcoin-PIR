@@ -310,13 +310,28 @@
             </div>
         </details>
 
-        <div id="dbSelectorRow" style="display: none; margin: 10px 0; padding: 8px 12px; background: #f0f8ff; border: 1px solid #bee5eb; border-radius: 6px;">
-            <label for="dbSelect" style="display: inline; font-size: 13px; color: #0c5460; margin-right: 8px;">Database:</label>
-            <select id="dbSelect" style="padding: 4px 8px; border: 1px solid #bee5eb; border-radius: 4px; font-size: 13px; background: white;">
-                <option value="0">Main UTXO (loading...)</option>
-            </select>
-            <span id="dbInfo" style="font-size: 12px; color: #888; margin-left: 10px;"></span>
+        <!-- Sync state row (visible when connected) -->
+        <div id="syncStateRow" style="display: none; margin: 10px 0; padding: 8px 12px; background: #fff8e1; border: 1px solid #ffd54f; border-radius: 6px; font-size: 13px;">
+            <span style="color: #6d5200;">Sync state:</span>
+            <span id="syncStateLabel" style="font-weight: bold; color: #6d5200; margin-left: 4px;">Not synced</span>
+            <button id="resetSyncBtn" class="small secondary" style="float: right; padding: 2px 8px; font-size: 11px;">Reset</button>
+            <div style="clear: both;"></div>
         </div>
+
+        <!-- Advanced (manual DB) — collapsed by default -->
+        <details id="advancedDbDetails" style="display: none; margin: 10px 0;">
+            <summary style="cursor: pointer; font-size: 13px; color: #888;">Advanced: query a specific database</summary>
+            <div id="dbSelectorRow" style="margin-top: 8px; padding: 8px 12px; background: #f0f8ff; border: 1px solid #bee5eb; border-radius: 6px;">
+                <label for="dbSelect" style="display: inline; font-size: 13px; color: #0c5460; margin-right: 8px;">Database:</label>
+                <select id="dbSelect" style="padding: 4px 8px; border: 1px solid #bee5eb; border-radius: 4px; font-size: 13px; background: white;">
+                    <option value="0">Main UTXO (loading...)</option>
+                </select>
+                <span id="dbInfo" style="font-size: 12px; color: #888; margin-left: 10px;"></span>
+                <div style="margin-top: 6px; font-size: 12px; color: #666;">
+                    Direct query against a single database. Bypasses the sync flow and does not update the sync state.
+                </div>
+            </div>
+        </details>
 
         <div class="step">
             <label for="scriptPubkeys">Bitcoin address(es) or scriptPubKey hex — one per line:</label>
@@ -367,7 +382,15 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                 </div>
             </details>
             <br>
-            <button id="queryBtn" style="width: 100%; font-size: 16px; padding: 12px;">Query UTXOs</button>
+            <button id="syncBtn" style="width: 100%; font-size: 16px; padding: 12px; background-color: #28a745; margin-bottom: 8px;" disabled>Sync to latest &amp; query</button>
+            <div id="syncPlanBox" style="display: none; margin: 8px 0; padding: 10px 14px; background: #e8f4fd; border: 1px solid #bee5eb; border-radius: 6px; font-size: 13px; color: #0c5460;">
+                <div id="syncPlanText" style="font-family: monospace;"></div>
+                <div style="margin-top: 8px;">
+                    <button id="syncConfirmBtn" class="small" style="background-color: #28a745;">Confirm sync</button>
+                    <button id="syncCancelBtn" class="small secondary" style="margin-left: 6px;">Cancel</button>
+                </div>
+            </div>
+            <button id="queryBtn" style="width: 100%; font-size: 16px; padding: 12px;">Query UTXOs (manual mode)</button>
         </div>
 
         <!-- Progress -->
@@ -593,7 +616,7 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
     </div>
 
     <script type="module">
-        import { BatchPirClient, OnionPirWebClient, HarmonyPirClient, hexToBytes, bytesToHex, scriptHash, scriptPubKeyToAddress, addressToScriptPubKey, decompileScript, decodeDeltaData } from './src/index.ts';
+        import { BatchPirClient, OnionPirWebClient, HarmonyPirClient, hexToBytes, bytesToHex, scriptHash, scriptPubKeyToAddress, addressToScriptPubKey, decompileScript, decodeDeltaData, computeSyncPlan, mergeDeltaIntoSnapshot } from './src/index.ts';
         import { fetchResidency } from './src/server-info.ts';
 
         /**
@@ -1003,6 +1026,7 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
 
                 await client.connect();
                 populateDbSelector();
+                refreshSyncStateUI();
             } catch (error) {
                 log(`Connection failed: ${error.message}`, 'error');
                 client = null;
@@ -1012,12 +1036,12 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
         function populateDbSelector() {
             const catalog = client?.getCatalog();
             const select = document.getElementById('dbSelect');
-            const row = document.getElementById('dbSelectorRow');
+            const advancedDetails = document.getElementById('advancedDbDetails');
             const infoSpan = document.getElementById('dbInfo');
             select.innerHTML = '';
 
             if (!catalog || catalog.databases.length <= 1) {
-                row.style.display = 'none';
+                advancedDetails.style.display = 'none';
                 return;
             }
 
@@ -1041,7 +1065,42 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                 }
             });
             select.dispatchEvent(new Event('change'));
+            advancedDetails.style.display = 'block';
+        }
+
+        // ─── Sync state (per server-pair, persisted in localStorage) ─────
+        function syncStateKey() {
+            const s0 = (document.getElementById('server0Url').value || '').trim();
+            const s1 = (document.getElementById('server1Url').value || '').trim();
+            return `bitcoinpir.dpf.lastSync:${s0}|${s1}`;
+        }
+        function loadLastSyncedHeight() {
+            try {
+                const raw = localStorage.getItem(syncStateKey());
+                if (!raw) return 0;
+                const n = parseInt(raw, 10);
+                return Number.isFinite(n) && n > 0 ? n : 0;
+            } catch { return 0; }
+        }
+        function saveLastSyncedHeight(h) {
+            try { localStorage.setItem(syncStateKey(), String(h)); } catch {}
+        }
+        function clearLastSyncedHeight() {
+            try { localStorage.removeItem(syncStateKey()); } catch {}
+        }
+        function refreshSyncStateUI() {
+            const row = document.getElementById('syncStateRow');
+            const label = document.getElementById('syncStateLabel');
+            const syncBtn = document.getElementById('syncBtn');
+            if (!client || !client.isConnected()) {
+                row.style.display = 'none';
+                if (syncBtn) syncBtn.disabled = true;
+                return;
+            }
             row.style.display = 'block';
+            const h = loadLastSyncedHeight();
+            label.textContent = h > 0 ? `synced to height ${h.toLocaleString()}` : 'not yet synced';
+            if (syncBtn) syncBtn.disabled = false;
         }
 
         function disconnect() {
@@ -1052,7 +1111,10 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                 setButtons(false);
             }
             document.getElementById('resultsContainer').innerHTML = '';
-            document.getElementById('dbSelectorRow').style.display = 'none';
+            document.getElementById('advancedDbDetails').style.display = 'none';
+            document.getElementById('syncStateRow').style.display = 'none';
+            document.getElementById('syncPlanBox').style.display = 'none';
+            document.getElementById('syncBtn').disabled = true;
         }
 
         async function queryUtxos() {
@@ -1188,6 +1250,214 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
             document.getElementById('queryBtn').disabled = false;
         }
 
+        // ════════════════════════════════════════════════════════════════════
+        // Sync flow: computeSyncPlan + sequential execution + delta merging
+        // ════════════════════════════════════════════════════════════════════
+
+        // Pending plan staged for confirmation. Captured here so the Confirm
+        // handler can re-use the same scriptHashes/lines that the user typed
+        // when they clicked "Sync to latest".
+        let pendingSync = null;
+
+        function describeStep(s) {
+            if (s.dbType === 'full') {
+                return `[full ${s.name} @ ${s.tipHeight.toLocaleString()}]`;
+            }
+            return `[delta ${s.name}: ${s.baseHeight.toLocaleString()} \u2192 ${s.tipHeight.toLocaleString()}]`;
+        }
+
+        async function planSync() {
+            if (!client || !client.isConnected()) {
+                log('Not connected. Connecting first...', 'info');
+                await connect();
+                if (!client) return;
+            }
+
+            // Parse the address textarea once and stash the lines + scriptHashes.
+            const textarea = document.getElementById('scriptPubkeys');
+            const rawLines = textarea.value.trim().split('\n')
+                .map(l => l.trim())
+                .filter(l => l.length > 0);
+            if (rawLines.length === 0) {
+                log('Please enter at least one address or scriptPubKey', 'error');
+                return;
+            }
+
+            const lines = [];
+            for (const raw of rawLines) {
+                if (/^[0-9a-fA-F]+$/.test(raw) && raw.length % 2 === 0) {
+                    lines.push(raw.toLowerCase());
+                } else {
+                    const spk = addressToScriptPubKey(raw);
+                    if (spk) {
+                        lines.push(spk);
+                    } else {
+                        log(`Unrecognized input: ${raw}`, 'error');
+                    }
+                }
+            }
+            if (lines.length === 0) {
+                log('No valid inputs found', 'error');
+                return;
+            }
+
+            const catalog = client.getCatalog();
+            if (!catalog || catalog.databases.length === 0) {
+                log('No catalog available', 'error');
+                return;
+            }
+
+            const lastSynced = loadLastSyncedHeight();
+            let plan;
+            try {
+                plan = computeSyncPlan(catalog, lastSynced || undefined);
+            } catch (e) {
+                log(`Sync plan failed: ${e.message}`, 'error');
+                return;
+            }
+
+            const planBox = document.getElementById('syncPlanBox');
+            const planText = document.getElementById('syncPlanText');
+
+            if (plan.steps.length === 0) {
+                planText.textContent = `Already at tip (height ${plan.targetHeight.toLocaleString()}). Nothing to do.`;
+                planBox.style.display = 'block';
+                document.getElementById('syncConfirmBtn').style.display = 'none';
+                document.getElementById('syncCancelBtn').textContent = 'Close';
+                pendingSync = null;
+                log(`Sync: already at height ${plan.targetHeight}`, 'info');
+                return;
+            }
+
+            const pretty = plan.steps.map(describeStep).join('  then  ');
+            const fromTxt = lastSynced ? `from height ${lastSynced.toLocaleString()}` : 'from scratch';
+            planText.innerHTML =
+                `<div>Sync plan ${fromTxt} \u2192 ${plan.targetHeight.toLocaleString()}` +
+                `${plan.isFreshSync ? ' (fresh sync)' : ''}:</div>` +
+                `<div style="margin-top: 4px;">${pretty}</div>`;
+            planBox.style.display = 'block';
+            document.getElementById('syncConfirmBtn').style.display = '';
+            document.getElementById('syncCancelBtn').textContent = 'Cancel';
+
+            pendingSync = { plan, lines, scriptHashes: lines.map(spkHex => scriptHash(hexToBytes(spkHex))) };
+            log(`Sync plan staged: ${plan.steps.length} step(s) to height ${plan.targetHeight}`, 'info');
+        }
+
+        function cancelSync() {
+            pendingSync = null;
+            document.getElementById('syncPlanBox').style.display = 'none';
+        }
+
+        async function executeSync() {
+            if (!pendingSync || !client || !client.isConnected()) return;
+            const { plan, lines, scriptHashes } = pendingSync;
+            const N = scriptHashes.length;
+
+            document.getElementById('syncBtn').disabled = true;
+            document.getElementById('queryBtn').disabled = true;
+            document.getElementById('syncConfirmBtn').disabled = true;
+            document.getElementById('syncCancelBtn').disabled = true;
+            document.getElementById('resetSyncBtn').disabled = true;
+
+            const resultsContainer = document.getElementById('resultsContainer');
+            resultsContainer.innerHTML = '';
+
+            // Per-scripthash merged result starts as null and is replaced/updated
+            // by each step. Steps run sequentially because deltas depend on the
+            // previous step's snapshot.
+            let merged = new Array(N).fill(null);
+            let lastFullStepResults = null; // for Merkle button (if applicable)
+
+            try {
+                for (let si = 0; si < plan.steps.length; si++) {
+                    const step = plan.steps[si];
+                    const stepLabel = `Step ${si + 1}/${plan.steps.length}: ${describeStep(step)}`;
+                    log(stepLabel, 'info');
+                    setProgress(5, stepLabel);
+
+                    const stepResults = step.dbType === 'full'
+                        ? await client.queryBatch(scriptHashes, (s, d) => {
+                            let pct = 5;
+                            if (s === 'Level 1') pct = 15;
+                            else if (s === 'Level 2') pct = 50;
+                            else if (s === 'Decode') pct = 90;
+                            setProgress(pct, `${stepLabel} \u2014 ${s}: ${d}`);
+                        }, step.dbId)
+                        : await client.queryDelta(scriptHashes, step.dbId, (s, d) => {
+                            let pct = 5;
+                            if (s === 'Level 1') pct = 15;
+                            else if (s === 'Level 2') pct = 50;
+                            else if (s === 'Decode') pct = 90;
+                            setProgress(pct, `${stepLabel} \u2014 ${s}: ${d}`);
+                        });
+
+                    if (step.dbType === 'full') {
+                        // Replace merged state entirely with the snapshot.
+                        merged = stepResults.slice();
+                        lastFullStepResults = stepResults;
+                    } else {
+                        // Apply delta on top of each per-query merged snapshot.
+                        for (let qi = 0; qi < N; qi++) {
+                            merged[qi] = mergeDeltaIntoSnapshot(merged[qi], stepResults[qi], (msg) => log(msg, 'error'));
+                        }
+                    }
+                }
+
+                // Render merged results.
+                let found = 0;
+                for (let qi = 0; qi < N; qi++) {
+                    const spkHex = lines[qi];
+                    const hashHex = bytesToHex(scriptHashes[qi]);
+                    const r = merged[qi];
+                    if (r) found++;
+                    renderResult(resultsContainer, spkHex, hashHex, r);
+                }
+
+                // Update sync state on success.
+                saveLastSyncedHeight(plan.targetHeight);
+                refreshSyncStateUI();
+
+                // Optional: offer Merkle verification on the last full snapshot.
+                if (lastFullStepResults && client.hasMerkle()) {
+                    const verifiable = lastFullStepResults.filter(r => r && !r.isWhale && r.indexPbcGroup !== undefined);
+                    if (verifiable.length > 0) {
+                        const note = document.createElement('div');
+                        note.style.cssText = 'margin: 12px 0; font-size: 12px; color: #666;';
+                        note.textContent = 'Merkle verification below applies to the most recent full snapshot only (deltas are not yet Merkle-verified end-to-end).';
+                        resultsContainer.appendChild(note);
+                        addBatchMerkleButton(resultsContainer, verifiable, 'dpf-sync',
+                            (results, onProg) => client.verifyMerkleBatch(results, onProg),
+                            () => client.getMerkleRootHex());
+                    }
+                }
+
+                setProgress(100, `Sync complete! ${found}/${N} found at height ${plan.targetHeight.toLocaleString()}`);
+                setTimeout(hideProgress, 2000);
+                log(`Sync complete: ${found}/${N} found at height ${plan.targetHeight}`, 'success');
+                document.getElementById('syncPlanBox').style.display = 'none';
+                pendingSync = null;
+            } catch (error) {
+                log(`Sync error: ${error.message || error}`, 'error');
+                setProgress(0, '');
+                hideProgress();
+                // Do NOT update lastSyncedHeight on failure.
+            } finally {
+                document.getElementById('syncBtn').disabled = !client || !client.isConnected();
+                document.getElementById('queryBtn').disabled = false;
+                document.getElementById('syncConfirmBtn').disabled = false;
+                document.getElementById('syncCancelBtn').disabled = false;
+                document.getElementById('resetSyncBtn').disabled = false;
+            }
+        }
+
+        function resetSyncState() {
+            clearLastSyncedHeight();
+            refreshSyncStateUI();
+            document.getElementById('syncPlanBox').style.display = 'none';
+            pendingSync = null;
+            log('Sync state reset', 'info');
+        }
+
         // ─── Example buttons ─────────────────────────────────────────────
         document.querySelectorAll('.example-btn[data-spk]').forEach(btn => {
             btn.addEventListener('click', () => {
@@ -1227,8 +1497,14 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
         document.getElementById('connectBtn').addEventListener('click', connect);
         document.getElementById('disconnectBtn').addEventListener('click', disconnect);
         document.getElementById('queryBtn').addEventListener('click', queryUtxos);
+        document.getElementById('syncBtn').addEventListener('click', planSync);
+        document.getElementById('syncConfirmBtn').addEventListener('click', executeSync);
+        document.getElementById('syncCancelBtn').addEventListener('click', cancelSync);
+        document.getElementById('resetSyncBtn').addEventListener('click', resetSyncState);
 
         setButtons(false);
+        // Initialize sync UI in disconnected state.
+        document.getElementById('syncBtn').disabled = true;
 
         // ═══════════════════════════════════════════════════════════════
         // Tab switching
