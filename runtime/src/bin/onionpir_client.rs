@@ -623,6 +623,7 @@ async fn main() {
     let reg_msg = RegisterKeysMsg {
         galois_keys: galois,
         gsw_keys: gsw,
+        db_id: 0,
     };
     sink.send(Message::Binary(reg_msg.encode().into())).await.expect("send keys");
     let ack = recv_binary(&mut stream, &mut sink).await;
@@ -686,7 +687,7 @@ async fn main() {
             }
         }
 
-        let batch = OnionPirBatchQuery { round_id: total_index_rounds, queries };
+        let batch = OnionPirBatchQuery { round_id: total_index_rounds, queries, db_id: 0 };
         sink.send(Message::Binary(batch.encode(REQ_ONIONPIR_INDEX_QUERY).into())).await.expect("send");
         total_index_rounds += 1;
 
@@ -830,7 +831,7 @@ async fn main() {
             queries.push(chunk_client.generate_query(idx));
         }
 
-        let batch = OnionPirBatchQuery { round_id: ri as u16, queries };
+        let batch = OnionPirBatchQuery { round_id: ri as u16, queries, db_id: 0 };
         sink.send(Message::Binary(batch.encode(REQ_ONIONPIR_CHUNK_QUERY).into())).await.expect("send");
 
         let resp_bytes = recv_binary(&mut stream, &mut sink).await;
@@ -1065,7 +1066,7 @@ async fn main() {
                         sib_queries.push(sib_client.generate_query(bin));
                     }
 
-                    let batch = OnionPirBatchQuery { round_id: (level * 100 + ri) as u16, queries: sib_queries };
+                    let batch = OnionPirBatchQuery { round_id: (level * 100 + ri) as u16, queries: sib_queries, db_id: 0 };
                     sink.send(Message::Binary(batch.encode(*req_sib).into())).await.expect("send");
 
                     let resp_bytes = recv_binary(&mut stream, &mut sink).await;

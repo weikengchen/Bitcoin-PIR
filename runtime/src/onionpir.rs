@@ -200,14 +200,22 @@ impl GroupServers {
 // ─── Wire protocol encoding/decoding ────────────────────────────────────────
 
 /// Key registration request from client.
+///
+/// Wire format:
+///   [4B galois_len][galois_keys][4B gsw_len][gsw_keys]
+///   Optional trailing [1B db_id] — only present when db_id != 0 (backward compat).
 pub struct RegisterKeysMsg {
     pub galois_keys: Vec<u8>,
     pub gsw_keys: Vec<u8>,
+    /// Database ID to register keys against (0 = main DB; 1+ = delta DBs).
+    /// Defaults to 0 for backward compatibility.
+    pub db_id: u8,
 }
 
 impl RegisterKeysMsg {
     pub fn encode(&self) -> Vec<u8> {
-        let payload_len = 1 + 4 + self.galois_keys.len() + 4 + self.gsw_keys.len();
+        let trailing = if self.db_id != 0 { 1 } else { 0 };
+        let payload_len = 1 + 4 + self.galois_keys.len() + 4 + self.gsw_keys.len() + trailing;
         let mut buf = Vec::with_capacity(4 + payload_len);
         buf.extend_from_slice(&(payload_len as u32).to_le_bytes());
         buf.push(REQ_REGISTER_KEYS);
@@ -215,6 +223,10 @@ impl RegisterKeysMsg {
         buf.extend_from_slice(&self.galois_keys);
         buf.extend_from_slice(&(self.gsw_keys.len() as u32).to_le_bytes());
         buf.extend_from_slice(&self.gsw_keys);
+        // Trailing db_id byte: only appended when non-zero for backward compatibility.
+        if self.db_id != 0 {
+            buf.push(self.db_id);
+        }
         buf
     }
 
@@ -237,7 +249,10 @@ impl RegisterKeysMsg {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "truncated gsw keys"));
         }
         let gsw_keys = data[pos..pos + gsw_len].to_vec();
-        Ok(RegisterKeysMsg { galois_keys, gsw_keys })
+        pos += gsw_len;
+        // Read trailing db_id if present (backward compatible: old clients don't send it).
+        let db_id = if pos < data.len() { data[pos] } else { 0 };
+        Ok(RegisterKeysMsg { galois_keys, gsw_keys, db_id })
     }
 }
 
@@ -248,9 +263,13 @@ impl RegisterKeysMsg {
 ///   For each group:
 ///     [4B query_len][query_data...]
 ///   (zero-length query_len means "skip this group / dummy")
+///   Optional trailing [1B db_id] — only present when db_id != 0 (backward compat).
 pub struct OnionPirBatchQuery {
     pub round_id: u16,
     pub queries: Vec<Vec<u8>>,
+    /// Database ID to query (0 = main DB; 1+ = delta DBs).
+    /// Defaults to 0 for backward compatibility.
+    pub db_id: u8,
 }
 
 impl OnionPirBatchQuery {
@@ -262,6 +281,10 @@ impl OnionPirBatchQuery {
         for q in &self.queries {
             payload.extend_from_slice(&(q.len() as u32).to_le_bytes());
             payload.extend_from_slice(q);
+        }
+        // Trailing db_id byte: only appended when non-zero for backward compatibility.
+        if self.db_id != 0 {
+            payload.push(self.db_id);
         }
         let mut msg = Vec::with_capacity(4 + payload.len());
         msg.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -292,7 +315,9 @@ impl OnionPirBatchQuery {
             queries.push(data[pos..pos + len].to_vec());
             pos += len;
         }
-        Ok(OnionPirBatchQuery { round_id, queries })
+        // Read trailing db_id if present (backward compatible: old clients don't send it).
+        let db_id = if pos < data.len() { data[pos] } else { 0 };
+        Ok(OnionPirBatchQuery { round_id, queries, db_id })
     }
 }
 

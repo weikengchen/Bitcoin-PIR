@@ -206,8 +206,10 @@ function planPbcRounds(
 
 // ─── Wire protocol helpers ────────────────────────────────────────────────
 
-function encodeRegisterKeys(galoisKeys: Uint8Array, gswKeys: Uint8Array): Uint8Array {
-  const payloadLen = 1 + 4 + galoisKeys.length + 4 + gswKeys.length;
+function encodeRegisterKeys(galoisKeys: Uint8Array, gswKeys: Uint8Array, dbId: number = 0): Uint8Array {
+  // Trailing db_id byte: only appended when non-zero for backward compatibility.
+  const trailing = dbId !== 0 ? 1 : 0;
+  const payloadLen = 1 + 4 + galoisKeys.length + 4 + gswKeys.length + trailing;
   const msg = new Uint8Array(4 + payloadLen);
   const dv = new DataView(msg.buffer);
   dv.setUint32(0, payloadLen, true);
@@ -216,13 +218,18 @@ function encodeRegisterKeys(galoisKeys: Uint8Array, gswKeys: Uint8Array): Uint8A
   dv.setUint32(pos, galoisKeys.length, true); pos += 4;
   msg.set(galoisKeys, pos); pos += galoisKeys.length;
   dv.setUint32(pos, gswKeys.length, true); pos += 4;
-  msg.set(gswKeys, pos);
+  msg.set(gswKeys, pos); pos += gswKeys.length;
+  if (dbId !== 0) {
+    msg[pos] = dbId & 0xFF;
+  }
   return msg;
 }
 
-function encodeBatchQuery(variant: number, roundId: number, queries: Uint8Array[]): Uint8Array {
+function encodeBatchQuery(variant: number, roundId: number, queries: Uint8Array[], dbId: number = 0): Uint8Array {
   let payloadSize = 1 + 2 + 1; // variant + round_id + num_groups
   for (const q of queries) payloadSize += 4 + q.length;
+  // Trailing db_id byte: only appended when non-zero for backward compatibility.
+  if (dbId !== 0) payloadSize += 1;
   const msg = new Uint8Array(4 + payloadSize);
   const dv = new DataView(msg.buffer);
   dv.setUint32(0, payloadSize, true);
@@ -233,6 +240,9 @@ function encodeBatchQuery(variant: number, roundId: number, queries: Uint8Array[
   for (const q of queries) {
     dv.setUint32(pos, q.length, true); pos += 4;
     msg.set(q, pos); pos += q.length;
+  }
+  if (dbId !== 0) {
+    msg[pos] = dbId & 0xFF;
   }
   return msg;
 }
@@ -280,9 +290,15 @@ export class OnionPirWebClient {
   // WASM module
   private wasmModule: OnionPirModule | null = null;
 
-  // FHE key state (saved after queryBatch for Merkle reuse)
+  // FHE key state (saved after queryBatch for Merkle reuse).
+  // Always reflects the most recent queryBatch call (Merkle verifies that batch).
   private fheClientId = 0;
   private fheSecretKey: Uint8Array | null = null;
+
+  // Per-DB FHE registration state. Each entry is the dbId for which we have
+  // already registered keys with the server (so we can skip re-registering).
+  // Maps dbId → true once registered.
+  private registeredDbs: Set<number> = new Set();
 
   constructor(config: OnionPirClientConfig) {
     this.config = config;
@@ -338,6 +354,9 @@ export class OnionPirWebClient {
   disconnect(): void {
     this.ws?.disconnect();
     this.ws = null;
+    // Reset per-connection FHE registration state — keys live only for the
+    // server connection, so a new connection requires re-registration.
+    this.registeredDbs.clear();
     this.setState('disconnected', 'Disconnected');
   }
 
@@ -395,13 +414,27 @@ export class OnionPirWebClient {
   async queryBatch(
     scriptHashes: Uint8Array[],
     onProgress?: (step: string, detail: string) => void,
+    dbId: number = 0,
   ): Promise<(QueryResult | null)[]> {
     if (!this.isConnected()) throw new Error('Not connected');
     if (!this.wasmModule) throw new Error('WASM not loaded');
 
     const N = scriptHashes.length;
     const progress = onProgress || (() => {});
-    this.log(`=== Batch query: ${N} script hashes ===`);
+    this.log(`=== Batch query: ${N} script hashes (dbId=${dbId}) ===`);
+
+    // NOTE: For dbId != 0 (delta DBs) the BFV parameters can differ because
+    // each DB may have a different `bins_per_table`. For now, the JSON server
+    // info only exposes the main DB's OnionPIR params. Querying a different
+    // DB is plumbed end-to-end through the wire format, but the caller is
+    // responsible for ensuring the params match — typically by configuring
+    // a separate client instance per DB. The current implementation reuses
+    // `this.indexBins` / `this.chunkBins`, so it only works correctly for
+    // a DB whose OnionPIR params match the JSON-advertised ones. The Rust
+    // server will route the query to the correct worker via db_id regardless.
+    if (dbId !== 0) {
+      this.log(`Note: dbId=${dbId} OnionPIR query — using main-DB params for BFV (server routes by db_id)`, 'info');
+    }
 
     // ── Generate keys and create per-level clients ─────────────────────
     // Generate keys with a real num_entries (not 0) — keys generated with
@@ -423,13 +456,21 @@ export class OnionPirWebClient {
     let chunkClient: WasmPirClient | null = null;
 
     try {
-      // ── Register keys once (shared across all levels) ────────────
-      progress('Setup', 'Registering keys...');
-
-      const regMsg = encodeRegisterKeys(galoisKeys, gswKeys);
-      const ack = await this.sendRaw(regMsg);
-      if (ack[4] !== RESP_KEYS_ACK) throw new Error('Key registration failed');
-      this.log('Keys registered (single registration, shared secret key)');
+      // ── Register keys once per (connection, dbId) ───────────────────
+      // Per-DB key registration: each DB has its own OnionPIR worker with
+      // its own KeyStore, so keys must be registered separately per dbId.
+      // We only register a fresh set if we haven't already done so for this
+      // dbId during the current connection.
+      if (!this.registeredDbs.has(dbId)) {
+        progress('Setup', `Registering keys (dbId=${dbId})...`);
+        const regMsg = encodeRegisterKeys(galoisKeys, gswKeys, dbId);
+        const ack = await this.sendRaw(regMsg);
+        if (ack[4] !== RESP_KEYS_ACK) throw new Error('Key registration failed');
+        this.registeredDbs.add(dbId);
+        this.log(`Keys registered for dbId=${dbId}`);
+      } else {
+        this.log(`Keys already registered for dbId=${dbId} (reusing)`);
+      }
 
       // ════════════════════════════════════════════════════════════════
       // LEVEL 1: Index PIR
@@ -496,7 +537,7 @@ export class OnionPirWebClient {
         }
 
         progress('Level 1', `Round ${roundNum}/${totalRounds}: querying server (${queries.length} FHE queries)...`);
-        const batchMsg = encodeBatchQuery(REQ_ONIONPIR_INDEX_QUERY, totalIndexRounds, queries);
+        const batchMsg = encodeBatchQuery(REQ_ONIONPIR_INDEX_QUERY, totalIndexRounds, queries, dbId);
         const respRaw = await this.sendRaw(batchMsg);
         totalIndexRounds++;
 
@@ -633,7 +674,7 @@ export class OnionPirWebClient {
           }
 
           progress('Level 2', `Chunk round ${ri + 1}/${chunkRounds.length}: querying server...`);
-          const batchMsg = encodeBatchQuery(REQ_ONIONPIR_CHUNK_QUERY, ri, queries);
+          const batchMsg = encodeBatchQuery(REQ_ONIONPIR_CHUNK_QUERY, ri, queries, dbId);
           const respRaw = await this.sendRaw(batchMsg);
 
           const respPayload = respRaw.slice(4);
