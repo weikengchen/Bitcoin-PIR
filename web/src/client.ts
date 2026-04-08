@@ -680,9 +680,20 @@ export class BatchPirClient {
     return !!(this.serverInfo?.merkle_bucket && this.serverInfo.merkle_bucket.index_levels.length > 0);
   }
 
+  /** Check if a specific database supports per-bucket Merkle verification. */
+  hasMerkleForDb(dbId: number): boolean {
+    const info = this.getMerkleInfoForDb(dbId);
+    return !!(info && info.index_levels.length > 0);
+  }
+
   /** Get the Merkle root hash hex (for display) */
   getMerkleRootHex(): string | undefined {
     return this.serverInfo?.merkle_bucket?.super_root ?? this.serverInfo?.merkle?.root;
+  }
+
+  /** Get the Merkle super-root hash hex for a specific database. */
+  getMerkleRootHexForDb(dbId: number): string | undefined {
+    return this.getMerkleInfoForDb(dbId)?.super_root;
   }
 
   /**

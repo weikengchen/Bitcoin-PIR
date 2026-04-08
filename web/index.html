@@ -960,11 +960,14 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
 
         // ─── Shared batch Merkle verification button ──────────────────────
         // verifyBatchFn: (results[], onProgress) → Promise<boolean[]>  (single batch call)
-        function addBatchMerkleButton(container, verifiableResults, prefix, verifyBatchFn, getRootHex) {
+        function addBatchMerkleButton(container, verifiableResults, prefix, verifyBatchFn, getRootHex, label) {
             const bar = document.createElement('div');
             bar.style.cssText = 'margin: 15px 0; padding: 12px 16px; background: #f0faf0; border: 1px solid #c3e6cb; border-radius: 8px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;';
+            const btnLabel = label
+                ? `&#128274; Verify Merkle Proofs \u2014 ${label} (${verifiableResults.length})`
+                : `&#128274; Verify All Merkle Proofs (${verifiableResults.length})`;
             bar.innerHTML = `
-                <button class="batch-merkle-btn" style="background-color: #28a745; white-space: nowrap;">&#128274; Verify All Merkle Proofs (${verifiableResults.length})</button>
+                <button class="batch-merkle-btn" style="background-color: #28a745; white-space: nowrap;">${btnLabel}</button>
                 <span class="batch-merkle-status" style="font-size: 13px; color: #666;"></span>
             `;
             container.insertBefore(bar, container.firstChild);
@@ -1390,7 +1393,11 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
             // full snapshot from the same session. Full steps overwrite the
             // seeded value; delta steps merge into it.
             let merged = scriptHashes.map(sh => syncSnapshotByHash.get(bytesToHex(sh)) || null);
-            let lastFullStepResults = null; // for Merkle button (if applicable)
+            // One entry per sync step that has Merkle support, in order.
+            // Each entry owns the raw per-query results from that step (not the
+            // merged view), because per-bucket Merkle verifies the bin content
+            // of the specific DB the step was run against.
+            const merkleSteps = [];
 
             try {
                 for (let si = 0; si < plan.steps.length; si++) {
@@ -1418,11 +1425,19 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                     if (step.dbType === 'full') {
                         // Replace merged state entirely with the snapshot.
                         merged = stepResults.slice();
-                        lastFullStepResults = stepResults;
                     } else {
                         // Apply delta on top of each per-query merged snapshot.
                         for (let qi = 0; qi < N; qi++) {
                             merged[qi] = mergeDeltaIntoSnapshot(merged[qi], stepResults[qi], (msg) => log(msg, 'error'));
+                        }
+                    }
+
+                    // Track this step for Merkle verification if the target DB
+                    // has per-bucket Merkle available.
+                    if (client.hasMerkleForDb(step.dbId)) {
+                        const verifiable = stepResults.filter(r => r && !r.isWhale && r.indexPbcGroup !== undefined);
+                        if (verifiable.length > 0) {
+                            merkleSteps.push({ step, verifiable });
                         }
                     }
                 }
@@ -1444,17 +1459,28 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                 saveLastSyncedHeight(plan.targetHeight);
                 refreshSyncStateUI();
 
-                // Optional: offer Merkle verification on the last full snapshot.
-                if (lastFullStepResults && client.hasMerkle()) {
-                    const verifiable = lastFullStepResults.filter(r => r && !r.isWhale && r.indexPbcGroup !== undefined);
-                    if (verifiable.length > 0) {
-                        const note = document.createElement('div');
-                        note.style.cssText = 'margin: 12px 0; font-size: 12px; color: #666;';
-                        note.textContent = 'Merkle verification below applies to the most recent full snapshot only (deltas are not yet Merkle-verified end-to-end).';
-                        resultsContainer.appendChild(note);
-                        addBatchMerkleButton(resultsContainer, verifiable, 'dpf-sync',
-                            (results, onProg) => client.verifyMerkleBatch(results, onProg),
-                            () => client.getMerkleRootHex());
+                // Offer Merkle verification for each step whose target DB
+                // has per-bucket Merkle available. Steps are rendered in plan
+                // order so the full snapshot button appears above any deltas.
+                if (merkleSteps.length > 0) {
+                    const note = document.createElement('div');
+                    note.style.cssText = 'margin: 12px 0; font-size: 12px; color: #666;';
+                    note.textContent = merkleSteps.length === 1
+                        ? `Merkle verification below applies to the ${merkleSteps[0].step.dbType} step of this sync.`
+                        : `Merkle verification below runs one proof batch per sync step (${merkleSteps.length} steps).`;
+                    resultsContainer.appendChild(note);
+                    // Insert in reverse order so they end up in plan order
+                    // (addBatchMerkleButton inserts before container.firstChild).
+                    for (let i = merkleSteps.length - 1; i >= 0; i--) {
+                        const { step, verifiable } = merkleSteps[i];
+                        const prefix = `dpf-sync-${step.dbType}-${step.dbId}`;
+                        const label = step.dbType === 'full'
+                            ? `full snapshot (db ${step.dbId}, height ${step.tipHeight.toLocaleString()})`
+                            : `delta (db ${step.dbId}, ${step.baseHeight.toLocaleString()} \u2192 ${step.tipHeight.toLocaleString()})`;
+                        addBatchMerkleButton(resultsContainer, verifiable, prefix,
+                            (results, onProg) => client.verifyMerkleBatch(results, onProg, step.dbId),
+                            () => client.getMerkleRootHexForDb(step.dbId),
+                            label);
                     }
                 }
 
