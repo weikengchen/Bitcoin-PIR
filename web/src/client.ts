@@ -30,7 +30,7 @@ import { cuckooPlace, planRounds } from './pbc.js';
 import { readVarint, decodeUtxoData, DummyRng } from './codec.js';
 import { findEntryInIndexResult, findChunkInResult } from './scan.js';
 import { ManagedWebSocket } from './ws.js';
-import { fetchServerInfoJson, fetchDatabaseCatalog, type ServerInfoJson, type DatabaseCatalog, type DatabaseCatalogEntry } from './server-info.js';
+import { fetchServerInfoJson, fetchDatabaseCatalog, type ServerInfoJson, type DatabaseCatalog, type DatabaseCatalogEntry, type BucketMerkleInfoJson } from './server-info.js';
 import { verifyBucketMerkleBatchDpf, type BucketMerkleItem } from './merkle-verify-bucket.js';
 
 // ─── Types ─────────────────────────────────────────────────────────────────
@@ -688,14 +688,19 @@ export class BatchPirClient {
   /**
    * Batch-verify per-bucket bin Merkle proofs for multiple query results.
    * Uses DPF sibling queries against flat per-group sibling tables.
+   *
+   * @param dbId - Database ID to verify against (0=main, 1+=delta). Defaults to 0.
    */
   async verifyMerkleBatch(
     results: QueryResult[],
     onProgress?: (step: string, detail: string) => void,
+    dbId: number = 0,
   ): Promise<boolean[]> {
     if (!this.isConnected()) throw new Error('Not connected');
-    const merkle = this.serverInfo?.merkle_bucket;
-    if (!merkle) throw new Error('Server does not support bucket Merkle');
+
+    // Resolve Merkle info for the target database
+    const merkle = this.getMerkleInfoForDb(dbId);
+    if (!merkle) throw new Error(`Database ${dbId} does not support bucket Merkle`);
 
     // Build BucketMerkleItem[] from verifiable results
     const items: BucketMerkleItem[] = [];
@@ -719,6 +724,7 @@ export class BatchPirClient {
     const batchResults = await verifyBucketMerkleBatchDpf(
       this.ws0!, this.ws1!, merkle, items, onProgress,
       (msg) => this.log(msg),
+      dbId,
     );
 
     const out: boolean[] = new Array(results.length).fill(false);
@@ -728,6 +734,17 @@ export class BatchPirClient {
       results[ri].merkleVerified = batchResults[j];
     }
     return out;
+  }
+
+  /** Get BucketMerkleInfoJson for a given database, checking per-DB info first. */
+  private getMerkleInfoForDb(dbId: number): BucketMerkleInfoJson | undefined {
+    // For db_id=0, use top-level merkle_bucket (backward compat)
+    if (dbId === 0) {
+      return this.serverInfo?.merkle_bucket;
+    }
+    // For other DBs, check the per-DB databases array
+    const dbInfo = this.serverInfo?.databases?.find(d => d.db_id === dbId);
+    return dbInfo?.merkle_bucket;
   }
 }
 

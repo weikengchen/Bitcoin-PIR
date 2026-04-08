@@ -13,7 +13,7 @@ fastprp = ["harmonypir/fastprp-prp"]
 alf = ["harmonypir/alf"]
 
 [dependencies]
-harmonypir = { path = "../../bitcoin-pir/harmonypir", default-features = false }
+harmonypir = { git = "https://github.com/Bitcoin-PIR/harmonypir.git", rev = "3478ea8b9bc3aa6aa83224d5b1c577a84a27f8ea", default-features = false }
 wasm-bindgen = "0.2"
 rand = "0.8"
 rand_chacha = "0.3"

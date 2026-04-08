@@ -94,6 +94,7 @@ function parseTreeTops(data: Uint8Array): ParsedTreeTops {
  * @param items - One per queried address
  * @param onProgress - Optional progress callback
  * @param log - Optional log function
+ * @param dbId - Optional database ID (0=main, 1+=delta). Defaults to 0.
  * @returns boolean[] — one per item
  */
 export async function verifyBucketMerkleBatchDpf(
@@ -103,6 +104,7 @@ export async function verifyBucketMerkleBatchDpf(
   items: BucketMerkleItem[],
   onProgress?: ProgressFn,
   log?: LogFn,
+  dbId: number = 0,
 ): Promise<boolean[]> {
   const A = BUCKET_MERKLE_ARITY; // 8
   const rng = new DummyRng();
@@ -111,9 +113,13 @@ export async function verifyBucketMerkleBatchDpf(
   log?.('Fetching bucket Merkle tree-tops...');
   onProgress?.('Merkle', 'Fetching tree-top caches...');
 
-  const topsReq = new Uint8Array(5);
-  new DataView(topsReq.buffer).setUint32(0, 1, true); // length = 1
+  const topsLen = dbId !== 0 ? 2 : 1;
+  const topsReq = new Uint8Array(4 + topsLen);
+  new DataView(topsReq.buffer).setUint32(0, topsLen, true);
   topsReq[4] = REQ_BUCKET_MERKLE_TREE_TOPS;
+  if (dbId !== 0) {
+    topsReq[5] = dbId;
+  }
 
   const topsRaw = await ws0.sendRaw(topsReq);
   // Response: [4B len][1B variant][tree_tops_bytes...]
@@ -150,6 +156,7 @@ export async function verifyBucketMerkleBatchDpf(
     K,
     0, // table_type = 0 for INDEX
     log,
+    dbId,
   );
 
   // ── Step 3: Verify CHUNK bins ──────────────────────────────────────
@@ -180,6 +187,7 @@ export async function verifyBucketMerkleBatchDpf(
     K_CHUNK,
     1, // table_type = 1 for CHUNK
     log,
+    dbId,
   ) : [];
 
   // ── Step 4: Combine results ────────────────────────────────────────
@@ -217,6 +225,7 @@ async function verifySiblingLevels(
   tableK: number,
   tableType: number,
   log?: LogFn,
+  dbId: number = 0,
 ): Promise<boolean[]> {
   const A = BUCKET_MERKLE_ARITY;
   const N = items.length;
@@ -268,8 +277,8 @@ async function verifySiblingLevels(
 
     // Encode and send batch to both servers using shared protocol
     const roundId = tableType * 100 + level;
-    const query0: BatchQuery = { level: 2, roundId, keys: s0Keys };
-    const query1: BatchQuery = { level: 2, roundId, keys: s1Keys };
+    const query0: BatchQuery = { level: 2, roundId, keys: s0Keys, dbId: dbId || undefined };
+    const query1: BatchQuery = { level: 2, roundId, keys: s1Keys, dbId: dbId || undefined };
     const req0Bytes = encodeRequest({ type: 'BucketMerkleSibBatch', query: query0 });
     const req1Bytes = encodeRequest({ type: 'BucketMerkleSibBatch', query: query1 });
 

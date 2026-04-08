@@ -48,7 +48,12 @@ impl ServerData {
                 databases: state.databases.iter().enumerate().map(|(i, db)| {
                     DatabaseCatalogEntry {
                         db_id: i as u8,
+                        db_type: match db.descriptor.db_type {
+                            runtime::table::DatabaseType::Full => 0,
+                            runtime::table::DatabaseType::Delta => 1,
+                        },
                         name: db.descriptor.name.clone(),
+                        base_height: db.descriptor.base_height,
                         height: db.descriptor.height,
                         index_bins_per_table: db.index.bins_per_table as u32,
                         chunk_bins_per_table: db.chunk.bins_per_table as u32,
@@ -57,6 +62,7 @@ impl ServerData {
                         tag_seed: db.index.tag_seed,
                         dpf_n_index: db.index.params.dpf_n,
                         dpf_n_chunk: db.chunk.params.dpf_n,
+                        has_bucket_merkle: db.has_bucket_merkle(),
                     }
                 }).collect(),
             }
@@ -65,7 +71,9 @@ impl ServerData {
             DatabaseCatalog {
                 databases: vec![DatabaseCatalogEntry {
                     db_id: 0,
+                    db_type: 0,
                     name: "main".to_string(),
+                    base_height: 0,
                     height: 0,
                     index_bins_per_table: self.tables.index_bins_per_table as u32,
                     chunk_bins_per_table: self.tables.chunk_bins_per_table as u32,
@@ -74,6 +82,7 @@ impl ServerData {
                     tag_seed: self.tables.tag_seed,
                     dpf_n_index: 20,
                     dpf_n_chunk: 21,
+                    has_bucket_merkle: false,
                 }],
             }
         }

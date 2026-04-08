@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseServerInfoJson } from '../server-info.js';
+import { parseServerInfoJson, decodeDatabaseCatalog } from '../server-info.js';
 
 describe('parseServerInfoJson', () => {
   const MINIMAL_JSON = JSON.stringify({
@@ -110,5 +110,118 @@ describe('parseServerInfoJson', () => {
     const json = MINIMAL_JSON.replace('0x71a2ef38b4c90d15', '0x0000000000000001');
     const info = parseServerInfoJson(json);
     expect(info.tag_seed).toBe(1n);
+  });
+});
+
+// ─── decodeDatabaseCatalog ──────────────────────────────────────────────────
+
+describe('decodeDatabaseCatalog', () => {
+  /** Helper: build a catalog binary buffer. */
+  function buildCatalogEntry(opts: {
+    dbId: number; dbType: number; name: string;
+    baseHeight: number; height: number;
+    indexBins: number; chunkBins: number;
+    indexK: number; chunkK: number;
+    tagSeed: bigint; dpfNIndex: number; dpfNChunk: number;
+    hasBucketMerkle?: boolean;
+  }): Uint8Array {
+    const nameBytes = new TextEncoder().encode(opts.name);
+    const buf = new Uint8Array(3 + nameBytes.length + 4 + 4 + 4 + 4 + 1 + 1 + 8 + 1 + 1 + 1);
+    const dv = new DataView(buf.buffer);
+    let pos = 0;
+    buf[pos++] = opts.dbId;
+    buf[pos++] = opts.dbType;
+    buf[pos++] = nameBytes.length;
+    buf.set(nameBytes, pos); pos += nameBytes.length;
+    dv.setUint32(pos, opts.baseHeight, true); pos += 4;
+    dv.setUint32(pos, opts.height, true); pos += 4;
+    dv.setUint32(pos, opts.indexBins, true); pos += 4;
+    dv.setUint32(pos, opts.chunkBins, true); pos += 4;
+    buf[pos++] = opts.indexK;
+    buf[pos++] = opts.chunkK;
+    dv.setBigUint64(pos, opts.tagSeed, true); pos += 8;
+    buf[pos++] = opts.dpfNIndex;
+    buf[pos++] = opts.dpfNChunk;
+    buf[pos++] = opts.hasBucketMerkle ? 1 : 0;
+    return buf;
+  }
+
+  it('decodes catalog with 1 full + 1 delta database', () => {
+    const entry0 = buildCatalogEntry({
+      dbId: 0, dbType: 0, name: 'main',
+      baseHeight: 0, height: 940611,
+      indexBins: 1048576, chunkBins: 2097152,
+      indexK: 75, chunkK: 80,
+      tagSeed: 0x71a2ef38b4c90d15n,
+      dpfNIndex: 20, dpfNChunk: 21,
+    });
+    const entry1 = buildCatalogEntry({
+      dbId: 1, dbType: 1, name: 'delta_940611_944000',
+      baseHeight: 940611, height: 944000,
+      indexBins: 4096, chunkBins: 8192,
+      indexK: 75, chunkK: 80,
+      tagSeed: 0xaabbccdd11223344n,
+      dpfNIndex: 12, dpfNChunk: 13,
+    });
+
+    const data = new Uint8Array(1 + entry0.length + entry1.length);
+    data[0] = 2; // num_databases
+    data.set(entry0, 1);
+    data.set(entry1, 1 + entry0.length);
+
+    const catalog = decodeDatabaseCatalog(data);
+
+    expect(catalog.databases).toHaveLength(2);
+
+    const db0 = catalog.databases[0];
+    expect(db0.dbId).toBe(0);
+    expect(db0.dbType).toBe(0);
+    expect(db0.name).toBe('main');
+    expect(db0.baseHeight).toBe(0);
+    expect(db0.height).toBe(940611);
+    expect(db0.indexBinsPerTable).toBe(1048576);
+    expect(db0.chunkBinsPerTable).toBe(2097152);
+    expect(db0.tagSeed).toBe(0x71a2ef38b4c90d15n);
+    expect(db0.dpfNIndex).toBe(20);
+    expect(db0.dpfNChunk).toBe(21);
+    expect(db0.hasBucketMerkle).toBe(false);
+
+    const db1 = catalog.databases[1];
+    expect(db1.dbId).toBe(1);
+    expect(db1.dbType).toBe(1);
+    expect(db1.name).toBe('delta_940611_944000');
+    expect(db1.baseHeight).toBe(940611);
+    expect(db1.height).toBe(944000);
+    expect(db1.indexBinsPerTable).toBe(4096);
+    expect(db1.chunkBinsPerTable).toBe(8192);
+    expect(db1.tagSeed).toBe(0xaabbccdd11223344n);
+    expect(db1.dpfNIndex).toBe(12);
+    expect(db1.dpfNChunk).toBe(13);
+    expect(db1.hasBucketMerkle).toBe(false);
+  });
+
+  it('decodes catalog with hasBucketMerkle flag', () => {
+    const entry0 = buildCatalogEntry({
+      dbId: 0, dbType: 0, name: 'main',
+      baseHeight: 0, height: 940611,
+      indexBins: 1048576, chunkBins: 2097152,
+      indexK: 75, chunkK: 80,
+      tagSeed: 0x71a2ef38b4c90d15n,
+      dpfNIndex: 20, dpfNChunk: 21,
+      hasBucketMerkle: true,
+    });
+
+    const data = new Uint8Array(1 + entry0.length);
+    data[0] = 1;
+    data.set(entry0, 1);
+
+    const catalog = decodeDatabaseCatalog(data);
+    expect(catalog.databases[0].hasBucketMerkle).toBe(true);
+  });
+
+  it('decodes empty catalog', () => {
+    const data = new Uint8Array([0]); // num_databases = 0
+    const catalog = decodeDatabaseCatalog(data);
+    expect(catalog.databases).toHaveLength(0);
   });
 });

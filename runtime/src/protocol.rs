@@ -178,9 +178,13 @@ pub struct ServerInfo {
 pub struct DatabaseCatalogEntry {
     /// Database ID (index into the server's database list).
     pub db_id: u8,
-    /// Human-readable name (e.g. "main", "delta_938612_940612").
+    /// 0 = full UTXO snapshot, 1 = delta between two heights.
+    pub db_type: u8,
+    /// Human-readable name (e.g. "main", "delta_940611_944000").
     pub name: String,
-    /// Block height this database represents.
+    /// Base height (0 for full snapshots, start height for deltas).
+    pub base_height: u32,
+    /// Tip height (snapshot height for full, end height for deltas).
     pub height: u32,
     /// INDEX-level bins_per_table.
     pub index_bins_per_table: u32,
@@ -196,6 +200,8 @@ pub struct DatabaseCatalogEntry {
     pub dpf_n_index: u8,
     /// DPF domain exponent for CHUNK level.
     pub dpf_n_chunk: u8,
+    /// Whether this database has per-bucket bin Merkle verification data.
+    pub has_bucket_merkle: bool,
 }
 
 /// Server's database catalog listing all available databases.
@@ -728,9 +734,11 @@ fn encode_db_catalog(buf: &mut Vec<u8>, cat: &DatabaseCatalog) {
     buf.push(cat.databases.len() as u8);
     for entry in &cat.databases {
         buf.push(entry.db_id);
+        buf.push(entry.db_type);
         let name_bytes = entry.name.as_bytes();
         buf.push(name_bytes.len() as u8);
         buf.extend_from_slice(name_bytes);
+        buf.extend_from_slice(&entry.base_height.to_le_bytes());
         buf.extend_from_slice(&entry.height.to_le_bytes());
         buf.extend_from_slice(&entry.index_bins_per_table.to_le_bytes());
         buf.extend_from_slice(&entry.chunk_bins_per_table.to_le_bytes());
@@ -739,6 +747,7 @@ fn encode_db_catalog(buf: &mut Vec<u8>, cat: &DatabaseCatalog) {
         buf.extend_from_slice(&entry.tag_seed.to_le_bytes());
         buf.push(entry.dpf_n_index);
         buf.push(entry.dpf_n_chunk);
+        buf.push(if entry.has_bucket_merkle { 1 } else { 0 });
     }
 }
 
@@ -750,10 +759,12 @@ fn decode_db_catalog(data: &[u8]) -> io::Result<DatabaseCatalog> {
     let mut pos = 1;
     let mut databases = Vec::with_capacity(num_dbs);
     for _ in 0..num_dbs {
-        if pos + 2 > data.len() {
+        if pos + 3 > data.len() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated catalog entry"));
         }
         let db_id = data[pos];
+        pos += 1;
+        let db_type = data[pos];
         pos += 1;
         let name_len = data[pos] as usize;
         pos += 1;
@@ -762,9 +773,13 @@ fn decode_db_catalog(data: &[u8]) -> io::Result<DatabaseCatalog> {
         }
         let name = String::from_utf8_lossy(&data[pos..pos + name_len]).to_string();
         pos += name_len;
-        if pos + 22 > data.len() {
+        // base_height(4) + height(4) + index_bins(4) + chunk_bins(4) + index_k(1) + chunk_k(1) + tag_seed(8) + dpf_n_index(1) + dpf_n_chunk(1) = 28
+        // + has_bucket_merkle(1) = 29 (optional for backward compat)
+        if pos + 28 > data.len() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated catalog fields"));
         }
+        let base_height = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+        pos += 4;
         let height = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
         pos += 4;
         let index_bins_per_table = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
@@ -781,9 +796,19 @@ fn decode_db_catalog(data: &[u8]) -> io::Result<DatabaseCatalog> {
         pos += 1;
         let dpf_n_chunk = data[pos];
         pos += 1;
+        // has_bucket_merkle: always present in current wire format (1 byte, 0 or 1)
+        let has_bucket_merkle = if pos < data.len() {
+            let v = data[pos] != 0;
+            pos += 1;
+            v
+        } else {
+            false
+        };
         databases.push(DatabaseCatalogEntry {
             db_id,
+            db_type,
             name,
+            base_height,
             height,
             index_bins_per_table,
             chunk_bins_per_table,
@@ -792,6 +817,7 @@ fn decode_db_catalog(data: &[u8]) -> io::Result<DatabaseCatalog> {
             tag_seed,
             dpf_n_index,
             dpf_n_chunk,
+            has_bucket_merkle,
         });
     }
     Ok(DatabaseCatalog { databases })

@@ -310,6 +310,14 @@
             </div>
         </details>
 
+        <div id="dbSelectorRow" style="display: none; margin: 10px 0; padding: 8px 12px; background: #f0f8ff; border: 1px solid #bee5eb; border-radius: 6px;">
+            <label for="dbSelect" style="display: inline; font-size: 13px; color: #0c5460; margin-right: 8px;">Database:</label>
+            <select id="dbSelect" style="padding: 4px 8px; border: 1px solid #bee5eb; border-radius: 4px; font-size: 13px; background: white;">
+                <option value="0">Main UTXO (loading...)</option>
+            </select>
+            <span id="dbInfo" style="font-size: 12px; color: #888; margin-left: 10px;"></span>
+        </div>
+
         <div class="step">
             <label for="scriptPubkeys">Bitcoin address(es) or scriptPubKey hex — one per line:</label>
             <textarea id="scriptPubkeys" rows="4" placeholder="Paste Bitcoin addresses (bc1..., 1..., 3...) or raw scriptPubKey hex, one per line...">1D4HSHPJxoPLqiBNFNarz34dcWPLvpiaeb
@@ -585,7 +593,7 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
     </div>
 
     <script type="module">
-        import { BatchPirClient, OnionPirWebClient, HarmonyPirClient, hexToBytes, bytesToHex, scriptHash, scriptPubKeyToAddress, addressToScriptPubKey, decompileScript } from './src/index.ts';
+        import { BatchPirClient, OnionPirWebClient, HarmonyPirClient, hexToBytes, bytesToHex, scriptHash, scriptPubKeyToAddress, addressToScriptPubKey, decompileScript, decodeDeltaData } from './src/index.ts';
         import { fetchResidency } from './src/server-info.ts';
 
         /**
@@ -816,6 +824,102 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
             container.appendChild(section);
         }
 
+        /**
+         * Render a delta query result (spent + new UTXOs).
+         */
+        function renderDeltaResult(container, spkHex, hashHex, result) {
+            const section = document.createElement('div');
+            section.className = 'container';
+            section.style.marginTop = '15px';
+
+            const address = scriptPubKeyToAddress(spkHex);
+            const scriptLabel = detectScriptLabel(spkHex);
+
+            let titleHtml;
+            if (address) {
+                const labelBadge = scriptLabel ? `<span style="font-size: 11px; color: #fff; background: #6c757d; padding: 1px 6px; border-radius: 3px; margin-left: 8px; vertical-align: middle;">${scriptLabel}</span>` : '';
+                titleHtml = `<a href="https://mempool.space/address/${address}" target="_blank" style="color: #0066cc; text-decoration: none; font-family: monospace;">${address}</a>${labelBadge}`;
+            } else {
+                const label = scriptLabel || 'Non-standard Script';
+                titleHtml = `<span style="font-family: monospace; font-size: 14px; color: #555; font-weight: bold;">${label}</span>`;
+            }
+
+            if (!result) {
+                section.innerHTML = `
+                    <h2 style="color:#28a745; margin-top:0;">No Changes</h2>
+                    <p>${titleHtml}</p>
+                    <p style="color: #999;">This address had no UTXO changes in the delta range.</p>
+                `;
+                container.appendChild(section);
+                return;
+            }
+
+            // Decode the raw chunk data as delta
+            let deltaData = { spent: [], newUtxos: [] };
+            if (result.rawChunkData && result.rawChunkData.length > 0) {
+                try {
+                    deltaData = decodeDeltaData(result.rawChunkData, (msg) => log(msg, 'error'));
+                } catch (e) {
+                    log(`Delta decode error: ${e.message}`, 'error');
+                }
+            }
+
+            const numSpent = deltaData.spent.length;
+            const numNew = deltaData.newUtxos.length;
+            const newSats = deltaData.newUtxos.reduce((s, u) => s + u.amount, 0n);
+
+            section.innerHTML = `
+                <div style="display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap;">
+                    <h2 style="margin-top:0;">${titleHtml}</h2>
+                </div>
+                <div style="display: flex; gap: 30px; flex-wrap: wrap; margin: 12px 0 10px 0;">
+                    <div><span style="color: #888; font-size: 13px;">Spent</span><br><span style="font-size: 18px; font-weight: bold; color: #dc3545;">${numSpent}</span></div>
+                    <div><span style="color: #888; font-size: 13px;">New</span><br><span style="font-size: 18px; font-weight: bold; color: #28a745;">${numNew}</span></div>
+                    <div><span style="color: #888; font-size: 13px;">New sats</span><br><span style="font-size: 16px; font-weight: bold; color: #f7931a;">${newSats.toLocaleString()}</span></div>
+                </div>
+            `;
+
+            // Spent table
+            if (numSpent > 0) {
+                const spentHtml = `
+                    <div style="margin-top: 8px;">
+                        <h3 style="color: #dc3545; font-size: 14px; margin-bottom: 6px;">Spent UTXOs</h3>
+                        <table class="utxo-table">
+                            <thead><tr><th>#</th><th style="min-width:280px;">TXID</th><th>Vout</th></tr></thead>
+                            <tbody>${deltaData.spent.map((s, i) => {
+                                const txid = txidToReversedHex(s.txid);
+                                return `<tr><td>${i+1}</td><td><a href="https://mempool.space/tx/${txid}" target="_blank" class="txid-link">${txid}</a></td><td>${s.vout}</td></tr>`;
+                            }).join('')}</tbody>
+                        </table>
+                    </div>
+                `;
+                const div = document.createElement('div');
+                div.innerHTML = spentHtml;
+                section.appendChild(div);
+            }
+
+            // New UTXOs table
+            if (numNew > 0) {
+                const newHtml = `
+                    <div style="margin-top: 8px;">
+                        <h3 style="color: #28a745; font-size: 14px; margin-bottom: 6px;">New UTXOs</h3>
+                        <table class="utxo-table">
+                            <thead><tr><th>#</th><th style="min-width:280px;">TXID</th><th>Vout</th><th>Amount (sats)</th><th>Amount (BTC)</th></tr></thead>
+                            <tbody>${deltaData.newUtxos.map((u, i) => {
+                                const txid = txidToReversedHex(u.txid);
+                                return `<tr><td>${i+1}</td><td><a href="https://mempool.space/tx/${txid}" target="_blank" class="txid-link">${txid}</a></td><td>${u.vout}</td><td>${u.amount.toLocaleString()}</td><td class="amount-btc">${formatBtc(u.amount)} BTC</td></tr>`;
+                            }).join('')}</tbody>
+                        </table>
+                    </div>
+                `;
+                const div = document.createElement('div');
+                div.innerHTML = newHtml;
+                section.appendChild(div);
+            }
+
+            container.appendChild(section);
+        }
+
         // ─── Shared batch Merkle verification button ──────────────────────
         // verifyBatchFn: (results[], onProgress) → Promise<boolean[]>  (single batch call)
         function addBatchMerkleButton(container, verifiableResults, prefix, verifyBatchFn, getRootHex) {
@@ -898,10 +1002,46 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                 });
 
                 await client.connect();
+                populateDbSelector();
             } catch (error) {
                 log(`Connection failed: ${error.message}`, 'error');
                 client = null;
             }
+        }
+
+        function populateDbSelector() {
+            const catalog = client?.getCatalog();
+            const select = document.getElementById('dbSelect');
+            const row = document.getElementById('dbSelectorRow');
+            const infoSpan = document.getElementById('dbInfo');
+            select.innerHTML = '';
+
+            if (!catalog || catalog.databases.length <= 1) {
+                row.style.display = 'none';
+                return;
+            }
+
+            for (const db of catalog.databases) {
+                const opt = document.createElement('option');
+                opt.value = db.dbId;
+                if (db.dbType === 0) {
+                    opt.textContent = `[${db.dbId}] ${db.name} (full, height ${db.height.toLocaleString()})`;
+                } else {
+                    opt.textContent = `[${db.dbId}] ${db.name} (delta, ${db.baseHeight.toLocaleString()} \u2192 ${db.height.toLocaleString()})`;
+                }
+                select.appendChild(opt);
+            }
+
+            select.addEventListener('change', () => {
+                const dbId = parseInt(select.value);
+                const entry = catalog.databases.find(d => d.dbId === dbId);
+                if (entry) {
+                    const merkleTag = entry.hasBucketMerkle ? ', Merkle' : '';
+                    infoSpan.textContent = `index_bins=${entry.indexBinsPerTable.toLocaleString()}, chunk_bins=${entry.chunkBinsPerTable.toLocaleString()}${merkleTag}`;
+                }
+            });
+            select.dispatchEvent(new Event('change'));
+            row.style.display = 'block';
         }
 
         function disconnect() {
@@ -912,6 +1052,7 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                 setButtons(false);
             }
             document.getElementById('resultsContainer').innerHTML = '';
+            document.getElementById('dbSelectorRow').style.display = 'none';
         }
 
         async function queryUtxos() {
@@ -974,40 +1115,70 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                 // Compute all script hashes up front
                 const scriptHashes = lines.map(spkHex => scriptHash(hexToBytes(spkHex)));
 
-                setProgress(5, `Batching ${N} queries...`);
+                // Get selected database
+                const dbId = parseInt(document.getElementById('dbSelect')?.value ?? '0') || 0;
+                const dbEntry = client.getCatalogEntry(dbId);
+                const isDelta = dbEntry?.dbType === 1;
+
+                setProgress(5, `Batching ${N} queries${isDelta ? ` (delta db ${dbId})` : ''}...`);
 
                 // One batched call — all queries packed into shared batches
-                const results = await client.queryBatch(scriptHashes, (step, detail) => {
-                    let pct = 5;
-                    if (step === 'Level 1') pct = 15;
-                    else if (step === 'Level 2') pct = 50;
-                    else if (step === 'Decode') pct = 90;
-                    setProgress(pct, `${step}: ${detail}`);
-                });
+                const results = isDelta
+                    ? await client.queryDelta(scriptHashes, dbId, (step, detail) => {
+                        let pct = 5;
+                        if (step === 'Level 1') pct = 15;
+                        else if (step === 'Level 2') pct = 50;
+                        else if (step === 'Decode') pct = 90;
+                        setProgress(pct, `${step}: ${detail}`);
+                    })
+                    : await client.queryBatch(scriptHashes, (step, detail) => {
+                        let pct = 5;
+                        if (step === 'Level 1') pct = 15;
+                        else if (step === 'Level 2') pct = 50;
+                        else if (step === 'Decode') pct = 90;
+                        setProgress(pct, `${step}: ${detail}`);
+                    });
 
                 // Render all results
                 let found = 0;
                 const dpfQueryResults = [];
+
+                if (isDelta) {
+                    // Delta header
+                    const hdr = document.createElement('div');
+                    hdr.style.cssText = 'padding: 10px 14px; background: #e8f4fd; border: 1px solid #bee5eb; border-radius: 6px; margin-bottom: 10px; font-size: 14px; color: #0c5460;';
+                    hdr.textContent = `Delta: ${dbEntry.baseHeight.toLocaleString()} \u2192 ${dbEntry.height.toLocaleString()} (${dbEntry.name})`;
+                    resultsContainer.appendChild(hdr);
+                }
+
                 for (let qi = 0; qi < N; qi++) {
                     const spkHex = lines[qi];
                     const hashHex = bytesToHex(scriptHashes[qi]);
                     const result = results[qi];
                     if (result) found++;
-                    renderResult(resultsContainer, spkHex, hashHex, result);
+
+                    if (isDelta) {
+                        renderDeltaResult(resultsContainer, spkHex, hashHex, result);
+                    } else {
+                        renderResult(resultsContainer, spkHex, hashHex, result);
+                    }
                     dpfQueryResults.push(result);
                 }
 
-                // Batch Merkle verify button
-                const verifiable = dpfQueryResults.filter(r => r && !r.isWhale && r.indexPbcGroup !== undefined);
-                if (verifiable.length > 0 && client.hasMerkle()) {
-                    addBatchMerkleButton(resultsContainer, verifiable, 'dpf',
-                        (results, onProg) => client.verifyMerkleBatch(results, onProg),
-                        () => client.getMerkleRootHex());
+                // Batch Merkle verify button (only for full DB with Merkle)
+                if (!isDelta) {
+                    const verifiable = dpfQueryResults.filter(r => r && !r.isWhale && r.indexPbcGroup !== undefined);
+                    if (verifiable.length > 0 && client.hasMerkle()) {
+                        addBatchMerkleButton(resultsContainer, verifiable, 'dpf',
+                            (results, onProg) => client.verifyMerkleBatch(results, onProg),
+                            () => client.getMerkleRootHex());
+                    }
                 }
 
-                setProgress(100, `Done! ${found}/${N} addresses found`);
+                const verb = isDelta ? 'changed' : 'found';
+                setProgress(100, `Done! ${found}/${N} addresses ${verb}`);
                 setTimeout(hideProgress, 2000);
-                log(`Batch complete: ${found}/${N} found`, 'success');
+                log(`Batch complete: ${found}/${N} ${verb}`, 'success');
             } catch (error) {
                 log(`Batch error: ${error.message}`, 'error');
                 setProgress(0, '');

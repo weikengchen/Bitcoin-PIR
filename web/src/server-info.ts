@@ -40,6 +40,14 @@ export interface ServerInfoJson {
   merkle?: MerkleInfoJson;
   merkle_bucket?: BucketMerkleInfoJson;
   onionpir_merkle?: OnionPirMerkleInfoJson;
+  /** Per-database info (Merkle availability). Present when server has >1 DB or any DB has bucket Merkle. */
+  databases?: PerDatabaseInfoJson[];
+}
+
+export interface PerDatabaseInfoJson {
+  db_id: number;
+  has_bucket_merkle: boolean;
+  merkle_bucket?: BucketMerkleInfoJson;
 }
 
 export interface MerkleLevelInfo {
@@ -105,6 +113,19 @@ export interface OnionPirMerkleInfoJson {
 const INFO_JSON_REQUEST = new Uint8Array([1, 0, 0, 0, REQ_GET_INFO_JSON]);
 
 // ─── Parser ──────────────────────────────────────────────────────────────────
+
+function parseBucketMerkleInfo(mb: any): BucketMerkleInfoJson {
+  return {
+    arity: mb.arity ?? 8,
+    index_levels: mb.index_levels ?? [],
+    chunk_levels: mb.chunk_levels ?? [],
+    index_roots: mb.index_roots ?? [],
+    chunk_roots: mb.chunk_roots ?? [],
+    super_root: mb.super_root ?? '',
+    tree_tops_hash: mb.tree_tops_hash ?? '',
+    tree_tops_size: mb.tree_tops_size ?? 0,
+  };
+}
 
 /**
  * Parse a JSON server info string into a typed object.
@@ -175,16 +196,20 @@ export function parseServerInfoJson(jsonStr: string): ServerInfoJson {
 
   if (raw.merkle_bucket && typeof raw.merkle_bucket === 'object') {
     const mb = raw.merkle_bucket;
-    info.merkle_bucket = {
-      arity: mb.arity ?? 8,
-      index_levels: mb.index_levels ?? [],
-      chunk_levels: mb.chunk_levels ?? [],
-      index_roots: mb.index_roots ?? [],
-      chunk_roots: mb.chunk_roots ?? [],
-      super_root: mb.super_root ?? '',
-      tree_tops_hash: mb.tree_tops_hash ?? '',
-      tree_tops_size: mb.tree_tops_size ?? 0,
-    };
+    info.merkle_bucket = parseBucketMerkleInfo(mb);
+  }
+
+  if (Array.isArray(raw.databases)) {
+    info.databases = raw.databases.map((db: any) => {
+      const entry: PerDatabaseInfoJson = {
+        db_id: db.db_id,
+        has_bucket_merkle: db.has_bucket_merkle ?? false,
+      };
+      if (db.merkle_bucket && typeof db.merkle_bucket === 'object') {
+        entry.merkle_bucket = parseBucketMerkleInfo(db.merkle_bucket);
+      }
+      return entry;
+    });
   }
 
   return info;
@@ -262,7 +287,12 @@ export async function fetchResidency(ws: ManagedWebSocket): Promise<ResidencyInf
 
 export interface DatabaseCatalogEntry {
   dbId: number;
+  /** 0 = full UTXO snapshot, 1 = delta between two heights. */
+  dbType: number;
   name: string;
+  /** Base height (0 for full snapshots, start height for deltas). */
+  baseHeight: number;
+  /** Tip height (snapshot height for full, end height for deltas). */
   height: number;
   indexBinsPerTable: number;
   chunkBinsPerTable: number;
@@ -271,6 +301,8 @@ export interface DatabaseCatalogEntry {
   tagSeed: bigint;
   dpfNIndex: number;
   dpfNChunk: number;
+  /** Whether this database has per-bucket bin Merkle verification data. */
+  hasBucketMerkle: boolean;
 }
 
 export interface DatabaseCatalog {
@@ -286,12 +318,13 @@ const CATALOG_REQUEST = new Uint8Array([1, 0, 0, 0, REQ_GET_DB_CATALOG]);
  * Wire format:
  *   [1B num_databases]
  *   Per database:
- *     [1B db_id][1B name_len][name bytes][4B height LE]
+ *     [1B db_id][1B db_type][1B name_len][name bytes]
+ *     [4B base_height LE][4B height LE]
  *     [4B index_bins LE][4B chunk_bins LE]
  *     [1B index_k][1B chunk_k][8B tag_seed LE]
  *     [1B dpf_n_index][1B dpf_n_chunk]
  */
-function decodeDatabaseCatalog(data: Uint8Array): DatabaseCatalog {
+export function decodeDatabaseCatalog(data: Uint8Array): DatabaseCatalog {
   const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
   let pos = 0;
   const numDatabases = data[pos++];
@@ -299,9 +332,11 @@ function decodeDatabaseCatalog(data: Uint8Array): DatabaseCatalog {
 
   for (let i = 0; i < numDatabases; i++) {
     const dbId = data[pos++];
+    const dbType = data[pos++];
     const nameLen = data[pos++];
     const name = new TextDecoder().decode(data.slice(pos, pos + nameLen));
     pos += nameLen;
+    const baseHeight = dv.getUint32(pos, true); pos += 4;
     const height = dv.getUint32(pos, true); pos += 4;
     const indexBinsPerTable = dv.getUint32(pos, true); pos += 4;
     const chunkBinsPerTable = dv.getUint32(pos, true); pos += 4;
@@ -310,12 +345,14 @@ function decodeDatabaseCatalog(data: Uint8Array): DatabaseCatalog {
     const tagSeed = dv.getBigUint64(pos, true); pos += 8;
     const dpfNIndex = data[pos++];
     const dpfNChunk = data[pos++];
+    // has_bucket_merkle: always present in current wire format (1 byte, 0 or 1)
+    const hasBucketMerkle = pos < data.length ? data[pos++] !== 0 : false;
 
     databases.push({
-      dbId, name, height,
+      dbId, dbType, name, baseHeight, height,
       indexBinsPerTable, chunkBinsPerTable,
       indexK, chunkK, tagSeed,
-      dpfNIndex, dpfNChunk,
+      dpfNIndex, dpfNChunk, hasBucketMerkle,
     });
   }
 

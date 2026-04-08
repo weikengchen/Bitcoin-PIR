@@ -17,7 +17,6 @@ use pir_core::params::compute_dpf_n;
 use futures_util::{SinkExt, StreamExt};
 use libdpf::Dpf;
 use std::time::Instant;
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
@@ -26,6 +25,7 @@ struct Args {
     server0: String,
     server1: String,
     script_hash: [u8; SCRIPT_HASH_SIZE],
+    db_id: u8,
 }
 
 fn parse_args() -> Args {
@@ -33,6 +33,7 @@ fn parse_args() -> Args {
     let mut server0 = "ws://localhost:8091".to_string();
     let mut server1 = "ws://localhost:8092".to_string();
     let mut hash_hex = String::new();
+    let mut db_id: u8 = 0;
 
     let mut i = 1;
     while i < args.len() {
@@ -40,8 +41,13 @@ fn parse_args() -> Args {
             "--server0" | "-s0" => { server0 = args[i + 1].clone(); i += 1; }
             "--server1" | "-s1" => { server1 = args[i + 1].clone(); i += 1; }
             "--hash" | "-h" => { hash_hex = args[i + 1].clone(); i += 1; }
+            "--db-id" | "--db" => {
+                db_id = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                i += 1;
+            }
             "--help" => {
-                println!("Usage: client --hash <hex> [--server0 URL] [--server1 URL]");
+                println!("Usage: client --hash <hex> [--server0 URL] [--server1 URL] [--db-id N]");
+                println!("  --db-id N  Database ID (0=main UTXO, 1+=delta). Default: 0");
                 std::process::exit(0);
             }
             _ => {}
@@ -60,7 +66,7 @@ fn parse_args() -> Args {
             .expect("invalid hex in --hash");
     }
 
-    Args { server0, server1, script_hash }
+    Args { server0, server1, script_hash, db_id }
 }
 
 // ─── PRNG for dummy queries ─────────────────────────────────────────────────
@@ -147,10 +153,15 @@ async fn main() {
     let args = parse_args();
     let hash_hex: String = args.script_hash.iter().map(|b| format!("{:02x}", b)).collect();
 
+    let db_id = args.db_id;
+
     println!("=== Two-Level Batch PIR Client ===");
     println!("  Script hash: {}", hash_hex);
     println!("  Server 0:    {}", args.server0);
     println!("  Server 1:    {}", args.server1);
+    if db_id != 0 {
+        println!("  Database:    {} (delta)", db_id);
+    }
     println!();
 
     let total_start = Instant::now();
@@ -184,9 +195,36 @@ async fn main() {
     // Also get info from server1 (just to verify, don't need it)
     let _ = ws_roundtrip(&mut sink1, &mut stream1, &info_req).await;
 
-    let index_bins = info.index_bins_per_table as usize;
-    let chunk_bins = info.chunk_bins_per_table as usize;
-    let tag_seed = info.tag_seed;
+    // Default to main DB params
+    let mut index_bins = info.index_bins_per_table as usize;
+    let mut chunk_bins = info.chunk_bins_per_table as usize;
+    let mut tag_seed = info.tag_seed;
+
+    // If db_id != 0, fetch catalog and override params from the delta entry
+    if db_id != 0 {
+        println!("  Fetching database catalog for db_id={}...", db_id);
+        let cat_resp = ws_roundtrip(&mut sink0, &mut stream0, &Request::GetDbCatalog).await;
+        match cat_resp {
+            Response::DbCatalog(cat) => {
+                if let Some(entry) = cat.databases.iter().find(|e| e.db_id == db_id) {
+                    index_bins = entry.index_bins_per_table as usize;
+                    chunk_bins = entry.chunk_bins_per_table as usize;
+                    tag_seed = entry.tag_seed;
+                    println!("  Catalog: db_id={} name=\"{}\" type={} base_height={} height={} has_merkle={}",
+                        entry.db_id, entry.name,
+                        if entry.db_type == 0 { "full" } else { "delta" },
+                        entry.base_height, entry.height, entry.has_bucket_merkle);
+                } else {
+                    eprintln!("ERROR: db_id={} not found in catalog (available: {:?})",
+                        db_id, cat.databases.iter().map(|e| e.db_id).collect::<Vec<_>>());
+                    return;
+                }
+            }
+            Response::Error(e) => { eprintln!("Catalog error: {}", e); return; }
+            _ => { eprintln!("Unexpected catalog response"); return; }
+        }
+    }
+
     let index_dpf_n = compute_dpf_n(index_bins);
     let chunk_dpf_n = compute_dpf_n(chunk_bins);
     println!("  Index: K={}, bins_per_table={}, dpf_n={}", info.index_k, index_bins, index_dpf_n);
@@ -239,8 +277,8 @@ async fn main() {
     }
 
     // Send to both servers concurrently
-    let req0 = Request::IndexBatch(BatchQuery { level: 0, round_id: 0, db_id: 0, keys: s0_keys });
-    let req1 = Request::IndexBatch(BatchQuery { level: 0, round_id: 0, db_id: 0, keys: s1_keys });
+    let req0 = Request::IndexBatch(BatchQuery { level: 0, round_id: 0, db_id, keys: s0_keys });
+    let req1 = Request::IndexBatch(BatchQuery { level: 0, round_id: 0, db_id, keys: s1_keys });
 
     let enc0 = req0.encode();
     let enc1 = req1.encode();
@@ -358,8 +396,8 @@ async fn main() {
         }
 
         // Send to both servers
-        let req0 = Request::ChunkBatch(BatchQuery { level: 1, round_id: ri as u16, db_id: 0, keys: s0_keys });
-        let req1 = Request::ChunkBatch(BatchQuery { level: 1, round_id: ri as u16, db_id: 0, keys: s1_keys });
+        let req0 = Request::ChunkBatch(BatchQuery { level: 1, round_id: ri as u16, db_id, keys: s0_keys });
+        let req1 = Request::ChunkBatch(BatchQuery { level: 1, round_id: ri as u16, db_id, keys: s1_keys });
 
         let enc0 = req0.encode();
         let enc1 = req1.encode();
@@ -439,8 +477,12 @@ async fn main() {
             assigned_group, index_bin_index,
             index_leaf[0], index_leaf[1], index_leaf[2], index_leaf[3]);
 
-        // Fetch tree-top caches from server (0x34)
-        let top_req = vec![0x34u8]; // REQ_BUCKET_MERKLE_TREE_TOPS
+        // Fetch tree-top caches from server (0x34), with optional db_id byte
+        let top_req = if db_id != 0 {
+            vec![0x34u8, db_id] // REQ_BUCKET_MERKLE_TREE_TOPS + db_id
+        } else {
+            vec![0x34u8] // REQ_BUCKET_MERKLE_TREE_TOPS (backward compat)
+        };
         let top_msg = {
             let len = top_req.len() as u32;
             let mut m = Vec::with_capacity(4 + top_req.len());
@@ -531,10 +573,10 @@ async fn main() {
                     // round_id = table_type * 100 + level (table_type=0 for INDEX)
                     let round_id = level as u16;
                     let req0 = Request::BucketMerkleSibBatch(BatchQuery {
-                        level: 2, round_id, db_id: 0, keys: s0_keys,
+                        level: 2, round_id, db_id, keys: s0_keys,
                     });
                     let req1 = Request::BucketMerkleSibBatch(BatchQuery {
-                        level: 2, round_id, db_id: 0, keys: s1_keys,
+                        level: 2, round_id, db_id, keys: s1_keys,
                     });
 
                     sink0.send(Message::Binary(req0.encode().into())).await.expect("send s0 sib");
@@ -656,9 +698,61 @@ async fn main() {
     println!("  Total data: {} bytes", full_data.len());
     println!();
 
-    // Decode UTXO entries
-    println!("[6] Decoding UTXO entries:");
-    {
+    // Decode entries — delta format differs from full UTXO format
+    if db_id != 0 {
+        // ── Delta data format ──────────────────────────────────────────
+        // [varint num_spent][per spent: 32B txid, varint vout]
+        // [varint num_new][per new: 32B txid, varint vout, varint amount]
+        println!("[6] Decoding DELTA entries:");
+        let mut pos = 0;
+
+        let (num_spent, sr) = read_varint(&full_data[pos..]);
+        pos += sr;
+        println!("  Spent UTXOs: {}", num_spent);
+        for i in 0..num_spent as usize {
+            if pos + 32 > full_data.len() {
+                println!("  (data truncated at spent entry {})", i);
+                break;
+            }
+            let txid_bytes = &full_data[pos..pos + 32];
+            pos += 32;
+            let mut txid_rev = [0u8; 32];
+            for j in 0..32 { txid_rev[j] = txid_bytes[31 - j]; }
+            let txid_hex: String = txid_rev.iter().map(|b| format!("{:02x}", b)).collect();
+            let (vout, vr) = read_varint(&full_data[pos..]);
+            pos += vr;
+            println!("    SPENT #{}: {}:{}", i + 1, txid_hex, vout);
+        }
+
+        let (num_new, nr) = read_varint(&full_data[pos..]);
+        pos += nr;
+        println!("  New UTXOs: {}", num_new);
+        let mut total_sats: u64 = 0;
+        for i in 0..num_new as usize {
+            if pos + 32 > full_data.len() {
+                println!("  (data truncated at new entry {})", i);
+                break;
+            }
+            let txid_bytes = &full_data[pos..pos + 32];
+            pos += 32;
+            let mut txid_rev = [0u8; 32];
+            for j in 0..32 { txid_rev[j] = txid_bytes[31 - j]; }
+            let txid_hex: String = txid_rev.iter().map(|b| format!("{:02x}", b)).collect();
+            let (vout, vr) = read_varint(&full_data[pos..]);
+            pos += vr;
+            let (amount, ar) = read_varint(&full_data[pos..]);
+            pos += ar;
+            total_sats += amount;
+            let btc = amount as f64 / 100_000_000.0;
+            println!("    NEW  #{}: {}:{} — {} sats ({:.8} BTC)", i + 1, txid_hex, vout, amount, btc);
+        }
+
+        println!();
+        println!("  Delta: {} spent, {} new, {} sats in new UTXOs",
+            num_spent, num_new, total_sats);
+    } else {
+        // ── Full UTXO data format ──────────────────────────────────────
+        println!("[6] Decoding UTXO entries:");
         let mut pos = 0;
         let (num_entries, bytes_read) = read_varint(&full_data[pos..]);
         pos += bytes_read;

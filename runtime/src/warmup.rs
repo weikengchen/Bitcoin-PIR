@@ -13,6 +13,8 @@ pub struct MmapRegion {
     pub name: String,
     pub ptr: *const u8,
     pub len: usize,
+    /// Warmup priority: lower = higher priority (warmed up first).
+    pub priority: u32,
 }
 
 // SAFETY: The raw pointers come from `memmap2::Mmap` objects that live for the
@@ -90,7 +92,11 @@ pub fn report_residency(regions: &[MmapRegion]) {
 
 /// Sequentially touch every page in every region to force them into the page cache.
 /// Reports progress per-file and overall with throughput.
-pub fn warmup_regions(regions: &[MmapRegion]) {
+/// Regions are sorted by priority (lower = warmed first).
+pub fn warmup_regions(regions: &mut [MmapRegion]) {
+    // Sort by priority so high-priority regions warm up first
+    regions.sort_by_key(|r| r.priority);
+
     let ps = page_size();
     let total_bytes: usize = regions.iter().map(|r| r.len).sum();
     let total_pages = (total_bytes + ps - 1) / ps;
@@ -103,7 +109,7 @@ pub fn warmup_regions(regions: &[MmapRegion]) {
     // Progress every ~256 MB (65536 pages at 4K)
     let progress_interval = 65536usize;
 
-    for region in regions {
+    for region in regions.iter() {
         let pages = (region.len + ps - 1) / ps;
         let region_start = Instant::now();
 

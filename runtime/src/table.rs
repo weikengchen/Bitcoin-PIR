@@ -71,16 +71,28 @@ impl MappedSubTable {
 }
 
 /// Describes a complete PIR database (INDEX + CHUNK + optional Merkle sub-tables).
+/// Whether a database is a full UTXO snapshot or a delta between two heights.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum DatabaseType {
+    /// Full UTXO set at a single height (base_height is always 0).
+    Full,
+    /// Delta (new + spent UTXOs) between base_height and height.
+    Delta,
+}
+
 pub struct DatabaseDescriptor {
-    /// Human-readable name (e.g. "main", "delta_938612_940612").
+    /// Human-readable name (e.g. "main", "delta_940611_944000").
     pub name: String,
-    /// Snapshot or end height.
+    /// Full or delta.
+    pub db_type: DatabaseType,
+    /// Starting height (0 for full snapshots, >0 for deltas).
+    pub base_height: u32,
+    /// Snapshot height (full) or end height (delta).
     pub height: u32,
     /// Parameters for the INDEX-level sub-table.
     pub index_params: TableParams,
     /// Parameters for the CHUNK-level sub-table.
     pub chunk_params: TableParams,
-    // Future: merkle_data_params, merkle_sibling_params, etc.
 }
 
 /// A fully loaded database with all sub-tables memory-mapped.

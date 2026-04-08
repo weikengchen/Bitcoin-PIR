@@ -7,12 +7,15 @@
 //! Uses pir-core's MappedDatabase for table loading instead of legacy CuckooTablePair.
 //!
 //! Usage:
-//!   unified_server --port 8091 [--data-dir /Volumes/Bitcoin/data] [--role primary|secondary] [--warmup]
+//!   unified_server --port 8091 [--data-dir /path/to/checkpoint] [--role primary|secondary] [--warmup]
+//!     [--checkpoint /path/to/checkpoint <height>]...
+//!     [--delta /path/to/delta <base_height> <tip_height>]...
 
 use runtime::eval::{self, GroupTiming};
 use runtime::protocol::*;
 use runtime::onionpir::*;
-use runtime::table::{MappedDatabase, MappedSubTable, DatabaseDescriptor, ServerState};
+use runtime::config::ServerConfig;
+use runtime::table::{MappedDatabase, MappedSubTable, DatabaseDescriptor, DatabaseType, ServerState};
 use runtime::warmup::{self, MmapRegion};
 
 use futures_util::{SinkExt, StreamExt};
@@ -49,17 +52,23 @@ struct CliArgs {
     data_dir: PathBuf,
     role: ServerRole,
     warmup: bool,
-    /// Delta databases: (path, name, height).
-    delta_dirs: Vec<(PathBuf, String, u32)>,
+    /// Path to databases.toml config file (overrides --checkpoint/--delta).
+    config_path: Option<PathBuf>,
+    /// Checkpoint databases: (path, height).
+    checkpoints: Vec<(PathBuf, u32)>,
+    /// Delta databases: (path, base_height, tip_height).
+    deltas: Vec<(PathBuf, u32, u32)>,
 }
 
 fn parse_args() -> CliArgs {
     let args: Vec<String> = std::env::args().collect();
     let mut port = 8091u16;
-    let mut data_dir = PathBuf::from("/Volumes/Bitcoin/data");
+    let mut data_dir = PathBuf::from("/Volumes/Bitcoin/data/checkpoints/940611");
     let mut role = ServerRole::Primary;
     let mut warmup = false;
-    let mut delta_dirs: Vec<(PathBuf, String, u32)> = Vec::new();
+    let mut config_path: Option<PathBuf> = None;
+    let mut checkpoints: Vec<(PathBuf, u32)> = Vec::new();
+    let mut deltas: Vec<(PathBuf, u32, u32)> = Vec::new();
 
     let mut i = 1;
     while i < args.len() {
@@ -86,14 +95,30 @@ fn parse_args() -> CliArgs {
             "--warmup" | "-w" => {
                 warmup = true;
             }
-            "--delta-dir" => {
-                // --delta-dir <path> <name> <height>
-                if let (Some(path), Some(name), Some(height)) = (
+            "--config" | "-c" => {
+                if let Some(path) = args.get(i + 1) {
+                    config_path = Some(PathBuf::from(path));
+                }
+                i += 1;
+            }
+            "--checkpoint" => {
+                // --checkpoint <path> <height>
+                if let (Some(path), Some(height)) = (
                     args.get(i + 1),
-                    args.get(i + 2),
+                    args.get(i + 2).and_then(|s| s.parse::<u32>().ok()),
+                ) {
+                    checkpoints.push((PathBuf::from(path), height));
+                    i += 2;
+                }
+            }
+            "--delta" => {
+                // --delta <path> <base_height> <tip_height>
+                if let (Some(path), Some(base), Some(tip)) = (
+                    args.get(i + 1),
+                    args.get(i + 2).and_then(|s| s.parse::<u32>().ok()),
                     args.get(i + 3).and_then(|s| s.parse::<u32>().ok()),
                 ) {
-                    delta_dirs.push((PathBuf::from(path), name.clone(), height));
+                    deltas.push((PathBuf::from(path), base, tip));
                     i += 3;
                 }
             }
@@ -102,7 +127,7 @@ fn parse_args() -> CliArgs {
         i += 1;
     }
 
-    CliArgs { port, data_dir, role, warmup, delta_dirs }
+    CliArgs { port, data_dir, role, warmup, config_path, checkpoints, deltas }
 }
 
 // ─── OnionPIR worker thread ─────────────────────────────────────────────────
@@ -511,6 +536,87 @@ impl UnifiedServerData {
             json.push('}');
         }
 
+        // Per-database info array (Merkle availability + params for each DB)
+        if self.state.databases.len() > 1 || self.state.databases.iter().any(|db| db.has_bucket_merkle()) {
+            json.push_str(r#","databases":["#);
+            for (i, db) in self.state.databases.iter().enumerate() {
+                if i > 0 { json.push(','); }
+                json.push_str(&format!(r#"{{"db_id":{},"has_bucket_merkle":{}"#,
+                    i, db.has_bucket_merkle()));
+
+                if db.has_bucket_merkle() {
+                    json.push_str(r#","merkle_bucket":{"arity":8,"#);
+
+                    // INDEX sibling levels
+                    json.push_str(r#""index_levels":["#);
+                    for (li, sib) in db.bucket_merkle_index_siblings.iter().enumerate() {
+                        if li > 0 { json.push(','); }
+                        json.push_str(&format!(
+                            r#"{{"dpf_n":{},"bins_per_table":{}}}"#,
+                            params::compute_dpf_n(sib.bins_per_table),
+                            sib.bins_per_table,
+                        ));
+                    }
+                    json.push_str("],");
+
+                    // CHUNK sibling levels
+                    json.push_str(r#""chunk_levels":["#);
+                    for (li, sib) in db.bucket_merkle_chunk_siblings.iter().enumerate() {
+                        if li > 0 { json.push(','); }
+                        json.push_str(&format!(
+                            r#"{{"dpf_n":{},"bins_per_table":{}}}"#,
+                            params::compute_dpf_n(sib.bins_per_table),
+                            sib.bins_per_table,
+                        ));
+                    }
+                    json.push_str("],");
+
+                    // Per-group roots
+                    if let Some(ref roots_data) = db.bucket_merkle_roots {
+                        let index_k = db.index.params.k;
+                        let chunk_k = db.chunk.params.k;
+
+                        json.push_str(r#""index_roots":["#);
+                        for g in 0..index_k {
+                            if g > 0 { json.push(','); }
+                            let root = &roots_data[g * 32..(g + 1) * 32];
+                            json.push('"');
+                            for b in root { json.push_str(&format!("{:02x}", b)); }
+                            json.push('"');
+                        }
+                        json.push_str("],");
+
+                        json.push_str(r#""chunk_roots":["#);
+                        for g in 0..chunk_k {
+                            if g > 0 { json.push(','); }
+                            let root = &roots_data[(index_k + g) * 32..(index_k + g + 1) * 32];
+                            json.push('"');
+                            for b in root { json.push_str(&format!("{:02x}", b)); }
+                            json.push('"');
+                        }
+                        json.push_str("],");
+                    }
+
+                    if let Some(ref sr) = db.bucket_merkle_root {
+                        json.push_str(&format!(r#""super_root":"{}","#,
+                            sr.iter().map(|b| format!("{:02x}", b)).collect::<String>()));
+                    }
+
+                    if let Some(ref tops) = db.bucket_merkle_tree_tops {
+                        let tops_hash = pir_core::merkle::sha256(tops);
+                        json.push_str(&format!(r#""tree_tops_hash":"{}","tree_tops_size":{}"#,
+                            tops_hash.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+                            tops.len()));
+                    }
+
+                    json.push('}'); // close merkle_bucket
+                }
+
+                json.push('}'); // close database entry
+            }
+            json.push(']'); // close databases array
+        }
+
         json.push('}');
         json
     }
@@ -533,7 +639,12 @@ impl UnifiedServerData {
             databases: self.state.databases.iter().enumerate().map(|(i, db)| {
                 DatabaseCatalogEntry {
                     db_id: i as u8,
+                    db_type: match db.descriptor.db_type {
+                        DatabaseType::Full => 0,
+                        DatabaseType::Delta => 1,
+                    },
                     name: db.descriptor.name.clone(),
+                    base_height: db.descriptor.base_height,
                     height: db.descriptor.height,
                     index_bins_per_table: db.index.bins_per_table as u32,
                     chunk_bins_per_table: db.chunk.bins_per_table as u32,
@@ -542,6 +653,7 @@ impl UnifiedServerData {
                     tag_seed: db.index.tag_seed,
                     dpf_n_index: params::compute_dpf_n(db.index.bins_per_table),
                     dpf_n_chunk: params::compute_dpf_n(db.chunk.bins_per_table),
+                    has_bucket_merkle: db.has_bucket_merkle(),
                 }
             }).collect(),
         }
@@ -609,12 +721,12 @@ impl UnifiedServerData {
         (BatchResult { level: 1, round_id: query.round_id, results }, total_dpf, total_fetch)
     }
 
-    fn process_merkle_sibling_batch(&self, query: &BatchQuery) -> (BatchResult, std::time::Duration, std::time::Duration) {
+    fn process_merkle_sibling_batch(&self, query: &BatchQuery, db: &MappedDatabase) -> (BatchResult, std::time::Duration, std::time::Duration) {
         // round_id encoding: `level * 100 + pbc_round_index`
         // The server only cares about the sibling level (which table to query).
         // The PBC round index is just echoed back for client-side correlation.
         let level = (query.round_id as usize) / 100;
-        let sib_table = &self.main_db().merkle_siblings[level];
+        let sib_table = &db.merkle_siblings[level];
         let k = sib_table.params.k;
         let result_size = sib_table.params.bin_size(); // slots_per_bin × slot_size
         let num_groups = query.keys.len().min(k);
@@ -781,57 +893,141 @@ async fn main() {
 
     println!("=== Unified PIR Server ({}) ===", role_name);
     println!("  Port:     {}", args.port);
-    println!("  Data dir: {}", args.data_dir.display());
-    for (path, name, height) in &args.delta_dirs {
-        println!("  Delta:    {} ({}, height={})", path.display(), name, height);
+    if let Some(ref config_path) = args.config_path {
+        println!("  Config:   {}", config_path.display());
+    } else {
+        println!("  Data dir: {}", args.data_dir.display());
+        for (path, height) in &args.checkpoints {
+            println!("  Checkpoint: {} (height={})", path.display(), height);
+        }
+        for (path, base, tip) in &args.deltas {
+            println!("  Delta:      {} ({}→{})", path.display(), base, tip);
+        }
     }
     println!();
 
     let total_start = Instant::now();
 
-    // ── Load main database (db_id=0) ────────────────────────────────────
-
-    let main_db = MappedDatabase::load(&args.data_dir, DatabaseDescriptor {
-        name: "main".to_string(),
-        height: 0,
-        index_params: INDEX_PARAMS,
-        chunk_params: CHUNK_PARAMS,
-    });
-
-    let index_k = main_db.index.params.k;
-    let chunk_k = main_db.chunk.params.k;
-
-    // ── Collect mmap regions for residency monitoring ──────────────────
+    // ── Load databases ─────────────────────────────────────────────────
+    let mut all_databases: Vec<MappedDatabase> = Vec::new();
     let mut mmap_regions: Vec<MmapRegion> = Vec::new();
-    mmap_regions.push(MmapRegion { name: "batch_pir_cuckoo.bin".into(), ptr: main_db.index.mmap.as_ptr(), len: main_db.index.mmap.len() });
-    mmap_regions.push(MmapRegion { name: "chunk_pir_cuckoo.bin".into(), ptr: main_db.chunk.mmap.as_ptr(), len: main_db.chunk.mmap.len() });
-    for (i, sib) in main_db.merkle_siblings.iter().enumerate() {
-        mmap_regions.push(MmapRegion { name: format!("merkle_sibling_dpf_L{}.bin", i), ptr: sib.mmap.as_ptr(), len: sib.mmap.len() });
-    }
 
-    // ── Load delta databases (db_id=1, 2, ...) ─────────────────────────
-    let mut extra_databases: Vec<MappedDatabase> = Vec::new();
-    for (path, name, height) in &args.delta_dirs {
-        let delta_db = MappedDatabase::load(path, DatabaseDescriptor {
-            name: name.clone(),
-            height: *height,
+    // The data_dir for OnionPIR / Merkle files = first database's directory.
+    let main_data_dir: PathBuf;
+
+    if let Some(ref config_path) = args.config_path {
+        let config = ServerConfig::load(config_path);
+        println!("[config] Loaded {} databases from {}", config.databases.len(), config_path.display());
+
+        for (i, db_cfg) in config.databases.iter().enumerate() {
+            let db_type = match db_cfg.db_type.as_str() {
+                "delta" => DatabaseType::Delta,
+                _ => DatabaseType::Full,
+            };
+            let db_path = config.db_path(i);
+            let db = MappedDatabase::load(&db_path, DatabaseDescriptor {
+                name: db_cfg.name.clone(),
+                db_type,
+                base_height: db_cfg.base_height,
+                height: db_cfg.height,
+                index_params: INDEX_PARAMS,
+                chunk_params: CHUNK_PARAMS,
+            });
+            let type_label = if db_type == DatabaseType::Delta {
+                format!("Delta:{}→{}", db_cfg.base_height, db_cfg.height)
+            } else {
+                format!("Full:{}", db_cfg.height)
+            };
+            println!("[{}] INDEX bins={}, CHUNK bins={}, dpf_n_index={}, dpf_n_chunk={}, priority={}",
+                type_label, db.index.bins_per_table, db.chunk.bins_per_table,
+                params::compute_dpf_n(db.index.bins_per_table),
+                params::compute_dpf_n(db.chunk.bins_per_table),
+                db_cfg.priority);
+            mmap_regions.push(MmapRegion {
+                name: format!("{}/batch_pir_cuckoo.bin", db_cfg.name),
+                ptr: db.index.mmap.as_ptr(), len: db.index.mmap.len(), priority: db_cfg.priority,
+            });
+            mmap_regions.push(MmapRegion {
+                name: format!("{}/chunk_pir_cuckoo.bin", db_cfg.name),
+                ptr: db.chunk.mmap.as_ptr(), len: db.chunk.mmap.len(), priority: db_cfg.priority,
+            });
+            all_databases.push(db);
+        }
+
+        // First database's directory is used for OnionPIR / Merkle files.
+        main_data_dir = config.db_path(0);
+    } else {
+        // Legacy CLI mode: --data-dir + --checkpoint + --delta
+
+        let main_db = MappedDatabase::load(&args.data_dir, DatabaseDescriptor {
+            name: "main".to_string(),
+            db_type: DatabaseType::Full,
+            base_height: 0,
+            height: 0,
             index_params: INDEX_PARAMS,
             chunk_params: CHUNK_PARAMS,
         });
-        println!("[Delta:{}] INDEX bins={}, CHUNK bins={}, dpf_n_index={}, dpf_n_chunk={}",
-            name, delta_db.index.bins_per_table, delta_db.chunk.bins_per_table,
-            params::compute_dpf_n(delta_db.index.bins_per_table),
-            params::compute_dpf_n(delta_db.chunk.bins_per_table));
-        mmap_regions.push(MmapRegion {
-            name: format!("{}/batch_pir_cuckoo.bin", name),
-            ptr: delta_db.index.mmap.as_ptr(), len: delta_db.index.mmap.len(),
-        });
-        mmap_regions.push(MmapRegion {
-            name: format!("{}/chunk_pir_cuckoo.bin", name),
-            ptr: delta_db.chunk.mmap.as_ptr(), len: delta_db.chunk.mmap.len(),
-        });
-        extra_databases.push(delta_db);
+
+        mmap_regions.push(MmapRegion { name: "batch_pir_cuckoo.bin".into(), ptr: main_db.index.mmap.as_ptr(), len: main_db.index.mmap.len(), priority: 1 });
+        mmap_regions.push(MmapRegion { name: "chunk_pir_cuckoo.bin".into(), ptr: main_db.chunk.mmap.as_ptr(), len: main_db.chunk.mmap.len(), priority: 1 });
+        all_databases.push(main_db);
+
+        for (path, height) in &args.checkpoints {
+            let name = format!("checkpoint_{}", height);
+            let db = MappedDatabase::load(path, DatabaseDescriptor {
+                name: name.clone(),
+                db_type: DatabaseType::Full,
+                base_height: 0,
+                height: *height,
+                index_params: INDEX_PARAMS,
+                chunk_params: CHUNK_PARAMS,
+            });
+            println!("[Checkpoint:{}] INDEX bins={}, CHUNK bins={}, dpf_n_index={}, dpf_n_chunk={}",
+                height, db.index.bins_per_table, db.chunk.bins_per_table,
+                params::compute_dpf_n(db.index.bins_per_table),
+                params::compute_dpf_n(db.chunk.bins_per_table));
+            mmap_regions.push(MmapRegion {
+                name: format!("{}/batch_pir_cuckoo.bin", name),
+                ptr: db.index.mmap.as_ptr(), len: db.index.mmap.len(), priority: 5,
+            });
+            mmap_regions.push(MmapRegion {
+                name: format!("{}/chunk_pir_cuckoo.bin", name),
+                ptr: db.chunk.mmap.as_ptr(), len: db.chunk.mmap.len(), priority: 5,
+            });
+            all_databases.push(db);
+        }
+
+        for (path, base, tip) in &args.deltas {
+            let name = format!("delta_{}_{}", base, tip);
+            let db = MappedDatabase::load(path, DatabaseDescriptor {
+                name: name.clone(),
+                db_type: DatabaseType::Delta,
+                base_height: *base,
+                height: *tip,
+                index_params: INDEX_PARAMS,
+                chunk_params: CHUNK_PARAMS,
+            });
+            println!("[Delta:{}→{}] INDEX bins={}, CHUNK bins={}, dpf_n_index={}, dpf_n_chunk={}",
+                base, tip, db.index.bins_per_table, db.chunk.bins_per_table,
+                params::compute_dpf_n(db.index.bins_per_table),
+                params::compute_dpf_n(db.chunk.bins_per_table));
+            mmap_regions.push(MmapRegion {
+                name: format!("{}/batch_pir_cuckoo.bin", name),
+                ptr: db.index.mmap.as_ptr(), len: db.index.mmap.len(), priority: 10,
+            });
+            mmap_regions.push(MmapRegion {
+                name: format!("{}/chunk_pir_cuckoo.bin", name),
+                ptr: db.chunk.mmap.as_ptr(), len: db.chunk.mmap.len(), priority: 10,
+            });
+            all_databases.push(db);
+        }
+
+        main_data_dir = args.data_dir.clone();
     }
+
+    let main_db = &all_databases[0];
+    let index_k = main_db.index.params.k;
+    let chunk_k = main_db.chunk.params.k;
 
     // ── Set up OnionPIR (primary only, if data available) ───────────────
 
@@ -847,13 +1043,13 @@ async fn main() {
     let mut num_index_sibling_levels: usize = 0;
     let mut num_data_sibling_levels: usize = 0;
 
-    let ntt_path = args.data_dir.join(ONION_NTT_FILE);
+    let ntt_path = main_data_dir.join(ONION_NTT_FILE);
     if args.role == ServerRole::Primary && ntt_path.exists() {
         println!("[OnionPIR] Loading data...");
 
-        let chunk_cuckoo_path = args.data_dir.join(ONION_CHUNK_CUCKOO_FILE);
-        let index_pir_dir = args.data_dir.join(ONION_INDEX_PIR_DIR);
-        let index_meta_path = args.data_dir.join(ONION_INDEX_META_FILE);
+        let chunk_cuckoo_path = main_data_dir.join(ONION_CHUNK_CUCKOO_FILE);
+        let index_pir_dir = main_data_dir.join(ONION_INDEX_PIR_DIR);
+        let index_meta_path = main_data_dir.join(ONION_INDEX_META_FILE);
 
         // Read OnionPIR-specific headers
         let cuckoo_data = std::fs::read(&chunk_cuckoo_path).expect("read onion chunk cuckoo");
@@ -893,7 +1089,7 @@ async fn main() {
         let ntt_file = std::fs::File::open(&ntt_path).expect("open NTT store");
         let ntt_mmap = unsafe { Mmap::map(&ntt_file) }.expect("mmap NTT store");
         println!("  NTT store: {:.2} GB", ntt_mmap.len() as f64 / 1e9);
-        mmap_regions.push(MmapRegion { name: ONION_NTT_FILE.into(), ptr: ntt_mmap.as_ptr(), len: ntt_mmap.len() });
+        mmap_regions.push(MmapRegion { name: ONION_NTT_FILE.into(), ptr: ntt_mmap.as_ptr(), len: ntt_mmap.len(), priority: 1 });
 
         // Load per-bin Merkle sibling databases (INDEX-MERKLE and DATA-MERKLE)
         struct SiblingLevelData {
@@ -934,30 +1130,30 @@ async fn main() {
 
                 println!("  {} Sibling L{}: K={}, bins={}, groups={}, NTT={:.2} GB",
                     prefix, level, k, bins_per_table, num_groups, ntt_mm.len() as f64 / 1e9);
-                mmap_regions.push(MmapRegion { name: format!("merkle_onion_{}_sib_L{}_ntt.bin", prefix, level), ptr: ntt_mm.as_ptr(), len: ntt_mm.len() });
+                mmap_regions.push(MmapRegion { name: format!("merkle_onion_{}_sib_L{}_ntt.bin", prefix, level), ptr: ntt_mm.as_ptr(), len: ntt_mm.len(), priority: 2 });
 
                 levels.push(SiblingLevelData { k, bins_per_table, num_groups, cuckoo_tables: tables, ntt_mmap: ntt_mm });
             }
             levels
         }
 
-        let index_sibling_levels = load_merkle_sib_levels(&args.data_dir, "index", &mut mmap_regions);
-        let data_sibling_levels = load_merkle_sib_levels(&args.data_dir, "data", &mut mmap_regions);
+        let index_sibling_levels = load_merkle_sib_levels(&main_data_dir, "index", &mut mmap_regions);
+        let data_sibling_levels = load_merkle_sib_levels(&main_data_dir, "data", &mut mmap_regions);
 
         // Load Merkle roots and tree-top caches
-        let root_path = args.data_dir.join("merkle_onion_index_root.bin");
+        let root_path = main_data_dir.join("merkle_onion_index_root.bin");
         if root_path.exists() {
             index_merkle_root = Some(std::fs::read(&root_path).expect("read index merkle root"));
         }
-        let root_path = args.data_dir.join("merkle_onion_data_root.bin");
+        let root_path = main_data_dir.join("merkle_onion_data_root.bin");
         if root_path.exists() {
             data_merkle_root = Some(std::fs::read(&root_path).expect("read data merkle root"));
         }
-        let top_path = args.data_dir.join("merkle_onion_index_tree_top.bin");
+        let top_path = main_data_dir.join("merkle_onion_index_tree_top.bin");
         if top_path.exists() {
             index_merkle_tree_top = Some(std::fs::read(&top_path).expect("read index merkle tree-top"));
         }
-        let top_path = args.data_dir.join("merkle_onion_data_tree_top.bin");
+        let top_path = main_data_dir.join("merkle_onion_data_tree_top.bin");
         if top_path.exists() {
             data_merkle_tree_top = Some(std::fs::read(&top_path).expect("read data merkle tree-top"));
         }
@@ -1162,16 +1358,14 @@ async fn main() {
 
     warmup::report_residency(&mmap_regions);
     if args.warmup {
-        warmup::warmup_regions(&mmap_regions);
+        warmup::warmup_regions(&mut mmap_regions);
         warmup::report_residency(&mmap_regions);
     }
     println!();
 
     // ── Assemble ServerState ────────────────────────────────────────────
-    let mut databases = vec![main_db];
-    databases.extend(extra_databases);
-    let num_databases = databases.len();
-    let state = ServerState { databases };
+    let num_databases = all_databases.len();
+    let state = ServerState { databases: all_databases };
 
     let server = Arc::new(UnifiedServerData {
         state,
@@ -1304,19 +1498,23 @@ async fn main() {
                     }
 
                     // ── Merkle sibling batch queries ──────────────────────
-                    REQ_MERKLE_SIBLING_BATCH if !server.main_db().merkle_siblings.is_empty() => {
+                    REQ_MERKLE_SIBLING_BATCH => {
                         if let Ok(Request::MerkleSiblingBatch(q)) = Request::decode(payload) {
                             let s = Arc::clone(&server);
                             let resp = tokio::task::spawn_blocking(move || {
+                                let db = match s.state.get_db(q.db_id) {
+                                    Some(db) if db.has_merkle() => db,
+                                    _ => return Response::Error(format!("db {} has no merkle siblings", q.db_id)),
+                                };
                                 let t = Instant::now();
                                 let n = q.keys.len();
                                 // round_id = level * 100 + pbc_round_index
                                 let level = q.round_id / 100;
                                 let pbc_round = q.round_id % 100;
-                                let (batch, dpf_sum, fetch_sum) = s.process_merkle_sibling_batch(&q);
+                                let (batch, dpf_sum, fetch_sum) = s.process_merkle_sibling_batch(&q, db);
                                 let wall = t.elapsed();
-                                println!("[merkle-sib] L{} r{} {} groups {:.2?} | dpf {:.2?} fetch+xor {:.2?}",
-                                    level, pbc_round, n, wall, dpf_sum, fetch_sum);
+                                println!("[merkle-sib] db={} L{} r{} {} groups {:.2?} | dpf {:.2?} fetch+xor {:.2?}",
+                                    q.db_id, level, pbc_round, n, wall, dpf_sum, fetch_sum);
                                 Response::MerkleSiblingBatch(batch)
                             }).await.unwrap();
                             let _ = sink.send(Message::Binary(resp.encode().into())).await;
@@ -1324,32 +1522,44 @@ async fn main() {
                     }
 
                     // ── Merkle tree-top cache fetch ──────────────────────
-                    REQ_MERKLE_TREE_TOP if server.main_db().merkle_tree_top.is_some() => {
-                        // Send: [4B len][1B RESP_MERKLE_TREE_TOP][tree_top_bytes...]
-                        let top = server.main_db().merkle_tree_top.as_ref().unwrap();
-                        let payload_len = 1 + top.len();
-                        let mut msg = Vec::with_capacity(4 + payload_len);
-                        msg.extend_from_slice(&(payload_len as u32).to_le_bytes());
-                        msg.push(RESP_MERKLE_TREE_TOP);
-                        msg.extend_from_slice(top);
-                        let _ = sink.send(Message::Binary(msg.into())).await;
-                        println!("[merkle-top] sent {} bytes", top.len());
+                    REQ_MERKLE_TREE_TOP => {
+                        // Optional db_id byte: payload[1] if present, else 0.
+                        let db_id = if payload.len() > 1 { payload[1] } else { 0 };
+                        let db = server.state.get_db(db_id);
+                        let top = db.and_then(|d| d.merkle_tree_top.as_ref());
+                        if let Some(top) = top {
+                            // Send: [4B len][1B RESP_MERKLE_TREE_TOP][tree_top_bytes...]
+                            let payload_len = 1 + top.len();
+                            let mut msg = Vec::with_capacity(4 + payload_len);
+                            msg.extend_from_slice(&(payload_len as u32).to_le_bytes());
+                            msg.push(RESP_MERKLE_TREE_TOP);
+                            msg.extend_from_slice(top);
+                            let _ = sink.send(Message::Binary(msg.into())).await;
+                            println!("[merkle-top] db={} sent {} bytes", db_id, top.len());
+                        } else {
+                            let err = Response::Error(format!("db {} has no merkle tree-top", db_id));
+                            let _ = sink.send(Message::Binary(err.encode().into())).await;
+                        }
                     }
 
                     // ── Per-bucket bin Merkle sibling batch queries ──────
-                    REQ_BUCKET_MERKLE_SIB_BATCH if server.main_db().has_bucket_merkle() => {
+                    REQ_BUCKET_MERKLE_SIB_BATCH => {
                         if let Ok(Request::BucketMerkleSibBatch(q)) = Request::decode(payload) {
                             let s = Arc::clone(&server);
                             let resp = tokio::task::spawn_blocking(move || {
+                                let db = match s.state.get_db(q.db_id) {
+                                    Some(db) if db.has_bucket_merkle() => db,
+                                    _ => return Response::Error(format!("db {} has no bucket merkle", q.db_id)),
+                                };
                                 let t = Instant::now();
                                 let n = q.keys.len();
                                 // round_id encodes: table_type * 100 + level
                                 let table_type = q.round_id / 100;
                                 let level = (q.round_id % 100) as usize;
                                 let sib_tables = if table_type == 0 {
-                                    &s.main_db().bucket_merkle_index_siblings
+                                    &db.bucket_merkle_index_siblings
                                 } else {
-                                    &s.main_db().bucket_merkle_chunk_siblings
+                                    &db.bucket_merkle_chunk_siblings
                                 };
                                 if level >= sib_tables.len() {
                                     return Response::Error(format!("bucket merkle: invalid level {}", level));
@@ -1357,8 +1567,8 @@ async fn main() {
                                 let sib = &sib_tables[level];
                                 let (batch, dpf_sum, fetch_sum) = s.process_generic_batch(&q, sib);
                                 let wall = t.elapsed();
-                                println!("[bkt-merkle-sib] T{} L{} {} groups {:.2?} | dpf {:.2?} fetch {:.2?}",
-                                    table_type, level, n, wall, dpf_sum, fetch_sum);
+                                println!("[bkt-merkle-sib] db={} T{} L{} {} groups {:.2?} | dpf {:.2?} fetch {:.2?}",
+                                    q.db_id, table_type, level, n, wall, dpf_sum, fetch_sum);
                                 Response::BucketMerkleSibBatch(batch)
                             }).await.unwrap();
                             let _ = sink.send(Message::Binary(resp.encode().into())).await;
@@ -1366,15 +1576,23 @@ async fn main() {
                     }
 
                     // ── Per-bucket Merkle tree-tops fetch ────────────────
-                    REQ_BUCKET_MERKLE_TREE_TOPS if server.main_db().bucket_merkle_tree_tops.is_some() => {
-                        let tops = server.main_db().bucket_merkle_tree_tops.as_ref().unwrap();
-                        let payload_len = 1 + tops.len();
-                        let mut msg = Vec::with_capacity(4 + payload_len);
-                        msg.extend_from_slice(&(payload_len as u32).to_le_bytes());
-                        msg.push(RESP_BUCKET_MERKLE_TREE_TOPS);
-                        msg.extend_from_slice(tops);
-                        let _ = sink.send(Message::Binary(msg.into())).await;
-                        println!("[bkt-merkle-tops] sent {} bytes", tops.len());
+                    REQ_BUCKET_MERKLE_TREE_TOPS => {
+                        // Optional db_id byte: payload[1] if present, else 0.
+                        let db_id = if payload.len() > 1 { payload[1] } else { 0 };
+                        let db = server.state.get_db(db_id);
+                        let tops = db.and_then(|d| d.bucket_merkle_tree_tops.as_ref());
+                        if let Some(tops) = tops {
+                            let payload_len = 1 + tops.len();
+                            let mut msg = Vec::with_capacity(4 + payload_len);
+                            msg.extend_from_slice(&(payload_len as u32).to_le_bytes());
+                            msg.push(RESP_BUCKET_MERKLE_TREE_TOPS);
+                            msg.extend_from_slice(tops);
+                            let _ = sink.send(Message::Binary(msg.into())).await;
+                            println!("[bkt-merkle-tops] db={} sent {} bytes", db_id, tops.len());
+                        } else {
+                            let err = Response::Error(format!("db {} has no bucket merkle tree-tops", db_id));
+                            let _ = sink.send(Message::Binary(err.encode().into())).await;
+                        }
                     }
 
                     // ── HarmonyPIR ────────────────────────────────────────

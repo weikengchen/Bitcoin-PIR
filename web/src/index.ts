@@ -136,6 +136,14 @@ export {
 
 export {
   fetchDatabaseCatalog,
+  decodeDatabaseCatalog,
   type DatabaseCatalog,
   type DatabaseCatalogEntry,
+  type PerDatabaseInfoJson,
 } from './server-info.js';
+
+export {
+  computeSyncPlan,
+  type SyncPlan,
+  type SyncStep,
+} from './sync.js';
