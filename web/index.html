@@ -1110,6 +1110,7 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                 log('Disconnected', 'info');
                 setButtons(false);
             }
+            syncSnapshotByHash.clear();
             document.getElementById('resultsContainer').innerHTML = '';
             document.getElementById('advancedDbDetails').style.display = 'none';
             document.getElementById('syncStateRow').style.display = 'none';
@@ -1259,6 +1260,13 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
         // when they clicked "Sync to latest".
         let pendingSync = null;
 
+        // Per-scripthash merged snapshot carried across sync clicks in the same
+        // session. Keyed by bytesToHex(scriptHash). Seeded into `merged` at the
+        // start of executeSync() so a delta-only plan (computed because the
+        // client is already "synced to height H") has a snapshot to apply on
+        // top of. Cleared on disconnect and reset-sync.
+        let syncSnapshotByHash = new Map();
+
         function describeStep(s) {
             if (s.dbType === 'full') {
                 return `[full ${s.name} @ ${s.tipHeight.toLocaleString()}]`;
@@ -1362,10 +1370,11 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
             const resultsContainer = document.getElementById('resultsContainer');
             resultsContainer.innerHTML = '';
 
-            // Per-scripthash merged result starts as null and is replaced/updated
-            // by each step. Steps run sequentially because deltas depend on the
-            // previous step's snapshot.
-            let merged = new Array(N).fill(null);
+            // Per-scripthash merged result. Seeded from the in-memory snapshot
+            // cache so a delta-only plan can apply on top of a previously-synced
+            // full snapshot from the same session. Full steps overwrite the
+            // seeded value; delta steps merge into it.
+            let merged = scriptHashes.map(sh => syncSnapshotByHash.get(bytesToHex(sh)) || null);
             let lastFullStepResults = null; // for Merkle button (if applicable)
 
             try {
@@ -1403,13 +1412,16 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                     }
                 }
 
-                // Render merged results.
+                // Render merged results and stash them for subsequent delta syncs.
                 let found = 0;
                 for (let qi = 0; qi < N; qi++) {
                     const spkHex = lines[qi];
                     const hashHex = bytesToHex(scriptHashes[qi]);
                     const r = merged[qi];
-                    if (r) found++;
+                    if (r) {
+                        found++;
+                        syncSnapshotByHash.set(hashHex, r);
+                    }
                     renderResult(resultsContainer, spkHex, hashHex, r);
                 }
 
@@ -1452,6 +1464,7 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
 
         function resetSyncState() {
             clearLastSyncedHeight();
+            syncSnapshotByHash.clear();
             refreshSyncStateUI();
             document.getElementById('syncPlanBox').style.display = 'none';
             pendingSync = null;
