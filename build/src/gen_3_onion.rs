@@ -29,7 +29,7 @@ use rayon::prelude::*;
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -39,11 +39,38 @@ const DEFAULT_INDEX_FILE: &str = "/Volumes/Bitcoin/data/intermediate/onion_index
 const DEFAULT_OUTPUT_DIR: &str = "/Volumes/Bitcoin/data/onion_index_pir";
 const DEFAULT_META_FILE: &str = "/Volumes/Bitcoin/data/onion_index_meta.bin";
 const DEFAULT_BIN_HASHES_FILE: &str = "/Volumes/Bitcoin/data/onion_index_bin_hashes.bin";
+const DEFAULT_INDEX_ALL_FILE: &str = "/Volumes/Bitcoin/data/onion_index_all.bin";
 
-/// Resolve input/output paths from optional `--data-dir <D>` argument.
-fn resolve_paths() -> (String, PathBuf, String, String) {
+/// Magic for the consolidated onion_index_all.bin file. The byte layout after
+/// this 32-byte master header is just K per-group preprocessed databases
+/// concatenated back-to-back, each in OnionPIR's standard save_db_to_file
+/// format. The per-group size is identical because all K groups share the
+/// same bins_per_table and OnionPIR params.
+const ONION_INDEX_ALL_MAGIC: u64 = 0xBA7C_0010_0000_0003;
+const ONION_INDEX_ALL_HEADER_BYTES: usize = 32; // 4 * u64
+
+/// Paths resolved from optional `--data-dir <D>` argument.
+struct GenPaths {
+    index_file: String,
+    output_dir: PathBuf,     // per-group dir (used as scratch)
+    meta_file: String,
+    bin_hashes_file: String,
+    index_all_file: String,  // NEW: consolidated single-file output
+}
+
+struct GenArgs {
+    paths: GenPaths,
+    /// When true, skip steps 1–7 and only run step 8 (read existing
+    /// group_N.bin files from output_dir, concat into index_all_file,
+    /// remove output_dir). Used to retrofit existing preprocessed snapshots
+    /// into the new single-file layout without re-running preprocessing.
+    consolidate_only: bool,
+}
+
+fn resolve_paths() -> GenArgs {
     let args: Vec<String> = env::args().collect();
     let mut data_dir: Option<String> = None;
+    let mut consolidate_only = false;
     let mut i = 1;
     while i < args.len() {
         if args[i] == "--data-dir" {
@@ -51,23 +78,28 @@ fn resolve_paths() -> (String, PathBuf, String, String) {
                 data_dir = Some(v.clone());
                 i += 1;
             }
+        } else if args[i] == "--consolidate-only" {
+            consolidate_only = true;
         }
         i += 1;
     }
-    match data_dir {
-        Some(d) => (
-            format!("{}/onion_index.bin", d),
-            PathBuf::from(format!("{}/onion_index_pir", d)),
-            format!("{}/onion_index_meta.bin", d),
-            format!("{}/onion_index_bin_hashes.bin", d),
-        ),
-        None => (
-            DEFAULT_INDEX_FILE.to_string(),
-            PathBuf::from(DEFAULT_OUTPUT_DIR),
-            DEFAULT_META_FILE.to_string(),
-            DEFAULT_BIN_HASHES_FILE.to_string(),
-        ),
-    }
+    let paths = match data_dir {
+        Some(d) => GenPaths {
+            index_file: format!("{}/onion_index.bin", d),
+            output_dir: PathBuf::from(format!("{}/onion_index_pir", d)),
+            meta_file: format!("{}/onion_index_meta.bin", d),
+            bin_hashes_file: format!("{}/onion_index_bin_hashes.bin", d),
+            index_all_file: format!("{}/onion_index_all.bin", d),
+        },
+        None => GenPaths {
+            index_file: DEFAULT_INDEX_FILE.to_string(),
+            output_dir: PathBuf::from(DEFAULT_OUTPUT_DIR),
+            meta_file: DEFAULT_META_FILE.to_string(),
+            bin_hashes_file: DEFAULT_BIN_HASHES_FILE.to_string(),
+            index_all_file: DEFAULT_INDEX_ALL_FILE.to_string(),
+        },
+    };
+    GenArgs { paths, consolidate_only }
 }
 
 /// OnionPIR index entry from gen_1_onion: 20B script_hash + 4B entry_id + 2B offset + 1B num_entries
@@ -307,6 +339,101 @@ fn serialize_cuckoo_bin(
     entry
 }
 
+// ─── --consolidate-only helper ──────────────────────────────────────────────
+
+/// Concatenate existing group_{0..K-1}.bin files from `output_dir` into
+/// `index_all_file` and remove the scratch directory. Used by the
+/// `--consolidate-only` flag to retrofit existing preprocessed snapshots
+/// into the new single-file layout without re-running NTT preprocessing.
+fn consolidate_only_main(
+    output_dir: &Path,
+    index_all_file: &str,
+    total_start: Instant,
+) {
+    println!("[consolidate-only] Scanning {} for group_*.bin files...", output_dir.display());
+
+    // Discover K by counting group_N.bin files. We require them to be
+    // contiguously numbered 0..K-1, all the same size.
+    let mut group_paths: Vec<PathBuf> = Vec::new();
+    let mut b = 0usize;
+    loop {
+        let path = output_dir.join(format!("group_{}.bin", b));
+        if !path.exists() {
+            break;
+        }
+        group_paths.push(path);
+        b += 1;
+    }
+    if group_paths.is_empty() {
+        panic!(
+            "[consolidate-only] No group_N.bin files found in {}. Was this directory already consolidated?",
+            output_dir.display()
+        );
+    }
+    let k_found = group_paths.len();
+    let per_group_bytes = fs::metadata(&group_paths[0])
+        .expect("stat group_0.bin")
+        .len() as usize;
+    println!(
+        "[consolidate-only] Found K={} preprocessed groups, per_group_bytes={} ({})",
+        k_found,
+        per_group_bytes,
+        format_bytes(per_group_bytes as u64),
+    );
+
+    let total_bytes = ONION_INDEX_ALL_HEADER_BYTES + k_found * per_group_bytes;
+    println!(
+        "[consolidate-only] Total output: {} bytes ({})",
+        total_bytes,
+        format_bytes(total_bytes as u64),
+    );
+
+    let out = File::create(index_all_file).expect("create onion_index_all.bin");
+    let mut w = BufWriter::with_capacity(16 * 1024 * 1024, out);
+
+    // Master header (32 bytes)
+    w.write_all(&ONION_INDEX_ALL_MAGIC.to_le_bytes()).unwrap();
+    w.write_all(&(k_found as u64).to_le_bytes()).unwrap();
+    w.write_all(&(per_group_bytes as u64).to_le_bytes()).unwrap();
+    w.write_all(&0u64.to_le_bytes()).unwrap();
+
+    let mut written: u64 = 0;
+    for (b, path) in group_paths.iter().enumerate() {
+        let meta = fs::metadata(path).expect("stat group file");
+        assert_eq!(
+            meta.len() as usize,
+            per_group_bytes,
+            "group_{}.bin size mismatch: expected {}, got {}",
+            b, per_group_bytes, meta.len(),
+        );
+        let bytes = fs::read(path).expect("read group file");
+        w.write_all(&bytes).unwrap();
+        written += bytes.len() as u64;
+        if b % 5 == 0 || b + 1 == k_found {
+            eprint!("\r  Appending group {}/{}", b + 1, k_found);
+            let _ = io::stderr().flush();
+        }
+    }
+    eprintln!();
+    w.flush().unwrap();
+    drop(w);
+
+    let actual_size = fs::metadata(index_all_file).expect("stat output").len() as usize;
+    assert_eq!(
+        actual_size, total_bytes,
+        "onion_index_all.bin size mismatch: expected {}, got {}",
+        total_bytes, actual_size
+    );
+    println!("[consolidate-only] Wrote {} bytes; removing scratch dir {}", written, output_dir.display());
+    fs::remove_dir_all(output_dir).expect("remove per-group dir");
+
+    println!("\n=== Summary (consolidate-only) ===");
+    println!("Consolidated K:    {}", k_found);
+    println!("Per-group bytes:   {} ({})", per_group_bytes, format_bytes(per_group_bytes as u64));
+    println!("Total output:      {} ({})", total_bytes, format_bytes(total_bytes as u64));
+    println!("Total time:        {:.2?}", total_start.elapsed());
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -320,13 +447,35 @@ fn main() {
     println!("=== gen_3_onion: Build OnionPIR Index Database ===\n");
     let total_start = Instant::now();
 
-    let (index_file_path, output_dir, meta_file, bin_hashes_file) = resolve_paths();
+    let gen_args = resolve_paths();
+    let paths = &gen_args.paths;
+    let index_file_path = &paths.index_file;
+    let output_dir = &paths.output_dir;
+    let meta_file = &paths.meta_file;
+    let bin_hashes_file = &paths.bin_hashes_file;
+    let index_all_file = &paths.index_all_file;
     println!("Paths:");
     println!("  Input index:     {}", index_file_path);
-    println!("  Output PIR dir:  {}", output_dir.display());
+    println!("  Scratch dir:     {}", output_dir.display());
     println!("  Output meta:     {}", meta_file);
     println!("  Output hashes:   {}", bin_hashes_file);
+    println!("  Output all:      {}", index_all_file);
+    if gen_args.consolidate_only {
+        println!("  Mode:            --consolidate-only (skip steps 1\u{2013}7)");
+    }
     println!();
+
+    // ── --consolidate-only fast path ────────────────────────────────────
+    //
+    // Skip steps 1–7 (the expensive parts: read input, build cuckoo tables,
+    // preprocess). Assume output_dir already contains K preprocessed
+    // group_{0..K-1}.bin files from a prior build, and just concatenate
+    // them into index_all_file. Used to retrofit existing main-DB snapshots
+    // into the consolidated layout without re-running NTT preprocessing.
+    if gen_args.consolidate_only {
+        consolidate_only_main(output_dir, index_all_file, total_start);
+        return;
+    }
 
     // ── 1. Read index file ──────────────────────────────────────────────
     println!("[1] Memory-mapping index file: {}", index_file_path);
@@ -608,6 +757,76 @@ fn main() {
     if !tag_found {
         println!("  Verification: FAIL (tag 0x{:016x} not found in decrypted bin)", test_tag);
     }
+
+    // ── 8. Consolidate per-group files into one onion_index_all.bin ─────
+    //
+    // Layout: [master header: 32B][group_0: per_group_bytes][group_1: ...]
+    //         ... [group_{K-1}: per_group_bytes]
+    // The 32-byte master header is [ONION_INDEX_ALL_MAGIC u64 | K u64 |
+    // per_group_bytes u64 | reserved u64]. Each group payload is whatever
+    // OnionPIR's save_db_to_file produced — server-side mmaps the whole
+    // file once and passes a per-group slice to load_db_from_bytes().
+    println!("\n[8] Consolidating {} per-group files into {}...", K, index_all_file);
+    let t_consolidate = Instant::now();
+    {
+        // All groups have identical size because they share params.
+        // Read the first group's size and assert the rest match.
+        let first_path = output_dir.join("group_0.bin");
+        let per_group_bytes = fs::metadata(&first_path)
+            .expect("stat group_0.bin")
+            .len() as usize;
+        println!("  Per-group bytes: {} ({})", per_group_bytes, format_bytes(per_group_bytes as u64));
+
+        let total_bytes = ONION_INDEX_ALL_HEADER_BYTES + K * per_group_bytes;
+        println!("  Total output:    {} ({})", total_bytes, format_bytes(total_bytes as u64));
+
+        let out = File::create(index_all_file).expect("create onion_index_all.bin");
+        let mut w = BufWriter::with_capacity(16 * 1024 * 1024, out);
+
+        // Master header (32 bytes)
+        w.write_all(&ONION_INDEX_ALL_MAGIC.to_le_bytes()).unwrap();
+        w.write_all(&(K as u64).to_le_bytes()).unwrap();
+        w.write_all(&(per_group_bytes as u64).to_le_bytes()).unwrap();
+        w.write_all(&0u64.to_le_bytes()).unwrap();
+
+        // Append each group's preprocessed bytes in order.
+        let mut written: u64 = 0;
+        for b in 0..K {
+            let path = output_dir.join(format!("group_{}.bin", b));
+            let meta = fs::metadata(&path).expect("stat group file");
+            assert_eq!(
+                meta.len() as usize,
+                per_group_bytes,
+                "group_{}.bin size mismatch: expected {}, got {}",
+                b, per_group_bytes, meta.len()
+            );
+            let bytes = fs::read(&path).expect("read group file");
+            w.write_all(&bytes).unwrap();
+            written += bytes.len() as u64;
+            if b % 10 == 0 || b + 1 == K {
+                eprint!("\r  Appending group {}/{}", b + 1, K);
+                let _ = io::stderr().flush();
+            }
+        }
+        eprintln!();
+        w.flush().unwrap();
+        drop(w);
+
+        let actual_size = fs::metadata(index_all_file).expect("stat output").len() as usize;
+        assert_eq!(
+            actual_size, total_bytes,
+            "onion_index_all.bin size mismatch: expected {}, got {}",
+            total_bytes, actual_size
+        );
+
+        // Clean up the scratch per-group directory. We intentionally delete
+        // it so subsequent runs don't mix stale per-group files with the new
+        // consolidated layout. The server's load path is fully switched to
+        // the consolidated file.
+        println!("  Wrote {} bytes; removing scratch dir {}", written, output_dir.display());
+        fs::remove_dir_all(&output_dir).expect("remove per-group dir");
+    }
+    println!("  Consolidated in {:.2?}", t_consolidate.elapsed());
 
     // ── Summary ─────────────────────────────────────────────────────────
     println!("\n=== Summary ===");

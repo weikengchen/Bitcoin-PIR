@@ -16,7 +16,9 @@
  */
 
 import type { QueryResult, UtxoEntry } from './client.js';
+import type { HarmonyQueryResult, HarmonyUtxoEntry } from './harmonypir_client.js';
 import { decodeDeltaData, type DeltaData, type SpentRef } from './codec.js';
+import { bytesToHex } from './hash.js';
 
 // ─── Single-result merge ─────────────────────────────────────────────────────
 
@@ -119,6 +121,94 @@ export function mergeDeltaBatch(
   const out: (QueryResult | null)[] = new Array(snapshots.length);
   for (let i = 0; i < snapshots.length; i++) {
     out[i] = mergeDeltaIntoSnapshot(snapshots[i], deltas[i], onError);
+  }
+  return out;
+}
+
+// ─── HarmonyPIR merge (different UTXO shape) ─────────────────────────────────
+
+/**
+ * Merge a delta query result into a snapshot query result for a single
+ * scripthash, HarmonyPIR edition. HarmonyPIR uses a different UTXO shape
+ * (`HarmonyQueryResult` with `utxos: {txid: string, vout, value: number}[]`)
+ * than DPF/OnionPIR's `QueryResult`, so we need a dedicated merger.
+ *
+ * The delta decoding is shared with DPF/OnionPIR via `decodeDeltaData` — only
+ * the snapshot type differs. Delta `amount: bigint` is downcast to
+ * `value: number` to match HarmonyPIR's internal representation (which is
+ * already lossy at the client level; see harmonypir_client.ts:55–59).
+ */
+export function mergeDeltaIntoHarmonySnapshot(
+  snapshot: HarmonyQueryResult | null,
+  deltaResult: HarmonyQueryResult | null,
+  onError?: (msg: string) => void,
+): HarmonyQueryResult | null {
+  // No snapshot → nothing to merge into.
+  if (!snapshot) return null;
+
+  // Whale snapshot → cannot apply a delta meaningfully.
+  if (snapshot.whale) return snapshot;
+
+  // No delta result for this scripthash → nothing changed.
+  if (!deltaResult || deltaResult.whale) return snapshot;
+
+  // Decode the delta payload from rawChunkData. If absent or empty, no change.
+  const rawDelta = deltaResult.rawChunkData;
+  if (!rawDelta || rawDelta.length === 0) return snapshot;
+
+  let delta: DeltaData;
+  try {
+    delta = decodeDeltaData(rawDelta, onError);
+  } catch (e) {
+    onError?.(`mergeDeltaIntoHarmonySnapshot: failed to decode delta: ${e}`);
+    return snapshot;
+  }
+
+  // Normalize both sides to "hex_txid:vout" for outpoint comparison. The
+  // snapshot already uses hex strings; the delta's SpentRef.txid is bytes.
+  const spentKeys = new Set<string>();
+  for (const s of delta.spent) {
+    spentKeys.add(`${bytesToHex(s.txid)}:${s.vout}`);
+  }
+
+  const remaining: HarmonyUtxoEntry[] = [];
+  for (const u of snapshot.utxos) {
+    if (!spentKeys.has(`${u.txid}:${u.vout}`)) {
+      remaining.push(u);
+    }
+  }
+
+  // Convert delta newUtxos (bytes txid, bigint amount) → HarmonyUtxoEntry
+  // (hex string txid, number value).
+  for (const u of delta.newUtxos) {
+    remaining.push({
+      txid: bytesToHex(u.txid),
+      vout: u.vout,
+      value: Number(u.amount),
+    });
+  }
+
+  return { ...snapshot, utxos: remaining };
+}
+
+/**
+ * Batch variant of `mergeDeltaIntoHarmonySnapshot` — mirrors `mergeDeltaBatch`
+ * for DPF/OnionPIR. Merges parallel arrays of Harmony snapshots and Harmony
+ * delta results pairwise.
+ */
+export function mergeDeltaHarmonyBatch(
+  snapshots: (HarmonyQueryResult | null)[],
+  deltas: (HarmonyQueryResult | null)[],
+  onError?: (msg: string) => void,
+): (HarmonyQueryResult | null)[] {
+  if (snapshots.length !== deltas.length) {
+    throw new Error(
+      `mergeDeltaHarmonyBatch: length mismatch: snapshots=${snapshots.length}, deltas=${deltas.length}`,
+    );
+  }
+  const out: (HarmonyQueryResult | null)[] = new Array(snapshots.length);
+  for (let i = 0; i < snapshots.length; i++) {
+    out[i] = mergeDeltaIntoHarmonySnapshot(snapshots[i], deltas[i], onError);
   }
   return out;
 }

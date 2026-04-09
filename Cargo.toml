@@ -33,3 +33,14 @@ lto = "thin"
 incremental = true
 debug-assertions = true
 debug = true
+
+# TODO(onionpir-pr): Remove this patch block once the upstream PR lands.
+#
+# This temporarily points `onionpir` at a local clone of
+# Bitcoin-PIR/OnionPIRv2-fork so we can build against the new
+# `load_db_from_borrowed` API introduced on branch
+# `feat/load-db-from-borrowed`. Once that branch is merged into main,
+# drop this [patch] section and update runtime/Cargo.toml's onionpir
+# dep to pin to the merge commit SHA.
+[patch."https://github.com/Bitcoin-PIR/OnionPIRv2-fork.git"]
+onionpir = { path = "/Users/cusgadmin/bitcoin-pir/OnionPIRv2/rust/onionpir" }

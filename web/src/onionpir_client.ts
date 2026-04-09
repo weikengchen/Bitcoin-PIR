@@ -878,6 +878,10 @@ export class OnionPirWebClient {
           dataBinHashes: addrDataBinHashes,
           dataLeafPositions: addrDataLeafPositions,
           scriptHash: scriptHashes[qi],
+          // Preserve raw bytes so delta-DB queries can be re-decoded via
+          // decodeDeltaData in the sync-merge flow. For main DB this is just
+          // the same bytes that decodeUtxoData already consumed above.
+          rawChunkData: fullData,
         };
       }
 

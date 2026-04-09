@@ -152,11 +152,20 @@ enum PirCommand {
 
 const ONION_NTT_FILE: &str = "onion_shared_ntt.bin";
 const ONION_CHUNK_CUCKOO_FILE: &str = "onion_chunk_cuckoo.bin";
-const ONION_INDEX_PIR_DIR: &str = "onion_index_pir";
+// Consolidated INDEX file produced by gen_3_onion. Replaces the legacy
+// onion_index_pir/group_{0..K-1}.bin directory layout. Layout:
+//   [master header 32B: magic u64 | K u64 | per_group_bytes u64 | reserved u64]
+//   [group_0: per_group_bytes] [group_1: per_group_bytes] ... [group_{K-1}]
+// Each per-group slice is exactly what OnionPIR's save_db_to_file produced
+// (standard preproc header + NTT-form data) and is passed into
+// PirServer::load_db_from_bytes — zero-copy via one outer mmap.
+const ONION_INDEX_ALL_FILE: &str = "onion_index_all.bin";
 const ONION_INDEX_META_FILE: &str = "onion_index_meta.bin";
 
 const ONION_CHUNK_MAGIC: u64 = 0xBA7C_0010_0000_0001;
 const ONION_INDEX_META_MAGIC: u64 = 0xBA7C_0010_0000_0002;
+const ONION_INDEX_ALL_MAGIC: u64 = 0xBA7C_0010_0000_0003;
+const ONION_INDEX_ALL_HEADER_BYTES: usize = 32;
 
 struct OnionChunkHeader {
     k_chunk: usize,
@@ -1191,8 +1200,16 @@ async fn main() {
             println!("[OnionPIR:{}] Loading data...", db_label);
 
             let chunk_cuckoo_path = db_dir.join(ONION_CHUNK_CUCKOO_FILE);
-            let index_pir_dir = db_dir.join(ONION_INDEX_PIR_DIR);
+            let index_all_path = db_dir.join(ONION_INDEX_ALL_FILE);
             let index_meta_path = db_dir.join(ONION_INDEX_META_FILE);
+
+            if !index_all_path.exists() {
+                println!(
+                    "[OnionPIR:{}] Skipping — {} missing in {}. Re-run scripts/build_delta_onion.sh (or gen_3_onion) to regenerate the consolidated INDEX layout.",
+                    db_label, ONION_INDEX_ALL_FILE, db_dir.display(),
+                );
+                continue;
+            }
 
             // Read OnionPIR-specific headers
             let cuckoo_data = std::fs::read(&chunk_cuckoo_path).expect("read onion chunk cuckoo");
@@ -1238,6 +1255,56 @@ async fn main() {
                 len: ntt_mmap.len(),
                 priority: 1,
             });
+
+            // Load consolidated INDEX file (onion_index_all.bin). Single mmap;
+            // we parse the 32-byte master header here and hand per-group slices
+            // to the PIR worker thread, which in turn feeds each slice into
+            // `PirServer::load_db_from_bytes` (zero-copy aliased pointer).
+            let index_all_file = std::fs::File::open(&index_all_path)
+                .unwrap_or_else(|e| panic!("open {}: {}", index_all_path.display(), e));
+            let index_all_mmap = unsafe { Mmap::map(&index_all_file) }
+                .expect("mmap onion_index_all.bin");
+            {
+                if index_all_mmap.len() < ONION_INDEX_ALL_HEADER_BYTES {
+                    panic!(
+                        "{}: file too small ({} bytes) for index_all master header",
+                        index_all_path.display(), index_all_mmap.len(),
+                    );
+                }
+                let magic = u64::from_le_bytes(index_all_mmap[0..8].try_into().unwrap());
+                let file_k = u64::from_le_bytes(index_all_mmap[8..16].try_into().unwrap()) as usize;
+                let file_per_group = u64::from_le_bytes(index_all_mmap[16..24].try_into().unwrap()) as usize;
+                assert_eq!(
+                    magic, ONION_INDEX_ALL_MAGIC,
+                    "{}: bad master magic (expected {:#x}, got {:#x})",
+                    index_all_path.display(), ONION_INDEX_ALL_MAGIC, magic,
+                );
+                assert_eq!(
+                    file_k, im.k,
+                    "{}: K mismatch (file says {}, meta says {})",
+                    index_all_path.display(), file_k, im.k,
+                );
+                let expected_len = ONION_INDEX_ALL_HEADER_BYTES + file_k * file_per_group;
+                assert_eq!(
+                    index_all_mmap.len(), expected_len,
+                    "{}: total size mismatch (expected {}, got {})",
+                    index_all_path.display(), expected_len, index_all_mmap.len(),
+                );
+                println!(
+                    "  Index-all: K={}, per_group={:.2} MB, total={:.2} MB",
+                    file_k,
+                    file_per_group as f64 / 1e6,
+                    index_all_mmap.len() as f64 / 1e6,
+                );
+            }
+            mmap_regions.push(MmapRegion {
+                name: format!("{}/{}", db_label, ONION_INDEX_ALL_FILE),
+                ptr: index_all_mmap.as_ptr(),
+                len: index_all_mmap.len(),
+                priority: 1,
+            });
+            let index_all_per_group =
+                u64::from_le_bytes(index_all_mmap[16..24].try_into().unwrap()) as usize;
 
             // Load per-DB Merkle sibling levels (if present on disk). Every
             // DB that ships `merkle_onion_*` sidecars gets its own per-bin
@@ -1338,7 +1405,7 @@ async fn main() {
             let k_chunk = ch.k_chunk;
             let index_bins = im.bins_per_table;
             let chunk_bins = ch.bins_per_table;
-            let index_pir_dir_clone = index_pir_dir.clone();
+            let index_all_per_group_for_worker = index_all_per_group;
             let worker_label = db_label.clone();
 
             let (tx, mut pir_rx) = mpsc::channel::<PirCommand>(64);
@@ -1373,16 +1440,31 @@ async fn main() {
                 }
                 println!("  [OnionPIR:{}] {} chunk servers ready", worker_label, k_chunk);
 
-                // Set up index servers
+                // Set up index servers — each slices into the consolidated
+                // onion_index_all.bin mmap via load_db_from_bytes (zero-copy).
+                // The mmap handle must outlive every PirServer that aliases
+                // it, which is satisfied by moving `index_all_mmap` into this
+                // worker thread closure — the mmap drops only when the
+                // thread exits, which happens on process shutdown.
                 let mut index_servers: Vec<PirServer> = Vec::with_capacity(k_index);
                 for b in 0..k_index {
-                    let path = index_pir_dir_clone.join(format!("group_{}.bin", b));
+                    let off = ONION_INDEX_ALL_HEADER_BYTES + b * index_all_per_group_for_worker;
+                    let end = off + index_all_per_group_for_worker;
+                    let slice = &index_all_mmap[off..end];
                     let mut server = PirServer::new(index_bins as u64);
-                    assert!(server.load_db(path.to_str().unwrap()), "Failed to load {:?}", path);
+                    // SAFETY: `index_all_mmap` is owned by this worker thread
+                    // and lives as long as `server`. The PirServer will NOT
+                    // munmap the borrowed buffer on drop (fd = -1 path inside
+                    // load_db_from_borrowed).
+                    assert!(
+                        unsafe { server.load_db_from_bytes(slice) },
+                        "Failed to load index group {} from consolidated index_all (offset {}, len {})",
+                        b, off, slice.len(),
+                    );
                     unsafe { server.set_key_store(&key_store); }
                     index_servers.push(server);
                 }
-                println!("  [OnionPIR:{}] {} index servers ready", worker_label, k_index);
+                println!("  [OnionPIR:{}] {} index servers ready (via onion_index_all.bin mmap)", worker_label, k_index);
 
                 // Set up sibling servers (per level, per PBC group) — main DB only
                 let mut sibling_all_index_tables: Vec<Vec<Vec<u32>>> = Vec::new();

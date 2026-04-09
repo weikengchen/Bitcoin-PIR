@@ -3,9 +3,13 @@ import {
   mergeDeltaIntoSnapshot,
   applyDeltaData,
   mergeDeltaBatch,
+  mergeDeltaIntoHarmonySnapshot,
+  mergeDeltaHarmonyBatch,
 } from '../sync-merge.js';
 import type { QueryResult, UtxoEntry } from '../client.js';
+import type { HarmonyQueryResult, HarmonyUtxoEntry } from '../harmonypir_client.js';
 import type { DeltaData } from '../codec.js';
+import { bytesToHex } from '../hash.js';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -363,5 +367,176 @@ describe('mergeDeltaBatch', () => {
 
   it('throws on length mismatch', () => {
     expect(() => mergeDeltaBatch([snapshot([])], [])).toThrow('length mismatch');
+  });
+});
+
+// ─── HarmonyPIR merge ────────────────────────────────────────────────────────
+
+/** Build a HarmonyUtxoEntry matching the wire shape the HarmonyPIR client uses. */
+function hUtxo(seed: number, vout: number, value: number): HarmonyUtxoEntry {
+  return { txid: bytesToHex(fakeTxid(seed)), vout, value };
+}
+
+/** Build a minimal HarmonyQueryResult snapshot from a list of entries. */
+function hSnapshot(utxos: HarmonyUtxoEntry[]): HarmonyQueryResult {
+  return {
+    address: '1Test',
+    scriptHash: '00'.repeat(20),
+    utxos,
+    whale: false,
+  };
+}
+
+/** Build a HarmonyQueryResult holding raw delta-encoded bytes. */
+function hDeltaResult(deltaBytes: Uint8Array): HarmonyQueryResult {
+  return {
+    address: '1Test',
+    scriptHash: '00'.repeat(20),
+    utxos: [],
+    whale: false,
+    rawChunkData: deltaBytes,
+  };
+}
+
+describe('mergeDeltaIntoHarmonySnapshot', () => {
+  it('removes spent entries by txid+vout and appends new utxos', () => {
+    const snap = hSnapshot([
+      hUtxo(1, 0, 1000),
+      hUtxo(2, 1, 2000),
+      hUtxo(3, 0, 3000),
+    ]);
+
+    const delta = hDeltaResult(encodeDelta(
+      [{ txid: fakeTxid(2), vout: 1 }],
+      [{ txid: fakeTxid(10), vout: 0, amount: 5000n }],
+    ));
+
+    const merged = mergeDeltaIntoHarmonySnapshot(snap, delta);
+
+    expect(merged).not.toBeNull();
+    expect(merged!.utxos).toHaveLength(3);
+    // utxo(1) and utxo(3) remain; utxo(2) was spent.
+    expect(merged!.utxos[0].txid).toBe(bytesToHex(fakeTxid(1)));
+    expect(merged!.utxos[1].txid).toBe(bytesToHex(fakeTxid(3)));
+    // new utxo appended with numeric value.
+    expect(merged!.utxos[2].txid).toBe(bytesToHex(fakeTxid(10)));
+    expect(merged!.utxos[2].value).toBe(5000);
+    expect(typeof merged!.utxos[2].value).toBe('number');
+  });
+
+  it('preserves snapshot metadata (address, scriptHash)', () => {
+    const snap: HarmonyQueryResult = {
+      address: '1BitcoinEaterAddressDontSendf59kuE',
+      scriptHash: 'aa'.repeat(20),
+      utxos: [hUtxo(1, 0, 1000)],
+      whale: false,
+      merkleRootHex: 'deadbeef',
+    };
+
+    const delta = hDeltaResult(encodeDelta([], [
+      { txid: fakeTxid(5), vout: 2, amount: 999n },
+    ]));
+
+    const merged = mergeDeltaIntoHarmonySnapshot(snap, delta);
+
+    expect(merged!.address).toBe('1BitcoinEaterAddressDontSendf59kuE');
+    expect(merged!.scriptHash).toBe('aa'.repeat(20));
+    expect(merged!.merkleRootHex).toBe('deadbeef');
+  });
+
+  it('vout discrimination: same txid different vouts are independent', () => {
+    const snap = hSnapshot([
+      hUtxo(1, 0, 1000),
+      hUtxo(1, 1, 2000),
+      hUtxo(1, 2, 3000),
+    ]);
+
+    const delta = hDeltaResult(encodeDelta(
+      [{ txid: fakeTxid(1), vout: 1 }],
+      [],
+    ));
+
+    const merged = mergeDeltaIntoHarmonySnapshot(snap, delta);
+
+    expect(merged!.utxos).toHaveLength(2);
+    expect(merged!.utxos[0].vout).toBe(0);
+    expect(merged!.utxos[1].vout).toBe(2);
+  });
+
+  it('returns snapshot unchanged for null delta', () => {
+    const snap = hSnapshot([hUtxo(1, 0, 1000)]);
+    expect(mergeDeltaIntoHarmonySnapshot(snap, null)).toBe(snap);
+  });
+
+  it('returns null for null snapshot (page-refresh case)', () => {
+    const delta = hDeltaResult(encodeDelta([], []));
+    expect(mergeDeltaIntoHarmonySnapshot(null, delta)).toBeNull();
+  });
+
+  it('leaves whale snapshots untouched', () => {
+    const whale: HarmonyQueryResult = {
+      address: '1Whale',
+      scriptHash: '00'.repeat(20),
+      utxos: [],
+      whale: true,
+    };
+    const delta = hDeltaResult(encodeDelta([], [
+      { txid: fakeTxid(1), vout: 0, amount: 1000n },
+    ]));
+    expect(mergeDeltaIntoHarmonySnapshot(whale, delta)).toBe(whale);
+  });
+
+  it('ignores whale delta results', () => {
+    const snap = hSnapshot([hUtxo(1, 0, 1000)]);
+    const whaleDelta: HarmonyQueryResult = {
+      address: '1Test',
+      scriptHash: '00'.repeat(20),
+      utxos: [],
+      whale: true,
+    };
+    expect(mergeDeltaIntoHarmonySnapshot(snap, whaleDelta)).toBe(snap);
+  });
+
+  it('returns snapshot unchanged for empty rawChunkData', () => {
+    const snap = hSnapshot([hUtxo(1, 0, 1000)]);
+    const empty = hDeltaResult(new Uint8Array(0));
+    expect(mergeDeltaIntoHarmonySnapshot(snap, empty)).toBe(snap);
+  });
+
+  it('returns snapshot unchanged for missing rawChunkData', () => {
+    const snap = hSnapshot([hUtxo(1, 0, 1000)]);
+    // No rawChunkData field set.
+    const noRaw: HarmonyQueryResult = {
+      address: '1Test',
+      scriptHash: '00'.repeat(20),
+      utxos: [],
+      whale: false,
+    };
+    expect(mergeDeltaIntoHarmonySnapshot(snap, noRaw)).toBe(snap);
+  });
+});
+
+describe('mergeDeltaHarmonyBatch', () => {
+  it('merges parallel arrays of Harmony snapshots + deltas', () => {
+    const snapA = hSnapshot([hUtxo(1, 0, 1000), hUtxo(2, 0, 2000)]);
+    const snapB = hSnapshot([hUtxo(3, 0, 3000)]);
+    const deltaA = hDeltaResult(encodeDelta(
+      [{ txid: fakeTxid(1), vout: 0 }],
+      [{ txid: fakeTxid(11), vout: 0, amount: 100n }],
+    ));
+    const deltaB = hDeltaResult(encodeDelta(
+      [{ txid: fakeTxid(2), vout: 0 }],
+      [],
+    ));
+
+    const out = mergeDeltaHarmonyBatch([snapA, snapB], [deltaA, deltaB]);
+
+    expect(out).toHaveLength(2);
+    expect(out[0]!.utxos).toHaveLength(2); // utxo(2) remains + new utxo(11)
+    expect(out[1]!.utxos).toHaveLength(1); // utxo(3) untouched (delta spent utxo(2), not in B)
+  });
+
+  it('throws on length mismatch', () => {
+    expect(() => mergeDeltaHarmonyBatch([hSnapshot([])], [])).toThrow('length mismatch');
   });
 });

@@ -152,4 +152,15 @@ export {
   mergeDeltaIntoSnapshot,
   applyDeltaData,
   mergeDeltaBatch,
+  mergeDeltaIntoHarmonySnapshot,
+  mergeDeltaHarmonyBatch,
 } from './sync-merge.js';
+
+export {
+  SyncController,
+  describeStep,
+  type SyncableResult,
+  type SyncExecuteHooks,
+  type SyncExecuteOutput,
+  type SyncControllerConfig,
+} from './sync-controller.js';

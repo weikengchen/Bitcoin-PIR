@@ -379,6 +379,11 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                     <button class="example-btn" id="pickRandomBtn" style="background-color: #e2e3f1; border-color: #6c757d;">Pick 50 random</button>
                     <button class="example-btn" id="pickRandom10Btn" style="background-color: #e2e3f1; border-color: #6c757d;">Pick 10 random</button>
                     <button class="example-btn" id="pickRandom5Btn" style="background-color: #e2e3f1; border-color: #6c757d;">Pick 5 random</button>
+                    <br>
+                    <span class="example-label" id="deltaExampleLabel" style="display: none;">Delta examples (present in both main &amp; delta — delta must be applied to see changes):</span>
+                    <button class="example-btn" id="loadDeltaAllBtn" style="display: none; background-color: #d1ecf1; border-color: #17a2b8;">Load all delta</button>
+                    <button class="example-btn" id="pickDeltaRandom10Btn" style="display: none; background-color: #e2f3f7; border-color: #17a2b8;">Pick 10 random delta</button>
+                    <button class="example-btn" id="pickDeltaRandom5Btn" style="display: none; background-color: #e2f3f7; border-color: #17a2b8;">Pick 5 random delta</button>
                 </div>
             </details>
             <br>
@@ -427,6 +432,14 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
             </div>
         </details>
 
+        <!-- Sync state row (visible when connected) -->
+        <div id="op-syncStateRow" style="display: none; margin: 10px 0; padding: 8px 12px; background: #fff8e1; border: 1px solid #ffd54f; border-radius: 6px; font-size: 13px;">
+            <span style="color: #6d5200;">Sync state:</span>
+            <span id="op-syncStateLabel" style="font-weight: bold; color: #6d5200; margin-left: 4px;">Not synced</span>
+            <button id="op-resetSyncBtn" class="small secondary" style="float: right; padding: 2px 8px; font-size: 11px;">Reset</button>
+            <div style="clear: both;"></div>
+        </div>
+
         <!-- Database selector (shown only when the server has a multi-DB catalog) -->
         <details id="op-advancedDbDetails" style="display: none; margin: 10px 0;">
             <summary style="cursor: pointer; font-size: 13px; color: #888;">Advanced: query a specific database</summary>
@@ -437,7 +450,7 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                 </select>
                 <span id="op-dbInfo" style="font-size: 12px; color: #888; margin-left: 10px;"></span>
                 <div style="margin-top: 6px; font-size: 12px; color: #666;">
-                    Switching databases re-registers FHE keys and re-uses the per-DB BFV parameters advertised by the server.
+                    Direct query against a single database. Bypasses the sync flow and does not update the sync state.
                 </div>
             </div>
         </details>
@@ -488,10 +501,23 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                     <button class="example-btn" id="op-pickRandomBtn" style="background-color: #e2e3f1; border-color: #6c757d;">Pick 50 random</button>
                     <button class="example-btn" id="op-pickRandom10Btn" style="background-color: #e2e3f1; border-color: #6c757d;">Pick 10 random</button>
                     <button class="example-btn" id="op-pickRandom5Btn" style="background-color: #e2e3f1; border-color: #6c757d;">Pick 5 random</button>
+                    <br>
+                    <span class="example-label" id="op-deltaExampleLabel" style="display: none;">Delta examples (present in both main &amp; delta — delta must be applied to see changes):</span>
+                    <button class="example-btn" id="op-loadDeltaAllBtn" style="display: none; background-color: #d1ecf1; border-color: #17a2b8;">Load all delta</button>
+                    <button class="example-btn" id="op-pickDeltaRandom10Btn" style="display: none; background-color: #e2f3f7; border-color: #17a2b8;">Pick 10 random delta</button>
+                    <button class="example-btn" id="op-pickDeltaRandom5Btn" style="display: none; background-color: #e2f3f7; border-color: #17a2b8;">Pick 5 random delta</button>
                 </div>
             </details>
             <br>
-            <button id="op-queryBtn" style="width: 100%; font-size: 16px; padding: 12px;">Query UTXOs</button>
+            <button id="op-syncBtn" style="width: 100%; font-size: 16px; padding: 12px; background-color: #28a745; margin-bottom: 8px;" disabled>Sync to latest &amp; query</button>
+            <div id="op-syncPlanBox" style="display: none; margin: 8px 0; padding: 10px 14px; background: #e8f4fd; border: 1px solid #bee5eb; border-radius: 6px; font-size: 13px; color: #0c5460;">
+                <div id="op-syncPlanText" style="font-family: monospace;"></div>
+                <div style="margin-top: 8px;">
+                    <button id="op-syncConfirmBtn" class="small" style="background-color: #28a745;">Confirm sync</button>
+                    <button id="op-syncCancelBtn" class="small secondary" style="margin-left: 6px;">Cancel</button>
+                </div>
+            </div>
+            <button id="op-queryBtn" style="width: 100%; font-size: 16px; padding: 12px;">Query UTXOs (manual mode)</button>
         </div>
 
         <!-- Progress -->
@@ -543,6 +569,14 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
             </div>
         </details>
 
+        <!-- Sync state row (visible when connected) -->
+        <div id="hp-syncStateRow" style="display: none; margin: 10px 0; padding: 8px 12px; background: #fff8e1; border: 1px solid #ffd54f; border-radius: 6px; font-size: 13px;">
+            <span style="color: #6d5200;">Sync state:</span>
+            <span id="hp-syncStateLabel" style="font-weight: bold; color: #6d5200; margin-left: 4px;">Not synced</span>
+            <button id="hp-resetSyncBtn" class="small secondary" style="float: right; padding: 2px 8px; font-size: 11px;">Reset</button>
+            <div style="clear: both;"></div>
+        </div>
+
         <!-- Database selector (shown only when the server has a multi-DB catalog) -->
         <details id="hp-advancedDbDetails" style="display: none; margin: 10px 0;">
             <summary style="cursor: pointer; font-size: 13px; color: #888;">Advanced: query a specific database</summary>
@@ -553,7 +587,7 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                 </select>
                 <span id="hp-dbInfo" style="font-size: 12px; color: #888; margin-left: 10px;"></span>
                 <div style="margin-top: 6px; font-size: 12px; color: #666;">
-                    Switching databases re-downloads hints for the new database (cached per PRP backend, so switching back is instant).
+                    Direct query against a single database. Switching re-downloads hints (cached per PRP backend, so switching back is instant). Bypasses the sync flow and does not update the sync state.
                 </div>
             </div>
         </details>
@@ -618,10 +652,23 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                     <button class="example-btn" id="hp-pickRandomBtn" style="background-color: #e2e3f1; border-color: #6c757d;">Pick 50 random</button>
                     <button class="example-btn" id="hp-pickRandom10Btn" style="background-color: #e2e3f1; border-color: #6c757d;">Pick 10 random</button>
                     <button class="example-btn" id="hp-pickRandom5Btn" style="background-color: #e2e3f1; border-color: #6c757d;">Pick 5 random</button>
+                    <br>
+                    <span class="example-label" id="hp-deltaExampleLabel" style="display: none;">Delta examples (present in both main &amp; delta — delta must be applied to see changes):</span>
+                    <button class="example-btn" id="hp-loadDeltaAllBtn" style="display: none; background-color: #d1ecf1; border-color: #17a2b8;">Load all delta</button>
+                    <button class="example-btn" id="hp-pickDeltaRandom10Btn" style="display: none; background-color: #e2f3f7; border-color: #17a2b8;">Pick 10 random delta</button>
+                    <button class="example-btn" id="hp-pickDeltaRandom5Btn" style="display: none; background-color: #e2f3f7; border-color: #17a2b8;">Pick 5 random delta</button>
                 </div>
             </details>
             <br>
-            <button id="hp-queryBtn" style="width: 100%; font-size: 16px; padding: 12px;">Query UTXOs</button>
+            <button id="hp-syncBtn" style="width: 100%; font-size: 16px; padding: 12px; background-color: #28a745; margin-bottom: 8px;" disabled>Sync to latest &amp; query</button>
+            <div id="hp-syncPlanBox" style="display: none; margin: 8px 0; padding: 10px 14px; background: #e8f4fd; border: 1px solid #bee5eb; border-radius: 6px; font-size: 13px; color: #0c5460;">
+                <div id="hp-syncPlanText" style="font-family: monospace;"></div>
+                <div style="margin-top: 8px;">
+                    <button id="hp-syncConfirmBtn" class="small" style="background-color: #28a745;">Confirm sync</button>
+                    <button id="hp-syncCancelBtn" class="small secondary" style="margin-left: 6px;">Cancel</button>
+                </div>
+            </div>
+            <button id="hp-queryBtn" style="width: 100%; font-size: 16px; padding: 12px;">Query UTXOs (manual mode)</button>
         </div>
 
         <!-- Progress -->
@@ -646,7 +693,7 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
     </div>
 
     <script type="module">
-        import { BatchPirClient, OnionPirWebClient, HarmonyPirClient, hexToBytes, bytesToHex, scriptHash, scriptPubKeyToAddress, addressToScriptPubKey, decompileScript, decodeDeltaData, computeSyncPlan, mergeDeltaIntoSnapshot } from './src/index.ts';
+        import { BatchPirClient, OnionPirWebClient, HarmonyPirClient, hexToBytes, bytesToHex, scriptHash, scriptPubKeyToAddress, addressToScriptPubKey, decompileScript, decodeDeltaData, computeSyncPlan, mergeDeltaIntoSnapshot, mergeDeltaIntoHarmonySnapshot, SyncController, describeStep } from './src/index.ts';
         import { fetchResidency } from './src/server-info.ts';
 
         /**
@@ -689,7 +736,30 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                 }
             }).join(' ');
         }
-        import EXAMPLE_SPKS from './src/example_spks.json';
+        import EXAMPLES from './src/example_spks.json';
+        // Legacy alias: the existing Pick-N-random buttons work on the main
+        // UTXO set. Delta-specific example lists live under EXAMPLES[`delta_<A>_<B>`]
+        // and are used by the "Delta examples" buttons added below.
+        const EXAMPLE_SPKS = EXAMPLES.main;
+        // All delta example arrays, keyed by catalog name
+        // (e.g. "delta_940611_944000"). Empty array for unknown keys.
+        function getDeltaExamples(dbName) {
+            return EXAMPLES[dbName] || [];
+        }
+        // Return the delta examples for the first delta database found in
+        // the given catalog, or null if none exists. Used to wire a single
+        // "Load delta examples" button without the user having to pick the
+        // delta by name.
+        function firstDeltaExamples(catalog) {
+            if (!catalog) return null;
+            for (const db of catalog.databases) {
+                if (db.dbType === 1) {
+                    const arr = EXAMPLES[db.name];
+                    if (arr && arr.length > 0) return { name: db.name, spks: arr, db };
+                }
+            }
+            return null;
+        }
 
         let client = null;
 
@@ -1060,6 +1130,7 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                 await client.connect();
                 populateDbSelector();
                 refreshSyncStateUI();
+                showDeltaExamples('', 'scriptPubkeys', client.getCatalog());
             } catch (error) {
                 log(`Connection failed: ${error.message}`, 'error');
                 client = null;
@@ -1102,25 +1173,17 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
         }
 
         // ─── Sync state (per server-pair, persisted in localStorage) ─────
-        function syncStateKey() {
-            const s0 = (document.getElementById('server0Url').value || '').trim();
-            const s1 = (document.getElementById('server1Url').value || '').trim();
-            return `bitcoinpir.dpf.lastSync:${s0}|${s1}`;
-        }
-        function loadLastSyncedHeight() {
-            try {
-                const raw = localStorage.getItem(syncStateKey());
-                if (!raw) return 0;
-                const n = parseInt(raw, 10);
-                return Number.isFinite(n) && n > 0 ? n : 0;
-            } catch { return 0; }
-        }
-        function saveLastSyncedHeight(h) {
-            try { localStorage.setItem(syncStateKey(), String(h)); } catch {}
-        }
-        function clearLastSyncedHeight() {
-            try { localStorage.removeItem(syncStateKey()); } catch {}
-        }
+        // The DPF SyncController owns the in-memory snapshot cache and the
+        // lastSyncedHeight key. Built once on script load; connect() just
+        // triggers refreshSyncStateUI() to reflect any persisted state.
+        const dpfSync = new SyncController({
+            storageKey: () => {
+                const s0 = (document.getElementById('server0Url').value || '').trim();
+                const s1 = (document.getElementById('server1Url').value || '').trim();
+                return `bitcoinpir.dpf.lastSync:${s0}|${s1}`;
+            },
+        });
+
         function refreshSyncStateUI() {
             const row = document.getElementById('syncStateRow');
             const label = document.getElementById('syncStateLabel');
@@ -1131,7 +1194,7 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                 return;
             }
             row.style.display = 'block';
-            const h = loadLastSyncedHeight();
+            const h = dpfSync.loadLastSyncedHeight();
             label.textContent = h > 0 ? `synced to height ${h.toLocaleString()}` : 'not yet synced';
             if (syncBtn) syncBtn.disabled = false;
         }
@@ -1143,12 +1206,15 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                 log('Disconnected', 'info');
                 setButtons(false);
             }
-            syncSnapshotByHash.clear();
+            // Keep the SyncController cache alive across disconnect/reconnect:
+            // the controller's page-refresh safety rule (computePlan) will
+            // force a fresh full sync anyway if the cache ends up stale.
             document.getElementById('resultsContainer').innerHTML = '';
             document.getElementById('advancedDbDetails').style.display = 'none';
             document.getElementById('syncStateRow').style.display = 'none';
             document.getElementById('syncPlanBox').style.display = 'none';
             document.getElementById('syncBtn').disabled = true;
+            hideDeltaExamples('');
         }
 
         async function queryUtxos() {
@@ -1285,7 +1351,7 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
         }
 
         // ════════════════════════════════════════════════════════════════════
-        // Sync flow: computeSyncPlan + sequential execution + delta merging
+        // Sync flow: delegates to the shared SyncController (sync-controller.ts)
         // ════════════════════════════════════════════════════════════════════
 
         // Pending plan staged for confirmation. Captured here so the Confirm
@@ -1293,37 +1359,17 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
         // when they clicked "Sync to latest".
         let pendingSync = null;
 
-        // Per-scripthash merged snapshot carried across sync clicks in the same
-        // session. Keyed by bytesToHex(scriptHash). Seeded into `merged` at the
-        // start of executeSync() so a delta-only plan (computed because the
-        // client is already "synced to height H") has a snapshot to apply on
-        // top of. Cleared on disconnect and reset-sync.
-        let syncSnapshotByHash = new Map();
-
-        function describeStep(s) {
-            if (s.dbType === 'full') {
-                return `[full ${s.name} @ ${s.tipHeight.toLocaleString()}]`;
-            }
-            return `[delta ${s.name}: ${s.baseHeight.toLocaleString()} \u2192 ${s.tipHeight.toLocaleString()}]`;
-        }
-
-        async function planSync() {
-            if (!client || !client.isConnected()) {
-                log('Not connected. Connecting first...', 'info');
-                await connect();
-                if (!client) return;
-            }
-
-            // Parse the address textarea once and stash the lines + scriptHashes.
-            const textarea = document.getElementById('scriptPubkeys');
+        // Parse the DPF textarea into lines + scriptHashes. Returns null on
+        // empty/invalid input (already logged).
+        function parseScriptInputs(textareaId) {
+            const textarea = document.getElementById(textareaId);
             const rawLines = textarea.value.trim().split('\n')
                 .map(l => l.trim())
                 .filter(l => l.length > 0);
             if (rawLines.length === 0) {
                 log('Please enter at least one address or scriptPubKey', 'error');
-                return;
+                return null;
             }
-
             const lines = [];
             for (const raw of rawLines) {
                 if (/^[0-9a-fA-F]+$/.test(raw) && raw.length % 2 === 0) {
@@ -1339,8 +1385,21 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
             }
             if (lines.length === 0) {
                 log('No valid inputs found', 'error');
-                return;
+                return null;
             }
+            return { lines, scriptHashes: lines.map(spkHex => scriptHash(hexToBytes(spkHex))) };
+        }
+
+        async function planSync() {
+            if (!client || !client.isConnected()) {
+                log('Not connected. Connecting first...', 'info');
+                await connect();
+                if (!client) return;
+            }
+
+            const parsed = parseScriptInputs('scriptPubkeys');
+            if (!parsed) return;
+            const { lines, scriptHashes } = parsed;
 
             const catalog = client.getCatalog();
             if (!catalog || catalog.databases.length === 0) {
@@ -1348,10 +1407,12 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                 return;
             }
 
-            const lastSynced = loadLastSyncedHeight();
+            // computePlan applies the page-refresh safety rule: if the in-memory
+            // cache does NOT hold snapshots for every scripthash, it treats the
+            // persisted lastSyncedHeight as 0 and returns a fresh-sync plan.
             let plan;
             try {
-                plan = computeSyncPlan(catalog, lastSynced || undefined);
+                plan = dpfSync.computePlan(catalog, scriptHashes);
             } catch (e) {
                 log(`Sync plan failed: ${e.message}`, 'error');
                 return;
@@ -1370,8 +1431,14 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                 return;
             }
 
-            const pretty = plan.steps.map(describeStep).join('  then  ');
-            const fromTxt = lastSynced ? `from height ${lastSynced.toLocaleString()}` : 'from scratch';
+            const pretty = plan.steps.map(s => describeStep(s)).join('  then  ');
+            const persistedHeight = dpfSync.loadLastSyncedHeight();
+            const cacheComplete = scriptHashes.every(sh => dpfSync.hasSnapshotFor(sh));
+            const fromTxt = plan.isFreshSync
+                ? (persistedHeight > 0 && !cacheComplete
+                    ? 'from scratch (cache empty after reload)'
+                    : 'from scratch')
+                : `from height ${persistedHeight.toLocaleString()}`;
             planText.innerHTML =
                 `<div>Sync plan ${fromTxt} \u2192 ${plan.targetHeight.toLocaleString()}` +
                 `${plan.isFreshSync ? ' (fresh sync)' : ''}:</div>` +
@@ -1380,7 +1447,7 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
             document.getElementById('syncConfirmBtn').style.display = '';
             document.getElementById('syncCancelBtn').textContent = 'Cancel';
 
-            pendingSync = { plan, lines, scriptHashes: lines.map(spkHex => scriptHash(hexToBytes(spkHex))) };
+            pendingSync = { plan, lines, scriptHashes };
             log(`Sync plan staged: ${plan.steps.length} step(s) to height ${plan.targetHeight}`, 'info');
         }
 
@@ -1403,80 +1470,52 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
             const resultsContainer = document.getElementById('resultsContainer');
             resultsContainer.innerHTML = '';
 
-            // Per-scripthash merged result. Seeded from the in-memory snapshot
-            // cache so a delta-only plan can apply on top of a previously-synced
-            // full snapshot from the same session. Full steps overwrite the
-            // seeded value; delta steps merge into it.
-            let merged = scriptHashes.map(sh => syncSnapshotByHash.get(bytesToHex(sh)) || null);
-            // One entry per sync step that has Merkle support, in order.
-            // Each entry owns the raw per-query results from that step (not the
-            // merged view), because per-bucket Merkle verifies the bin content
-            // of the specific DB the step was run against.
-            const merkleSteps = [];
-
             try {
-                for (let si = 0; si < plan.steps.length; si++) {
-                    const step = plan.steps[si];
-                    const stepLabel = `Step ${si + 1}/${plan.steps.length}: ${describeStep(step)}`;
-                    log(stepLabel, 'info');
-                    setProgress(5, stepLabel);
-
-                    const stepResults = step.dbType === 'full'
-                        ? await client.queryBatch(scriptHashes, (s, d) => {
+                const { merged, verifiableSteps } = await dpfSync.execute(plan, {
+                    scriptHashes,
+                    queryStep: async (step, si) => {
+                        const stepLabel = describeStep(step, si + 1, plan.steps.length);
+                        log(stepLabel, 'info');
+                        setProgress(5, stepLabel);
+                        const progressFn = (s, d) => {
                             let pct = 5;
                             if (s === 'Level 1') pct = 15;
                             else if (s === 'Level 2') pct = 50;
                             else if (s === 'Decode') pct = 90;
                             setProgress(pct, `${stepLabel} \u2014 ${s}: ${d}`);
-                        }, step.dbId)
-                        : await client.queryDelta(scriptHashes, step.dbId, (s, d) => {
-                            let pct = 5;
-                            if (s === 'Level 1') pct = 15;
-                            else if (s === 'Level 2') pct = 50;
-                            else if (s === 'Decode') pct = 90;
-                            setProgress(pct, `${stepLabel} \u2014 ${s}: ${d}`);
-                        });
+                        };
+                        return step.dbType === 'full'
+                            ? client.queryBatch(scriptHashes, progressFn, step.dbId)
+                            : client.queryDelta(scriptHashes, step.dbId, progressFn);
+                    },
+                    mergeStep: (snapshot, delta) =>
+                        mergeDeltaIntoSnapshot(snapshot, delta, (msg) => log(msg, 'error')),
+                    onError: (msg) => log(msg, 'error'),
+                });
 
-                    if (step.dbType === 'full') {
-                        // Replace merged state entirely with the snapshot.
-                        merged = stepResults.slice();
-                    } else {
-                        // Apply delta on top of each per-query merged snapshot.
-                        for (let qi = 0; qi < N; qi++) {
-                            merged[qi] = mergeDeltaIntoSnapshot(merged[qi], stepResults[qi], (msg) => log(msg, 'error'));
-                        }
-                    }
-
-                    // Track this step for Merkle verification if the target DB
-                    // has per-bucket Merkle available.
-                    if (client.hasMerkleForDb(step.dbId)) {
-                        const verifiable = stepResults.filter(r => r && !r.isWhale && r.indexPbcGroup !== undefined);
-                        if (verifiable.length > 0) {
-                            merkleSteps.push({ step, verifiable });
-                        }
-                    }
-                }
-
-                // Render merged results and stash them for subsequent delta syncs.
+                // Render merged results.
                 let found = 0;
                 for (let qi = 0; qi < N; qi++) {
                     const spkHex = lines[qi];
                     const hashHex = bytesToHex(scriptHashes[qi]);
                     const r = merged[qi];
-                    if (r) {
-                        found++;
-                        syncSnapshotByHash.set(hashHex, r);
-                    }
+                    if (r) found++;
                     renderResult(resultsContainer, spkHex, hashHex, r);
                 }
 
-                // Update sync state on success.
-                saveLastSyncedHeight(plan.targetHeight);
                 refreshSyncStateUI();
 
                 // Offer Merkle verification for each step whose target DB
-                // has per-bucket Merkle available. Steps are rendered in plan
-                // order so the full snapshot button appears above any deltas.
+                // has per-bucket Merkle available. Rendered in plan order so
+                // the full snapshot button appears above any deltas.
+                const merkleSteps = verifiableSteps
+                    .map(({ step, stepResults }) => ({
+                        step,
+                        verifiable: stepResults.filter(r => r && !r.isWhale && r.indexPbcGroup !== undefined),
+                    }))
+                    .filter(({ step, verifiable }) =>
+                        verifiable.length > 0 && client.hasMerkleForDb(step.dbId));
+
                 if (merkleSteps.length > 0) {
                     const note = document.createElement('div');
                     note.style.cssText = 'margin: 12px 0; font-size: 12px; color: #666;';
@@ -1508,7 +1547,7 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                 log(`Sync error: ${error.message || error}`, 'error');
                 setProgress(0, '');
                 hideProgress();
-                // Do NOT update lastSyncedHeight on failure.
+                // SyncController only commits state on full success; nothing to roll back.
             } finally {
                 document.getElementById('syncBtn').disabled = !client || !client.isConnected();
                 document.getElementById('queryBtn').disabled = false;
@@ -1519,8 +1558,7 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
         }
 
         function resetSyncState() {
-            clearLastSyncedHeight();
-            syncSnapshotByHash.clear();
+            dpfSync.reset();
             refreshSyncStateUI();
             document.getElementById('syncPlanBox').style.display = 'none';
             pendingSync = null;
@@ -1561,6 +1599,53 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
         document.getElementById('pickRandom5Btn').addEventListener('click', () => {
             document.getElementById('scriptPubkeys').value = pickRandom(EXAMPLE_SPKS, 5).join('\n');
         });
+
+        // ─── Delta example button wiring (shared across tabs) ────────────
+        // Each tab has three delta buttons (load all, pick 10 random, pick 5
+        // random) plus a label, all hidden by default. Call showDeltaExamples
+        // after connect() once the catalog is known — it reveals the buttons
+        // and points them at the delta's scripthash list, or hides them if
+        // the server doesn't expose any delta database.
+        function showDeltaExamples(tabPrefix, textareaId, catalog) {
+            const labelEl = document.getElementById(`${tabPrefix}deltaExampleLabel`);
+            const allBtn = document.getElementById(`${tabPrefix}loadDeltaAllBtn`);
+            const r10Btn = document.getElementById(`${tabPrefix}pickDeltaRandom10Btn`);
+            const r5Btn = document.getElementById(`${tabPrefix}pickDeltaRandom5Btn`);
+            const delta = firstDeltaExamples(catalog);
+            if (!delta) {
+                labelEl.style.display = 'none';
+                allBtn.style.display = 'none';
+                r10Btn.style.display = 'none';
+                r5Btn.style.display = 'none';
+                return;
+            }
+            labelEl.textContent = `Delta examples (present in both main & ${delta.name} — delta must be applied to see changes, ${delta.spks.length} available):`;
+            labelEl.style.display = '';
+            allBtn.style.display = '';
+            allBtn.textContent = `Load all ${delta.spks.length} delta`;
+            r10Btn.style.display = delta.spks.length > 10 ? '' : 'none';
+            r5Btn.style.display = delta.spks.length > 5 ? '' : 'none';
+            // Replace click listeners by cloning the buttons (cheap, avoids
+            // stacking handlers across reconnects).
+            const wire = (btn, getValue) => {
+                const clone = btn.cloneNode(true);
+                btn.parentNode.replaceChild(clone, btn);
+                clone.addEventListener('click', () => {
+                    document.getElementById(textareaId).value = getValue();
+                });
+                return clone;
+            };
+            wire(allBtn, () => delta.spks.join('\n'));
+            wire(r10Btn, () => pickRandom(delta.spks, 10).join('\n'));
+            wire(r5Btn, () => pickRandom(delta.spks, 5).join('\n'));
+        }
+
+        function hideDeltaExamples(tabPrefix) {
+            for (const suffix of ['deltaExampleLabel', 'loadDeltaAllBtn', 'pickDeltaRandom10Btn', 'pickDeltaRandom5Btn']) {
+                const el = document.getElementById(`${tabPrefix}${suffix}`);
+                if (el) el.style.display = 'none';
+            }
+        }
 
         // ─── Main buttons (DPF) ────────────────────────────────────────
         document.getElementById('connectBtn').addEventListener('click', connect);
@@ -1685,9 +1770,37 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
         // ═══════════════════════════════════════════════════════════════
         let opClient = null;
 
+        // OnionPIR SyncController — owns snapshot cache + lastSyncedHeight for
+        // the OnionPIR tab. setDbId is cheap for OnionPIR (just BFV params),
+        // so no beforeStep hook is needed.
+        const opSync = new SyncController({
+            storageKey: () => {
+                const url = (document.getElementById('op-serverUrl').value || '').trim();
+                return `bitcoinpir.onionpir.lastSync:${url}`;
+            },
+        });
+
+        // Pending OnionPIR sync plan staged for confirmation.
+        let opPendingSync = null;
+
         function opSetButtons(connected) {
             document.getElementById('op-connectBtn').disabled = connected;
             document.getElementById('op-disconnectBtn').disabled = !connected;
+        }
+
+        function opRefreshSyncStateUI() {
+            const row = document.getElementById('op-syncStateRow');
+            const label = document.getElementById('op-syncStateLabel');
+            const syncBtn = document.getElementById('op-syncBtn');
+            if (!opClient || !opClient.isConnected()) {
+                row.style.display = 'none';
+                if (syncBtn) syncBtn.disabled = true;
+                return;
+            }
+            row.style.display = 'block';
+            const h = opSync.loadLastSyncedHeight();
+            label.textContent = h > 0 ? `synced to height ${h.toLocaleString()}` : 'not yet synced';
+            if (syncBtn) syncBtn.disabled = false;
         }
 
         function opSetProgress(percent, label) {
@@ -1779,6 +1892,8 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                 await opClient.connect();
                 // Expose the multi-DB selector once the catalog is loaded.
                 opPopulateDbSelector();
+                opRefreshSyncStateUI();
+                showDeltaExamples('op-', 'op-scriptPubkeys', opClient.getCatalog());
                 // Dev-only: expose client on window for browser console debugging.
                 window.opClient = opClient;
             } catch (error) {
@@ -1791,7 +1906,226 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
             if (opClient) { opClient.disconnect(); opClient = null; }
             document.getElementById('op-resultsContainer').innerHTML = '';
             document.getElementById('op-advancedDbDetails').style.display = 'none';
+            document.getElementById('op-syncStateRow').style.display = 'none';
+            document.getElementById('op-syncPlanBox').style.display = 'none';
+            document.getElementById('op-syncBtn').disabled = true;
+            hideDeltaExamples('op-');
+            opPendingSync = null;
             opSetButtons(false);
+        }
+
+        // ─── OnionPIR sync flow (mirrors DPF) ─────────────────────────────
+        async function opPlanSync() {
+            if (!opClient || !opClient.isConnected()) {
+                log('OnionPIR: Not connected. Connecting first...', 'info');
+                await opConnect();
+                if (!opClient) return;
+            }
+
+            const parsed = parseOpScriptInputs();
+            if (!parsed) return;
+            const { lines, scriptHashes } = parsed;
+
+            const catalog = opClient.getCatalog();
+            if (!catalog || catalog.databases.length === 0) {
+                log('OnionPIR: No catalog available', 'error');
+                return;
+            }
+
+            let plan;
+            try {
+                plan = opSync.computePlan(catalog, scriptHashes);
+            } catch (e) {
+                log(`OnionPIR sync plan failed: ${e.message}`, 'error');
+                return;
+            }
+
+            const planBox = document.getElementById('op-syncPlanBox');
+            const planText = document.getElementById('op-syncPlanText');
+
+            if (plan.steps.length === 0) {
+                planText.textContent = `Already at tip (height ${plan.targetHeight.toLocaleString()}). Nothing to do.`;
+                planBox.style.display = 'block';
+                document.getElementById('op-syncConfirmBtn').style.display = 'none';
+                document.getElementById('op-syncCancelBtn').textContent = 'Close';
+                opPendingSync = null;
+                log(`OnionPIR sync: already at height ${plan.targetHeight}`, 'info');
+                return;
+            }
+
+            const pretty = plan.steps.map(s => describeStep(s)).join('  then  ');
+            const persistedHeight = opSync.loadLastSyncedHeight();
+            const cacheComplete = scriptHashes.every(sh => opSync.hasSnapshotFor(sh));
+            const fromTxt = plan.isFreshSync
+                ? (persistedHeight > 0 && !cacheComplete
+                    ? 'from scratch (cache empty after reload)'
+                    : 'from scratch')
+                : `from height ${persistedHeight.toLocaleString()}`;
+            planText.innerHTML =
+                `<div>Sync plan ${fromTxt} \u2192 ${plan.targetHeight.toLocaleString()}` +
+                `${plan.isFreshSync ? ' (fresh sync)' : ''}:</div>` +
+                `<div style="margin-top: 4px;">${pretty}</div>`;
+            planBox.style.display = 'block';
+            document.getElementById('op-syncConfirmBtn').style.display = '';
+            document.getElementById('op-syncCancelBtn').textContent = 'Cancel';
+
+            opPendingSync = { plan, lines, scriptHashes };
+            log(`OnionPIR sync plan staged: ${plan.steps.length} step(s) to height ${plan.targetHeight}`, 'info');
+        }
+
+        // Parse OnionPIR textarea with address auto-conversion. Returns null
+        // on empty/invalid input (already logged).
+        function parseOpScriptInputs() {
+            const textarea = document.getElementById('op-scriptPubkeys');
+            const rawLines = textarea.value.trim().split('\n').map(l => l.trim()).filter(l => l.length > 0);
+            if (rawLines.length === 0) { log('Please enter at least one address', 'error'); return null; }
+            const lines = [];
+            let converted = 0;
+            const convNote = document.getElementById('op-conversionNote');
+            for (const raw of rawLines) {
+                if (/^[0-9a-fA-F]+$/.test(raw) && raw.length % 2 === 0) {
+                    lines.push(raw.toLowerCase());
+                } else {
+                    const spk = addressToScriptPubKey(raw);
+                    if (spk) { lines.push(spk); converted++; }
+                    else { log(`Unrecognized input: ${raw}`, 'error'); }
+                }
+            }
+            if (converted > 0) {
+                convNote.textContent = `Converted ${converted} address${converted > 1 ? 'es' : ''} to scriptPubKey hex`;
+                convNote.style.display = 'block';
+                setTimeout(() => { convNote.style.display = 'none'; }, 5000);
+            }
+            if (lines.length === 0) { log('No valid inputs', 'error'); return null; }
+            return { lines, scriptHashes: lines.map(spkHex => scriptHash(hexToBytes(spkHex))) };
+        }
+
+        function opCancelSync() {
+            opPendingSync = null;
+            document.getElementById('op-syncPlanBox').style.display = 'none';
+        }
+
+        async function opExecuteSync() {
+            if (!opPendingSync || !opClient || !opClient.isConnected()) return;
+            const { plan, lines, scriptHashes } = opPendingSync;
+            const N = scriptHashes.length;
+
+            document.getElementById('op-syncBtn').disabled = true;
+            document.getElementById('op-queryBtn').disabled = true;
+            document.getElementById('op-syncConfirmBtn').disabled = true;
+            document.getElementById('op-syncCancelBtn').disabled = true;
+            document.getElementById('op-resetSyncBtn').disabled = true;
+
+            const resultsContainer = document.getElementById('op-resultsContainer');
+            resultsContainer.innerHTML = '';
+
+            // Remember which dbId the client was on so we can restore it after
+            // sync (in case the sync steps changed the active DB).
+            const savedDbId = opClient.getDbId();
+
+            try {
+                const { merged, verifiableSteps } = await opSync.execute(plan, {
+                    scriptHashes,
+                    queryStep: async (step, si) => {
+                        const stepLabel = describeStep(step, si + 1, plan.steps.length);
+                        log(`OnionPIR: ${stepLabel}`, 'info');
+                        opSetProgress(5, stepLabel);
+                        // Set the OnionPIR client's active DB for this step
+                        // (cheap: just updates BFV params + clears Merkle caches).
+                        if (opClient.getDbId() !== step.dbId) {
+                            opClient.setDbId(step.dbId);
+                        }
+                        return opClient.queryBatch(scriptHashes, (s, d) => {
+                            let pct = 5;
+                            if (s === 'Setup') pct = 10;
+                            else if (s === 'Level 1') pct = 25;
+                            else if (s === 'Level 2') pct = 55;
+                            else if (s === 'Decode') pct = 90;
+                            opSetProgress(pct, `${stepLabel} \u2014 ${s}: ${d}`);
+                        }, step.dbId);
+                    },
+                    mergeStep: (snapshot, delta) =>
+                        mergeDeltaIntoSnapshot(snapshot, delta, (msg) => log(msg, 'error')),
+                    onError: (msg) => log(msg, 'error'),
+                });
+
+                // Render merged results.
+                let found = 0;
+                for (let qi = 0; qi < N; qi++) {
+                    const spkHex = lines[qi];
+                    const hashHex = bytesToHex(scriptHashes[qi]);
+                    const r = merged[qi];
+                    if (r) found++;
+                    renderResult(resultsContainer, spkHex, hashHex, r);
+                }
+
+                opRefreshSyncStateUI();
+
+                // Per-step Merkle verification buttons (OnionPIR per-bin).
+                // Steps are rendered in plan order.
+                const merkleSteps = verifiableSteps
+                    .map(({ step, stepResults }) => ({
+                        step,
+                        verifiable: stepResults.filter(r => r && !r.isWhale && r.indexBinHash !== undefined),
+                    }))
+                    .filter(({ step, verifiable }) =>
+                        verifiable.length > 0 && opClient.hasMerkleForDb(step.dbId));
+
+                if (merkleSteps.length > 0) {
+                    const note = document.createElement('div');
+                    note.style.cssText = 'margin: 12px 0; font-size: 12px; color: #666;';
+                    note.textContent = merkleSteps.length === 1
+                        ? `Merkle verification below applies to the ${merkleSteps[0].step.dbType} step of this sync.`
+                        : `Merkle verification below runs one proof batch per sync step (${merkleSteps.length} steps).`;
+                    resultsContainer.appendChild(note);
+                    for (let i = merkleSteps.length - 1; i >= 0; i--) {
+                        const { step, verifiable } = merkleSteps[i];
+                        const prefix = `op-sync-${step.dbType}-${step.dbId}`;
+                        const label = step.dbType === 'full'
+                            ? `full snapshot (db ${step.dbId}, height ${step.tipHeight.toLocaleString()})`
+                            : `delta (db ${step.dbId}, ${step.baseHeight.toLocaleString()} \u2192 ${step.tipHeight.toLocaleString()})`;
+                        // verifyMerkleBatch uses the client's active dbId; set
+                        // it for each proof batch so results line up with the
+                        // step's DB (mirrors per-step FHE key state).
+                        addBatchMerkleButton(resultsContainer, verifiable, prefix,
+                            (results, onProg) => {
+                                if (opClient.getDbId() !== step.dbId) opClient.setDbId(step.dbId);
+                                return opClient.verifyMerkleBatch(results, onProg);
+                            },
+                            () => opClient.getMerkleRootHexForDb(step.dbId),
+                            label);
+                    }
+                }
+
+                opSetProgress(100, `Sync complete! ${found}/${N} found at height ${plan.targetHeight.toLocaleString()}`);
+                setTimeout(opHideProgress, 2000);
+                log(`OnionPIR sync complete: ${found}/${N} found at height ${plan.targetHeight}`, 'success');
+                document.getElementById('op-syncPlanBox').style.display = 'none';
+                opPendingSync = null;
+            } catch (error) {
+                log(`OnionPIR sync error: ${error.message || error}`, 'error');
+                opSetProgress(0, '');
+                opHideProgress();
+            } finally {
+                // Restore the user-facing active DB to whatever it was before
+                // sync so the advanced dropdown label is still accurate.
+                if (opClient && opClient.getDbId() !== savedDbId) {
+                    opClient.setDbId(savedDbId);
+                }
+                document.getElementById('op-syncBtn').disabled = !opClient || !opClient.isConnected();
+                document.getElementById('op-queryBtn').disabled = false;
+                document.getElementById('op-syncConfirmBtn').disabled = false;
+                document.getElementById('op-syncCancelBtn').disabled = false;
+                document.getElementById('op-resetSyncBtn').disabled = false;
+            }
+        }
+
+        function opResetSyncState() {
+            opSync.reset();
+            opRefreshSyncStateUI();
+            document.getElementById('op-syncPlanBox').style.display = 'none';
+            opPendingSync = null;
+            log('OnionPIR sync state reset', 'info');
         }
 
         async function opQueryUtxos() {
@@ -1909,12 +2243,18 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
         document.getElementById('op-connectBtn').addEventListener('click', opConnect);
         document.getElementById('op-disconnectBtn').addEventListener('click', opDisconnect);
         document.getElementById('op-queryBtn').addEventListener('click', opQueryUtxos);
+        document.getElementById('op-syncBtn').addEventListener('click', opPlanSync);
+        document.getElementById('op-syncConfirmBtn').addEventListener('click', opExecuteSync);
+        document.getElementById('op-syncCancelBtn').addEventListener('click', opCancelSync);
+        document.getElementById('op-resetSyncBtn').addEventListener('click', opResetSyncState);
         document.getElementById('op-dbSelect').addEventListener('change', (e) => {
             const newDbId = parseInt(e.target.value);
             if (!opClient) return;
             opSwitchDb(newDbId);
         });
         opSetButtons(false);
+        // Initialize sync button in disabled state.
+        document.getElementById('op-syncBtn').disabled = true;
 
         // ═══════════════════════════════════════════════════════════════
         // HarmonyPIR tab logic
@@ -1924,6 +2264,35 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
         let hpHintsLoaded = false;
         let hpCurrentPrp = 0;
         let hpSwitchingDb = false;
+
+        // HarmonyPIR SyncController — owns snapshot cache + lastSyncedHeight
+        // for the HarmonyPIR tab. The beforeStep hook delegates to hpSwitchDb,
+        // which handles the hint cache-restore-or-download dance.
+        const hpSync = new SyncController({
+            storageKey: () => {
+                const hintUrl = (document.getElementById('hp-hintServerUrl').value || '').trim();
+                const queryUrl = (document.getElementById('hp-queryServerUrl').value || '').trim();
+                return `bitcoinpir.harmonypir.lastSync:${hintUrl}|${queryUrl}`;
+            },
+        });
+
+        // Pending HarmonyPIR sync plan staged for confirmation.
+        let hpPendingSync = null;
+
+        function hpRefreshSyncStateUI() {
+            const row = document.getElementById('hp-syncStateRow');
+            const label = document.getElementById('hp-syncStateLabel');
+            const syncBtn = document.getElementById('hp-syncBtn');
+            if (!hpClient || !hpHintsLoaded) {
+                row.style.display = 'none';
+                if (syncBtn) syncBtn.disabled = true;
+                return;
+            }
+            row.style.display = 'block';
+            const h = hpSync.loadLastSyncedHeight();
+            label.textContent = h > 0 ? `synced to height ${h.toLocaleString()}` : 'not yet synced';
+            if (syncBtn) syncBtn.disabled = false;
+        }
 
         function hpPopulateDbSelector() {
             const catalog = hpClient?.getCatalog();
@@ -2150,6 +2519,8 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
 
                 // Expose the multi-DB selector now that the catalog is loaded.
                 hpPopulateDbSelector();
+                hpRefreshSyncStateUI();
+                showDeltaExamples('hp-', 'hp-scriptPubkeys', hpClient.getCatalog());
 
                 // Update UI when query server disconnects (e.g. idle timeout).
                 hpClient.onQueryServerClose(() => {
@@ -2186,6 +2557,11 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                 hpClient.disconnectQueryServer();
             }
             document.getElementById('hp-resultsContainer').innerHTML = '';
+            document.getElementById('hp-syncStateRow').style.display = 'none';
+            document.getElementById('hp-syncPlanBox').style.display = 'none';
+            document.getElementById('hp-syncBtn').disabled = true;
+            hideDeltaExamples('hp-');
+            hpPendingSync = null;
             const statusDiv = document.getElementById('hp-status');
             statusDiv.textContent = hpHintsLoaded
                 ? 'Status: Disconnected (hints preserved)'
@@ -2194,6 +2570,247 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
             hpSetButtons(false);
             document.getElementById('hp-connectBtn').disabled = false;
             hpHideProgress();
+        }
+
+        // ─── HarmonyPIR sync flow ─────────────────────────────────────────
+        // Parse HarmonyPIR textarea with address auto-conversion.
+        function parseHpScriptInputs() {
+            const textarea = document.getElementById('hp-scriptPubkeys');
+            const rawLines = textarea.value.trim().split('\n').map(l => l.trim()).filter(l => l.length > 0);
+            if (rawLines.length === 0) { log('Please enter at least one address', 'error'); return null; }
+            const lines = [];
+            let converted = 0;
+            const convNote = document.getElementById('hp-conversionNote');
+            for (const raw of rawLines) {
+                if (/^[0-9a-fA-F]+$/.test(raw) && raw.length % 2 === 0) {
+                    lines.push(raw.toLowerCase());
+                } else {
+                    const spk = addressToScriptPubKey(raw);
+                    if (spk) { lines.push(spk); converted++; }
+                    else { log(`Unrecognized input: ${raw}`, 'error'); }
+                }
+            }
+            if (converted > 0) {
+                convNote.textContent = `Converted ${converted} address${converted > 1 ? 'es' : ''} to scriptPubKey hex`;
+                convNote.style.display = 'block';
+                setTimeout(() => { convNote.style.display = 'none'; }, 5000);
+            }
+            if (lines.length === 0) { log('No valid inputs', 'error'); return null; }
+            return { lines, scriptHashes: lines.map(spkHex => scriptHash(hexToBytes(spkHex))) };
+        }
+
+        async function hpPlanSync() {
+            if (hpSwitchingPrp) { log('HarmonyPIR: PRP switch in progress, please wait.', 'error'); return; }
+            if (!hpClient || !hpHintsLoaded) {
+                log('HarmonyPIR: Auto-connecting...', 'info');
+                await hpConnect();
+                if (!hpClient || !hpHintsLoaded) {
+                    log('HarmonyPIR: Connection or hint download failed.', 'error');
+                    return;
+                }
+            }
+
+            const parsed = parseHpScriptInputs();
+            if (!parsed) return;
+            const { lines, scriptHashes } = parsed;
+
+            const catalog = hpClient.getCatalog();
+            if (!catalog || catalog.databases.length === 0) {
+                log('HarmonyPIR: No catalog available', 'error');
+                return;
+            }
+
+            let plan;
+            try {
+                plan = hpSync.computePlan(catalog, scriptHashes);
+            } catch (e) {
+                log(`HarmonyPIR sync plan failed: ${e.message}`, 'error');
+                return;
+            }
+
+            const planBox = document.getElementById('hp-syncPlanBox');
+            const planText = document.getElementById('hp-syncPlanText');
+
+            if (plan.steps.length === 0) {
+                planText.textContent = `Already at tip (height ${plan.targetHeight.toLocaleString()}). Nothing to do.`;
+                planBox.style.display = 'block';
+                document.getElementById('hp-syncConfirmBtn').style.display = 'none';
+                document.getElementById('hp-syncCancelBtn').textContent = 'Close';
+                hpPendingSync = null;
+                log(`HarmonyPIR sync: already at height ${plan.targetHeight}`, 'info');
+                return;
+            }
+
+            const pretty = plan.steps.map(s => describeStep(s)).join('  then  ');
+            const persistedHeight = hpSync.loadLastSyncedHeight();
+            const cacheComplete = scriptHashes.every(sh => hpSync.hasSnapshotFor(sh));
+            const fromTxt = plan.isFreshSync
+                ? (persistedHeight > 0 && !cacheComplete
+                    ? 'from scratch (cache empty after reload)'
+                    : 'from scratch')
+                : `from height ${persistedHeight.toLocaleString()}`;
+            planText.innerHTML =
+                `<div>Sync plan ${fromTxt} \u2192 ${plan.targetHeight.toLocaleString()}` +
+                `${plan.isFreshSync ? ' (fresh sync)' : ''}:</div>` +
+                `<div style="margin-top: 4px;">${pretty}</div>`;
+            planBox.style.display = 'block';
+            document.getElementById('hp-syncConfirmBtn').style.display = '';
+            document.getElementById('hp-syncCancelBtn').textContent = 'Cancel';
+
+            hpPendingSync = { plan, lines, scriptHashes };
+            log(`HarmonyPIR sync plan staged: ${plan.steps.length} step(s) to height ${plan.targetHeight}`, 'info');
+        }
+
+        function hpCancelSync() {
+            hpPendingSync = null;
+            document.getElementById('hp-syncPlanBox').style.display = 'none';
+        }
+
+        async function hpExecuteSync() {
+            if (!hpPendingSync || !hpClient || !hpHintsLoaded) return;
+            const { plan, lines, scriptHashes } = hpPendingSync;
+            const N = scriptHashes.length;
+
+            document.getElementById('hp-syncBtn').disabled = true;
+            document.getElementById('hp-queryBtn').disabled = true;
+            document.getElementById('hp-syncConfirmBtn').disabled = true;
+            document.getElementById('hp-syncCancelBtn').disabled = true;
+            document.getElementById('hp-resetSyncBtn').disabled = true;
+
+            const resultsContainer = document.getElementById('hp-resultsContainer');
+            resultsContainer.innerHTML = '';
+
+            const savedDbId = hpClient.getDbId();
+
+            try {
+                const { merged, verifiableSteps } = await hpSync.execute(plan, {
+                    scriptHashes,
+                    beforeStep: async (step, si) => {
+                        // HarmonyPIR has strict per-(dbId, PRP) hint state.
+                        // Switching DBs triggers hpSwitchDb which either hits
+                        // the hint cache (instant) or re-downloads hints
+                        // (slower — progress shows in #hp-offlineContainer).
+                        if (hpClient.getDbId() !== step.dbId) {
+                            const stepLabel = describeStep(step, si + 1, plan.steps.length);
+                            hpSetProgress(5, `${stepLabel} \u2014 switching DB / loading hints...`);
+                            await hpSwitchDb(step.dbId);
+                            if (!hpHintsLoaded) {
+                                throw new Error(`HarmonyPIR: hint load failed for db ${step.dbId}`);
+                            }
+                        }
+                    },
+                    queryStep: async (step, si) => {
+                        const stepLabel = describeStep(step, si + 1, plan.steps.length);
+                        log(`HarmonyPIR: ${stepLabel}`, 'info');
+                        hpSetProgress(10, stepLabel);
+                        // HarmonyPIR queryBatch takes addresses OR scriptPubKey hex;
+                        // we pass the hex `lines`. Returns Map<qi, HarmonyQueryResult>.
+                        const resultMap = await hpClient.queryBatch(lines, (phase, detail) => {
+                            let pct = 10;
+                            if (phase === 'Level 1') pct = 30;
+                            else if (phase === 'Level 2') pct = 60;
+                            else if (phase === 'Reassemble') pct = 90;
+                            hpSetProgress(pct, `${stepLabel} \u2014 ${phase}: ${detail}`);
+                        });
+                        // Convert Map<qi, HarmonyQueryResult> → (HarmonyQueryResult|null)[]
+                        // in scripthash order for the SyncController's merge loop.
+                        const arr = new Array(N).fill(null);
+                        for (let qi = 0; qi < N; qi++) {
+                            arr[qi] = resultMap.get(qi) ?? null;
+                        }
+                        return arr;
+                    },
+                    mergeStep: (snapshot, delta) =>
+                        mergeDeltaIntoHarmonySnapshot(snapshot, delta, (msg) => log(msg, 'error')),
+                    onError: (msg) => log(msg, 'error'),
+                });
+
+                // Store inspector data for the most recent step (the last
+                // queryBatch call populated it internally).
+                hpInspectorDataMap = hpClient.lastInspectorData;
+
+                // Render merged HarmonyQueryResults via the existing adapter.
+                let found = 0;
+                for (let qi = 0; qi < N; qi++) {
+                    const spkHex = lines[qi];
+                    const hashHex = bytesToHex(scriptHashes[qi]);
+                    const hResult = merged[qi];
+                    const r = harmonyResultToRenderFormat(hResult);
+                    if (r && r.entries.length > 0) found++;
+                    renderResult(resultsContainer, spkHex, hashHex, r, qi);
+                }
+
+                hpRefreshSyncStateUI();
+
+                // Per-step Merkle verification. Matches DPF / OnionPIR pattern:
+                // verify against each step's raw stepResults (not the merged
+                // view) so bin content lines up with the DB the step ran on.
+                const merkleSteps = verifiableSteps
+                    .map(({ step, stepResults }) => ({
+                        step,
+                        verifiable: stepResults.filter(r => r && !r.whale && r.indexPbcGroup !== undefined && r.rawChunkData),
+                    }))
+                    .filter(({ step, verifiable }) =>
+                        verifiable.length > 0 && hpClient.hasMerkleForDb(step.dbId));
+
+                if (merkleSteps.length > 0) {
+                    const note = document.createElement('div');
+                    note.style.cssText = 'margin: 12px 0; font-size: 12px; color: #666;';
+                    note.textContent = merkleSteps.length === 1
+                        ? `Merkle verification below applies to the ${merkleSteps[0].step.dbType} step of this sync.`
+                        : `Merkle verification below runs one proof batch per sync step (${merkleSteps.length} steps).`;
+                    resultsContainer.appendChild(note);
+                    for (let i = merkleSteps.length - 1; i >= 0; i--) {
+                        const { step, verifiable } = merkleSteps[i];
+                        const prefix = `hp-sync-${step.dbType}-${step.dbId}`;
+                        const label = step.dbType === 'full'
+                            ? `full snapshot (db ${step.dbId}, height ${step.tipHeight.toLocaleString()})`
+                            : `delta (db ${step.dbId}, ${step.baseHeight.toLocaleString()} \u2192 ${step.tipHeight.toLocaleString()})`;
+                        // HarmonyPIR verifyMerkleBatch uses the client's
+                        // active dbId — ensure it matches the step before
+                        // running each proof batch (may trigger an internal
+                        // switch via hpSwitchDb if needed).
+                        addBatchMerkleButton(resultsContainer, verifiable, prefix,
+                            async (results, onProg) => {
+                                if (hpClient.getDbId() !== step.dbId) {
+                                    await hpSwitchDb(step.dbId);
+                                }
+                                return hpClient.verifyMerkleBatch(results, onProg);
+                            },
+                            () => hpClient.getMerkleRootHex(),
+                            label);
+                    }
+                }
+
+                hpSetProgress(100, `Sync complete! ${found}/${N} found at height ${plan.targetHeight.toLocaleString()}`);
+                setTimeout(hpHideProgress, 2000);
+                log(`HarmonyPIR sync complete: ${found}/${N} found at height ${plan.targetHeight}`, 'success');
+                document.getElementById('hp-syncPlanBox').style.display = 'none';
+                hpPendingSync = null;
+            } catch (error) {
+                log(`HarmonyPIR sync error: ${error.message || error}`, 'error');
+                hpSetProgress(0, '');
+                hpHideProgress();
+            } finally {
+                // Restore the user-facing active DB if possible. hpSwitchDb
+                // handles the hint cache / re-download automatically.
+                if (hpClient && hpClient.getDbId() !== savedDbId) {
+                    try { await hpSwitchDb(savedDbId); } catch {}
+                }
+                document.getElementById('hp-syncBtn').disabled = !hpClient || !hpHintsLoaded;
+                document.getElementById('hp-queryBtn').disabled = false;
+                document.getElementById('hp-syncConfirmBtn').disabled = false;
+                document.getElementById('hp-syncCancelBtn').disabled = false;
+                document.getElementById('hp-resetSyncBtn').disabled = false;
+            }
+        }
+
+        function hpResetSyncState() {
+            hpSync.reset();
+            hpRefreshSyncStateUI();
+            document.getElementById('hp-syncPlanBox').style.display = 'none';
+            hpPendingSync = null;
+            log('HarmonyPIR sync state reset', 'info');
         }
 
         async function hpQueryUtxos() {
@@ -2396,6 +3013,10 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
         document.getElementById('hp-connectBtn').addEventListener('click', hpConnect);
         document.getElementById('hp-disconnectBtn').addEventListener('click', hpDisconnect);
         document.getElementById('hp-queryBtn').addEventListener('click', hpQueryUtxos);
+        document.getElementById('hp-syncBtn').addEventListener('click', hpPlanSync);
+        document.getElementById('hp-syncConfirmBtn').addEventListener('click', hpExecuteSync);
+        document.getElementById('hp-syncCancelBtn').addEventListener('click', hpCancelSync);
+        document.getElementById('hp-resetSyncBtn').addEventListener('click', hpResetSyncState);
         document.getElementById('hp-dbSelect').addEventListener('change', async (e) => {
             const newDbId = parseInt(e.target.value);
             if (!hpClient) return;
@@ -2418,6 +3039,8 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
             }
         });
         hpSetButtons(false);
+        // Initialize HarmonyPIR sync button in disabled state.
+        document.getElementById('hp-syncBtn').disabled = true;
     </script>
 
     <!-- Query Inspector Modal -->
