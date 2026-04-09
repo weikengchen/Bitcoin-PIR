@@ -1,19 +1,19 @@
-//! OnionPIRv2 integration for 1-server Bitcoin PIR.
+//! OnionPIRv2 wire protocol + message types for Bitcoin PIR.
 //!
-//! Maps existing PBC cuckoo tables into OnionPIR databases.
-//! Each PBC group becomes its own OnionPIR `Server` instance.
-//! Within a group, each cuckoo bin maps to one OnionPIR entry (by index).
+//! This module exposes the WebSocket variant codes and encode/decode logic
+//! for the OnionPIR request/response messages (key registration, batched
+//! queries, Merkle sibling queries). It is consumed by:
 //!
-//! Architecture:
-//!   - K OnionPIR Server instances (one per PBC group)
-//!   - All share the same `num_entries` (= bins_per_table), so clients
-//!     can reuse a single set of encryption parameters
-//!   - Client queries group g for entry i  ⟹  OnionPIR query to servers[g] at index i
-//!   - Server returns encrypted entry  ⟹  client decrypts to get cuckoo bin contents
-
-use onionpir::{self, Server as PirServer};
-use std::path::Path;
-use std::time::Instant;
+//!   - `bin/unified_server.rs` — the production server, which owns its own
+//!     `PirServer` setup via consolidated `onion_index_all.bin` mmap +
+//!     shared NTT store, and only uses this module for wire formats.
+//!   - `bin/onionpir_client.rs` — the CLI client, which uses the same wire
+//!     formats + the `REQ_*`/`RESP_*` variant constants.
+//!
+//! The older `GroupServers::load` / `populate_server` helper that built
+//! one `PirServer` per PBC group from a cuckoo table file was removed
+//! after the INDEX layout migrated to the consolidated `onion_index_all.bin`
+//! format (see `gen_3_onion` + `unified_server.rs` INDEX load path).
 
 // ─── Wire protocol constants for OnionPIR messages ──────────────────────────
 
@@ -36,166 +36,6 @@ pub const RESP_ONIONPIR_MERKLE_INDEX_SIBLING: u8 = 0x53;
 pub const RESP_ONIONPIR_MERKLE_INDEX_TREE_TOP: u8 = 0x54;
 pub const RESP_ONIONPIR_MERKLE_DATA_SIBLING: u8 = 0x55;
 pub const RESP_ONIONPIR_MERKLE_DATA_TREE_TOP: u8 = 0x56;
-
-// ─── OnionPIR database population ───────────────────────────────────────────
-
-/// Populate one OnionPIR Server from a single group's cuckoo table data.
-///
-/// `table_bytes`: the raw bytes of this group's cuckoo table (no header — just bins).
-///   Length must be `bins_per_table * bin_byte_size`.
-/// `bins_per_table`: number of cuckoo bins in this group.
-/// `bin_byte_size`: byte size of one cuckoo bin (all slots concatenated).
-///   - Index level: INDEX_SLOTS_PER_BIN * INDEX_SLOT_SIZE = 4 * 17 = 68
-///   - Chunk level: CHUNK_SLOTS_PER_BIN * CHUNK_SLOT_SIZE = 3 * 44 = 132
-///
-/// Each cuckoo bin becomes one OnionPIR entry at the same index.
-/// If `entry_size > bin_byte_size`, the entry is zero-padded.
-/// If `entry_size < bin_byte_size`, this panics — rebuild OnionPIR with larger EntrySize.
-fn populate_server(
-    server: &mut PirServer,
-    table_bytes: &[u8],
-    bins_per_table: usize,
-    bin_byte_size: usize,
-) {
-    let p = onionpir::params_info(bins_per_table as u64);
-    let entry_size = p.entry_size as usize;
-    assert!(
-        entry_size >= bin_byte_size,
-        "OnionPIR entry_size ({}) < cuckoo bin size ({}). \
-         Rebuild OnionPIR with EntrySize >= {}.",
-        entry_size, bin_byte_size, bin_byte_size
-    );
-
-    let entries_per_pt = 1; // one entry per plaintext (standard for small entries)
-    let fst_dim = p.fst_dim_sz as usize;
-    let chunk_size = fst_dim * entries_per_pt * entry_size;
-
-    for chunk_idx in 0..(p.other_dim_sz as usize) {
-        let mut chunk_data = vec![0u8; chunk_size];
-
-        for i in 0..fst_dim {
-            let global_idx = chunk_idx * fst_dim * entries_per_pt + i;
-            if global_idx < bins_per_table {
-                let src_offset = global_idx * bin_byte_size;
-                let dst_offset = i * entry_size;
-                let src = &table_bytes[src_offset..src_offset + bin_byte_size];
-                chunk_data[dst_offset..dst_offset + bin_byte_size].copy_from_slice(src);
-                // remaining bytes in [dst_offset + bin_byte_size .. dst_offset + entry_size]
-                // are already zero from vec initialization
-            }
-        }
-
-        server.push_chunk(&chunk_data, chunk_idx);
-    }
-}
-
-// ─── Bucket server set ──────────────────────────────────────────────────────
-
-/// Manages K OnionPIR Server instances loaded from a cuckoo table file.
-///
-/// Each PBC group has its own preprocessed OnionPIR database.
-/// Preprocessing is expensive (NTT transforms), so results are saved to disk
-/// and mmap-loaded on subsequent runs.
-pub struct GroupServers {
-    pub servers: Vec<PirServer>,
-    pub num_groups: usize,
-    pub bins_per_table: usize,
-    pub entry_size: usize,
-}
-
-impl GroupServers {
-    /// Load or build OnionPIR databases for all groups from a cuckoo table file.
-    ///
-    /// Parameters:
-    ///   - `cuckoo_mmap`: the full memory-mapped cuckoo file (header + all group tables)
-    ///   - `header_size`: byte offset where group data starts (after file header)
-    ///   - `num_groups`: K (number of PBC groups)
-    ///   - `bins_per_table`: cuckoo bins per group
-    ///   - `bin_byte_size`: bytes per cuckoo bin (all slots)
-    ///   - `preprocess_dir`: directory for saving/loading preprocessed .bin files
-    pub fn load(
-        cuckoo_mmap: &[u8],
-        header_size: usize,
-        num_groups: usize,
-        bins_per_table: usize,
-        bin_byte_size: usize,
-        preprocess_dir: &Path,
-    ) -> Self {
-        let p = onionpir::params_info(bins_per_table as u64);
-        let entry_size = p.entry_size as usize;
-        let padded_entries = p.num_entries as usize;
-
-        println!("  OnionPIR params: num_entries={} (padded from {}), entry_size={}, fst_dim={}, other_dim={}",
-            padded_entries, bins_per_table, entry_size, p.fst_dim_sz, p.other_dim_sz);
-
-        let table_byte_size = bins_per_table * bin_byte_size;
-        let mut servers = Vec::with_capacity(num_groups);
-
-        for b in 0..num_groups {
-            let preproc_path = preprocess_dir.join(format!("group_{}.bin", b));
-            let mut server = PirServer::new(bins_per_table as u64);
-
-            let loaded = preproc_path.exists()
-                && server.load_db(preproc_path.to_str().expect("valid path"));
-
-            if loaded {
-                if b == 0 {
-                    println!("  Loading preprocessed databases from {:?}", preprocess_dir);
-                }
-            } else {
-                if b == 0 {
-                    println!("  Building OnionPIR databases (this is slow — NTT preprocessing)...");
-                }
-                let t = Instant::now();
-
-                let table_offset = header_size + b * table_byte_size;
-                let table_bytes = &cuckoo_mmap[table_offset..table_offset + table_byte_size];
-                populate_server(&mut server, table_bytes, bins_per_table, bin_byte_size);
-
-                server.preprocess();
-
-                // Ensure directory exists
-                std::fs::create_dir_all(preprocess_dir).ok();
-                server.save_db(preproc_path.to_str().expect("valid path"));
-
-                if b % 10 == 0 || b + 1 == num_groups {
-                    println!("    Group {}/{} preprocessed in {:.2?}", b + 1, num_groups, t.elapsed());
-                }
-            }
-
-            servers.push(server);
-        }
-
-        GroupServers { servers, num_groups, bins_per_table, entry_size }
-    }
-
-    /// Register a client's encryption keys with ALL group servers.
-    ///
-    /// `galois_keys` and `gsw_keys` are the serialized SEAL keys from the client.
-    /// These are several MB each and only sent once per session.
-    pub fn register_client(&mut self, client_id: u64, galois_keys: &[u8], gsw_keys: &[u8]) {
-        for server in &mut self.servers {
-            server.set_galois_key(client_id, galois_keys);
-            server.set_gsw_key(client_id, gsw_keys);
-        }
-    }
-
-    /// Answer a batch of OnionPIR queries (one per group).
-    ///
-    /// `queries[g]` is the encrypted query for group `g`.
-    /// Empty entries (zero-length) are skipped (no query for that group).
-    /// Returns `responses[g]` = encrypted response (or empty if skipped).
-    pub fn answer_batch(&mut self, client_id: u64, queries: &[Vec<u8>]) -> Vec<Vec<u8>> {
-        assert_eq!(queries.len(), self.num_groups);
-        queries.iter().enumerate().map(|(b, q)| {
-            if q.is_empty() {
-                Vec::new()
-            } else {
-                self.servers[b].answer_query(client_id, q)
-            }
-        }).collect()
-    }
-}
 
 // ─── Wire protocol encoding/decoding ────────────────────────────────────────
 

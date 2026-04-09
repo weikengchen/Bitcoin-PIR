@@ -9,7 +9,12 @@
 # Pipeline:
 #   1. delta_gen_1_onion           — pack delta into 3840B entries + 27B index
 #   2. gen_2_onion   --data-dir …  — build NTT store, chunk cuckoo, DATA bin hashes
-#   3. gen_3_onion   --data-dir …  — build index PIR databases + INDEX bin hashes
+#   3. gen_3_onion   --data-dir …  — build K per-group index PIR databases,
+#                                    consolidate them into onion_index_all.bin
+#                                    (single-file layout consumed by the server
+#                                    via load_db_from_bytes), and emit INDEX
+#                                    bin hashes. The scratch onion_index_pir/
+#                                    directory is removed after consolidation.
 #   4. gen_4_build_merkle_onion
 #        --data-dir …              — build per-bin Merkle trees (INDEX + DATA)
 #
@@ -25,7 +30,8 @@
 #   onion_shared_ntt.bin            — shared NTT store (chunk level)
 #   onion_chunk_cuckoo.bin
 #   onion_data_bin_hashes.bin
-#   onion_index_pir/group_N.bin     — one per PBC group
+#   onion_index_all.bin             — consolidated per-group INDEX PIR databases
+#                                     (32B master header + K × per_group_bytes)
 #   onion_index_meta.bin
 #   onion_index_bin_hashes.bin
 #   merkle_onion_index_root.bin

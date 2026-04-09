@@ -16,10 +16,6 @@ name = "client"
 path = "src/bin/client.rs"
 
 [[bin]]
-name = "onionpir_server"
-path = "src/bin/onionpir_server.rs"
-
-[[bin]]
 name = "onionpir_client"
 path = "src/bin/onionpir_client.rs"
 
