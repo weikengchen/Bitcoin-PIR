@@ -31,6 +31,14 @@ Bitcoin Private Information Retrieval (PIR) system with three backends: DPF-PIR,
 
 ## Next TODOs
 
+### Recent Fix: Merkle Verification for "Not Found" Results
+- Previously, Merkle verification only worked for queries that FOUND a match
+- Now all three PIR clients (DPF, OnionPIR, HarmonyPIR) track the first bin checked
+  even when the scripthash is NOT found in the database
+- This allows Merkle verification of delta databases even when addresses have
+  no activity in the delta period
+- Security benefit: proves the server returned authentic "not found" responses
+
 ### If GitHub Actions SUCCEEDS:
 1. **Test in browser**: Open the deployed web app, check DevTools console for `[PIR] SDK WASM loaded`
 2. **Run a sync**: Connect to servers, enter a scriptPubKey, click Sync - verify sync planning works

@@ -361,6 +361,9 @@ export class BatchPirClient {
 
     // Per-query results from Level 1
     const indexResults: Map<number, { startChunkId: number; numChunks: number; pbcGroup: number; binIndex: number; binContent: Uint8Array }> = new Map();
+    // Track "not found" queries with their bin info for Merkle verification
+    // (proves the server returned authentic bin content even when no match)
+    const notFoundBins: Map<number, { pbcGroup: number; binIndex: number; binContent: Uint8Array }> = new Map();
 
     for (let ir = 0; ir < indexRounds.length; ir++) {
       const round = indexRounds[ir];
@@ -422,9 +425,18 @@ export class BatchPirClient {
         let found: { startChunkId: number; numChunks: number } | null = null;
         let matchedBinContent: Uint8Array | undefined;
         let matchedBinIndex = 0;
+        // Track the first bin (h=0) for Merkle verification even if not found
+        let firstBinContent: Uint8Array | undefined;
+        let firstBinIndex = 0;
         const expectedTag = computeTag(tagSeed, scriptHashes[queryIdx]);
         for (let h = 0; h < INDEX_CUCKOO_NUM_HASHES; h++) {
           const result = this.xorBuffers(r0[h], r1[h]);
+          // Always capture the first bin for Merkle verification
+          if (h === 0) {
+            firstBinContent = result;
+            const ck = deriveCuckooKey(groupId, 0);
+            firstBinIndex = cuckooHash(scriptHashes[queryIdx], ck, indexBins);
+          }
           found = findEntryInIndexResult(result, expectedTag, this.serverInfo!.index_slots_per_bin, this.serverInfo!.index_slot_size);
           if (found) {
             matchedBinContent = result;
@@ -444,6 +456,14 @@ export class BatchPirClient {
           });
         } else {
           this.log(`  Query ${queryIdx}: not found in index`, 'error');
+          // Store the first bin for Merkle verification of "not found"
+          if (firstBinContent) {
+            notFoundBins.set(queryIdx, {
+              pbcGroup: groupId,
+              binIndex: firstBinIndex,
+              binContent: firstBinContent,
+            });
+          }
         }
       }
     }
@@ -605,7 +625,28 @@ export class BatchPirClient {
 
       const info = queryChunkInfo.get(qi);
       if (!info) {
-        // Not found in index
+        // Not found in index — but we may still have bin content for Merkle verification
+        const nfBin = notFoundBins.get(qi);
+        if (nfBin) {
+          // Create a "not found" result with verifiable bin content
+          results[qi] = {
+            entries: [],
+            totalSats: 0n,
+            startChunkId: 0,
+            numChunks: 0,
+            numRounds: 0,
+            isWhale: false,
+            merkleRootHex: this.serverInfo?.merkle_bucket?.super_root ?? this.serverInfo?.merkle?.root,
+            scriptHash: scriptHashes[qi],
+            indexPbcGroup: nfBin.pbcGroup,
+            indexBinIndex: nfBin.binIndex,
+            indexBinContent: nfBin.binContent,
+            // No chunk data for not-found queries
+            chunkPbcGroups: [],
+            chunkBinIndices: [],
+            chunkBinContents: [],
+          };
+        }
         continue;
       }
 

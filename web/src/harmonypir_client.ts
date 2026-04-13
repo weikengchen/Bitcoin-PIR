@@ -741,6 +741,8 @@ export class HarmonyPirClient {
 
     const indexResults = new Map<number, { startChunkId: number; numChunks: number; pbcGroup: number; binIndex: number; binContent: Uint8Array }>();
     const whaleQueries = new Set<number>();
+    // Track "not found" queries with their first bin info for Merkle verification
+    const notFoundBins = new Map<number, { pbcGroup: number; binIndex: number; binContent: Uint8Array }>();
 
     for (let ir = 0; ir < indexRounds.length; ir++) {
       const round = indexRounds[ir];
@@ -827,9 +829,19 @@ export class HarmonyPirClient {
         for (const [groupId, qi] of realGroups) {
           const answer = answers.get(groupId);
           if (!answer) continue;
+          // For h=0, always track the bin for Merkle verification (even if not found)
+          if (h === 0 && !notFoundBins.has(qi)) {
+            notFoundBins.set(qi, {
+              pbcGroup: groupId,
+              binIndex: realBinIndices.get(groupId) ?? 0,
+              binContent: answer,
+            });
+          }
           const expectedTag = computeTag(this.tagSeed, scriptHashes[qi]);
           const found = findEntryInIndexResult(answer, expectedTag, HARMONY_INDEX_W / INDEX_SLOT_SIZE, INDEX_SLOT_SIZE);
           if (found) {
+            // Found! Remove from notFoundBins since we'll use indexResults
+            notFoundBins.delete(qi);
             if (found.numChunks === 0) {
               whaleQueries.add(qi);
               const qd = inspectorMap.get(qi);
@@ -1022,7 +1034,22 @@ export class HarmonyPirClient {
       }
       const info = queryChunkInfo.get(qi);
       if (!info) {
-        results.set(qi, { address: addresses[qi], scriptHash: shHexes[qi], utxos: [], whale: false });
+        // Not found — but we may still have bin info for Merkle verification
+        const nfBin = notFoundBins.get(qi);
+        results.set(qi, {
+          address: addresses[qi],
+          scriptHash: shHexes[qi],
+          utxos: [],
+          whale: false,
+          merkleRootHex: this.serverInfo?.merkle_bucket?.super_root ?? this.serverInfo?.merkle?.root,
+          scriptHashBytes: scriptHashes[qi],
+          indexPbcGroup: nfBin?.pbcGroup,
+          indexBinIndex: nfBin?.binIndex,
+          indexBinContent: nfBin?.binContent,
+          chunkPbcGroups: [],
+          chunkBinIndices: [],
+          chunkBinContents: [],
+        });
         continue;
       }
       const chunks: Uint8Array[] = [];
