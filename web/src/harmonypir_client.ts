@@ -1663,78 +1663,91 @@ export class HarmonyPirClient {
 
     const sibGroupIds = levelOffset === 10 ? this._indexSibGroupIds : this._chunkSibGroupIds;
 
-    // For each sibling level, query via HarmonyPIR batch
+    // Group items by PBC group. PBC group is derived from the scripthash, so all
+    // cuckoo positions for the same query share one PBC group; "not found"
+    // verification needs INDEX_CUCKOO_NUM_HASHES bins per query and we must do
+    // separate rounds for each, since each round's flat table holds one query
+    // per group.
+    const itemsByGroup = new Map<number, number[]>();
+    for (let i = 0; i < N; i++) {
+      const g = items[i].pbcGroup;
+      const arr = itemsByGroup.get(g);
+      if (arr) arr.push(i);
+      else itemsByGroup.set(g, [i]);
+    }
+    const maxItemsPerGroup = Math.max(1, ...Array.from(itemsByGroup.values(), arr => arr.length));
+
+    // For each sibling level, query via HarmonyPIR batch.
+    // Run `maxItemsPerGroup` passes per level so items sharing a group each get
+    // their own query; K-padding is preserved within each pass.
     for (let level = 0; level < levelInfos.length; level++) {
       const groupIds = sibGroupIds[level];
       if (!groupIds || groupIds.length === 0) continue;
 
-      // Determine target group_id = floor(nodeIdx / arity) for each item
-      const itemGroupIds = items.map((_, i) => Math.floor(nodeIdx[i] / A));
-
-      // Build batch: one query per PBC group (tableK groups)
-      const groupToItem = new Map<number, number>(); // pbcGroup → item index
-      for (let i = 0; i < N; i++) {
-        groupToItem.set(items[i].pbcGroup, i);
-      }
-
-      const buildItems: BuildItem[] = [];
-      for (let g = 0; g < tableK; g++) {
-        const globalId = groupIds[g];
-        const itemIdx = groupToItem.get(g);
-        if (itemIdx !== undefined) {
-          buildItems.push({ groupId: globalId, binIndex: itemGroupIds[itemIdx] });
-        } else {
-          buildItems.push({ groupId: globalId }); // dummy
-        }
-      }
-
-      // Build HarmonyPIR requests
-      const reqBytesMap = await this.doBuildBatch(buildItems, 'index'); // level doesn't matter for pool
-
-      // Encode and send batch
-      const batchItems = buildItems.map((item, g) => ({
-        groupId: g, // local group ID for wire protocol
-        subQueryBytes: [(reqBytesMap.get(item.groupId)?.bytes) ?? new Uint8Array(0)],
-      }));
-      const wireLevel = levelOffset + level;
-      const reqMsg = this.encodeHarmonyBatchRequest(wireLevel, 0, 1, batchItems);
-      const respData = await this.sendQueryRequest(reqMsg);
-      const batchResp = this.decodeHarmonyBatchResponse(respData);
-
-      // Process responses
-      const processItems: ProcessItem[] = [];
-      for (let g = 0; g < tableK; g++) {
-        const itemIdx = groupToItem.get(g);
-        if (itemIdx === undefined) continue;
-        const respItem = batchResp.get(g);
-        if (respItem && respItem.length > 0) {
-          processItems.push({ groupId: groupIds[g], response: respItem[0] });
-        }
-      }
-      const answers = await this.doProcessBatch(processItems, 'index');
-
-      // Update per-item state with recovered sibling rows
-      for (let i = 0; i < N; i++) {
-        const g = items[i].pbcGroup;
-        const globalId = groupIds[g];
-        const row = answers.get(globalId);
-        if (!row || row.length < SIB_W) {
-          this.log(`Merkle L${level}: no sibling row for group ${g}`);
-          currentHash[i] = ZERO_HASH;
-          continue;
+      for (let pass = 0; pass < maxItemsPerGroup; pass++) {
+        const passGroupToItem = new Map<number, number>();
+        for (const [g, arr] of itemsByGroup) {
+          if (pass < arr.length) passGroupToItem.set(g, arr[pass]);
         }
 
-        const childPos = nodeIdx[i] % A;
-        const children: Uint8Array[] = [];
-        for (let c = 0; c < A; c++) {
-          if (c === childPos) {
-            children.push(currentHash[i]);
+        const buildItems: BuildItem[] = [];
+        for (let g = 0; g < tableK; g++) {
+          const globalId = groupIds[g];
+          const itemIdx = passGroupToItem.get(g);
+          if (itemIdx !== undefined) {
+            buildItems.push({ groupId: globalId, binIndex: Math.floor(nodeIdx[itemIdx] / A) });
           } else {
-            children.push(row.slice(c * 32, (c + 1) * 32));
+            buildItems.push({ groupId: globalId }); // dummy
           }
         }
-        currentHash[i] = computeParentN(children);
-        nodeIdx[i] = Math.floor(nodeIdx[i] / A);
+
+        // Build HarmonyPIR requests
+        const reqBytesMap = await this.doBuildBatch(buildItems, 'index'); // level doesn't matter for pool
+
+        // Encode and send batch
+        const batchItems = buildItems.map((item, g) => ({
+          groupId: g, // local group ID for wire protocol
+          subQueryBytes: [(reqBytesMap.get(item.groupId)?.bytes) ?? new Uint8Array(0)],
+        }));
+        const wireLevel = levelOffset + level;
+        const reqMsg = this.encodeHarmonyBatchRequest(wireLevel, 0, 1, batchItems);
+        const respData = await this.sendQueryRequest(reqMsg);
+        const batchResp = this.decodeHarmonyBatchResponse(respData);
+
+        // Process responses
+        const processItems: ProcessItem[] = [];
+        for (let g = 0; g < tableK; g++) {
+          const itemIdx = passGroupToItem.get(g);
+          if (itemIdx === undefined) continue;
+          const respItem = batchResp.get(g);
+          if (respItem && respItem.length > 0) {
+            processItems.push({ groupId: groupIds[g], response: respItem[0] });
+          }
+        }
+        const answers = await this.doProcessBatch(processItems, 'index');
+
+        // Update state for items active in THIS pass only
+        for (const [g, itemIdx] of passGroupToItem) {
+          const globalId = groupIds[g];
+          const row = answers.get(globalId);
+          if (!row || row.length < SIB_W) {
+            this.log(`Merkle L${level}: no sibling row for group ${g}`);
+            currentHash[itemIdx] = ZERO_HASH;
+            continue;
+          }
+
+          const childPos = nodeIdx[itemIdx] % A;
+          const children: Uint8Array[] = [];
+          for (let c = 0; c < A; c++) {
+            if (c === childPos) {
+              children.push(currentHash[itemIdx]);
+            } else {
+              children.push(row.slice(c * 32, (c + 1) * 32));
+            }
+          }
+          currentHash[itemIdx] = computeParentN(children);
+          nodeIdx[itemIdx] = Math.floor(nodeIdx[itemIdx] / A);
+        }
       }
     }
 

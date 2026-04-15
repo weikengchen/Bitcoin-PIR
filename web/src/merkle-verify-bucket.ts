@@ -240,97 +240,109 @@ async function verifySiblingLevels(
     nodeIdx[i] = items[i].binIndex;
   }
 
-  // For each sibling level, query all K groups via DPF
+  // Group items by PBC group. PBC group is derived from the scripthash, so all
+  // cuckoo positions (h=0, h=1) for the same query land in the SAME PBC group.
+  // For "not found" verification we have INDEX_CUCKOO_NUM_HASHES bins per query
+  // sharing one PBC group; we must do separate DPF rounds for each, since each
+  // round's flat table holds one DPF key per group.
+  const itemsByGroup = new Map<number, number[]>();
+  for (let i = 0; i < N; i++) {
+    const g = items[i].pbcGroup;
+    const arr = itemsByGroup.get(g);
+    if (arr) arr.push(i);
+    else itemsByGroup.set(g, [i]);
+  }
+  const maxItemsPerGroup = Math.max(1, ...Array.from(itemsByGroup.values(), arr => arr.length));
+
+  // For each sibling level, query all K groups via DPF.
+  // Run `maxItemsPerGroup` passes per level so that items sharing a group each
+  // get their own DPF query. K-padding is preserved within each pass.
   for (let level = 0; level < levelInfos.length; level++) {
     const levelInfo = levelInfos[level];
 
-    // Determine which group_id each item needs at this level
-    // group_id = floor(nodeIdx / arity)
-    const itemGroupIds: number[] = items.map((_, i) => Math.floor(nodeIdx[i] / A));
-
-    // Build batch: one DPF key-pair per PBC group (tableK groups total)
-    // For each PBC group, at most one item is "real" (the rest are dummy)
-    const groupToItem = new Map<number, number>(); // pbcGroup → item index
-    for (let i = 0; i < N; i++) {
-      groupToItem.set(items[i].pbcGroup, i); // last one wins for multi-address
-    }
-
-    // Generate DPF keys for all K groups
-    const s0Keys: Uint8Array[][] = [];
-    const s1Keys: Uint8Array[][] = [];
-
-    for (let g = 0; g < tableK; g++) {
-      let alpha: number;
-      const itemIdx = groupToItem.get(g);
-      if (itemIdx !== undefined) {
-        // Real: target the group_id in the flat table
-        alpha = itemGroupIds[itemIdx];
-      } else {
-        // Dummy: random target
-        alpha = Number(rng.nextU64() % BigInt(levelInfo.bins_per_table));
+    for (let pass = 0; pass < maxItemsPerGroup; pass++) {
+      // Recompute group_id at this level for items active in this pass
+      const passGroupToItem = new Map<number, number>();
+      for (const [g, arr] of itemsByGroup) {
+        if (pass < arr.length) passGroupToItem.set(g, arr[pass]);
       }
 
-      const pair = await genDpfKeysN(alpha, levelInfo.dpf_n);
-      s0Keys.push([pair.key0]);
-      s1Keys.push([pair.key1]);
-    }
+      // Generate DPF keys for all K groups
+      const s0Keys: Uint8Array[][] = [];
+      const s1Keys: Uint8Array[][] = [];
 
-    // Encode and send batch to both servers using shared protocol
-    const roundId = tableType * 100 + level;
-    const query0: BatchQuery = { level: 2, roundId, keys: s0Keys, dbId: dbId || undefined };
-    const query1: BatchQuery = { level: 2, roundId, keys: s1Keys, dbId: dbId || undefined };
-    const req0Bytes = encodeRequest({ type: 'BucketMerkleSibBatch', query: query0 });
-    const req1Bytes = encodeRequest({ type: 'BucketMerkleSibBatch', query: query1 });
-
-    const [resp0Raw, resp1Raw] = await Promise.all([
-      ws0.sendRaw(req0Bytes),
-      ws1.sendRaw(req1Bytes),
-    ]);
-
-    // Decode responses using shared protocol decoder
-    const resp0 = decodeResponse(resp0Raw.slice(4)); // strip 4-byte length prefix
-    const resp1 = decodeResponse(resp1Raw.slice(4));
-
-    if (resp0.type !== 'BucketMerkleSibBatch' || resp1.type !== 'BucketMerkleSibBatch') {
-      log?.(`Merkle L${level}: failed to get sibling responses (${resp0.type}, ${resp1.type})`);
-      return items.map(() => false);
-    }
-
-    const r0Results = resp0.result.results;
-    const r1Results = resp1.result.results;
-
-    // For each real item, XOR the two server responses to get the sibling row
-    for (let i = 0; i < N; i++) {
-      const g = items[i].pbcGroup;
-      if (g >= r0Results.length || g >= r1Results.length) {
-        log?.(`Merkle L${level}: group ${g} out of range (have ${r0Results.length})`);
-        currentHash[i] = ZERO_HASH;
-        continue;
-      }
-
-      // XOR the single hash-function result (flat table = 1 key per group)
-      const r0 = r0Results[g][0];
-      const r1 = r1Results[g][0];
-      const row = xorBuffers(r0, r1);
-
-      if (row.length < BUCKET_MERKLE_SIB_ROW_SIZE) {
-        log?.(`Merkle L${level}: row too short for group ${g}`);
-        currentHash[i] = ZERO_HASH;
-        continue;
-      }
-
-      // Extract arity children from the row
-      const childPos = nodeIdx[i] % A;
-      const children: Uint8Array[] = [];
-      for (let c = 0; c < A; c++) {
-        if (c === childPos) {
-          children.push(currentHash[i]);
+      for (let g = 0; g < tableK; g++) {
+        let alpha: number;
+        const itemIdx = passGroupToItem.get(g);
+        if (itemIdx !== undefined) {
+          // Real: target the group_id in the flat table for this item
+          alpha = Math.floor(nodeIdx[itemIdx] / A);
         } else {
-          children.push(row.slice(c * 32, (c + 1) * 32));
+          // Dummy: random target
+          alpha = Number(rng.nextU64() % BigInt(levelInfo.bins_per_table));
         }
+
+        const pair = await genDpfKeysN(alpha, levelInfo.dpf_n);
+        s0Keys.push([pair.key0]);
+        s1Keys.push([pair.key1]);
       }
-      currentHash[i] = computeParentN(children);
-      nodeIdx[i] = Math.floor(nodeIdx[i] / A);
+
+      // Encode and send batch to both servers using shared protocol
+      const roundId = tableType * 100 + level;
+      const query0: BatchQuery = { level: 2, roundId, keys: s0Keys, dbId: dbId || undefined };
+      const query1: BatchQuery = { level: 2, roundId, keys: s1Keys, dbId: dbId || undefined };
+      const req0Bytes = encodeRequest({ type: 'BucketMerkleSibBatch', query: query0 });
+      const req1Bytes = encodeRequest({ type: 'BucketMerkleSibBatch', query: query1 });
+
+      const [resp0Raw, resp1Raw] = await Promise.all([
+        ws0.sendRaw(req0Bytes),
+        ws1.sendRaw(req1Bytes),
+      ]);
+
+      // Decode responses using shared protocol decoder
+      const resp0 = decodeResponse(resp0Raw.slice(4)); // strip 4-byte length prefix
+      const resp1 = decodeResponse(resp1Raw.slice(4));
+
+      if (resp0.type !== 'BucketMerkleSibBatch' || resp1.type !== 'BucketMerkleSibBatch') {
+        log?.(`Merkle L${level} pass ${pass}: failed to get sibling responses (${resp0.type}, ${resp1.type})`);
+        return items.map(() => false);
+      }
+
+      const r0Results = resp0.result.results;
+      const r1Results = resp1.result.results;
+
+      // Update state for items active in THIS pass only
+      for (const [g, itemIdx] of passGroupToItem) {
+        if (g >= r0Results.length || g >= r1Results.length) {
+          log?.(`Merkle L${level}: group ${g} out of range (have ${r0Results.length})`);
+          currentHash[itemIdx] = ZERO_HASH;
+          continue;
+        }
+
+        // XOR the single hash-function result (flat table = 1 key per group)
+        const r0 = r0Results[g][0];
+        const r1 = r1Results[g][0];
+        const row = xorBuffers(r0, r1);
+
+        if (row.length < BUCKET_MERKLE_SIB_ROW_SIZE) {
+          log?.(`Merkle L${level}: row too short for group ${g}`);
+          currentHash[itemIdx] = ZERO_HASH;
+          continue;
+        }
+
+        // Extract arity children from the row
+        const childPos = nodeIdx[itemIdx] % A;
+        const children: Uint8Array[] = [];
+        for (let c = 0; c < A; c++) {
+          if (c === childPos) {
+            children.push(currentHash[itemIdx]);
+          } else {
+            children.push(row.slice(c * 32, (c + 1) * 32));
+          }
+        }
+        currentHash[itemIdx] = computeParentN(children);
+        nodeIdx[itemIdx] = Math.floor(nodeIdx[itemIdx] / A);
+      }
     }
   }
 
