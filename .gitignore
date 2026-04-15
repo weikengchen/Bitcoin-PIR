@@ -45,3 +45,6 @@ PLAN_*.md
 
 # Claude Code
 .claude/
+
+# Deployment artifacts (local configs, secrets, notes, SSH known_hosts)
+deploy/
