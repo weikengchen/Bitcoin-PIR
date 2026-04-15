@@ -2735,15 +2735,34 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                 await hpClient.fetchServerInfo();
                 await hpClient.initGroups();
 
-                statusDiv.textContent = 'Status: Connected (downloading hints...)';
-                statusDiv.className = 'status connected';
                 hpSetButtons(true);
                 hpHintsLoaded = false;
 
                 document.getElementById('hp-offlineContainer').style.display = 'block';
-                document.getElementById('hp-offlineStatus').textContent = 'Downloading...';
 
-                await hpFetchHints();
+                // Try IndexedDB-persisted hints first; falls back to fresh download.
+                statusDiv.textContent = 'Status: Checking persisted hints...';
+                statusDiv.className = 'status connecting';
+                const restored = await hpClient.restoreHintsFromCache(hpCurrentPrp);
+                if (restored) {
+                    hpHintsLoaded = true;
+                    const offlineStatus = document.getElementById('hp-offlineStatus');
+                    const offlineFill = document.getElementById('hp-offlineFill');
+                    const offlineLabel = document.getElementById('hp-offlineLabel');
+                    offlineStatus.textContent = 'Restored from browser storage';
+                    offlineFill.style.width = '100%';
+                    offlineFill.style.backgroundColor = '#28a745';
+                    const remaining = await hpClient.getMinQueriesRemaining();
+                    offlineLabel.textContent =
+                        'Hints restored (~' + hpClient.estimateHintSize() + ' MB, ' +
+                        remaining + ' queries available). No re-download required.';
+                    log('HarmonyPIR: Hints restored from IndexedDB', 'success');
+                } else {
+                    statusDiv.textContent = 'Status: Connected (downloading hints...)';
+                    statusDiv.className = 'status connected';
+                    document.getElementById('hp-offlineStatus').textContent = 'Downloading...';
+                    await hpFetchHints();
+                }
 
                 if (hpHintsLoaded) {
                     statusDiv.textContent = 'Status: Ready';

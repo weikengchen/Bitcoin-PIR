@@ -41,6 +41,15 @@ import { computeBinLeafHash, computeParentN, ZERO_HASH } from './merkle.js';
 import { sha256 } from './hash.js';
 
 import { HarmonyWorkerPool, BuildItem, BuildResult, ProcessItem } from './harmonypir_worker_pool.js';
+import {
+  buildCacheKey as idbCacheKey,
+  fingerprintsEqual,
+  getHints as idbGetHints,
+  putHints as idbPutHints,
+  deleteHints as idbDeleteHints,
+  HINT_SCHEMA_VERSION,
+  type HintFingerprint,
+} from './harmonypir_hint_db.js';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -494,6 +503,13 @@ export class HarmonyPirClient {
     this.hintsLoaded = true;
     const totalSec = ((performance.now() - t0) / 1000).toFixed(1);
     this.log(`Hints downloaded successfully (${totalSec}s, ~${this.estimateHintSize()} MB)`);
+
+    // Persist so a page reload can restore without re-downloading.
+    try {
+      await this.saveHintsToCache();
+    } catch (e) {
+      this.log(`Hint persist after download failed: ${(e as Error).message}`);
+    }
   }
 
   /**
@@ -1630,6 +1646,13 @@ export class HarmonyPirClient {
     this._chunkSibGroupIds = chunkSibGroupIds;
     this.siblingHintsLoaded = true;
     this.log('Sibling hints loaded');
+
+    // Re-persist so the IndexedDB record now includes sibling hints too.
+    try {
+      await this.saveHintsToCache();
+    } catch (e) {
+      this.log(`Hint persist after sibling download failed: ${(e as Error).message}`);
+    }
   }
 
   // Stored sibling group IDs (set by initAndFetchSiblingHints)
@@ -1791,10 +1814,22 @@ export class HarmonyPirClient {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // PRP hint caching
+  // PRP hint caching (in-memory + IndexedDB)
   // ═══════════════════════════════════════════════════════════════════════════
 
-  /** Save current hint state to cache for the current (dbId, PRP backend). */
+  /** Build the fingerprint that ties cached hints to a specific server DB state. */
+  private currentFingerprint(): HintFingerprint {
+    const fp: HintFingerprint = {
+      indexBinsPerTable: this.indexBinsPerTable,
+      chunkBinsPerTable: this.chunkBinsPerTable,
+      tagSeed: this.tagSeed.toString(),
+    };
+    const merkle = this.getBucketMerkleForDb(this.dbId);
+    if (merkle?.super_root) fp.superRoot = merkle.super_root;
+    return fp;
+  }
+
+  /** Save current hint state to in-memory cache AND IndexedDB. */
   async saveHintsToCache(): Promise<void> {
     if (!this.pool || !this.hintsLoaded) return;
     const backend = this.config.prpBackend ?? 0;
@@ -1806,24 +1841,153 @@ export class HarmonyPirClient {
       totalHintBytes: this.totalHintBytes,
     });
     this.log(`Cached hints for db=${this.dbId} backend=${backend} (${serialized.size} groups)`);
+
+    // Also persist to IndexedDB so hints survive page reload.
+    try {
+      const hasSiblings = Array.from(serialized.keys()).some(id => id >= K + K_CHUNK);
+      await idbPutHints({
+        cacheKey: idbCacheKey(this.config.queryServerUrl, this.dbId, backend),
+        serverUrl: this.config.queryServerUrl,
+        dbId: this.dbId,
+        backend,
+        prpKey: new Uint8Array(this.prpKey),
+        groups: serialized,
+        totalHintBytes: this.totalHintBytes,
+        fingerprint: this.currentFingerprint(),
+        hasMainHints: this.hintsLoaded,
+        hasSiblingHints: this.siblingHintsLoaded && hasSiblings,
+        savedAt: Date.now(),
+        schemaVersion: HINT_SCHEMA_VERSION,
+      });
+      this.log(`Persisted hints to IndexedDB (db=${this.dbId} backend=${backend}, siblings=${hasSiblings})`);
+    } catch (e) {
+      this.log(`IndexedDB persist failed (continuing with in-memory cache): ${(e as Error).message}`);
+    }
   }
 
-  /** Try to restore hints from cache for a given PRP backend. Returns true on cache hit. */
+  /**
+   * Restore hints from in-memory cache, falling back to IndexedDB.
+   * Returns true on cache hit (from either source). Updates `hintsLoaded`
+   * and `siblingHintsLoaded` based on which group families were restored.
+   * IndexedDB entries are validated against the current server fingerprint;
+   * mismatches are deleted so the caller can cleanly re-download.
+   */
   async restoreHintsFromCache(backend: number): Promise<boolean> {
-    const key = this.hintCacheKey(this.dbId, backend);
-    const cached = this.hintCache.get(key);
-    if (!cached || !this.pool) return false;
-    this.prpKey = new Uint8Array(cached.prpKey);
-    this.totalHintBytes = cached.totalHintBytes;
-    await this.pool.deserializeAll(cached.groups, this.prpKey);
-    this.hintsLoaded = true;
-    this.log(`Restored ${cached.groups.size} groups from cache (db=${this.dbId} backend=${backend})`);
+    if (!this.pool) return false;
+
+    // In-memory cache first (cheapest).
+    const memKey = this.hintCacheKey(this.dbId, backend);
+    const memCached = this.hintCache.get(memKey);
+    if (memCached) {
+      this.prpKey = new Uint8Array(memCached.prpKey);
+      this.totalHintBytes = memCached.totalHintBytes;
+      await this.pool.deserializeAll(memCached.groups, this.prpKey);
+      this.hintsLoaded = true;
+      const hasSiblings = Array.from(memCached.groups.keys()).some(id => id >= K + K_CHUNK);
+      if (hasSiblings) this.siblingHintsLoaded = true;
+      this.log(`Restored ${memCached.groups.size} groups from memory cache (db=${this.dbId} backend=${backend})`);
+      return true;
+    }
+
+    // Fall back to IndexedDB.
+    const idbKey = idbCacheKey(this.config.queryServerUrl, this.dbId, backend);
+    let stored;
+    try {
+      stored = await idbGetHints(idbKey);
+    } catch (e) {
+      this.log(`IndexedDB lookup failed: ${(e as Error).message}`);
+      return false;
+    }
+    if (!stored) return false;
+
+    // Validate against current server state.
+    const current = this.currentFingerprint();
+    if (!fingerprintsEqual(stored.fingerprint, current)) {
+      this.log(`Persisted hints stale (server fingerprint changed); deleting entry.`);
+      try { await idbDeleteHints(idbKey); } catch { /* best-effort */ }
+      return false;
+    }
+
+    // Deserialize into workers.
+    try {
+      await this.pool.deserializeAll(stored.groups, stored.prpKey);
+    } catch (e) {
+      this.log(`Persisted hint deserialize failed (${(e as Error).message}); deleting entry.`);
+      try { await idbDeleteHints(idbKey); } catch { /* best-effort */ }
+      return false;
+    }
+
+    this.prpKey = new Uint8Array(stored.prpKey);
+    this.totalHintBytes = stored.totalHintBytes;
+    this.hintsLoaded = stored.hasMainHints;
+    if (stored.hasSiblingHints) {
+      // Reconstruct sibling group-ID tables from current server merkle info so
+      // verifyMerkleBatch() knows which groups to query.
+      const merkle = this.getBucketMerkleForDb(this.dbId);
+      if (merkle) this.rebuildSiblingGroupIds(merkle);
+      this.siblingHintsLoaded = true;
+    }
+    // Populate in-memory cache from the IDB hit so subsequent saves round-trip.
+    this.hintCache.set(memKey, {
+      prpKey: new Uint8Array(stored.prpKey),
+      groups: stored.groups,
+      totalHintBytes: stored.totalHintBytes,
+    });
+
+    const ageHrs = ((Date.now() - stored.savedAt) / 3600000).toFixed(1);
+    this.log(
+      `Restored ${stored.groups.size} groups from IndexedDB ` +
+      `(db=${this.dbId} backend=${backend}, age=${ageHrs}h, siblings=${stored.hasSiblingHints})`
+    );
     return true;
   }
 
-  /** Check if cached hints exist for the active dbId + given PRP backend. */
+  /**
+   * Recompute the global group IDs used for each INDEX/CHUNK sibling level.
+   * This mirrors the allocation logic in initAndFetchSiblingHints() so
+   * verifyMerkleBatch() can locate restored sibling groups in the pool.
+   */
+  private rebuildSiblingGroupIds(
+    merkle: import('./server-info.js').BucketMerkleInfoJson,
+  ): void {
+    let nextGroupId = K + K_CHUNK;
+    const indexSib: number[][] = [];
+    for (let level = 0; level < merkle.index_levels.length; level++) {
+      const ids: number[] = [];
+      for (let g = 0; g < K; g++) ids.push(nextGroupId + g);
+      indexSib.push(ids);
+      nextGroupId += K;
+    }
+    const chunkSib: number[][] = [];
+    for (let level = 0; level < merkle.chunk_levels.length; level++) {
+      const ids: number[] = [];
+      for (let g = 0; g < K_CHUNK; g++) ids.push(nextGroupId + g);
+      chunkSib.push(ids);
+      nextGroupId += K_CHUNK;
+    }
+    this._indexSibGroupIds = indexSib;
+    this._chunkSibGroupIds = chunkSib;
+  }
+
+  /** Check if cached hints exist in memory for the active dbId + given PRP backend. */
   hasCachedHints(backend: number): boolean {
     return this.hintCache.has(this.hintCacheKey(this.dbId, backend));
+  }
+
+  /**
+   * Check if persisted hints exist in IndexedDB for the current server +
+   * active dbId + given PRP backend. Async; validates fingerprint match.
+   */
+  async hasPersistedHints(backend: number): Promise<boolean> {
+    try {
+      const stored = await idbGetHints(
+        idbCacheKey(this.config.queryServerUrl, this.dbId, backend)
+      );
+      if (!stored) return false;
+      return fingerprintsEqual(stored.fingerprint, this.currentFingerprint());
+    } catch {
+      return false;
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
