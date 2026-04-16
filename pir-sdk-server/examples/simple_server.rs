@@ -137,11 +137,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!("Building server...");
 
-    let server = PirServerBuilder::new()
+    let mut builder = PirServerBuilder::new()
         .port(config.port)
-        .warmup(config.warmup)
-        .build()
-        .await;
+        .warmup(config.warmup);
+
+    // Forward parsed databases into the builder. Without this, the builder
+    // would be empty even though the user passed --db or --config flags.
+    for db in &config.databases {
+        if db.is_delta() {
+            builder = builder.add_delta_db(&db.path, db.base_height, db.height);
+        } else {
+            builder = builder.add_full_db(&db.path, db.height);
+        }
+    }
+
+    let server = builder.build().await;
 
     match server {
         Ok(server) => {
