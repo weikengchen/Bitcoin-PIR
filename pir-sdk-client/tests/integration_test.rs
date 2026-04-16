@@ -281,13 +281,13 @@ async fn test_harmony_client_sync_single() {
     let result = client.sync(&script_hashes, None).await.expect("sync failed");
 
     assert_eq!(result.results.len(), 1);
-    // NOTE: HarmonyClient's `fetch_legacy_info` (REQ_HARMONY_GET_INFO = 0x40)
-    // returns the old `ServerInfo` wire shape that predates `DatabaseCatalog`
-    // and does not carry a `height` field — so `synced_height` is always 0
-    // here. Fixing this requires teaching HarmonyClient to prefer
-    // REQ_GET_DB_CATALOG (the hint/query servers already respond to it),
-    // which is tracked under SDK_ROADMAP P2 "Error taxonomy & API
-    // completeness". Until then, just assert the shape.
+    // HarmonyClient now prefers REQ_GET_DB_CATALOG (0x02) over the legacy
+    // REQ_HARMONY_GET_INFO (0x40), so `synced_height` reflects the real tip.
+    assert!(
+        result.synced_height > 0,
+        "synced_height should be non-zero via REQ_GET_DB_CATALOG; got {}",
+        result.synced_height,
+    );
     assert!(result.was_fresh_sync);
 
     println!("Sync result: {:?}", result);

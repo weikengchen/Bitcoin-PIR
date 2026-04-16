@@ -232,11 +232,12 @@ forgotten. Padding/privacy invariants (🔒 items in the roadmap) must
 not be optimized away — see "Query Padding" above.
 
 Short-term active work:
-- _(none — all P0 items closed.)_ Next candidate per
-  [SDK_ROADMAP.md](SDK_ROADMAP.md) is likely P1 **HarmonyClient should
-  use `REQ_GET_DB_CATALOG`** (small fix, unblocks real height-based
-  caching for two-server deployments) or **Connection resilience**
-  if the focus shifts to production robustness.
+- _(none — all P0 items closed, and the P1
+  `REQ_GET_DB_CATALOG` item is now closed too.)_ Next candidates per
+  [SDK_ROADMAP.md](SDK_ROADMAP.md) are P1 **Connection resilience**
+  (auto-reconnect / per-request deadlines in `WsConnection`), P1
+  **OnionPIR LRU-eviction retry** (100-connection eviction recovery),
+  and P1 **Thread-safety audit for `unsafe impl Sync for SendClient`**.
 
 ### Completed milestones
 - PIR SDK + WASM bindings + web integration (commit `19cbf5f`).
@@ -302,6 +303,28 @@ Short-term active work:
   + a `url.https://github.com/.insteadOf git@github.com:` git config
   rewrite so Cargo can fetch the SEAL submodule (its `.gitmodules`
   uses an SSH URL which the runner has no credentials for).
+- **HarmonyClient `REQ_GET_DB_CATALOG` with legacy fallback** (P1):
+  Previously `HarmonyClient::fetch_catalog` always called the legacy
+  `REQ_HARMONY_GET_INFO = 0x40`, whose `ServerInfo` wire shape predates
+  `DatabaseCatalog` and carries no `height` / `has_bucket_merkle`
+  fields. As a result `SyncResult::synced_height` was pinned to `0`
+  for every Harmony deployment and cache-by-height was broken.
+  `fetch_catalog` now tries `REQ_GET_DB_CATALOG = 0x02` first via a
+  new `try_fetch_db_catalog`, returning `Ok(None)` on empty reply /
+  `RESP_ERROR` / unknown-variant so `fetch_legacy_info` can still
+  serve older servers. Both Harmony unified_server roles (hint pir2,
+  query pir1) already answer `REQ_GET_DB_CATALOG` — the match arm in
+  `unified_server.rs::REQ_GET_DB_CATALOG` runs before any role check —
+  so sending it over `hint_conn` works for both. Integration test
+  `test_harmony_client_sync_single` now asserts `synced_height > 0`
+  end-to-end against the public servers (was previously relaxed with
+  a NOTE comment). Also deduplicated the three copies of
+  `encode_request` / `decode_catalog` that the DPF, Harmony, and
+  OnionPIR clients each maintained into a single shared
+  [`pir-sdk-client/src/protocol.rs`](pir-sdk-client/src/protocol.rs)
+  module (4 new unit tests for wire-format and catalog decoding) —
+  future catalog-format changes now live in one place instead of
+  three.
 
 ---
 

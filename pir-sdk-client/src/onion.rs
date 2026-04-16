@@ -49,6 +49,7 @@
 //! client — never "optimize" it away.
 
 use crate::connection::WsConnection;
+use crate::protocol::{decode_catalog, encode_request, REQ_GET_DB_CATALOG, RESP_DB_CATALOG};
 use async_trait::async_trait;
 use pir_sdk::{
     compute_sync_plan, merge_delta_batch, DatabaseCatalog, DatabaseInfo, DatabaseKind,
@@ -78,10 +79,7 @@ use std::collections::{HashMap, HashSet};
 const REQ_GET_INFO_JSON: u8 = 0x03;
 /// Response: JSON server info payload.
 const RESP_GET_INFO_JSON: u8 = 0x03;
-/// Request: fetch the DPF-format database catalog (reused for heights/names).
-const REQ_GET_DB_CATALOG: u8 = 0x02;
-/// Response: DPF-format database catalog.
-const RESP_DB_CATALOG: u8 = 0x02;
+// `REQ_GET_DB_CATALOG` / `RESP_DB_CATALOG` come from `crate::protocol`.
 
 /// Request: register FHE keys for a client.
 #[cfg(feature = "onion")]
@@ -1406,16 +1404,6 @@ fn find_in_chunk_cuckoo(
 
 // ─── Wire encoding / decoding ──────────────────────────────────────────────
 
-/// Encode a simple request `[4B len LE][1B variant][payload]`.
-fn encode_request(variant: u8, payload: &[u8]) -> Vec<u8> {
-    let total_len = 1 + payload.len();
-    let mut buf = Vec::with_capacity(4 + total_len);
-    buf.extend_from_slice(&(total_len as u32).to_le_bytes());
-    buf.push(variant);
-    buf.extend_from_slice(payload);
-    buf
-}
-
 /// Encode a `RegisterKeysMsg`.
 #[cfg(feature = "onion")]
 fn encode_register_keys(galois: &[u8], gsw: &[u8], db_id: u8) -> Vec<u8> {
@@ -1484,89 +1472,6 @@ fn decode_onionpir_batch_result(data: &[u8]) -> PirResult<Vec<Vec<u8>>> {
         pos += len;
     }
     Ok(results)
-}
-
-/// Decode a DPF-format database catalog from response bytes (after variant byte).
-///
-/// This mirrors the layout produced by the unified server for `REQ_GET_DB_CATALOG`:
-/// `[1B num_dbs][entry...]*` — num_dbs is **one byte** (the server encoder is
-/// `buf.push(cat.databases.len() as u8)`). A prior u16 read silently accepted
-/// single-entry catalogs (since `db_id == 0x00` made the high byte zero)
-/// but then pushed the cursor off-by-one into every subsequent field,
-/// producing "truncated catalog name" against real servers.
-fn decode_catalog(data: &[u8]) -> PirResult<DatabaseCatalog> {
-    if data.is_empty() {
-        return Err(PirError::Decode("catalog too short".into()));
-    }
-    let num_dbs = data[0] as usize;
-    let mut pos = 1;
-    let mut databases = Vec::with_capacity(num_dbs);
-
-    for _ in 0..num_dbs {
-        if pos + 3 > data.len() {
-            return Err(PirError::Decode("truncated catalog entry header".into()));
-        }
-        let db_id = data[pos];
-        pos += 1;
-        let db_type = data[pos];
-        pos += 1;
-        let name_len = data[pos] as usize;
-        pos += 1;
-        if pos + name_len > data.len() {
-            return Err(PirError::Decode("truncated catalog name".into()));
-        }
-        let name = String::from_utf8_lossy(&data[pos..pos + name_len]).into_owned();
-        pos += name_len;
-
-        // 29 fixed bytes: base_height(4) + height(4) + index_bins(4)
-        // + chunk_bins(4) + index_k(1) + chunk_k(1) + tag_seed(8)
-        // + dpf_n_index(1) + dpf_n_chunk(1) + has_bucket_merkle(1).
-        if pos + 29 > data.len() {
-            return Err(PirError::Decode("truncated catalog fields".into()));
-        }
-        let base_height = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-        pos += 4;
-        let height = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-        pos += 4;
-        let index_bins = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-        pos += 4;
-        let chunk_bins = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-        pos += 4;
-        let index_k = data[pos];
-        pos += 1;
-        let chunk_k = data[pos];
-        pos += 1;
-        let tag_seed = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-        pos += 8;
-        let dpf_n_index = data[pos];
-        pos += 1;
-        let dpf_n_chunk = data[pos];
-        pos += 1;
-        let has_bucket_merkle = data[pos] != 0;
-        pos += 1;
-
-        let kind = if db_type == 1 {
-            DatabaseKind::Delta { base_height }
-        } else {
-            DatabaseKind::Full
-        };
-
-        databases.push(DatabaseInfo {
-            db_id,
-            kind,
-            name,
-            height,
-            index_bins,
-            chunk_bins,
-            index_k,
-            chunk_k,
-            tag_seed,
-            dpf_n_index,
-            dpf_n_chunk,
-            has_bucket_merkle,
-        });
-    }
-    Ok(DatabaseCatalog { databases })
 }
 
 // ─── JSON parsing (minimal, no serde) ───────────────────────────────────────

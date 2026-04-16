@@ -95,6 +95,24 @@ change near them needs extra care — do not optimize away padding.
      batches (~32 MiB against the main UTXO database).
   All 12 ignored tests now pass against the public servers in ~3m on a
   laptop.
+- **HarmonyClient uses `REQ_GET_DB_CATALOG` (0x02) with legacy
+  fallback.** Previously it always called the legacy
+  `REQ_HARMONY_GET_INFO` (0x40), whose `ServerInfo` wire shape predates
+  `DatabaseCatalog` and has no `height` or `has_bucket_merkle` fields —
+  `SyncResult::synced_height` was therefore hard-wired to `0` for every
+  Harmony deployment, and cache-by-height was broken. Both Harmony
+  unified_server roles (hint + query) already respond to
+  `REQ_GET_DB_CATALOG` (the match arm runs before the role check), so
+  `HarmonyClient::fetch_catalog` now sends it over `hint_conn` first via
+  the new `try_fetch_db_catalog`, returning `Ok(None)` on empty reply /
+  `RESP_ERROR` / unknown variant so the legacy `fetch_legacy_info` path
+  can still serve older servers. The integration test
+  `test_harmony_client_sync_single` now asserts `synced_height > 0`
+  against live public servers. Also deduplicated the three copies of
+  `encode_request` / `decode_catalog` into a new shared
+  `pir-sdk-client/src/protocol.rs` module (with 4 unit tests covering
+  the wire format) — future catalog-format changes now live in one
+  place instead of three.
 
 ## P0 — Blockers for "production-ready"
 
@@ -109,16 +127,6 @@ _(none — all P0 items closed.)_
 - [ ] **Connection resilience.** WebSocket disconnects, server restarts,
       request timeouts. `WsConnection` is best-effort today; add
       auto-reconnect with backoff and per-request deadlines.
-- [ ] **HarmonyClient should use `REQ_GET_DB_CATALOG`.** Today it calls
-      the legacy `REQ_HARMONY_GET_INFO` (`fetch_legacy_info`), which
-      returns a `ServerInfo` shape predating `DatabaseCatalog` and has
-      no `height` / `has_bucket_merkle` fields. As a result
-      `SyncResult::synced_height` is always `0` for HarmonyClient and
-      callers that cache-by-height can't work. Both hint and query
-      unified_server roles already respond to `REQ_GET_DB_CATALOG` — the
-      client just needs to prefer it and fall back to legacy on
-      `RESP_ERROR`. Covered by an integration-test note in
-      `test_harmony_client_sync_single`.
 - [ ] **Thread-safety audit for `unsafe impl Sync for SendClient`.**
       Documented as safe because only `&mut self` FFI calls mutate, but
       this assumes OpenMP/SEAL static state is also safe under
@@ -186,9 +194,9 @@ link the branch / commit.
 
 ### In progress
 
-_(none — P0 is empty and the first P1 blocker (CI integration tests)
-is closed. Next candidate is likely **HarmonyClient should use
-`REQ_GET_DB_CATALOG`** since the fix is small and unblocks real
-cache-by-height behaviour for two-server deployments, or
-**Connection resilience** if the focus shifts to production
-robustness.)_
+_(none — P0 is empty. P1's `REQ_GET_DB_CATALOG` item is now closed
+too, so `SyncResult::synced_height` works for Harmony. Next candidate
+is **Connection resilience** (auto-reconnect / per-request deadlines
+in `WsConnection`) or **OnionPIR LRU-eviction retry** depending on
+whether production robustness or OnionPIR mid-session stability is
+the more pressing need.)_

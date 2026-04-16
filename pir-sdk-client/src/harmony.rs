@@ -34,6 +34,9 @@ use crate::merkle_verify::{
     fetch_tree_tops, verify_bucket_merkle_batch_generic, BucketMerkleItem,
     BucketMerkleSiblingQuerier, TreeTop, BUCKET_MERKLE_ARITY, BUCKET_MERKLE_SIB_ROW_SIZE,
 };
+use crate::protocol::{
+    decode_catalog, encode_request, REQ_GET_DB_CATALOG, RESP_DB_CATALOG, RESP_ERROR,
+};
 use async_trait::async_trait;
 use harmonypir_wasm::HarmonyGroup;
 use pir_core::params::{
@@ -58,7 +61,8 @@ const RESP_HARMONY_HINTS: u8 = 0x41;
 const REQ_HARMONY_BATCH_QUERY: u8 = 0x43;
 const RESP_HARMONY_BATCH_QUERY: u8 = 0x43;
 
-const RESP_ERROR: u8 = 0xff;
+// `REQ_GET_DB_CATALOG` / `RESP_DB_CATALOG` / `RESP_ERROR` come from
+// `crate::protocol` — shared with `DpfClient` and `OnionClient`.
 
 /// PRP backends (mirrors `harmonypir_wasm::PRP_*`).
 pub const PRP_HOANG: u8 = 0;
@@ -212,7 +216,48 @@ impl HarmonyClient {
         self.sibling_hints_loaded = None;
     }
 
+    /// Try to fetch the full `DatabaseCatalog` via `REQ_GET_DB_CATALOG`.
+    ///
+    /// Returns `Ok(Some(catalog))` on success, `Ok(None)` if the server
+    /// replied with a shape the catalog decoder can't understand (e.g. a
+    /// legacy hint server that doesn't implement `REQ_GET_DB_CATALOG` and
+    /// echoes back some other variant byte, or a `RESP_ERROR`). A
+    /// legitimate transport/I/O failure still bubbles up as `Err`.
+    ///
+    /// Both Harmony roles (hint + query) answer `REQ_GET_DB_CATALOG` —
+    /// the match arm in `unified_server.rs` runs before any role check
+    /// — so we can use whichever connection is convenient. We use
+    /// `hint_conn` for consistency with `fetch_legacy_info`.
+    async fn try_fetch_db_catalog(&mut self) -> PirResult<Option<DatabaseCatalog>> {
+        let conn = self.hint_conn.as_mut().ok_or(PirError::NotConnected)?;
+        let request = encode_request(REQ_GET_DB_CATALOG, &[]);
+        let response = conn.roundtrip(&request).await?;
+
+        if response.is_empty() {
+            return Ok(None);
+        }
+        if response[0] == RESP_ERROR {
+            // Server explicitly doesn't support catalog — fall back to legacy.
+            return Ok(None);
+        }
+        if response[0] != RESP_DB_CATALOG {
+            // Any unexpected variant byte — treat as unsupported rather
+            // than a hard protocol error so the legacy fallback can run.
+            return Ok(None);
+        }
+        let catalog = decode_catalog(&response[1..])?;
+        Ok(Some(catalog))
+    }
+
     /// Fetch server info (legacy single-database path).
+    ///
+    /// `REQ_HARMONY_GET_INFO` predates `DatabaseCatalog` and returns a
+    /// `ServerInfo` shape with no `height` or `has_bucket_merkle` fields.
+    /// The catalog this synthesises therefore has `height = 0` and
+    /// `has_bucket_merkle = false`, which is fine for servers that don't
+    /// publish bucket Merkle roots but is strictly worse than the
+    /// `REQ_GET_DB_CATALOG` path — callers that cache by height won't work
+    /// against a legacy-only server.
     async fn fetch_legacy_info(&mut self) -> PirResult<DatabaseInfo> {
         let conn = self.hint_conn.as_mut().ok_or(PirError::NotConnected)?;
 
@@ -1173,6 +1218,28 @@ impl PirClient for HarmonyClient {
             return Err(PirError::NotConnected);
         }
 
+        // Prefer `REQ_GET_DB_CATALOG`: it carries real `height` and
+        // `has_bucket_merkle` fields and reports every database the server
+        // is serving (fresh + deltas), so `SyncResult::synced_height` is
+        // accurate and cache-by-height works correctly. Fall back to the
+        // legacy `REQ_HARMONY_GET_INFO` only for servers that don't support
+        // the newer request (empty reply, unknown variant byte, or
+        // `RESP_ERROR`).
+        if let Some(catalog) = self.try_fetch_db_catalog().await? {
+            log::info!(
+                "[PIR-AUDIT] HarmonyClient fetched DatabaseCatalog via REQ_GET_DB_CATALOG: \
+                 {} database(s), latest_tip={:?}",
+                catalog.databases.len(),
+                catalog.latest_tip()
+            );
+            self.catalog = Some(catalog.clone());
+            return Ok(catalog);
+        }
+
+        log::warn!(
+            "[PIR-AUDIT] HarmonyClient server did not respond to REQ_GET_DB_CATALOG; \
+             falling back to legacy REQ_HARMONY_GET_INFO (height will be 0, Merkle off)"
+        );
         let info = self.fetch_legacy_info().await?;
         let catalog = DatabaseCatalog {
             databases: vec![info],
@@ -1292,16 +1359,6 @@ impl PirClient for HarmonyClient {
 }
 
 // ─── Wire protocol helpers ──────────────────────────────────────────────────
-
-/// Encode a simple request with length prefix: `[4B len LE][1B variant][payload]`.
-fn encode_request(variant: u8, payload: &[u8]) -> Vec<u8> {
-    let total_len = 1 + payload.len();
-    let mut buf = Vec::with_capacity(4 + total_len);
-    buf.extend_from_slice(&(total_len as u32).to_le_bytes());
-    buf.push(variant);
-    buf.extend_from_slice(payload);
-    buf
-}
 
 struct BatchItem {
     group_id: u8,

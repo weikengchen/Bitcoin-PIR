@@ -7,6 +7,7 @@ use crate::connection::WsConnection;
 use crate::merkle_verify::{
     fetch_tree_tops, verify_bucket_merkle_batch_dpf, BucketMerkleItem,
 };
+use crate::protocol::{decode_catalog, encode_request, REQ_GET_DB_CATALOG, RESP_DB_CATALOG};
 use async_trait::async_trait;
 use libdpf::Dpf;
 use pir_sdk::{
@@ -775,8 +776,8 @@ impl PirClient for DpfClient {
             return Err(PirError::NotConnected);
         }
 
-        // Try to fetch full catalog first (REQ_GET_DB_CATALOG = 0x02)
-        let request = encode_request(0x02, &[]);
+        // Try to fetch full catalog first
+        let request = encode_request(REQ_GET_DB_CATALOG, &[]);
         let conn0 = self.conn0.as_mut().ok_or(PirError::NotConnected)?;
         let response = conn0.roundtrip(&request).await?;
 
@@ -784,8 +785,8 @@ impl PirClient for DpfClient {
             return Err(PirError::Protocol("empty catalog response".into()));
         }
 
-        // Check if server supports catalog (RESP_DB_CATALOG = 0x02)
-        if response[0] == 0x02 {
+        // Check if server supports catalog (RESP_DB_CATALOG)
+        if response[0] == RESP_DB_CATALOG {
             let catalog = decode_catalog(&response[1..])?;
             self.catalog = Some(catalog.clone());
             return Ok(catalog);
@@ -912,16 +913,6 @@ impl PirClient for DpfClient {
 
 // ─── Protocol helpers ───────────────────────────────────────────────────────
 
-/// Encode a simple request with length prefix.
-fn encode_request(variant: u8, payload: &[u8]) -> Vec<u8> {
-    let total_len = 1 + payload.len();
-    let mut buf = Vec::with_capacity(4 + total_len);
-    buf.extend_from_slice(&(total_len as u32).to_le_bytes());
-    buf.push(variant);
-    buf.extend_from_slice(payload);
-    buf
-}
-
 /// Encode a batch query request.
 ///
 /// Wire format matches `runtime/src/protocol.rs::encode_batch_query`:
@@ -1030,93 +1021,6 @@ fn decode_batch_response(data: &[u8]) -> PirResult<Vec<Vec<Vec<u8>>>> {
     }
 
     Ok(results)
-}
-
-/// Decode a database catalog from response bytes.
-///
-/// Wire format matches `runtime/src/protocol.rs::encode_db_catalog`:
-/// `[1B num_dbs][entry...]*` — num_dbs is **one byte**, not two. The
-/// previous u16 read mis-parsed live servers (the second byte of a
-/// single-entry catalog is `db_id == 0x00`, so the length field appeared
-/// correct but pushed the cursor off-by-one into every subsequent field).
-fn decode_catalog(data: &[u8]) -> PirResult<DatabaseCatalog> {
-    if data.is_empty() {
-        return Err(PirError::Decode("catalog too short".into()));
-    }
-
-    let num_dbs = data[0] as usize;
-    let mut pos = 1;
-    let mut databases = Vec::with_capacity(num_dbs);
-
-    for _ in 0..num_dbs {
-        if pos + 2 > data.len() {
-            return Err(PirError::Decode("truncated catalog entry".into()));
-        }
-
-        let db_id = data[pos];
-        pos += 1;
-        let db_type = data[pos];
-        pos += 1;
-
-        let name_len = data[pos] as usize;
-        pos += 1;
-        if pos + name_len > data.len() {
-            return Err(PirError::Decode("truncated catalog name".into()));
-        }
-        let name = String::from_utf8_lossy(&data[pos..pos + name_len]).into_owned();
-        pos += name_len;
-
-        // 29 fixed bytes: base_height(4) + height(4) + index_bins(4)
-        // + chunk_bins(4) + index_k(1) + chunk_k(1) + tag_seed(8)
-        // + dpf_n_index(1) + dpf_n_chunk(1) + has_bucket_merkle(1).
-        if pos + 29 > data.len() {
-            return Err(PirError::Decode("truncated catalog fields".into()));
-        }
-
-        let base_height = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-        pos += 4;
-        let height = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-        pos += 4;
-        let index_bins = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-        pos += 4;
-        let chunk_bins = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-        pos += 4;
-        let index_k = data[pos];
-        pos += 1;
-        let chunk_k = data[pos];
-        pos += 1;
-        let tag_seed = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-        pos += 8;
-        let dpf_n_index = data[pos];
-        pos += 1;
-        let dpf_n_chunk = data[pos];
-        pos += 1;
-        let has_bucket_merkle = data[pos] != 0;
-        pos += 1;
-
-        let kind = if db_type == 1 {
-            DatabaseKind::Delta { base_height }
-        } else {
-            DatabaseKind::Full
-        };
-
-        databases.push(DatabaseInfo {
-            db_id,
-            kind,
-            name,
-            height,
-            index_bins,
-            chunk_bins,
-            index_k,
-            chunk_k,
-            tag_seed,
-            dpf_n_index,
-            dpf_n_chunk,
-            has_bucket_merkle,
-        });
-    }
-
-    Ok(DatabaseCatalog { databases })
 }
 
 // ─── PIR helpers ────────────────────────────────────────────────────────────
