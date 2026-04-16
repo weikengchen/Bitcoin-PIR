@@ -4,8 +4,17 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use pir_sdk::{PirError, PirResult};
 use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+
+/// PIR responses can be very large — a fresh-sync chunk batch against the
+/// live `main` database returns ~32 MiB in a single WebSocket frame, which
+/// blows past `tungstenite`'s defaults (16 MiB frame / 64 MiB message).
+/// Bumping both limits to 256 MiB keeps normal PIR traffic well below the
+/// ceiling while still bounding memory use against a malicious server.
+const MAX_WS_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
+const MAX_WS_FRAME_SIZE: usize = 256 * 1024 * 1024;
 
 /// A WebSocket connection to a PIR server.
 pub struct WsConnection {
@@ -14,10 +23,41 @@ pub struct WsConnection {
     url: String,
 }
 
+/// Install the `ring` crypto provider for rustls exactly once per process.
+///
+/// rustls 0.23+ requires a process-wide default `CryptoProvider` before any
+/// TLS handshake. We install `ring` (pure-Rust, no C toolchain). Multiple
+/// threads calling `connect()` concurrently are serialized by `OnceLock`;
+/// a pre-installed provider (e.g. by a consumer application) is left alone.
+fn install_default_crypto_provider() {
+    use std::sync::OnceLock;
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        // `install_default` returns `Err` if a provider was already installed
+        // by a different crate (or a previous call). Either way the post-
+        // condition "a provider is installed" holds, so the error is ignored.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 impl WsConnection {
     /// Connect to a WebSocket URL.
+    ///
+    /// Supports both `ws://` and `wss://` URLs. For `wss://` the rustls
+    /// `ring` crypto provider is installed lazily on first call.
+    ///
+    /// The `tungstenite` 16 MiB default max frame size is bumped to
+    /// [`MAX_WS_FRAME_SIZE`] so fresh-sync chunk batches (which can exceed
+    /// 30 MiB against the main UTXO database) don't get rejected with
+    /// `"Space limit exceeded: Message too long"`.
     pub async fn connect(url: &str) -> PirResult<Self> {
-        let (ws, _) = tokio_tungstenite::connect_async(url)
+        install_default_crypto_provider();
+        let config = WebSocketConfig {
+            max_message_size: Some(MAX_WS_MESSAGE_SIZE),
+            max_frame_size: Some(MAX_WS_FRAME_SIZE),
+            ..Default::default()
+        };
+        let (ws, _) = tokio_tungstenite::connect_async_with_config(url, Some(config), false)
             .await
             .map_err(|e| PirError::ConnectionFailed(format!("{}: {}", url, e)))?;
 

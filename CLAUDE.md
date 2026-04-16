@@ -233,9 +233,10 @@ not be optimized away — see "Query Padding" above.
 
 Short-term active work:
 - _(none — all P0 items closed.)_ Next candidate per
-  [SDK_ROADMAP.md](SDK_ROADMAP.md) is P1 "Run ignored integration tests
-  in CI" since the twelve ignored integration tests are what would
-  end-to-end validate the Merkle + `merkle_verified` paths added in P0.
+  [SDK_ROADMAP.md](SDK_ROADMAP.md) is likely P1 **HarmonyClient should
+  use `REQ_GET_DB_CATALOG`** (small fix, unblocks real height-based
+  caching for two-server deployments) or **Connection resilience**
+  if the focus shifts to production robustness.
 
 ### Completed milestones
 - PIR SDK + WASM bindings + web integration (commit `19cbf5f`).
@@ -270,6 +271,24 @@ Short-term active work:
   input taints the merge. New unit tests in `pir-sdk/src/sync.rs`
   cover AND semantics, `(None, Some(del))` propagation, and the
   `merkle_failed()` / default-verified state.
+- **CI integration tests against live public PIR servers** (first P1):
+  `pir-sdk-client/tests/integration_test.rs` now defaults to the
+  public deployment (`wss://pir1.chenweikeng.com` /
+  `wss://pir2.chenweikeng.com`) with per-URL env var overrides, and
+  `.github/workflows/pir-sdk-integration.yml` runs all 12 ignored tests
+  on every push/PR plus a daily canary. Surfaced and fixed three
+  protocol mismatches that were blocking live-server runs: (1) the
+  DPF batch wire format (`encode_batch_query` had a spurious leading
+  `level` byte, wrongly-positioned `db_id`, and per-group `num_keys`
+  counts instead of a single top-level `keys_per_group`), (2) catalog
+  `num_dbs` was decoded as u16 instead of u8 — single-entry catalogs
+  looked corrupted because the `db_id` byte was being read as the
+  high byte of the count, (3) `wss://` support needed `rustls` with
+  an explicit `ring` crypto provider (lazy-installed via `OnceLock`)
+  plus bumping the WebSocket max-frame-size to 256 MiB so fresh-sync
+  chunk batches (~32 MiB) fit in a single frame. OnionPIR integration
+  tests now exist too, gated behind `--features onion`. See
+  [SDK_ROADMAP.md](SDK_ROADMAP.md) Completed section for details.
 
 ---
 

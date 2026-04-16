@@ -1,0 +1,84 @@
+name: PIR SDK Integration Tests
+
+# Runs the `pir-sdk-client` integration suite against the public PIR
+# deployment (wss://pir1.chenweikeng.com / wss://pir2.chenweikeng.com).
+# These are the same servers the web client at
+# https://chenweikeng.com/bitcoin-pir uses, so a failure here would
+# typically also break the web client — the workflow is our early-warning
+# signal for SDK vs. production-server protocol drift.
+#
+# The tests are marked `#[ignore]` in the test binary and must be opted
+# into with `-- --ignored`. Running them sequentially (`--test-threads=1`)
+# keeps TLS handshakes from stepping on each other and keeps the fresh-sync
+# chunk-batch traffic under the Cloudflare connection limit.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'pir-sdk/**'
+      - 'pir-sdk-client/**'
+      - 'pir-core/**'
+      - 'harmonypir-wasm/**'
+      - '.github/workflows/pir-sdk-integration.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'pir-sdk/**'
+      - 'pir-sdk-client/**'
+      - 'pir-core/**'
+      - 'harmonypir-wasm/**'
+      - '.github/workflows/pir-sdk-integration.yml'
+  workflow_dispatch:
+  # Daily canary — catches breakage from server-side protocol changes
+  # even when no SDK PRs land. 06:17 UTC = off-peak for the servers.
+  schedule:
+    - cron: '17 6 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    name: pir-sdk-client integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: always
+      # Pin the default URLs explicitly so the CI log shows what we
+      # tested against. Override via repository variables or a fork's
+      # env block to hit a different deployment.
+      PIR_DPF_SERVER0_URL: wss://pir1.chenweikeng.com
+      PIR_DPF_SERVER1_URL: wss://pir2.chenweikeng.com
+      PIR_HARMONY_HINT_URL: wss://pir2.chenweikeng.com
+      PIR_HARMONY_QUERY_URL: wss://pir1.chenweikeng.com
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-sdk-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-sdk-
+
+      - name: Build pir-sdk-client (library + tests)
+        run: cargo build -p pir-sdk-client --tests
+
+      # --test-threads=1 serializes connections. The live servers are
+      # fine under parallel load from real clients, but a burst of
+      # simultaneous handshakes from a single runner IP can briefly
+      # trip rate limits and surface as "Handshake not finished" errors.
+      - name: Run unit tests
+        run: cargo test -p pir-sdk-client
+      - name: Run ignored integration tests against live PIR servers
+        run: cargo test -p pir-sdk-client --test integration_test -- --ignored --test-threads=1 --nocapture

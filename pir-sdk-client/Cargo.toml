@@ -36,7 +36,17 @@ rand = { version = "0.8", optional = true }
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "io-util", "time"] }
-tokio-tungstenite = "0.24"
+# `rustls-tls-webpki-roots` enables `wss://` with the bundled Mozilla root
+# store. No system OpenSSL/schannel dependency — works identically in CI
+# across Linux/macOS/Windows and in consumer apps that don't want a
+# native-tls dependency.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# Explicit rustls dep to pin the `ring` crypto provider (rustls 0.23+
+# requires exactly one of `ring` / `aws-lc-rs`; `ring` is pure-Rust and
+# avoids the C toolchain dependency `aws-lc-rs` brings). The provider is
+# installed at `WsConnection::connect()` time via
+# `install_default_crypto_provider()`.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 futures-util = "0.3"
 async-trait = "0.1"
 

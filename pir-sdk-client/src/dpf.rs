@@ -923,25 +923,48 @@ fn encode_request(variant: u8, payload: &[u8]) -> Vec<u8> {
 }
 
 /// Encode a batch query request.
+///
+/// Wire format matches `runtime/src/protocol.rs::encode_batch_query`:
+/// ```text
+/// [4B total_len LE][1B variant]
+///   [2B round_id LE]
+///   [1B num_groups]
+///   [1B keys_per_group]     // SINGLE top-level byte, not per-group
+///   For each group:
+///     For each key (keys_per_group times):
+///       [2B key_len LE][key_data]
+///   [1B db_id]              // OPTIONAL, only appended when db_id != 0
+/// ```
+///
+/// Note: no `level` byte on the wire — the server distinguishes index
+/// (variant=0x11) from chunk (variant=0x21) via the variant byte alone.
+/// The `level` field inside `BatchQuery` is reset to 0 by the server
+/// decoder and re-derived from the variant.
 fn encode_batch_query(
     variant: u8,
-    level: u8,
+    _level: u8,
     round_id: u16,
     db_id: u8,
     keys: &[Vec<Vec<u8>>],
 ) -> Vec<u8> {
     let mut payload = Vec::new();
-    payload.push(level);
     payload.extend_from_slice(&round_id.to_le_bytes());
-    payload.push(db_id);
     payload.push(keys.len() as u8); // num_groups
+    let keys_per_group = keys.first().map_or(0, |k| k.len()) as u8;
+    payload.push(keys_per_group);
 
     for group_keys in keys {
-        payload.push(group_keys.len() as u8); // num_keys per group
         for key in group_keys {
             payload.extend_from_slice(&(key.len() as u16).to_le_bytes());
             payload.extend_from_slice(key);
         }
+    }
+
+    // Trailing db_id byte — only appended when non-zero, matches server
+    // backward-compatible decode (`decode_batch_query` defaults to 0 when
+    // the byte is absent).
+    if db_id != 0 {
+        payload.push(db_id);
     }
 
     let total_len = 1 + payload.len();
@@ -953,6 +976,19 @@ fn encode_batch_query(
 }
 
 /// Decode a batch response into per-group, per-key results.
+///
+/// Wire format matches `runtime/src/protocol.rs::encode_batch_result`:
+/// ```text
+/// [1B variant]
+/// [2B round_id LE]
+/// [1B num_groups]
+/// [1B results_per_group]    // SINGLE top-level byte, not per-group
+/// For each group:
+///   For each result (results_per_group times):
+///     [2B res_len LE][res_data]
+/// ```
+///
+/// Note: no `level` byte on the wire.
 fn decode_batch_response(data: &[u8]) -> PirResult<Vec<Vec<Vec<u8>>>> {
     if data.is_empty() {
         return Err(PirError::Decode("empty batch response".into()));
@@ -962,33 +998,22 @@ fn decode_batch_response(data: &[u8]) -> PirResult<Vec<Vec<Vec<u8>>>> {
     let _variant = data[0];
     let mut pos = 1;
 
-    // level, round_id
-    if pos + 3 > data.len() {
+    // [round_id][num_groups][results_per_group]
+    if pos + 4 > data.len() {
         return Err(PirError::Decode("truncated batch response header".into()));
     }
-    let _level = data[pos];
-    pos += 1;
     let _round_id = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
     pos += 2;
-
-    // num_groups
-    if pos >= data.len() {
-        return Err(PirError::Decode("missing num_groups".into()));
-    }
     let num_groups = data[pos] as usize;
+    pos += 1;
+    let results_per_group = data[pos] as usize;
     pos += 1;
 
     let mut results = Vec::with_capacity(num_groups);
 
     for _ in 0..num_groups {
-        if pos >= data.len() {
-            return Err(PirError::Decode("truncated group results".into()));
-        }
-        let num_keys = data[pos] as usize;
-        pos += 1;
-
-        let mut group_results = Vec::with_capacity(num_keys);
-        for _ in 0..num_keys {
+        let mut group_results = Vec::with_capacity(results_per_group);
+        for _ in 0..results_per_group {
             if pos + 2 > data.len() {
                 return Err(PirError::Decode("truncated result length".into()));
             }
@@ -1008,13 +1033,19 @@ fn decode_batch_response(data: &[u8]) -> PirResult<Vec<Vec<Vec<u8>>>> {
 }
 
 /// Decode a database catalog from response bytes.
+///
+/// Wire format matches `runtime/src/protocol.rs::encode_db_catalog`:
+/// `[1B num_dbs][entry...]*` — num_dbs is **one byte**, not two. The
+/// previous u16 read mis-parsed live servers (the second byte of a
+/// single-entry catalog is `db_id == 0x00`, so the length field appeared
+/// correct but pushed the cursor off-by-one into every subsequent field).
 fn decode_catalog(data: &[u8]) -> PirResult<DatabaseCatalog> {
-    if data.len() < 2 {
+    if data.is_empty() {
         return Err(PirError::Decode("catalog too short".into()));
     }
 
-    let num_dbs = u16::from_le_bytes(data[0..2].try_into().unwrap()) as usize;
-    let mut pos = 2;
+    let num_dbs = data[0] as usize;
+    let mut pos = 1;
     let mut databases = Vec::with_capacity(num_dbs);
 
     for _ in 0..num_dbs {
@@ -1035,7 +1066,10 @@ fn decode_catalog(data: &[u8]) -> PirResult<DatabaseCatalog> {
         let name = String::from_utf8_lossy(&data[pos..pos + name_len]).into_owned();
         pos += name_len;
 
-        if pos + 26 > data.len() {
+        // 29 fixed bytes: base_height(4) + height(4) + index_bins(4)
+        // + chunk_bins(4) + index_k(1) + chunk_k(1) + tag_seed(8)
+        // + dpf_n_index(1) + dpf_n_chunk(1) + has_bucket_merkle(1).
+        if pos + 29 > data.len() {
             return Err(PirError::Decode("truncated catalog fields".into()));
         }
 

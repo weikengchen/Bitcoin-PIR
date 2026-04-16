@@ -1488,13 +1488,18 @@ fn decode_onionpir_batch_result(data: &[u8]) -> PirResult<Vec<Vec<u8>>> {
 
 /// Decode a DPF-format database catalog from response bytes (after variant byte).
 ///
-/// This mirrors the layout produced by the unified server for `REQ_GET_DB_CATALOG`.
+/// This mirrors the layout produced by the unified server for `REQ_GET_DB_CATALOG`:
+/// `[1B num_dbs][entry...]*` — num_dbs is **one byte** (the server encoder is
+/// `buf.push(cat.databases.len() as u8)`). A prior u16 read silently accepted
+/// single-entry catalogs (since `db_id == 0x00` made the high byte zero)
+/// but then pushed the cursor off-by-one into every subsequent field,
+/// producing "truncated catalog name" against real servers.
 fn decode_catalog(data: &[u8]) -> PirResult<DatabaseCatalog> {
-    if data.len() < 2 {
+    if data.is_empty() {
         return Err(PirError::Decode("catalog too short".into()));
     }
-    let num_dbs = u16::from_le_bytes(data[0..2].try_into().unwrap()) as usize;
-    let mut pos = 2;
+    let num_dbs = data[0] as usize;
+    let mut pos = 1;
     let mut databases = Vec::with_capacity(num_dbs);
 
     for _ in 0..num_dbs {
@@ -1513,7 +1518,10 @@ fn decode_catalog(data: &[u8]) -> PirResult<DatabaseCatalog> {
         let name = String::from_utf8_lossy(&data[pos..pos + name_len]).into_owned();
         pos += name_len;
 
-        if pos + 26 > data.len() {
+        // 29 fixed bytes: base_height(4) + height(4) + index_bins(4)
+        // + chunk_bins(4) + index_k(1) + chunk_k(1) + tag_seed(8)
+        // + dpf_n_index(1) + dpf_n_chunk(1) + has_bucket_merkle(1).
+        if pos + 29 > data.len() {
             return Err(PirError::Decode("truncated catalog fields".into()));
         }
         let base_height = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());

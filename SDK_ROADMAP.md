@@ -65,6 +65,36 @@ change near them needs extra care — do not optimize away padding.
   untrusted input taints the merge. WASM exposes `merkleVerified` as a
   getter and in `toJson()`. New unit tests cover AND semantics,
   `(None, Some(del))` propagation, and `merkle_failed()` state.
+- **CI integration tests against live public PIR servers.** The 12
+  `#[ignore = "requires running PIR servers"]` tests in
+  `pir-sdk-client/tests/integration_test.rs` now default to
+  `wss://pir1.chenweikeng.com` / `wss://pir2.chenweikeng.com` (the same
+  servers the web client uses) and are driven by
+  `.github/workflows/pir-sdk-integration.yml` on every push/PR plus a
+  daily canary cron. Configurable per-URL via env vars
+  (`PIR_DPF_SERVER0_URL`, `PIR_DPF_SERVER1_URL`, `PIR_HARMONY_HINT_URL`,
+  `PIR_HARMONY_QUERY_URL`, `PIR_ONION_URL`) for local runs against
+  `unified_server`. Includes a new `onion_tests` module for OnionPIR
+  (gated behind `--features onion`), plus three protocol fixes that
+  were blocking live-server runs:
+  1. **Batch wire format** — `pir-sdk-client/src/dpf.rs` was sending an
+     extra leading `level` byte, putting `db_id` before the keys
+     instead of as an optional trailing byte, and emitting a per-group
+     `num_keys` counter. Now matches
+     `runtime/src/protocol.rs::encode_batch_query` exactly:
+     `[round_id u16][num_groups u8][keys_per_group u8][keys...][db_id u8]?`.
+  2. **Catalog `num_dbs` size** — was decoded as u16, but the server
+     encodes as u8; a single-entry catalog's `db_id=0` byte was being
+     read as the high byte of `num_dbs`, pushing every subsequent
+     field off by one.
+  3. **TLS + frame-size** — added `rustls` with the `ring` crypto
+     provider (installed lazily via `OnceLock`) plus
+     `tokio-tungstenite`'s `rustls-tls-webpki-roots` feature for
+     `wss://` support. Bumped the WebSocket max-message / max-frame
+     size from 16 MiB to 256 MiB to accommodate fresh-sync chunk
+     batches (~32 MiB against the main UTXO database).
+  All 12 ignored tests now pass against the public servers in ~3m on a
+  laptop.
 
 ## P0 — Blockers for "production-ready"
 
@@ -79,17 +109,21 @@ _(none — all P0 items closed.)_
 - [ ] **Connection resilience.** WebSocket disconnects, server restarts,
       request timeouts. `WsConnection` is best-effort today; add
       auto-reconnect with backoff and per-request deadlines.
-- [ ] **Run ignored integration tests in CI.** All 8
-      `#[ignore = "requires running PIR servers"]` tests never execute.
-      Spin up a fixture server in a GitHub Actions job (or
-      `testcontainers`) and drop the `ignore` where safe.
+- [ ] **HarmonyClient should use `REQ_GET_DB_CATALOG`.** Today it calls
+      the legacy `REQ_HARMONY_GET_INFO` (`fetch_legacy_info`), which
+      returns a `ServerInfo` shape predating `DatabaseCatalog` and has
+      no `height` / `has_bucket_merkle` fields. As a result
+      `SyncResult::synced_height` is always `0` for HarmonyClient and
+      callers that cache-by-height can't work. Both hint and query
+      unified_server roles already respond to `REQ_GET_DB_CATALOG` — the
+      client just needs to prefer it and fall back to legacy on
+      `RESP_ERROR`. Covered by an integration-test note in
+      `test_harmony_client_sync_single`.
 - [ ] **Thread-safety audit for `unsafe impl Sync for SendClient`.**
       Documented as safe because only `&mut self` FFI calls mutate, but
       this assumes OpenMP/SEAL static state is also safe under
       concurrent read. Worth a second pair of eyes from OnionPIR
       maintainers.
-- [ ] **Test HarmonyClient end-to-end against a live two-server
-      deployment.** Integration tests exist but are ignored.
 
 ## P2 — API completeness
 
@@ -152,7 +186,9 @@ link the branch / commit.
 
 ### In progress
 
-_(none — all P0 items closed. Next candidate is P1; the best starting
-point is probably **Run ignored integration tests in CI**, since the
-twelve ignored integration tests block end-to-end validation of the
-Merkle + `merkle_verified` paths added in P0.)_
+_(none — P0 is empty and the first P1 blocker (CI integration tests)
+is closed. Next candidate is likely **HarmonyClient should use
+`REQ_GET_DB_CATALOG`** since the fix is small and unblocks real
+cache-by-height behaviour for two-server deployments, or
+**Connection resilience** if the focus shifts to production
+robustness.)_
