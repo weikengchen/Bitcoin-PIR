@@ -289,6 +289,19 @@ Short-term active work:
   chunk batches (~32 MiB) fit in a single frame. OnionPIR integration
   tests now exist too, gated behind `--features onion`. See
   [SDK_ROADMAP.md](SDK_ROADMAP.md) Completed section for details.
+- **OnionPIR CI job** (follow-up to the CI milestone): the
+  `integration-onion` job in
+  `.github/workflows/pir-sdk-integration.yml` builds `pir-sdk-client`
+  with `--features onion` (which compiles SEAL + libonionpir from
+  source via CMake + GCC) and runs the new `onion_tests::` module
+  against `wss://pir1.chenweikeng.com`. It's a separate job from the
+  DPF/Harmony integration job because the C++ build is slow
+  (~5–10 min cold); PRs that only touch DPF/Harmony code still get
+  fast feedback. Two things the runner needs that plain
+  ubuntu-latest doesn't give for free: `CARGO_NET_GIT_FETCH_WITH_CLI=true`
+  + a `url.https://github.com/.insteadOf git@github.com:` git config
+  rewrite so Cargo can fetch the SEAL submodule (its `.gitmodules`
+  uses an SSH URL which the runner has no credentials for).
 
 ---
 

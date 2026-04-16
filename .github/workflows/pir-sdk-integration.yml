@@ -82,3 +82,76 @@ jobs:
         run: cargo test -p pir-sdk-client
       - name: Run ignored integration tests against live PIR servers
         run: cargo test -p pir-sdk-client --test integration_test -- --ignored --test-threads=1 --nocapture
+
+  integration-onion:
+    # OnionPIR tests live in their own job because the `onion` feature
+    # pulls in the `onionpir` crate, which builds SEAL + libonionpir from
+    # source via CMake + GCC — a slow, ~5–10 minute compile. Running it
+    # separately keeps the DPF/Harmony smoke tests fast on PRs while still
+    # giving us end-to-end OnionPIR coverage.
+    name: pir-sdk-client OnionPIR integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      PIR_ONION_URL: wss://pir1.chenweikeng.com
+      # The SEAL submodule is declared with an SSH URL
+      # (git@github.com:…) in the `OnionPIRv2-fork` repo. Cargo's
+      # libgit2-based fetcher won't authenticate as us on GitHub, so
+      # force Cargo to shell out to the git CLI, which then honors the
+      # `insteadOf` rewrite we install below.
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install C++ toolchain
+        # ubuntu-latest already ships with gcc/g++/cmake, but we pin the
+        # install step explicitly so the workflow stays reproducible if
+        # GitHub's image ever trims them. libgomp is linked dynamically
+        # by libonionpir for OpenMP.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake libgomp1
+
+      - name: Rewrite SSH GitHub URLs to HTTPS (for SEAL submodule)
+        # The `onionpir` crate we depend on has a SEAL submodule whose
+        # URL is `git@github.com:Bitcoin-PIR/SEAL-For-OnionPIR-fork.git`.
+        # CI runners don't have SSH access to GitHub, so rewrite all
+        # `git@github.com:` URLs to `https://github.com/` before Cargo
+        # does its recursive submodule update.
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+
+      - name: Cache Cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Separate cache key from the main integration job — the
+          # `onion` feature produces a completely different target
+          # directory (libonionpir.a, libseal-4.1.a, C++ object files).
+          key: ${{ runner.os }}-cargo-sdk-onion-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-sdk-onion-
+
+      - name: Build pir-sdk-client with --features onion (library + tests)
+        run: cargo build -p pir-sdk-client --features onion --tests
+
+      - name: Run unit tests with --features onion
+        run: cargo test -p pir-sdk-client --features onion
+
+      - name: Run ignored OnionPIR integration tests against live PIR servers
+        # The `onion_tests` filter scopes this to the OnionPIR module
+        # introduced in integration_test.rs — the DPF / Harmony tests
+        # already ran in the `integration` job without the feature.
+        # (Quoted to keep YAML from parsing `::` as a mapping.)
+        run: "cargo test -p pir-sdk-client --features onion --test integration_test -- --ignored --test-threads=1 --nocapture onion_tests::"
