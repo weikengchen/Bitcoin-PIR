@@ -52,6 +52,7 @@
 mod connection;
 mod dpf;
 mod harmony;
+mod merkle_verify;
 mod onion;
 
 pub use connection::WsConnection;

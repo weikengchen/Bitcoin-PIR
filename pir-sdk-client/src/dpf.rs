@@ -4,6 +4,9 @@
 //! Queries are split across two servers; XORing their responses reveals the actual data.
 
 use crate::connection::WsConnection;
+use crate::merkle_verify::{
+    fetch_tree_tops, verify_bucket_merkle_batch_dpf, BucketMerkleItem,
+};
 use async_trait::async_trait;
 use libdpf::Dpf;
 use pir_sdk::{
@@ -46,6 +49,51 @@ const CHUNK_RESULT_SIZE: usize = CHUNK_SLOTS_PER_BIN * CHUNK_SLOT_SIZE;
 
 /// Number of PBC hash functions.
 const NUM_HASHES: usize = 3;
+
+// ─── Merkle verification traces ─────────────────────────────────────────────
+
+/// Record of one INDEX cuckoo bin we checked during a query.
+///
+/// Populated by `query_index_level` for every cuckoo position it probes.
+/// Consumed by the Merkle verifier to prove the bin content (and therefore
+/// the FOUND/NOT-FOUND conclusion) is consistent with the published root.
+#[derive(Clone, Debug)]
+struct IndexBinTrace {
+    /// PBC group this bin belongs to (0..index_k).
+    pbc_group: usize,
+    /// Cuckoo bin index within the group's flat table.
+    bin_index: u32,
+    /// XOR-reconstructed bin content (INDEX_SLOTS_PER_BIN × INDEX_SLOT_SIZE bytes).
+    bin_content: Vec<u8>,
+}
+
+/// Record of one CHUNK cuckoo bin we used to recover a retrieved chunk.
+#[derive(Clone, Debug)]
+struct ChunkBinTrace {
+    /// PBC group this bin belongs to (0..chunk_k).
+    pbc_group: usize,
+    /// Cuckoo bin index within the group's flat table.
+    bin_index: u32,
+    /// XOR-reconstructed bin content.
+    bin_content: Vec<u8>,
+}
+
+/// Metadata collected during a `query_single` call that downstream code
+/// needs for Merkle verification. Built regardless of whether verification
+/// will run — the overhead is negligible (we already have the XOR'd bins).
+#[derive(Clone, Debug)]
+struct QueryTraces {
+    /// Every INDEX bin we inspected. For NOT-FOUND this is all
+    /// `INDEX_CUCKOO_NUM_HASHES` positions (required for the absence proof);
+    /// for FOUND it can be up to the cuckoo position that matched.
+    index_bins: Vec<IndexBinTrace>,
+    /// If the query resolved to a match, the index in `index_bins` of the
+    /// matching bin. `None` for NOT-FOUND or whale.
+    matched_index_idx: Option<usize>,
+    /// Per-chunk bin traces — one entry per chunk that was recovered.
+    /// Empty for NOT-FOUND, whale, or zero-chunk matches.
+    chunk_bins: Vec<ChunkBinTrace>,
+}
 
 // ─── DPF Client ─────────────────────────────────────────────────────────────
 
@@ -110,68 +158,262 @@ impl DpfClient {
     }
 
     /// Execute a single query step for a batch of script hashes.
+    ///
+    /// Runs PIR queries for each script hash, then — if the target database
+    /// publishes a per-bucket Merkle tree (`DatabaseInfo::has_bucket_merkle`) —
+    /// performs a single batched Merkle verification covering every INDEX
+    /// cuckoo position inspected (two per not-found query) and every CHUNK bin
+    /// that returned data. Items whose Merkle proof fails are zeroed (treated
+    /// as unverified; callers should treat them as an unknown/error state).
     async fn execute_step(
         &mut self,
         script_hashes: &[ScriptHash],
         _step: &SyncStep,
         db_info: &DatabaseInfo,
     ) -> PirResult<Vec<Option<QueryResult>>> {
-        let mut results = Vec::with_capacity(script_hashes.len());
+        let mut results: Vec<Option<QueryResult>> = Vec::with_capacity(script_hashes.len());
+        let mut traces: Vec<QueryTraces> = Vec::with_capacity(script_hashes.len());
+
+        log::info!(
+            "[PIR-AUDIT] execute_step: db_id={}, name={}, height={}, queries={}, has_bucket_merkle={}",
+            db_info.db_id,
+            db_info.name,
+            db_info.height,
+            script_hashes.len(),
+            db_info.has_bucket_merkle
+        );
 
         for script_hash in script_hashes {
-            let result = self.query_single(script_hash, db_info).await?;
+            let (result, trace) = self.query_single(script_hash, db_info).await?;
             results.push(result);
+            traces.push(trace);
+        }
+
+        if db_info.has_bucket_merkle {
+            self.run_merkle_verification(&mut results, &traces, db_info)
+                .await?;
+        } else {
+            log::info!(
+                "[PIR-AUDIT] Merkle verification SKIPPED (db_id={} has no bucket Merkle)",
+                db_info.db_id
+            );
         }
 
         Ok(results)
     }
 
+    /// Build `BucketMerkleItem`s from collected query traces and verify them
+    /// in one padded batch.
+    ///
+    /// On any bin failing verification, the corresponding query is coerced to
+    /// `None` to signal an unverified/untrusted result — the caller cannot
+    /// tell whether the server lied or the data simply isn't there.
+    async fn run_merkle_verification(
+        &mut self,
+        results: &mut [Option<QueryResult>],
+        traces: &[QueryTraces],
+        db_info: &DatabaseInfo,
+    ) -> PirResult<()> {
+        // Build items + mapping from item back to the query it covers.
+        let mut items: Vec<BucketMerkleItem> = Vec::new();
+        let mut item_to_query: Vec<usize> = Vec::new();
+
+        for (qi, trace) in traces.iter().enumerate() {
+            // Skip whales — we deliberately cannot Merkle-verify them
+            // (no chunk chain), matching the TS client behavior.
+            let is_whale = results
+                .get(qi)
+                .and_then(|r| r.as_ref().map(|x| x.is_whale))
+                .unwrap_or(false);
+            if is_whale {
+                log::info!(
+                    "[PIR-AUDIT] Merkle: skipping query #{} (whale — unverifiable)",
+                    qi
+                );
+                continue;
+            }
+
+            match trace.matched_index_idx {
+                Some(mi) => {
+                    // FOUND: one item covering the matching INDEX bin and all
+                    // CHUNK bins we retrieved.
+                    let idx = &trace.index_bins[mi];
+                    let mut it = BucketMerkleItem {
+                        index_pbc_group: idx.pbc_group,
+                        index_bin_index: idx.bin_index,
+                        index_bin_content: idx.bin_content.clone(),
+                        chunk_pbc_groups: Vec::with_capacity(trace.chunk_bins.len()),
+                        chunk_bin_indices: Vec::with_capacity(trace.chunk_bins.len()),
+                        chunk_bin_contents: Vec::with_capacity(trace.chunk_bins.len()),
+                    };
+                    for cb in &trace.chunk_bins {
+                        it.chunk_pbc_groups.push(cb.pbc_group);
+                        it.chunk_bin_indices.push(cb.bin_index);
+                        it.chunk_bin_contents.push(cb.bin_content.clone());
+                    }
+                    log::info!(
+                        "[PIR-AUDIT] Merkle: query #{} FOUND — 1 index bin + {} chunk bins to verify",
+                        qi, trace.chunk_bins.len()
+                    );
+                    items.push(it);
+                    item_to_query.push(qi);
+                }
+                None => {
+                    // NOT-FOUND: one item per INDEX cuckoo bin we checked
+                    // (must all pass to prove absence).
+                    log::info!(
+                        "[PIR-AUDIT] Merkle: query #{} NOT FOUND — verifying {} cuckoo bins for absence proof",
+                        qi, trace.index_bins.len()
+                    );
+                    for bin in &trace.index_bins {
+                        items.push(BucketMerkleItem {
+                            index_pbc_group: bin.pbc_group,
+                            index_bin_index: bin.bin_index,
+                            index_bin_content: bin.bin_content.clone(),
+                            chunk_pbc_groups: Vec::new(),
+                            chunk_bin_indices: Vec::new(),
+                            chunk_bin_contents: Vec::new(),
+                        });
+                        item_to_query.push(qi);
+                    }
+                }
+            }
+        }
+
+        if items.is_empty() {
+            log::info!("[PIR-AUDIT] Merkle: no items to verify — nothing to do");
+            return Ok(());
+        }
+
+        // Fetch tree-tops blob (server 0 only — both servers share it).
+        let conn0 = self.conn0.as_mut().ok_or(PirError::NotConnected)?;
+        let tree_tops = fetch_tree_tops(conn0, db_info.db_id).await?;
+
+        // Disjoint field borrows: `self.conn0` and `self.conn1` are separate
+        // Option fields, so we can borrow both mutably at once.
+        let conn0 = self.conn0.as_mut().ok_or(PirError::NotConnected)?;
+        let conn1 = self.conn1.as_mut().ok_or(PirError::NotConnected)?;
+        let index_k = db_info.index_k as usize;
+        let chunk_k = db_info.chunk_k as usize;
+        let per_item = verify_bucket_merkle_batch_dpf(
+            conn0,
+            conn1,
+            &items,
+            db_info.index_bins,
+            db_info.chunk_bins,
+            index_k,
+            chunk_k,
+            db_info.db_id,
+            &tree_tops,
+        )
+        .await?;
+
+        // Aggregate per-item outcomes back to per-query verdicts:
+        // a query passes iff ALL its items pass.
+        let mut per_query_ok = vec![true; results.len()];
+        let mut per_query_touched = vec![false; results.len()];
+        for (ii, ok) in per_item.iter().enumerate() {
+            let qi = item_to_query[ii];
+            per_query_touched[qi] = true;
+            if !ok {
+                per_query_ok[qi] = false;
+            }
+        }
+
+        for qi in 0..results.len() {
+            if !per_query_touched[qi] {
+                continue; // whale or skipped
+            }
+            if !per_query_ok[qi] {
+                log::warn!(
+                    "[PIR-AUDIT] Merkle FAILED for query #{}: result set to None (untrusted)",
+                    qi
+                );
+                results[qi] = None;
+            } else {
+                log::info!("[PIR-AUDIT] Merkle PASSED for query #{}", qi);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Query a single script hash against a database.
+    ///
+    /// Also returns `QueryTraces` describing every INDEX/CHUNK cuckoo bin we
+    /// inspected, so the caller (`execute_step`) can run per-bucket Merkle
+    /// verification if `DatabaseInfo::has_bucket_merkle` is set.
     async fn query_single(
         &mut self,
         script_hash: &ScriptHash,
         db_info: &DatabaseInfo,
-    ) -> PirResult<Option<QueryResult>> {
+    ) -> PirResult<(Option<QueryResult>, QueryTraces)> {
         // Step 1: Index-level PIR query
-        let index_result = self.query_index_level(script_hash, db_info).await?;
+        let (found_info, index_bins, matched_idx) =
+            self.query_index_level(script_hash, db_info).await?;
 
-        let (start_chunk_id, num_chunks, is_whale) = match index_result {
+        let mut traces = QueryTraces {
+            index_bins,
+            matched_index_idx: matched_idx,
+            chunk_bins: Vec::new(),
+        };
+
+        let (start_chunk_id, num_chunks, is_whale) = match found_info {
             Some((start, num, whale)) => (start, num, whale),
-            None => return Ok(None),
+            None => return Ok((None, traces)),
         };
 
         if num_chunks == 0 {
-            return Ok(Some(QueryResult {
-                entries: Vec::new(),
-                is_whale,
-                raw_chunk_data: None,
-            }));
+            // Whale (matched tag but no chunks to retrieve).
+            return Ok((
+                Some(QueryResult {
+                    entries: Vec::new(),
+                    is_whale,
+                    raw_chunk_data: None,
+                }),
+                traces,
+            ));
         }
 
         // Step 2: Chunk-level PIR queries (multi-round)
         let chunk_ids: Vec<u32> = (start_chunk_id..start_chunk_id + num_chunks as u32).collect();
-        let chunk_data = self.query_chunk_level(&chunk_ids, db_info).await?;
+        let (chunk_data, chunk_bins) = self.query_chunk_level(&chunk_ids, db_info).await?;
+        traces.chunk_bins = chunk_bins;
 
         // Step 3: Decode UTXO entries
         let entries = decode_utxo_entries(&chunk_data);
 
-        Ok(Some(QueryResult {
-            entries,
-            is_whale,
-            raw_chunk_data: if db_info.kind.is_delta() {
-                Some(chunk_data)
-            } else {
-                None
-            },
-        }))
+        Ok((
+            Some(QueryResult {
+                entries,
+                is_whale,
+                raw_chunk_data: if db_info.kind.is_delta() {
+                    Some(chunk_data)
+                } else {
+                    None
+                },
+            }),
+            traces,
+        ))
     }
 
     /// Execute index-level PIR query.
+    ///
+    /// Returns `(found_info, index_bins, matched_idx)`:
+    /// * `found_info` — `Some((start_chunk, num_chunks, is_whale))` on match.
+    /// * `index_bins` — one trace per cuckoo position we actually inspected.
+    ///   For NOT-FOUND this is always exactly `INDEX_CUCKOO_NUM_HASHES` bins
+    ///   (required for the absence proof). For FOUND we stop probing as soon
+    ///   as the tag is located, matching the TS client.
+    /// * `matched_idx` — index into `index_bins` of the matching bin.
+    ///
+    /// Padding invariant: the underlying PIR batch always covers all K groups
+    /// regardless of match outcome (CLAUDE.md privacy requirement).
     async fn query_index_level(
         &mut self,
         script_hash: &ScriptHash,
         db_info: &DatabaseInfo,
-    ) -> PirResult<Option<(u32, u8, bool)>> {
+    ) -> PirResult<(Option<(u32, u8, bool)>, Vec<IndexBinTrace>, Option<usize>)> {
         let k = db_info.index_k as usize;
         let bins = db_info.index_bins as usize;
         let dpf_n = db_info.dpf_n_index;
@@ -188,6 +430,16 @@ impl DpfClient {
             let key = pir_core::hash::derive_cuckoo_key(master_seed, assigned_group, h);
             my_locs.push(pir_core::hash::cuckoo_hash(script_hash, key, bins) as u64);
         }
+
+        log::info!(
+            "[PIR-AUDIT] INDEX query: script_hash={}, assigned_group={}, k={}, bins={}, cuckoo_positions={:?} (K-padded to {} groups)",
+            format_hash_short(script_hash),
+            assigned_group,
+            k,
+            bins,
+            my_locs,
+            k
+        );
 
         // Generate DPF keys for all K groups
         let dpf = Dpf::with_default_key();
@@ -239,26 +491,73 @@ impl DpfClient {
         // Compute expected tag
         let my_tag = pir_core::hash::compute_tag(tag_seed, script_hash);
 
-        // XOR results for assigned group and look for our entry
-        for h in 0..INDEX_CUCKOO_NUM_HASHES {
-            let mut result = results0[assigned_group][h].clone();
-            xor_into(&mut result, &results1[assigned_group][h]);
+        // XOR results for assigned group and look for our entry.
+        // Record every bin we inspect so the Merkle verifier can cover the
+        // "NOT FOUND at both cuckoo positions" absence proof.
+        let mut index_bins: Vec<IndexBinTrace> = Vec::with_capacity(INDEX_CUCKOO_NUM_HASHES);
+        let mut found: Option<(u32, u8, bool)> = None;
+        let mut matched_idx: Option<usize> = None;
 
-            if let Some((start_chunk, num_chunks)) = find_entry_in_index_result(&result, my_tag) {
+        for h in 0..INDEX_CUCKOO_NUM_HASHES {
+            let mut bin_content = results0[assigned_group][h].clone();
+            xor_into(&mut bin_content, &results1[assigned_group][h]);
+
+            let bin_index = my_locs[h] as u32;
+            let trace = IndexBinTrace {
+                pbc_group: assigned_group,
+                bin_index,
+                bin_content: bin_content.clone(),
+            };
+
+            if let Some((start_chunk, num_chunks)) =
+                find_entry_in_index_result(&bin_content, my_tag)
+            {
                 let is_whale = num_chunks == 0;
-                return Ok(Some((start_chunk, num_chunks as u8, is_whale)));
+                log::info!(
+                    "[PIR-AUDIT] INDEX FOUND at cuckoo h={} (group={}, bin={}): start_chunk={}, num_chunks={}, whale={}",
+                    h, assigned_group, bin_index, start_chunk, num_chunks, is_whale
+                );
+                matched_idx = Some(index_bins.len());
+                index_bins.push(trace);
+                found = Some((start_chunk, num_chunks as u8, is_whale));
+                break;
+            } else {
+                log::info!(
+                    "[PIR-AUDIT] INDEX miss at cuckoo h={} (group={}, bin={})",
+                    h, assigned_group, bin_index
+                );
+                index_bins.push(trace);
             }
         }
 
-        Ok(None)
+        if found.is_none() {
+            log::info!(
+                "[PIR-AUDIT] INDEX NOT FOUND: verified {} cuckoo positions at group {} — all {} bins will be Merkle-verified for absence proof",
+                index_bins.len(),
+                assigned_group,
+                index_bins.len()
+            );
+        }
+
+        Ok((found, index_bins, matched_idx))
     }
 
     /// Execute chunk-level PIR queries (multi-round).
+    ///
+    /// Returns `(chunk_data, chunk_bins)`:
+    /// * `chunk_data` — assembled raw chunk bytes in the order of `chunk_ids`.
+    /// * `chunk_bins` — per-chunk (pbc_group, bin_index, bin_content) for every
+    ///   chunk we actually located. The `bin_content` is the XOR-reconstructed
+    ///   full bin (all `CHUNK_SLOTS_PER_BIN` slots), which is what the per-bucket
+    ///   Merkle tree commits to.
+    ///
+    /// Padding invariant: each round emits exactly K_CHUNK DPF queries
+    /// regardless of how many real chunks that round carries.
     async fn query_chunk_level(
         &mut self,
         chunk_ids: &[u32],
         db_info: &DatabaseInfo,
-    ) -> PirResult<Vec<u8>> {
+    ) -> PirResult<(Vec<u8>, Vec<ChunkBinTrace>)> {
         let k = db_info.chunk_k as usize;
         let bins = db_info.chunk_bins as usize;
         let dpf_n = db_info.dpf_n_chunk;
@@ -267,8 +566,22 @@ impl DpfClient {
         // Plan multi-round chunk retrieval
         let rounds = plan_chunk_rounds(chunk_ids, k);
 
+        log::info!(
+            "[PIR-AUDIT] CHUNK phase: {} chunks across {} rounds, k={}, bins={} (each round K_CHUNK-padded to {} groups)",
+            chunk_ids.len(),
+            rounds.len(),
+            k,
+            bins,
+            k
+        );
+
         let mut all_data = Vec::new();
-        let mut chunk_data_map: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
+        let mut chunk_data_map: std::collections::HashMap<u32, Vec<u8>> =
+            std::collections::HashMap::new();
+        // One trace per chunk successfully located; keyed by chunk_id so later
+        // loss-order preservation matches `chunk_ids`.
+        let mut chunk_trace_map: std::collections::HashMap<u32, ChunkBinTrace> =
+            std::collections::HashMap::new();
 
         for (round_id, round) in rounds.iter().enumerate() {
             // Generate DPF keys for this round
@@ -279,17 +592,26 @@ impl DpfClient {
             let mut s1_keys: Vec<Vec<Vec<u8>>> = vec![Vec::new(); k];
 
             // Track which chunk is in which group for this round
-            let mut group_to_chunk: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+            let mut group_to_chunk: std::collections::HashMap<usize, u32> =
+                std::collections::HashMap::new();
 
             for &(chunk_id, group_id) in round {
                 group_to_chunk.insert(group_id, chunk_id);
             }
 
+            // Per-group, per-cuckoo-hash bin index that real queries will hit.
+            // We need these later to record (group, bin_index) for each chunk
+            // we actually find.
+            let mut real_locs: std::collections::HashMap<(usize, usize), u32> =
+                std::collections::HashMap::new();
+
             for g in 0..k {
                 for h in 0..CHUNK_CUCKOO_NUM_HASHES {
                     let alpha = if let Some(&chunk_id) = group_to_chunk.get(&g) {
                         let key = pir_core::hash::derive_cuckoo_key(master_seed, g, h);
-                        pir_core::hash::cuckoo_hash_int(chunk_id, key, bins) as u64
+                        let loc = pir_core::hash::cuckoo_hash_int(chunk_id, key, bins) as u64;
+                        real_locs.insert((g, h), loc as u32);
+                        loc
                     } else {
                         rng.next_u64() % bins as u64
                     };
@@ -323,26 +645,60 @@ impl DpfClient {
 
             // Extract chunk data for each chunk in this round
             for &(chunk_id, group_id) in round {
+                let mut found_any = false;
                 for h in 0..CHUNK_CUCKOO_NUM_HASHES {
-                    let mut result = results0[group_id][h].clone();
-                    xor_into(&mut result, &results1[group_id][h]);
+                    let mut bin_content = results0[group_id][h].clone();
+                    xor_into(&mut bin_content, &results1[group_id][h]);
 
-                    if let Some(data) = find_chunk_in_result(&result, chunk_id) {
-                        chunk_data_map.insert(chunk_id, data.to_vec());
+                    if find_chunk_in_result(&bin_content, chunk_id).is_some() {
+                        // Slice the actual chunk payload for decoding.
+                        let data = find_chunk_in_result(&bin_content, chunk_id)
+                            .expect("find_chunk_in_result returned Some above")
+                            .to_vec();
+                        let bin_index = *real_locs.get(&(group_id, h)).ok_or_else(|| {
+                            PirError::InvalidState(format!(
+                                "missing recorded loc for chunk_id={} group={} h={}",
+                                chunk_id, group_id, h
+                            ))
+                        })?;
+                        chunk_data_map.insert(chunk_id, data);
+                        chunk_trace_map.insert(
+                            chunk_id,
+                            ChunkBinTrace {
+                                pbc_group: group_id,
+                                bin_index,
+                                bin_content,
+                            },
+                        );
+                        log::info!(
+                            "[PIR-AUDIT] CHUNK FOUND: chunk_id={}, group={}, bin={}, cuckoo_h={}",
+                            chunk_id, group_id, bin_index, h
+                        );
+                        found_any = true;
                         break;
                     }
+                }
+                if !found_any {
+                    log::warn!(
+                        "[PIR-AUDIT] CHUNK MISSING: chunk_id={}, group={} (no cuckoo position matched)",
+                        chunk_id, group_id
+                    );
                 }
             }
         }
 
-        // Assemble chunk data in order
+        // Assemble chunk data + traces in the order of `chunk_ids`.
+        let mut chunk_bins = Vec::with_capacity(chunk_ids.len());
         for chunk_id in chunk_ids {
             if let Some(data) = chunk_data_map.get(chunk_id) {
                 all_data.extend_from_slice(data);
             }
+            if let Some(trace) = chunk_trace_map.remove(chunk_id) {
+                chunk_bins.push(trace);
+            }
         }
 
-        Ok(all_data)
+        Ok((all_data, chunk_bins))
     }
 }
 
@@ -796,6 +1152,27 @@ fn decode_utxo_entries(data: &[u8]) -> Vec<UtxoEntry> {
     }
 
     entries
+}
+
+/// Hex-format a 20-byte script hash as "aabbcc..eeff" (first and last 4 bytes).
+/// Avoids pulling in the `hex` crate for one audit-log string.
+fn format_hash_short(h: &[u8]) -> String {
+    if h.len() <= 8 {
+        let mut s = String::with_capacity(h.len() * 2);
+        for b in h {
+            s.push_str(&format!("{:02x}", b));
+        }
+        return s;
+    }
+    let mut s = String::with_capacity(22);
+    for b in &h[..4] {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s.push_str("..");
+    for b in &h[h.len() - 4..] {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
 }
 
 // ─── Simple RNG ─────────────────────────────────────────────────────────────

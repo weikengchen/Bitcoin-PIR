@@ -59,7 +59,9 @@ To fully hide found/not-found, the client would need to send dummy chunk and Mer
    - Hash functions exposed to JS
    - Built with `wasm-pack build --target web`
 
-3. **pir-sdk-client/** - Rust client placeholders (DPF, OnionPIR, HarmonyPIR)
+3. **pir-sdk-client/** - Native Rust client. `DpfClient` is fully implemented
+   (including per-bucket Merkle verification, see item 8 below). `HarmonyClient`
+   and `OnionClient` are placeholders — see their module docs.
 
 4. **pir-sdk-server/** - Server-side SDK placeholder
 
@@ -69,17 +71,40 @@ To fully hide found/not-found, the client would need to send dummy chunk and Mer
    - `web/index.html` - Calls `initSdkWasm()` at startup
    - `web/package.json` - Added `pir-sdk-wasm` dependency
 
-6. **Merkle Verification for "Not Found" Results** (commit `60fe19c`):
-   - All three PIR clients (DPF, OnionPIR, HarmonyPIR) now track ALL bins checked
-   - For "not found", verifies ALL INDEX_CUCKOO_NUM_HASHES=2 positions
-   - Proves scripthash is truly absent from the database
-   - Enables Merkle verification of delta databases even when no activity
+6. **Merkle Verification for "Not Found" Results** (web TS clients, commit `60fe19c`):
+   - All three **web TypeScript** PIR clients (DPF, OnionPIR, HarmonyPIR)
+     track ALL bins checked.
+   - For "not found", verifies ALL INDEX_CUCKOO_NUM_HASHES=2 positions.
+   - Proves scripthash is truly absent from the database.
+   - Enables Merkle verification of delta databases even when no activity.
 
 7. **Human-Verifiable Audit Logging** (commit `9a693c5`):
-   - Added `[PIR-AUDIT]` prefixed logs to all three PIR clients
-   - Logs show: query parameters, padding reminders, per-query FOUND/NOT FOUND status,
-     bin indices, chunk IDs, Merkle verification details
-   - Enables humans to verify PIR operations are correct
+   - `[PIR-AUDIT]` prefixed logs in web TS clients (DPF, OnionPIR, HarmonyPIR)
+     and in the native Rust `DpfClient` (see item 8).
+   - Logs show: query parameters, padding reminders, per-query FOUND/NOT FOUND
+     status, bin indices, chunk IDs, Merkle verification details.
+   - Enables humans to verify PIR operations are correct.
+
+8. **Native Rust per-bucket Merkle verification (DPF only)**:
+   - New module [`pir-sdk-client/src/merkle_verify.rs`](pir-sdk-client/src/merkle_verify.rs)
+     implements the shared verifier: bin-leaf hash, K-padded DPF sibling batches,
+     tree-top parsing, full walk-to-root. 12 unit tests cover good proofs,
+     tampered content, wrong bin index, encoding/decoding round-trips, and
+     partial-cache walks against `pir-core::merkle`.
+   - [`DpfClient`](pir-sdk-client/src/dpf.rs) now tracks every INDEX cuckoo bin
+     it inspects (both `INDEX_CUCKOO_NUM_HASHES=2` positions for not-found,
+     the matching position for found) and every CHUNK bin that returned a
+     UTXO, then batch-verifies them via
+     `run_merkle_verification` against the per-group root from the tree-top
+     blob. Queries whose Merkle proof fails are coerced to `None`.
+   - Gated on `DatabaseInfo::has_bucket_merkle`. Padding (K=75 INDEX,
+     K_CHUNK=80 CHUNK, 25 MERKLE) is preserved — see CLAUDE.md "Query Padding"
+     section above.
+   - Whales are deliberately not Merkle-verified (matches TS client behavior).
+   - `HarmonyClient` and `OnionClient` remain placeholders: since they issue
+     no real PIR queries, there are no bins to Merkle-verify. Their module
+     docs reference `DpfClient::run_merkle_verification` as the pattern to
+     copy once queries land.
 
 ---
 
