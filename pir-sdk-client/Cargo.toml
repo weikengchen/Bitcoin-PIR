@@ -5,6 +5,18 @@ edition = "2021"
 description = "PIR SDK Client: Native Rust client for PIR queries"
 license = "MIT OR Apache-2.0"
 
+[features]
+default = []
+# Enable fast PRP backend (FastPRP) for HarmonyPIR — faster per-element but slower build.
+fastprp = ["harmonypir-wasm/fastprp"]
+# Enable ALF PRP backend for HarmonyPIR — fastest per-element with native per-group tweaks.
+alf = ["harmonypir-wasm/alf"]
+# Enable the real OnionPIR client. Off by default because the upstream
+# `onionpir` crate requires a C++ toolchain + cmake + Homebrew GCC on macOS
+# and pulls in the SEAL submodule. Without this feature, `OnionClient` keeps
+# its placeholder behavior (warn + return None).
+onion = ["dep:onionpir", "dep:rand"]
+
 [dependencies]
 # Core SDK types and traits
 pir-sdk = { path = "../pir-sdk" }
@@ -12,6 +24,15 @@ pir-core = { path = "../pir-core" }
 
 # DPF library
 libdpf = { git = "https://github.com/weikengchen/libdpf.git" }
+
+# HarmonyPIR stateful per-group wrapper (reusable native rlib).
+harmonypir-wasm = { path = "../harmonypir-wasm" }
+
+# OnionPIR v2 FFI bindings — C++ SEAL-based FHE. Pulled in only under the
+# `onion` feature because it requires a native toolchain (cmake, GCC, SEAL
+# submodule). Pinned to the same rev used by the `runtime` crate.
+onionpir = { git = "https://github.com/Bitcoin-PIR/OnionPIRv2-fork.git", rev = "946550a836c28c1b00805f99805a2873ba47074e", optional = true }
+rand = { version = "0.8", optional = true }
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "io-util", "time"] }

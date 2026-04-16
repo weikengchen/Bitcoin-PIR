@@ -7,8 +7,8 @@ A Rust SDK for Private Information Retrieval (PIR) on Bitcoin UTXO data.
 This SDK provides a unified interface for PIR queries with support for multiple backends:
 
 - **DPF-PIR**: Two-server protocol using Distributed Point Functions (recommended)
-- **HarmonyPIR**: Two-server protocol with offline hints (placeholder)
-- **OnionPIR**: Single-server FHE-based protocol (placeholder)
+- **HarmonyPIR**: Two-server protocol with offline hints (hint server + query server)
+- **OnionPIR**: Single-server FHE-based protocol (placeholder — requires FHE library integration)
 
 ## Crates
 

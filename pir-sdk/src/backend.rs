@@ -134,10 +134,8 @@ impl ServerConfig {
             warmup: false,
         }
     }
-
-    /// Load configuration from a TOML file.
-    pub fn load(_path: &std::path::Path) -> PirResult<Self> {
-        // TODO: Implement TOML loading (reuse existing config.rs logic)
-        Ok(Self::new())
-    }
 }
+
+// Note: this is a protocol-level config type intended to be built
+// programmatically. For TOML loading, use `pir_sdk_server::ServerConfig::load`
+// which has the deserialize impls wired up.

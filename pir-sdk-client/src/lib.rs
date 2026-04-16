@@ -5,7 +5,8 @@
 //! - **DPF** (`DpfClient`): Two-server client using Distributed Point Functions.
 //!   This is the recommended backend for production use.
 //! - **HarmonyPIR** (`HarmonyClient`): Two-server client with offline hint phase.
-//!   Currently a placeholder - use harmonypir-wasm for browser deployments.
+//!   Connects to a separate hint server and query server; enable the `fastprp` or
+//!   `alf` cargo feature to select a faster PRP backend.
 //! - **OnionPIR** (`OnionClient`): Single-server FHE-based client.
 //!   Currently a placeholder - requires FHE library integration.
 //!
@@ -55,7 +56,7 @@ mod onion;
 
 pub use connection::WsConnection;
 pub use dpf::DpfClient;
-pub use harmony::HarmonyClient;
+pub use harmony::{HarmonyClient, PRP_ALF, PRP_FASTPRP, PRP_HOANG};
 pub use onion::OnionClient;
 
 // Re-export SDK types

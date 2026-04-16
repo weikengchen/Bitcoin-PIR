@@ -7,11 +7,15 @@
 //!   cargo run --release -p runtime --bin unified_server -- --port 8091 &
 //!   cargo run --release -p runtime --bin unified_server -- --port 8092 &
 
-use pir_sdk_client::{DpfClient, PirClient, ScriptHash};
+use pir_sdk_client::{DpfClient, HarmonyClient, PirClient, ScriptHash};
 
 /// Default server URLs for testing.
 const SERVER0_URL: &str = "ws://127.0.0.1:8091";
 const SERVER1_URL: &str = "ws://127.0.0.1:8092";
+
+/// HarmonyPIR test URLs — query server on 8091 (unified_server), hint server on 8092.
+const HARMONY_QUERY_URL: &str = "ws://127.0.0.1:8091";
+const HARMONY_HINT_URL: &str = "ws://127.0.0.1:8092";
 
 /// A known test script hash (can be replaced with actual test data).
 fn test_script_hash() -> ScriptHash {
@@ -172,6 +176,77 @@ async fn test_dpf_client_compute_sync_plan() {
         let plan = client.compute_sync_plan(&catalog, Some(latest - 1000)).expect("compute_sync_plan failed");
         println!("Delta plan: {:?}", plan);
     }
+
+    client.disconnect().await.unwrap();
+}
+
+// ─── HarmonyPIR Integration Tests (require running servers) ─────────────────
+
+#[tokio::test]
+#[ignore = "requires running PIR servers"]
+async fn test_harmony_client_connect() {
+    let mut client = HarmonyClient::new(HARMONY_HINT_URL, HARMONY_QUERY_URL);
+
+    let result = client.connect().await;
+    assert!(result.is_ok(), "Failed to connect: {:?}", result.err());
+    assert!(client.is_connected());
+
+    client.disconnect().await.unwrap();
+    assert!(!client.is_connected());
+}
+
+#[tokio::test]
+#[ignore = "requires running PIR servers"]
+async fn test_harmony_client_fetch_catalog() {
+    let mut client = HarmonyClient::new(HARMONY_HINT_URL, HARMONY_QUERY_URL);
+    client.connect().await.expect("connect failed");
+
+    let catalog = client.fetch_catalog().await.expect("fetch_catalog failed");
+
+    assert!(!catalog.databases.is_empty(), "catalog should have at least one database");
+    let main_db = &catalog.databases[0];
+    assert_eq!(main_db.db_id, 0);
+    assert!(main_db.index_bins > 0);
+    assert!(main_db.chunk_bins > 0);
+    assert!(main_db.index_k > 0);
+    assert!(main_db.chunk_k > 0);
+
+    println!("Catalog: {:?}", catalog);
+
+    client.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires running PIR servers"]
+async fn test_harmony_client_sync_single() {
+    let mut client = HarmonyClient::new(HARMONY_HINT_URL, HARMONY_QUERY_URL);
+    client.connect().await.expect("connect failed");
+
+    let script_hashes = vec![test_script_hash()];
+    let result = client.sync(&script_hashes, None).await.expect("sync failed");
+
+    assert_eq!(result.results.len(), 1);
+    assert!(result.synced_height > 0);
+    assert!(result.was_fresh_sync);
+
+    println!("Sync result: {:?}", result);
+
+    client.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires running PIR servers"]
+async fn test_harmony_client_query_batch() {
+    let mut client = HarmonyClient::new(HARMONY_HINT_URL, HARMONY_QUERY_URL);
+    client.connect().await.expect("connect failed");
+    client.fetch_catalog().await.expect("fetch_catalog failed");
+
+    let script_hashes = vec![test_script_hash()];
+    let results = client.query_batch(&script_hashes, 0).await.expect("query_batch failed");
+
+    assert_eq!(results.len(), 1);
+
+    println!("Query result: {:?}", results);
 
     client.disconnect().await.unwrap();
 }
