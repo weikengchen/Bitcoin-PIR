@@ -20,6 +20,7 @@ change near them needs extra care — do not optimize away padding.
   `BucketMerkleSiblingQuerier` trait — DPF and Harmony backends drive the
   same walk/top logic, with Harmony-specific sibling queries routed through
   `REQ_HARMONY_BATCH_QUERY` (levels `10+L` INDEX, `20+L` CHUNK).
+  Commit `6aee562`.
 - Web TypeScript client parity for all three protocols including Merkle
   verification and IndexedDB-cached Harmony hints.
 

@@ -143,6 +143,8 @@ Short-term active work:
 - `[PIR-AUDIT]` logging in web clients (commit `9a693c5`).
 - Native Rust `HarmonyClient` + `OnionClient` un-stub (commit `f37db8f`).
 - Native Rust `DpfClient` per-bucket Merkle verification (commit `8bd4b7b`).
+- Native Rust `HarmonyClient` per-bucket Merkle verification via
+  shared `BucketMerkleSiblingQuerier` trait (commit `6aee562`, P0 #1).
 
 ---
 
