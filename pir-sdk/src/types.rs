@@ -19,6 +19,28 @@ pub struct UtxoEntry {
     pub amount_sats: u64,
 }
 
+/// A reference to one cuckoo bin inspected during a PIR query.
+///
+/// Populated into [`QueryResult::index_bins`] / [`QueryResult::chunk_bins`]
+/// by the inspector query path (e.g. `DpfClient::query_batch_with_inspector`)
+/// so that per-bucket Merkle verification can run as a standalone second
+/// pass against the same raw content that produced the user-facing result.
+///
+/// The `bin_content` is the XOR-reconstructed bin payload (all slots, not
+/// just the matched slot) — i.e. exactly what the Merkle leaf hash is
+/// computed over (`SHA256(bin_index_le || bin_content)`). Rebuilding a
+/// `BucketMerkleItem` from this struct is a direct field copy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct BucketRef {
+    /// PBC group this bin belongs to (0..k).
+    pub pbc_group: u32,
+    /// Cuckoo bin index within the group's flat table.
+    pub bin_index: u32,
+    /// XOR-reconstructed bin content (slots_per_bin × slot_size bytes).
+    pub bin_content: Vec<u8>,
+}
+
 impl UtxoEntry {
     /// Create a new UTXO entry.
     pub fn new(txid: [u8; 32], vout: u32, amount_sats: u64) -> Self {
@@ -217,6 +239,29 @@ pub struct QueryResult {
     /// Raw chunk data for delta merging (only populated for delta queries).
     #[cfg_attr(feature = "serde", serde(skip))]
     pub raw_chunk_data: Option<Vec<u8>>,
+    /// Inspector state: every INDEX cuckoo bin the client probed for this
+    /// query. Populated only by the inspector path
+    /// (e.g. `DpfClient::query_batch_with_inspector`); the main `sync` and
+    /// `query_batch` paths leave this empty to keep the hot path lean.
+    ///
+    /// For not-found queries this always contains `INDEX_CUCKOO_NUM_HASHES=2`
+    /// bins (the absence-proof invariant). For found queries it contains
+    /// every position up to and including the matched one. See CLAUDE.md
+    /// "Merkle INDEX Item-Count Symmetry" for why the wire count is always
+    /// 2 — the observable invariant is enforced at the Merkle-item layer
+    /// (`run_merkle_verification`), not here.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub index_bins: Vec<BucketRef>,
+    /// Inspector state: every CHUNK cuckoo bin that backed a decoded UTXO.
+    /// Empty for not-found, whale, and zero-chunk matches. Populated only
+    /// by the inspector path.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub chunk_bins: Vec<BucketRef>,
+    /// If this query resolved to a match, the index within
+    /// [`index_bins`](Self::index_bins) of the matching bin. `None` for
+    /// not-found / whale / inspector-free paths.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub matched_index_idx: Option<usize>,
 }
 
 impl Default for QueryResult {
@@ -238,6 +283,9 @@ impl QueryResult {
             is_whale: false,
             merkle_verified: true,
             raw_chunk_data: None,
+            index_bins: Vec::new(),
+            chunk_bins: Vec::new(),
+            matched_index_idx: None,
         }
     }
 
@@ -250,6 +298,9 @@ impl QueryResult {
             is_whale: false,
             merkle_verified: true,
             raw_chunk_data: None,
+            index_bins: Vec::new(),
+            chunk_bins: Vec::new(),
+            matched_index_idx: None,
         }
     }
 
@@ -264,6 +315,9 @@ impl QueryResult {
             is_whale: false,
             merkle_verified: false,
             raw_chunk_data: None,
+            index_bins: Vec::new(),
+            chunk_bins: Vec::new(),
+            matched_index_idx: None,
         }
     }
 

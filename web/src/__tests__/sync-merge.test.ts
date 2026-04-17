@@ -6,8 +6,8 @@ import {
   mergeDeltaIntoHarmonySnapshot,
   mergeDeltaHarmonyBatch,
 } from '../sync-merge.js';
-import type { QueryResult, UtxoEntry } from '../client.js';
-import type { HarmonyQueryResult, HarmonyUtxoEntry } from '../harmonypir_client.js';
+import type { QueryResult, UtxoEntry } from '../types.js';
+import type { HarmonyQueryResult, HarmonyUtxoEntry } from '../harmony-types.js';
 import type { DeltaData } from '../codec.js';
 import { bytesToHex } from '../hash.js';
 

@@ -29,11 +29,14 @@
 //! `runtime/src/bin/harmonypir_batch_e2e.rs` but fetches hints over
 //! the wire instead of computing them from a local mmap.
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::connection::WsConnection;
+use crate::hint_cache;
 use crate::merkle_verify::{
     fetch_tree_tops, verify_bucket_merkle_batch_generic, BucketMerkleItem,
     BucketMerkleSiblingQuerier, TreeTop, BUCKET_MERKLE_ARITY, BUCKET_MERKLE_SIB_ROW_SIZE,
 };
+use crate::transport::PirTransport;
 use crate::protocol::{
     decode_catalog, encode_request, REQ_GET_DB_CATALOG, RESP_DB_CATALOG, RESP_ERROR,
 };
@@ -44,11 +47,13 @@ use pir_core::params::{
     INDEX_CUCKOO_NUM_HASHES, INDEX_PARAMS, INDEX_SLOT_SIZE, INDEX_SLOTS_PER_BIN, TAG_SIZE,
 };
 use pir_sdk::{
-    compute_sync_plan, merge_delta_batch, DatabaseCatalog, DatabaseInfo, DatabaseKind,
-    PirBackendType, PirClient, PirError, PirResult, QueryResult, ScriptHash, SyncPlan, SyncResult,
-    SyncStep, UtxoEntry,
+    compute_sync_plan, merge_delta_batch, BucketRef, ConnectionState, DatabaseCatalog,
+    DatabaseInfo, DatabaseKind, PirBackendType, PirClient, PirError, PirResult, QueryResult,
+    ScriptHash, StateListener, SyncPlan, SyncProgress, SyncResult, SyncStep, UtxoEntry,
 };
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 // ─── Wire protocol constants ────────────────────────────────────────────────
 
@@ -130,14 +135,143 @@ struct QueryTraces {
     chunk_bins: Vec<ChunkBinTrace>,
 }
 
+// ─── Trace → BucketMerkleItem / BucketRef translators ───────────────────────
+//
+// These mirror the DPF client's helpers (`dpf.rs::items_from_trace` etc.):
+// the point is to share exactly one item-layout convention between the
+// hot-path Merkle verifier (which runs over fresh `QueryTraces`) and the
+// deferred-verify path (which rebuilds items from already-persisted
+// `QueryResult.index_bins` / `chunk_bins`). Any drift between the two
+// sides would produce silent verification mismatches.
+
+/// Build `BucketMerkleItem`s for one query from its internal trace —
+/// emits one item per probed INDEX cuckoo bin, with CHUNK bins attached
+/// only to the matched INDEX item (or none, if not matched). This
+/// layout preserves the 🔒 Merkle INDEX Item-Count Symmetry invariant:
+/// every query contributes exactly `INDEX_CUCKOO_NUM_HASHES` items
+/// regardless of found / not-found / whale.
+fn items_from_trace(trace: &QueryTraces) -> Vec<BucketMerkleItem> {
+    trace
+        .index_bins
+        .iter()
+        .enumerate()
+        .map(|(bi, bin)| {
+            let mut it = BucketMerkleItem {
+                index_pbc_group: bin.pbc_group,
+                index_bin_index: bin.bin_index,
+                index_bin_content: bin.bin_content.clone(),
+                chunk_pbc_groups: Vec::new(),
+                chunk_bin_indices: Vec::new(),
+                chunk_bin_contents: Vec::new(),
+            };
+            if trace.matched_index_idx == Some(bi) {
+                for cb in &trace.chunk_bins {
+                    it.chunk_pbc_groups.push(cb.pbc_group);
+                    it.chunk_bin_indices.push(cb.bin_index);
+                    it.chunk_bin_contents.push(cb.bin_content.clone());
+                }
+            }
+            it
+        })
+        .collect()
+}
+
+/// Flatten a per-query traces list into a padded item list plus the
+/// `item_index → query_index` backmapping the verifier needs to fold
+/// per-item verdicts back to per-query verdicts.
+fn collect_merkle_items_from_traces(
+    traces: &[QueryTraces],
+) -> (Vec<BucketMerkleItem>, Vec<usize>) {
+    let mut items = Vec::new();
+    let mut item_to_query = Vec::new();
+    for (qi, trace) in traces.iter().enumerate() {
+        for it in items_from_trace(trace) {
+            items.push(it);
+            item_to_query.push(qi);
+        }
+    }
+    (items, item_to_query)
+}
+
+/// Build `BucketMerkleItem`s for one query from a `QueryResult`'s
+/// inspector-populated fields. Symmetric with [`items_from_trace`] —
+/// same per-query-item layout, same ordering — but works on the public
+/// type so callers can reverify persisted results via
+/// [`HarmonyClient::verify_merkle_batch_for_results`].
+fn items_from_inspector_result(result: &QueryResult) -> Vec<BucketMerkleItem> {
+    result
+        .index_bins
+        .iter()
+        .enumerate()
+        .map(|(bi, bin)| {
+            let mut it = BucketMerkleItem {
+                index_pbc_group: bin.pbc_group as usize,
+                index_bin_index: bin.bin_index,
+                index_bin_content: bin.bin_content.clone(),
+                chunk_pbc_groups: Vec::new(),
+                chunk_bin_indices: Vec::new(),
+                chunk_bin_contents: Vec::new(),
+            };
+            if result.matched_index_idx == Some(bi) {
+                for cb in &result.chunk_bins {
+                    it.chunk_pbc_groups.push(cb.pbc_group as usize);
+                    it.chunk_bin_indices.push(cb.bin_index);
+                    it.chunk_bin_contents.push(cb.bin_content.clone());
+                }
+            }
+            it
+        })
+        .collect()
+}
+
+/// Flatten a per-query `QueryResult` list into a padded item list plus
+/// the `item_index → query_index` backmapping. `None` results
+/// contribute zero items (nothing to verify).
+fn collect_merkle_items_from_results(
+    results: &[Option<QueryResult>],
+) -> (Vec<BucketMerkleItem>, Vec<usize>) {
+    let mut items = Vec::new();
+    let mut item_to_query = Vec::new();
+    for (qi, maybe_r) in results.iter().enumerate() {
+        if let Some(r) = maybe_r {
+            for it in items_from_inspector_result(r) {
+                items.push(it);
+                item_to_query.push(qi);
+            }
+        }
+    }
+    (items, item_to_query)
+}
+
+/// Convert an internal `IndexBinTrace` / `ChunkBinTrace` into the
+/// public `BucketRef` shape. The public type widens `pbc_group` to
+/// `u32` and drops the internal `ChunkBinTrace` vs `IndexBinTrace`
+/// distinction — the discriminant is already encoded by which vec the
+/// ref lives on (`QueryResult.index_bins` vs `QueryResult.chunk_bins`).
+fn index_trace_to_bucket_ref(t: &IndexBinTrace) -> BucketRef {
+    BucketRef {
+        pbc_group: t.pbc_group as u32,
+        bin_index: t.bin_index,
+        bin_content: t.bin_content.clone(),
+    }
+}
+
+fn chunk_trace_to_bucket_ref(t: &ChunkBinTrace) -> BucketRef {
+    BucketRef {
+        pbc_group: t.pbc_group as u32,
+        bin_index: t.bin_index,
+        bin_content: t.bin_content.clone(),
+    }
+}
+
 // ─── HarmonyPIR Client ──────────────────────────────────────────────────────
 
 /// HarmonyPIR client for two-server PIR queries.
 pub struct HarmonyClient {
     hint_server_url: String,
     query_server_url: String,
-    hint_conn: Option<WsConnection>,
-    query_conn: Option<WsConnection>,
+    hint_conn: Option<Box<dyn PirTransport>>,
+    query_conn: Option<Box<dyn PirTransport>>,
     catalog: Option<DatabaseCatalog>,
     prp_backend: u8,
     master_prp_key: [u8; 16],
@@ -157,6 +291,23 @@ pub struct HarmonyClient {
     /// whenever `loaded_db_id` changes or `master_prp_key`/`prp_backend`
     /// changes (via `invalidate_groups`).
     sibling_hints_loaded: Option<u8>,
+    /// On-disk cache directory for hint blobs. `None` (the default) means
+    /// "no filesystem cache" — `save_hints_bytes` / `load_hints_bytes`
+    /// still work as explicit byte-level APIs, but nothing is read or
+    /// written automatically. Set via
+    /// [`HarmonyClient::with_hint_cache_dir`] or
+    /// [`HarmonyClient::set_hint_cache_dir`].
+    ///
+    /// Session 5 will thread a wasm32-side IndexedDB wrapper through
+    /// the same save/load byte APIs, so the filesystem path here only
+    /// activates on native targets.
+    hint_cache_dir: Option<PathBuf>,
+    /// Optional observer invoked on every `ConnectionState` transition.
+    /// Mirrors the DPF client's listener slot (see `dpf.rs` for the
+    /// rationale behind `Arc<dyn StateListener>` over `Box`): sharing
+    /// one sink between DPF + Harmony clients lets the WASM bindings
+    /// plumb a single `Rc<RefCell<js_sys::Function>>` through both.
+    state_listener: Option<Arc<dyn StateListener>>,
 }
 
 impl HarmonyClient {
@@ -190,7 +341,123 @@ impl HarmonyClient {
             index_sib_groups: HashMap::new(),
             chunk_sib_groups: HashMap::new(),
             sibling_hints_loaded: None,
+            hint_cache_dir: None,
+            state_listener: None,
         }
+    }
+
+    // ─── Hint cache configuration ───────────────────────────────────────────
+
+    /// Configure an on-disk cache directory for hint blobs.
+    ///
+    /// When set, [`ensure_groups_ready`](Self::ensure_groups_ready) and
+    /// [`ensure_sibling_groups_ready`](Self::ensure_sibling_groups_ready)
+    /// will transparently restore hints from disk (skipping the server
+    /// roundtrips) and persist them back after any fresh fetch. Cache
+    /// files are named by the SHA-256 fingerprint of
+    /// `(master_prp_key, prp_backend, db_id, height, index_bins,
+    /// chunk_bins, tag_seed, index_k, chunk_k)`, so snapshots for
+    /// different master keys / backends / databases never collide on
+    /// disk.
+    ///
+    /// The cache preserves `HarmonyGroup::query_count` and the
+    /// relocation log across restarts, so a client that persists after
+    /// each sync resumes exactly where it left off (the usual
+    /// per-group `max_queries` budget still applies — once a group is
+    /// exhausted the next launch will see a schema mismatch and
+    /// refetch).
+    ///
+    /// Any I/O or schema error during restore is swallowed and falls
+    /// through to the network fetch path; persist errors are logged
+    /// but do not fail the parent `ensure_*` call.
+    ///
+    /// The builder form (consumes `self`) is convenient for one-line
+    /// construction; use [`set_hint_cache_dir`](Self::set_hint_cache_dir)
+    /// from mutable contexts.
+    pub fn with_hint_cache_dir<P: Into<PathBuf>>(mut self, dir: P) -> Self {
+        self.hint_cache_dir = Some(dir.into());
+        self
+    }
+
+    /// Mutable-reference counterpart to
+    /// [`with_hint_cache_dir`](Self::with_hint_cache_dir). Passing
+    /// `None` disables the on-disk cache for subsequent `ensure_*`
+    /// calls without touching any already-restored in-memory state.
+    pub fn set_hint_cache_dir(&mut self, dir: Option<PathBuf>) {
+        self.hint_cache_dir = dir;
+    }
+
+    /// Return the currently configured cache directory, if any.
+    pub fn hint_cache_dir(&self) -> Option<&std::path::Path> {
+        self.hint_cache_dir.as_deref()
+    }
+
+    /// Resolve the on-disk cache path for `db_info` under the current
+    /// `hint_cache_dir`. Returns `None` when no cache directory is
+    /// configured.
+    fn cache_path_for(&self, db_info: &DatabaseInfo) -> Option<PathBuf> {
+        let dir = self.hint_cache_dir.as_ref()?;
+        let key = hint_cache::CacheKey::from_db_info(
+            self.master_prp_key,
+            self.prp_backend,
+            db_info,
+        );
+        Some(dir.join(key.filename()))
+    }
+}
+
+impl HarmonyClient {
+
+    /// The two server URLs this client was configured with, in
+    /// `(hint_server, query_server)` order. Useful for display-only
+    /// surfaces that want to show "connected to …" without
+    /// reconstructing the URLs from caller state.
+    pub fn server_urls(&self) -> (&str, &str) {
+        (&self.hint_server_url, &self.query_server_url)
+    }
+
+    /// Register a callback that will be invoked on every
+    /// [`ConnectionState`] transition (`Connecting` → `Connected` /
+    /// `Disconnected`). Replaces any previously registered listener
+    /// — only one listener per client; share one
+    /// `Arc<dyn StateListener>` across multiple clients if you need a
+    /// fan-in sink.
+    ///
+    /// No-op invocation if the listener is `None`; passing a fresh
+    /// `None` clears the slot.
+    pub fn set_state_listener(&mut self, listener: Option<Arc<dyn StateListener>>) {
+        self.state_listener = listener;
+    }
+
+    /// Emit a state transition to the registered listener, if any.
+    /// Kept as an inherent method so the async `connect`/`disconnect`
+    /// trait impls can fire it without re-borrowing `self`.
+    fn notify_state(&self, state: ConnectionState) {
+        if let Some(listener) = &self.state_listener {
+            listener.on_state_change(state);
+        }
+    }
+
+    /// Install pre-built transports directly, bypassing the URL-based
+    /// [`PirClient::connect`] path.
+    ///
+    /// This is the test-injection escape hatch the `PirTransport` trait was
+    /// designed around: state-machine tests can hand in a
+    /// [`MockTransport`](crate::transport::MockTransport) (or any other
+    /// impl) and drive the client without opening real WebSockets.
+    /// `PirClient::is_connected` returns `true` after this call.
+    ///
+    /// Fires the same `Connected` state event a URL-driven `connect()`
+    /// would — lets injection-driven tests exercise the state listener
+    /// without a real WebSocket handshake.
+    pub fn connect_with_transport(
+        &mut self,
+        hint_conn: Box<dyn PirTransport>,
+        query_conn: Box<dyn PirTransport>,
+    ) {
+        self.hint_conn = Some(hint_conn);
+        self.query_conn = Some(query_conn);
+        self.notify_state(ConnectionState::Connected);
     }
 
     /// Override the master PRP key (16 bytes).
@@ -214,6 +481,300 @@ impl HarmonyClient {
         self.chunk_sib_groups.clear();
         self.loaded_db_id = None;
         self.sibling_hints_loaded = None;
+    }
+
+    // ─── Hint persistence: save / load ─────────────────────────────────────
+
+    /// Serialize the currently loaded hint state (main + sibling groups)
+    /// into a self-describing blob.
+    ///
+    /// Returns `Ok(None)` when nothing is loaded — callers can treat
+    /// that as "no state to persist". On success the byte blob carries
+    /// the cache key fingerprint in its header, so any later
+    /// [`load_hints_bytes`](Self::load_hints_bytes) call that doesn't
+    /// match the same master key + shape fails cleanly rather than
+    /// silently loading mismatched state.
+    ///
+    /// This is the explicit byte-level API that Session 5 will wrap
+    /// with IndexedDB persistence on wasm32. Native callers who want
+    /// filesystem persistence should prefer
+    /// [`with_hint_cache_dir`](Self::with_hint_cache_dir) +
+    /// [`persist_hints_to_cache`](Self::persist_hints_to_cache),
+    /// which handle path resolution and atomic rename for them.
+    pub fn save_hints_bytes(&self) -> PirResult<Option<Vec<u8>>> {
+        let db_id = match self.loaded_db_id {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+        let catalog = self.catalog.as_ref().ok_or_else(|| {
+            PirError::InvalidState(
+                "save_hints_bytes: catalog not fetched (call fetch_catalog first)".into(),
+            )
+        })?;
+        let db_info = catalog
+            .get(db_id)
+            .ok_or(PirError::DatabaseNotFound(db_id))?;
+
+        let key =
+            hint_cache::CacheKey::from_db_info(self.master_prp_key, self.prp_backend, db_info);
+        let mut bundle = hint_cache::HintBundle::new();
+
+        for (&gid, group) in &self.index_groups {
+            bundle.main_index.insert(gid, group.serialize());
+        }
+        for (&gid, group) in &self.chunk_groups {
+            bundle.main_chunk.insert(gid, group.serialize());
+        }
+        // Sibling level is stored in memory as `usize` but realistic
+        // Merkle tree depths are well under 255 (typically <= 12);
+        // narrow to u8 for the wire format.
+        for (&(level, gid), group) in &self.index_sib_groups {
+            debug_assert!(level < 256, "sibling level overflow at save time");
+            bundle
+                .index_sib
+                .insert((level as u8, gid), group.serialize());
+        }
+        for (&(level, gid), group) in &self.chunk_sib_groups {
+            debug_assert!(level < 256, "sibling level overflow at save time");
+            bundle
+                .chunk_sib
+                .insert((level as u8, gid), group.serialize());
+        }
+
+        Ok(Some(hint_cache::encode_hints(&key, &bundle)))
+    }
+
+    /// Load hint state from a blob produced by
+    /// [`save_hints_bytes`](Self::save_hints_bytes).
+    ///
+    /// The blob's embedded fingerprint is cross-checked against the
+    /// caller-supplied `db_info` + this client's master key / PRP
+    /// backend; a mismatch is reported as [`PirError::InvalidState`].
+    /// Malformed or incompatible blobs surface as [`PirError::Decode`],
+    /// so a calling `ensure_*` can treat any non-`Ok` outcome as
+    /// "cache miss — fall back to network".
+    ///
+    /// On success, `loaded_db_id` is set to `db_info.db_id` and all
+    /// groups present in the blob are materialised. If the blob
+    /// includes sibling state, `sibling_hints_loaded` is also set;
+    /// otherwise the sibling maps stay empty so the next
+    /// [`ensure_sibling_groups_ready`](Self::ensure_sibling_groups_ready)
+    /// will fetch them from the server.
+    pub fn load_hints_bytes(
+        &mut self,
+        bytes: &[u8],
+        db_info: &DatabaseInfo,
+    ) -> PirResult<()> {
+        let expected_fp =
+            hint_cache::CacheKey::from_db_info(self.master_prp_key, self.prp_backend, db_info)
+                .fingerprint();
+        let decoded = hint_cache::decode_hints(bytes, Some(&expected_fp))?;
+        self.load_bundle_into_groups(&decoded.bundle, db_info)?;
+        Ok(())
+    }
+
+    /// Re-derive per-group `HarmonyGroup` instances from a
+    /// [`hint_cache::HintBundle`].
+    ///
+    /// Group IDs follow the same layout convention as
+    /// [`ensure_groups_ready`](Self::ensure_groups_ready) and
+    /// [`ensure_sibling_groups_ready`](Self::ensure_sibling_groups_ready),
+    /// so `HarmonyGroup::deserialize` can regenerate the same derived
+    /// PRP keys the server uses:
+    ///
+    /// * main INDEX group g → `group_id = g`
+    /// * main CHUNK group g → `group_id = k_index + g`
+    /// * INDEX sib level L group g →
+    ///   `group_id = (k_index + k_chunk) + L * k_index + g`
+    /// * CHUNK sib level L group g →
+    ///   `group_id = (k_index + k_chunk) + index_sib_levels * k_index
+    ///              + L * k_chunk + g`
+    ///
+    /// `index_sib_levels` is inferred from the bundle (max cached
+    /// level + 1); this is safe because the server always caches
+    /// every level 0..N-1 together.
+    fn load_bundle_into_groups(
+        &mut self,
+        bundle: &hint_cache::HintBundle,
+        db_info: &DatabaseInfo,
+    ) -> PirResult<()> {
+        let k_index = db_info.index_k as usize;
+        let k_chunk = db_info.chunk_k as usize;
+
+        // Start from a clean slate so partial restores don't mix state
+        // from an earlier `ensure_*` pass.
+        self.index_groups.clear();
+        self.chunk_groups.clear();
+        self.index_sib_groups.clear();
+        self.chunk_sib_groups.clear();
+        self.loaded_db_id = None;
+        self.sibling_hints_loaded = None;
+
+        for (&gid, bytes) in &bundle.main_index {
+            let group =
+                HarmonyGroup::deserialize(bytes, &self.master_prp_key, gid as u32).map_err(
+                    |e| {
+                        PirError::BackendState(format!(
+                            "deserialize main INDEX group {}: {:?}",
+                            gid, e
+                        ))
+                    },
+                )?;
+            self.index_groups.insert(gid, group);
+        }
+        for (&gid, bytes) in &bundle.main_chunk {
+            let group_id = (k_index + gid as usize) as u32;
+            let group =
+                HarmonyGroup::deserialize(bytes, &self.master_prp_key, group_id).map_err(|e| {
+                    PirError::BackendState(format!(
+                        "deserialize main CHUNK group {}: {:?}",
+                        gid, e
+                    ))
+                })?;
+            self.chunk_groups.insert(gid, group);
+        }
+
+        let index_sib_levels = bundle
+            .index_sib
+            .keys()
+            .map(|(l, _)| *l as usize + 1)
+            .max()
+            .unwrap_or(0);
+
+        for (&(level, gid), bytes) in &bundle.index_sib {
+            let sl = level as usize;
+            let g = gid as usize;
+            let group_id = ((k_index + k_chunk) + sl * k_index + g) as u32;
+            let group =
+                HarmonyGroup::deserialize(bytes, &self.master_prp_key, group_id).map_err(|e| {
+                    PirError::BackendState(format!(
+                        "deserialize INDEX sib L{} g{}: {:?}",
+                        sl, g, e
+                    ))
+                })?;
+            self.index_sib_groups.insert((sl, gid), group);
+        }
+        for (&(level, gid), bytes) in &bundle.chunk_sib {
+            let sl = level as usize;
+            let g = gid as usize;
+            let group_id =
+                ((k_index + k_chunk) + index_sib_levels * k_index + sl * k_chunk + g) as u32;
+            let group =
+                HarmonyGroup::deserialize(bytes, &self.master_prp_key, group_id).map_err(|e| {
+                    PirError::BackendState(format!(
+                        "deserialize CHUNK sib L{} g{}: {:?}",
+                        sl, g, e
+                    ))
+                })?;
+            self.chunk_sib_groups.insert((sl, gid), group);
+        }
+
+        // Only claim "loaded" when all main groups this db expects are
+        // present — a partial bundle (e.g. from a truncated legacy
+        // format) must trigger a network refetch rather than serve a
+        // half-state. Note: `k_index` and `k_chunk` are from the
+        // caller's `db_info`, and the bundle header has already been
+        // fingerprint-checked, so this length compare is a sanity
+        // guard rather than a trust boundary.
+        let full_main =
+            bundle.main_index.len() == k_index && bundle.main_chunk.len() == k_chunk;
+        if full_main {
+            self.loaded_db_id = Some(db_info.db_id);
+            // Tentatively claim sibling state if any are present; the
+            // caller (`ensure_sibling_groups_ready`) will validate the
+            // count against the server's tree-tops and re-fetch on
+            // mismatch, so this is a fast-path hint rather than a
+            // trust anchor.
+            if !bundle.index_sib.is_empty() || !bundle.chunk_sib.is_empty() {
+                self.sibling_hints_loaded = Some(db_info.db_id);
+            }
+        }
+        Ok(())
+    }
+
+    // ─── Hint persistence: file-backed cache ───────────────────────────────
+
+    /// Persist the current hint state to the configured cache directory.
+    ///
+    /// No-op when `hint_cache_dir` is unset or `save_hints_bytes`
+    /// returns `None` (nothing loaded). Uses an atomic rename
+    /// (`<file>.tmp` → `<file>`) so a crash mid-write leaves the
+    /// previous cache file intact.
+    pub fn persist_hints_to_cache(&self, db_info: &DatabaseInfo) -> PirResult<()> {
+        let Some(path) = self.cache_path_for(db_info) else {
+            return Ok(());
+        };
+        let Some(bytes) = self.save_hints_bytes()? else {
+            return Ok(());
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            hint_cache::write_cache_file(&path, &bytes)?;
+            log::info!(
+                "[PIR-AUDIT] HarmonyPIR: persisted {} bytes to {}",
+                bytes.len(),
+                path.display()
+            );
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            // On wasm32 the filesystem path isn't available; Session 5
+            // wires IndexedDB through the `save_hints_bytes` /
+            // `load_hints_bytes` pair directly. Silently no-op rather
+            // than fail so shared code paths stay oblivious.
+            let _ = (path, bytes);
+        }
+        Ok(())
+    }
+
+    /// Try to restore hints from the configured cache directory.
+    ///
+    /// Returns `Ok(true)` if the cache file existed and was loaded
+    /// successfully, `Ok(false)` when the cache is cold or the blob
+    /// was rejected (bad magic, schema mismatch, fingerprint mismatch,
+    /// truncation). Any transient I/O error (disk full, permissions,
+    /// etc.) still bubbles up as `Err` so the caller can decide
+    /// whether to retry or surface it.
+    ///
+    /// Always `Ok(false)` when `hint_cache_dir` is unset.
+    pub fn restore_hints_from_cache(&mut self, db_info: &DatabaseInfo) -> PirResult<bool> {
+        let Some(path) = self.cache_path_for(db_info) else {
+            return Ok(false);
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let Some(bytes) = hint_cache::read_cache_file(&path)? else {
+                return Ok(false);
+            };
+            match self.load_hints_bytes(&bytes, db_info) {
+                Ok(()) => {
+                    log::info!(
+                        "[PIR-AUDIT] HarmonyPIR: restored hints from {} \
+                         ({} INDEX + {} CHUNK main, {} INDEX sib + {} CHUNK sib)",
+                        path.display(),
+                        self.index_groups.len(),
+                        self.chunk_groups.len(),
+                        self.index_sib_groups.len(),
+                        self.chunk_sib_groups.len()
+                    );
+                    Ok(true)
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[PIR-AUDIT] HarmonyPIR: rejected cache at {} ({}); refetching",
+                        path.display(),
+                        e
+                    );
+                    self.invalidate_groups();
+                    Ok(false)
+                }
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = path;
+            Ok(false)
+        }
     }
 
     /// Try to fetch the full `DatabaseCatalog` via `REQ_GET_DB_CATALOG`.
@@ -295,6 +856,15 @@ impl HarmonyClient {
 
     /// Ensure the per-group `HarmonyGroup` instances exist for `db_info`
     /// and their hints are loaded.
+    ///
+    /// Fast path: if [`with_hint_cache_dir`](Self::with_hint_cache_dir)
+    /// was called and a valid cache file exists for this db_info,
+    /// groups are rehydrated from disk and the server roundtrips are
+    /// skipped entirely. On cache miss / cache reject, the network
+    /// fetch runs as before and the result is persisted back to disk.
+    /// Sibling hints are only persisted once
+    /// [`ensure_sibling_groups_ready`](Self::ensure_sibling_groups_ready)
+    /// has populated them (see that method for the second persist).
     async fn ensure_groups_ready(&mut self, db_info: &DatabaseInfo) -> PirResult<()> {
         if self.loaded_db_id == Some(db_info.db_id)
             && !self.index_groups.is_empty()
@@ -304,6 +874,16 @@ impl HarmonyClient {
         }
 
         self.invalidate_groups();
+
+        // ── Try the on-disk cache before hitting the wire ─────────────
+        // Any cache error is swallowed and we fall through to network
+        // fetch — the cache is a fast path, never a correctness
+        // dependency. I/O errors propagate so the caller sees them.
+        if self.restore_hints_from_cache(db_info)?
+            && self.loaded_db_id == Some(db_info.db_id)
+        {
+            return Ok(());
+        }
 
         let k_index = db_info.index_k as usize;
         let k_chunk = db_info.chunk_k as usize;
@@ -341,6 +921,18 @@ impl HarmonyClient {
         self.fetch_and_load_hints(db_info.db_id, 1, k_chunk as u8).await?;
 
         self.loaded_db_id = Some(db_info.db_id);
+
+        // Persist the freshly-fetched main hints so a warm restart
+        // gets the fast path. Sibling state isn't loaded yet; it will
+        // be persisted again by `ensure_sibling_groups_ready` once the
+        // tree-tops RPC returns. Persist errors are logged and
+        // ignored so a read-only cache dir doesn't wedge queries.
+        if let Err(e) = self.persist_hints_to_cache(db_info) {
+            log::warn!(
+                "[PIR-AUDIT] HarmonyPIR: failed to persist main hints to cache: {}",
+                e
+            );
+        }
         Ok(())
     }
 
@@ -615,6 +1207,15 @@ impl HarmonyClient {
                     // this to `false` if the INDEX proof fails.
                     merkle_verified: true,
                     raw_chunk_data: None,
+                    // HarmonyClient doesn't surface inspector state to
+                    // `QueryResult` today (the per-group hints and
+                    // cuckoo-position machinery are internal to the query
+                    // path). Kept empty here so the struct shape matches
+                    // the other clients; the WASM-side HarmonyClient
+                    // inspector extensions are Session 5 territory.
+                    index_bins: Vec::new(),
+                    chunk_bins: Vec::new(),
+                    matched_index_idx: None,
                 }),
                 traces,
             ));
@@ -639,6 +1240,11 @@ impl HarmonyClient {
                 } else {
                     None
                 },
+                // See comment above — Harmony inspector state is out of
+                // scope for Session 2.
+                index_bins: Vec::new(),
+                chunk_bins: Vec::new(),
+                matched_index_idx: None,
             }),
             traces,
         ))
@@ -841,18 +1447,6 @@ impl HarmonyClient {
         db_info: &DatabaseInfo,
         tree_tops: &[TreeTop],
     ) -> PirResult<()> {
-        if self.sibling_hints_loaded == Some(db_info.db_id)
-            && !self.index_sib_groups.is_empty()
-            && !self.chunk_sib_groups.is_empty()
-        {
-            return Ok(());
-        }
-
-        // Reset any stale state.
-        self.index_sib_groups.clear();
-        self.chunk_sib_groups.clear();
-        self.sibling_hints_loaded = None;
-
         let k_index = db_info.index_k as usize;
         let k_chunk = db_info.chunk_k as usize;
         if tree_tops.len() < k_index + k_chunk {
@@ -875,6 +1469,27 @@ impl HarmonyClient {
             .map(|t| t.cache_from_level)
             .max()
             .unwrap_or(0);
+
+        // Early-return only if our populated sibling state exactly
+        // matches what the server-advertised tree-tops expect. Bare
+        // "non-empty" was weaker: a cache restored from an older
+        // snapshot with fewer levels would slip through and later
+        // fail verification. This tighter check validates both
+        // `sibling_hints_loaded` and the per-level group counts,
+        // matching the invariants `persist_hints_to_cache` writes out.
+        let expected_index_sib = index_sib_levels * k_index;
+        let expected_chunk_sib = chunk_sib_levels * k_chunk;
+        if self.sibling_hints_loaded == Some(db_info.db_id)
+            && self.index_sib_groups.len() == expected_index_sib
+            && self.chunk_sib_groups.len() == expected_chunk_sib
+        {
+            return Ok(());
+        }
+
+        // Reset any stale state before the refetch.
+        self.index_sib_groups.clear();
+        self.chunk_sib_groups.clear();
+        self.sibling_hints_loaded = None;
 
         log::info!(
             "[PIR-AUDIT] HarmonyPIR sibling init: db_id={}, INDEX sib levels={}, CHUNK sib levels={}",
@@ -956,6 +1571,18 @@ impl HarmonyClient {
         }
 
         self.sibling_hints_loaded = Some(db_info.db_id);
+
+        // Persist the combined main + sibling hint state — this is
+        // the "complete" snapshot the fast path in
+        // `ensure_groups_ready` will restore next launch. Persist
+        // errors are logged and ignored (read-only cache dirs must
+        // not fail live queries).
+        if let Err(e) = self.persist_hints_to_cache(db_info) {
+            log::warn!(
+                "[PIR-AUDIT] HarmonyPIR: failed to persist hints (main+sib) to cache: {}",
+                e
+            );
+        }
         Ok(())
     }
 
@@ -963,27 +1590,28 @@ impl HarmonyClient {
     /// in one padded batch via HarmonyPIR sibling queries.
     ///
     /// Mirrors `dpf.rs::run_merkle_verification`: on any bin failing
-    /// verification, the corresponding query is coerced to `None` to signal
-    /// an unverified/untrusted result.
+    /// verification, the corresponding query is coerced to
+    /// `Some(QueryResult::merkle_failed())` to signal an unverified
+    /// (untrusted) result.
+    ///
+    /// Implementation is a thin shim over the two helpers that also
+    /// power the standalone
+    /// [`verify_merkle_batch_for_results`](Self::verify_merkle_batch_for_results)
+    /// API — items come from the per-query [`QueryTraces`], but the
+    /// verifier itself is shared.
     async fn run_merkle_verification(
         &mut self,
         results: &mut [Option<QueryResult>],
         traces: &[QueryTraces],
         db_info: &DatabaseInfo,
     ) -> PirResult<()> {
-        // Build items + mapping from item back to the query it covers.
-        let mut items: Vec<BucketMerkleItem> = Vec::new();
-        let mut item_to_query: Vec<usize> = Vec::new();
-
+        // Log the per-query outcome/item-count summary — kept here (not
+        // in `collect_merkle_items_from_traces`) because this is the
+        // path that feeds `[PIR-AUDIT]` audit logs. The
+        // `verify_merkle_batch_for_results` path rebuilds items from
+        // already-audited query results, so it doesn't need to re-log
+        // the bin counts.
         for (qi, trace) in traces.iter().enumerate() {
-            // Emit one BucketMerkleItem per probed INDEX bin so the Merkle
-            // item count is uniform (INDEX_CUCKOO_NUM_HASHES items per query)
-            // across found / not-found / whale. CHUNK bins attach only to the
-            // matched INDEX item; the other item(s) get empty chunk vectors.
-            //
-            // Whales are verified on the INDEX side — the bin content with
-            // num_chunks=0 is committed to the INDEX Merkle root, so verifying
-            // it proves the server-reported whale status.
             let outcome = match trace.matched_index_idx {
                 Some(_) => {
                     let is_whale = results
@@ -1001,34 +1629,73 @@ impl HarmonyClient {
                 trace.index_bins.len(),
                 trace.chunk_bins.len()
             );
+        }
 
-            for (bi, bin) in trace.index_bins.iter().enumerate() {
-                let is_matched = trace.matched_index_idx == Some(bi);
-                let mut it = BucketMerkleItem {
-                    index_pbc_group: bin.pbc_group,
-                    index_bin_index: bin.bin_index,
-                    index_bin_content: bin.bin_content.clone(),
-                    chunk_pbc_groups: Vec::new(),
-                    chunk_bin_indices: Vec::new(),
-                    chunk_bin_contents: Vec::new(),
-                };
-                if is_matched {
-                    for cb in &trace.chunk_bins {
-                        it.chunk_pbc_groups.push(cb.pbc_group);
-                        it.chunk_bin_indices.push(cb.bin_index);
-                        it.chunk_bin_contents.push(cb.bin_content.clone());
-                    }
+        let (items, item_to_query) = collect_merkle_items_from_traces(traces);
+        let verdicts = self
+            .verify_merkle_items(&items, &item_to_query, results.len(), db_info)
+            .await?;
+
+        for (qi, verdict) in verdicts.into_iter().enumerate() {
+            match verdict {
+                None => continue, // not touched (no items attached to this query)
+                Some(true) => {
+                    log::info!("[PIR-AUDIT] HarmonyPIR Merkle PASSED for query #{}", qi);
+                    // merkle_verified is already true by construction in query_single.
                 }
-                items.push(it);
-                item_to_query.push(qi);
+                Some(false) => {
+                    log::warn!(
+                        "[PIR-AUDIT] HarmonyPIR Merkle FAILED for query #{}: \
+                         emitting QueryResult {{ merkle_verified: false, entries: [] }} (untrusted)",
+                        qi
+                    );
+                    // Surface the failure as a distinct signal from "not found"
+                    // (the old behaviour collapsed both to `None`). Entries are
+                    // wiped so downstream callers cannot accidentally trust
+                    // unverified data even if they ignore `merkle_verified`.
+                    results[qi] = Some(QueryResult::merkle_failed());
+                }
             }
         }
 
+        Ok(())
+    }
+
+    /// Shared verifier backend used by both
+    /// [`run_merkle_verification`](Self::run_merkle_verification) (inline,
+    /// over fresh `QueryTraces`) and
+    /// [`verify_merkle_batch_for_results`](Self::verify_merkle_batch_for_results)
+    /// (standalone, over persisted `QueryResult.index_bins/chunk_bins`).
+    ///
+    /// Runs the full Merkle pipeline: `REQ_BUCKET_MERKLE_TREE_TOPS`
+    /// fetch on the query server, `ensure_sibling_groups_ready` (which
+    /// hits the hint server on cache miss), then
+    /// [`verify_bucket_merkle_batch_generic`] via a
+    /// [`HarmonySiblingQuerier`] holding mutable borrows of the sibling
+    /// group maps + query connection.
+    ///
+    /// Returns one verdict per query:
+    /// * `None`    — no items attached (query skipped verification).
+    /// * `Some(true)`  — all attached items verified.
+    /// * `Some(false)` — at least one item failed.
+    ///
+    /// Padding invariant: per-item Merkle work is uniform by
+    /// construction — callers must always attach
+    /// `INDEX_CUCKOO_NUM_HASHES` INDEX items per query, regardless of
+    /// found/not-found (see CLAUDE.md "Merkle INDEX Item-Count
+    /// Symmetry").
+    async fn verify_merkle_items(
+        &mut self,
+        items: &[BucketMerkleItem],
+        item_to_query: &[usize],
+        num_queries: usize,
+        db_info: &DatabaseInfo,
+    ) -> PirResult<Vec<Option<bool>>> {
         if items.is_empty() {
             log::info!(
                 "[PIR-AUDIT] HarmonyPIR Merkle: no items to verify — nothing to do"
             );
-            return Ok(());
+            return Ok(vec![None; num_queries]);
         }
 
         // Fetch tree-tops blob via the query server (same blob both servers share).
@@ -1044,7 +1711,7 @@ impl HarmonyClient {
 
         // Temporarily move sibling maps out of self so the querier can hold
         // mutable borrows of both them and the query connection. The maps
-        // are restored before returning.
+        // are restored before returning (on success OR failure).
         let mut index_sib_groups = std::mem::take(&mut self.index_sib_groups);
         let mut chunk_sib_groups = std::mem::take(&mut self.chunk_sib_groups);
 
@@ -1060,7 +1727,7 @@ impl HarmonyClient {
             };
             verify_bucket_merkle_batch_generic(
                 &mut querier,
-                &items,
+                items,
                 db_info.index_bins,
                 db_info.chunk_bins,
                 index_k,
@@ -1077,39 +1744,392 @@ impl HarmonyClient {
 
         let per_item = per_item?;
 
-        // Aggregate per-item outcomes back to per-query verdicts.
-        let mut per_query_ok = vec![true; results.len()];
-        let mut per_query_touched = vec![false; results.len()];
+        // Aggregate per-item outcomes back to per-query verdicts: a
+        // query passes iff ALL its items pass.
+        let mut per_query: Vec<Option<bool>> = vec![None; num_queries];
         for (ii, ok) in per_item.iter().enumerate() {
             let qi = item_to_query[ii];
-            per_query_touched[qi] = true;
-            if !ok {
-                per_query_ok[qi] = false;
-            }
+            per_query[qi] = match per_query[qi] {
+                None => Some(*ok),
+                Some(prev) => Some(prev && *ok),
+            };
+        }
+        Ok(per_query)
+    }
+
+    /// Run a batch of PIR queries against `db_id` and return the raw
+    /// per-query results **with inspector state populated**, deferring
+    /// Merkle verification to a later
+    /// [`verify_merkle_batch_for_results`](Self::verify_merkle_batch_for_results)
+    /// call.
+    ///
+    /// # Shape vs. the trait-level `query_batch`
+    ///
+    /// Identical semantics to `DpfClient::query_batch_with_inspector`
+    /// (see that method for the full contract). In short:
+    ///
+    /// * Every successful query returns `Some(QueryResult)` with
+    ///   `index_bins` / `chunk_bins` / `matched_index_idx` populated
+    ///   from the query's internal `QueryTraces`.
+    /// * `matched_index_idx == None && entries.is_empty()` encodes
+    ///   "not found".
+    /// * `merkle_verified` is `true` — Merkle was **not** attempted.
+    ///   Callers that care MUST pass the results to
+    ///   `verify_merkle_batch_for_results` to get real verdicts.
+    ///
+    /// # 🔒 Padding invariant
+    ///
+    /// Same as the hot path — K=75 INDEX / K_CHUNK=80 CHUNK groups per
+    /// round, synthetic HarmonyGroup dummies fill empty slots. This
+    /// method only changes whether the client further requests Merkle
+    /// siblings, not what the server sees at the query layer.
+    pub async fn query_batch_with_inspector(
+        &mut self,
+        script_hashes: &[ScriptHash],
+        db_id: u8,
+    ) -> PirResult<Vec<Option<QueryResult>>> {
+        if !self.is_connected() {
+            return Err(PirError::NotConnected);
         }
 
-        for qi in 0..results.len() {
-            if !per_query_touched[qi] {
-                continue; // whale-without-INDEX-items or skipped
-            }
-            if !per_query_ok[qi] {
-                log::warn!(
-                    "[PIR-AUDIT] HarmonyPIR Merkle FAILED for query #{}: \
-                     emitting QueryResult {{ merkle_verified: false, entries: [] }} (untrusted)",
-                    qi
-                );
-                // Surface the failure as a distinct signal from "not found"
-                // (the old behaviour collapsed both to `None`). Entries are
-                // wiped so downstream callers cannot accidentally trust
-                // unverified data even if they ignore `merkle_verified`.
-                results[qi] = Some(QueryResult::merkle_failed());
-            } else {
-                log::info!("[PIR-AUDIT] HarmonyPIR Merkle PASSED for query #{}", qi);
-                // merkle_verified is already true by construction in query_single.
-            }
+        let catalog = self
+            .catalog
+            .clone()
+            .ok_or_else(|| PirError::InvalidState("no catalog".into()))?;
+
+        let db_info = catalog
+            .get(db_id)
+            .ok_or(PirError::DatabaseNotFound(db_id))?
+            .clone();
+
+        // Ensure groups are loaded for this db before firing queries;
+        // `query_single` would do this per-call, but front-loading it
+        // makes the inspector-path failure mode (hint-fetch errors)
+        // cleaner — they surface as `Err` before any query runs.
+        self.ensure_groups_ready(&db_info).await?;
+
+        let mut results: Vec<Option<QueryResult>> = Vec::with_capacity(script_hashes.len());
+        for script_hash in script_hashes {
+            let (qr, trace) = self.query_single(script_hash, &db_info).await?;
+
+            // Translate the trace into public `BucketRef`s. For
+            // not-found we synthesise an empty `QueryResult` so the
+            // inspector state isn't lost to the `None` return
+            // convention.
+            let with_inspector = match qr {
+                Some(mut r) => {
+                    r.index_bins = trace
+                        .index_bins
+                        .iter()
+                        .map(index_trace_to_bucket_ref)
+                        .collect();
+                    r.chunk_bins = trace
+                        .chunk_bins
+                        .iter()
+                        .map(chunk_trace_to_bucket_ref)
+                        .collect();
+                    r.matched_index_idx = trace.matched_index_idx;
+                    Some(r)
+                }
+                None => {
+                    let mut r = QueryResult::empty();
+                    r.index_bins = trace
+                        .index_bins
+                        .iter()
+                        .map(index_trace_to_bucket_ref)
+                        .collect();
+                    // chunk_bins empty by construction for not-found.
+                    r.matched_index_idx = trace.matched_index_idx;
+                    Some(r)
+                }
+            };
+            results.push(with_inspector);
         }
 
-        Ok(())
+        Ok(results)
+    }
+
+    /// Standalone per-bucket Merkle verifier for results previously
+    /// returned by
+    /// [`query_batch_with_inspector`](Self::query_batch_with_inspector)
+    /// (or reconstructed by the caller from persisted storage — the
+    /// verifier only needs `QueryResult.index_bins`, `chunk_bins`, and
+    /// `matched_index_idx`).
+    ///
+    /// Rebuilds the same `BucketMerkleItem` set the inline
+    /// [`run_merkle_verification`](Self::run_merkle_verification) path
+    /// builds, then runs the networked verifier via the shared
+    /// [`verify_merkle_items`](Self::verify_merkle_items) helper.
+    ///
+    /// Returns one `bool` per input query:
+    /// * `true`  — all items verified, or no items attached (e.g. the
+    ///   caller passed a `None` for that index, so there is nothing to
+    ///   contradict).
+    /// * `false` — at least one attached item failed the proof; the
+    ///   corresponding result must be treated as untrusted and should
+    ///   be discarded or surfaced as `QueryResult::merkle_failed()`.
+    ///
+    /// # 🔒 Padding invariant
+    ///
+    /// The underlying Merkle round is uniform by construction — the
+    /// caller supplies items built from `INDEX_CUCKOO_NUM_HASHES`
+    /// probes per query, and the shared verifier pads each level's
+    /// sibling batch to K / K_CHUNK siblings (see CLAUDE.md "Query
+    /// Padding").
+    pub async fn verify_merkle_batch_for_results(
+        &mut self,
+        results: &[Option<QueryResult>],
+        db_id: u8,
+    ) -> PirResult<Vec<bool>> {
+        if !self.is_connected() {
+            return Err(PirError::NotConnected);
+        }
+
+        let catalog = self
+            .catalog
+            .clone()
+            .ok_or_else(|| PirError::InvalidState("no catalog".into()))?;
+
+        let db_info = catalog
+            .get(db_id)
+            .ok_or(PirError::DatabaseNotFound(db_id))?
+            .clone();
+
+        // If the database doesn't publish bucket Merkle, "verify" is a
+        // no-op — mirrors `execute_step`'s skip branch so callers can
+        // always call `verify_merkle_batch_for_results` without
+        // pre-checking `has_bucket_merkle` first. Matches the
+        // `QueryResult::merkle_verified` semantics ("no failure
+        // detected").
+        if !db_info.has_bucket_merkle {
+            log::info!(
+                "[PIR-AUDIT] HarmonyPIR verify_merkle_batch_for_results SKIPPED: \
+                 db_id={} has no bucket Merkle",
+                db_id
+            );
+            return Ok(vec![true; results.len()]);
+        }
+
+        // ensure_groups_ready + ensure_sibling_groups_ready need the
+        // main groups to exist before sibling hints are fetched —
+        // otherwise the HarmonySiblingQuerier would see empty
+        // `index_sib_groups`/`chunk_sib_groups` maps.
+        self.ensure_groups_ready(&db_info).await?;
+
+        let (items, item_to_query) = collect_merkle_items_from_results(results);
+        let verdicts = self
+            .verify_merkle_items(&items, &item_to_query, results.len(), &db_info)
+            .await?;
+
+        // Translate `Option<bool>` to `bool` for the public surface:
+        // `None` (no items attached) maps to `true` — consistent with
+        // the "nothing to falsify" reading above.
+        Ok(verdicts
+            .into_iter()
+            .map(|v| v.unwrap_or(true))
+            .collect())
+    }
+
+    /// Like [`PirClient::sync`], but drives a [`SyncProgress`] observer
+    /// through every step of the computed [`SyncPlan`]. Intended for
+    /// UI surfaces (terminal spinner, JS `onProgress` callback) that
+    /// want granular feedback on multi-step sync chains.
+    ///
+    /// Progress events fire in this order:
+    /// 1. Per step, `on_step_start(step_index, total_steps, description)`
+    ///    where `description` is the [`SyncStep::name`]
+    ///    (e.g. `"full @940611"` or `"delta 940611→944000"`).
+    /// 2. Per step, `on_step_progress(step_index, 1.0)` once the step's
+    ///    PIR + Merkle work returns (step granularity — sub-step
+    ///    progress isn't wired through the current `execute_step`).
+    /// 3. Per step, `on_step_complete(step_index)`.
+    /// 4. Once all steps succeed, `on_complete(synced_height)`.
+    /// 5. On any error, `on_error(&e)` before the error is propagated.
+    ///
+    /// Padding invariants are preserved — progress is purely
+    /// observational and doesn't change what's sent on the wire.
+    pub async fn sync_with_progress(
+        &mut self,
+        script_hashes: &[ScriptHash],
+        last_height: Option<u32>,
+        progress: &dyn SyncProgress,
+    ) -> PirResult<SyncResult> {
+        let run = async {
+            if !self.is_connected() {
+                self.connect().await?;
+            }
+
+            let catalog = match &self.catalog {
+                Some(c) => c.clone(),
+                None => self.fetch_catalog().await?,
+            };
+
+            let plan = self.compute_sync_plan(&catalog, last_height)?;
+
+            if plan.is_empty() {
+                return Ok(SyncResult {
+                    results: vec![None; script_hashes.len()],
+                    synced_height: plan.target_height,
+                    was_fresh_sync: false,
+                });
+            }
+
+            let catalog = self
+                .catalog
+                .clone()
+                .ok_or_else(|| PirError::InvalidState("no catalog".into()))?;
+
+            let total = plan.steps.len();
+            let mut merged: Vec<Option<QueryResult>> = vec![None; script_hashes.len()];
+            for (step_idx, step) in plan.steps.iter().enumerate() {
+                progress.on_step_start(step_idx, total, &step.name);
+
+                let db_info = catalog
+                    .get(step.db_id)
+                    .ok_or(PirError::DatabaseNotFound(step.db_id))?
+                    .clone();
+
+                let step_results = self.execute_step(script_hashes, step, &db_info).await?;
+
+                // Single coarse tick per step — see doc comment above
+                // for why finer granularity isn't wired yet.
+                progress.on_step_progress(step_idx, 1.0);
+
+                if step.is_full() {
+                    merged = step_results;
+                } else {
+                    merged = merge_delta_batch(&merged, &step_results)?;
+                }
+                progress.on_step_complete(step_idx);
+            }
+
+            let result = SyncResult {
+                results: merged,
+                synced_height: plan.target_height,
+                was_fresh_sync: plan.is_fresh_sync,
+            };
+            progress.on_complete(result.synced_height);
+            Ok(result)
+        }
+        .await;
+
+        if let Err(e) = &run {
+            progress.on_error(e);
+        }
+        run
+    }
+
+    // ─── Session 5 DB-switch + hint stats API ──────────────────────────────
+
+    /// Get the db_id the currently loaded hint state corresponds to,
+    /// or `None` if no hints are loaded.
+    ///
+    /// Mirrors `loaded_db_id` — after a
+    /// [`set_db_id`](Self::set_db_id) to a different id, a subsequent
+    /// `ensure_groups_ready` has to refetch hints (or restore from
+    /// cache) before this matches again.
+    pub fn db_id(&self) -> Option<u8> {
+        self.loaded_db_id
+    }
+
+    /// Invalidate any loaded hint state and pin subsequent queries to
+    /// `db_id`. No network traffic yet; the next
+    /// [`execute_step`](Self::execute_step) /
+    /// [`query_batch`](Self::query_batch) /
+    /// [`query_batch_with_inspector`](Self::query_batch_with_inspector)
+    /// will see the db mismatch and refetch (or restore from the hint
+    /// cache if configured).
+    ///
+    /// Use this when an app pins a wallet to a specific db_id ahead of
+    /// time — e.g. a browser session that just fetched a fresh
+    /// catalog and wants to preload hints for db_id=0 before the user
+    /// initiates a query.
+    ///
+    /// Passing the *same* `db_id` that's already loaded is a no-op;
+    /// switching to any other id clears all in-memory hint state.
+    /// This intentionally drops cached sibling groups too — a
+    /// different db has different tree tops, so stale siblings would
+    /// fail verification on their next use.
+    pub fn set_db_id(&mut self, db_id: u8) {
+        if self.loaded_db_id == Some(db_id) {
+            return;
+        }
+        self.invalidate_groups();
+    }
+
+    /// Minimum remaining per-group query budget across every loaded
+    /// `HarmonyGroup` (main INDEX/CHUNK and sibling INDEX/CHUNK). If
+    /// nothing is loaded, returns `None` — callers should treat that
+    /// as "unknown, call `ensure_groups_ready` first".
+    ///
+    /// HarmonyPIR groups each carry a `max_queries` budget; once any
+    /// group in the batch exhausts, the next PIR round will error out
+    /// on that group. This accessor is the primitive the browser UI
+    /// uses to decide "time to refresh hints" proactively.
+    pub fn min_queries_remaining(&self) -> Option<u32> {
+        let mut min: Option<u32> = None;
+        for g in self.index_groups.values() {
+            let r = g.queries_remaining();
+            min = Some(match min {
+                None => r,
+                Some(m) => m.min(r),
+            });
+        }
+        for g in self.chunk_groups.values() {
+            let r = g.queries_remaining();
+            min = Some(match min {
+                None => r,
+                Some(m) => m.min(r),
+            });
+        }
+        for g in self.index_sib_groups.values() {
+            let r = g.queries_remaining();
+            min = Some(match min {
+                None => r,
+                Some(m) => m.min(r),
+            });
+        }
+        for g in self.chunk_sib_groups.values() {
+            let r = g.queries_remaining();
+            min = Some(match min {
+                None => r,
+                Some(m) => m.min(r),
+            });
+        }
+        min
+    }
+
+    /// Byte size of the blob [`save_hints_bytes`](Self::save_hints_bytes)
+    /// would produce **right now**. Returns 0 when no state is loaded.
+    ///
+    /// This calls `save_hints_bytes()` internally and measures the
+    /// resulting blob length. It is therefore O(total hint bytes) —
+    /// fine for UI-polling-with-a-few-seconds-period cadence, but
+    /// callers should not call it in the hot query path. Silently
+    /// returns 0 on any internal error so UI surfaces don't have to
+    /// care about transport state — this is a display-only estimate.
+    pub fn estimate_hint_size_bytes(&self) -> usize {
+        match self.save_hints_bytes() {
+            Ok(Some(bytes)) => bytes.len(),
+            _ => 0,
+        }
+    }
+
+    /// 16-byte fingerprint of the on-disk / in-memory cache key for
+    /// `db_info` under this client's current master key and PRP
+    /// backend. Useful for JS-side cache eviction policies (e.g.
+    /// IndexedDB key derivation) without recomputing the hash in TS.
+    ///
+    /// This is exactly the same fingerprint embedded in the
+    /// [`save_hints_bytes`](Self::save_hints_bytes) blob header and
+    /// used as the on-disk cache filename stem — so
+    /// `fingerprint(db_info) == load_hints_bytes(save_hints_bytes()?.?,
+    /// db_info)`'s expected fingerprint. The accessor is a pure
+    /// function of `(master_prp_key, prp_backend, db_info)` — no
+    /// network traffic, safe to call from anywhere.
+    pub fn cache_fingerprint(&self, db_info: &DatabaseInfo) -> [u8; 16] {
+        hint_cache::CacheKey::from_db_info(self.master_prp_key, self.prp_backend, db_info)
+            .fingerprint()
     }
 
     /// Build and send one CHUNK batch (K_CHUNK groups, 1 sub-query each).
@@ -1183,15 +2203,53 @@ impl PirClient for HarmonyClient {
             self.hint_server_url,
             self.query_server_url
         );
+        self.notify_state(ConnectionState::Connecting);
 
-        let (hint_conn, query_conn) = tokio::try_join!(
-            WsConnection::connect(&self.hint_server_url),
-            WsConnection::connect(&self.query_server_url),
-        )?;
+        // Native → tokio::try_join! over tokio-tungstenite; WASM →
+        // futures::future::try_join over web-sys WebSocket. See `DpfClient`
+        // for the same pattern with an explanation.
+        #[cfg(not(target_arch = "wasm32"))]
+        let dial_result: PirResult<(Box<dyn PirTransport>, Box<dyn PirTransport>)> = async {
+            let (h, q) = tokio::try_join!(
+                WsConnection::connect(&self.hint_server_url),
+                WsConnection::connect(&self.query_server_url),
+            )?;
+            Ok((
+                Box::new(h) as Box<dyn PirTransport>,
+                Box::new(q) as Box<dyn PirTransport>,
+            ))
+        }
+        .await;
+        #[cfg(target_arch = "wasm32")]
+        let dial_result: PirResult<(Box<dyn PirTransport>, Box<dyn PirTransport>)> = async {
+            use crate::wasm_transport::WasmWebSocketTransport;
+            let (h, q) = futures::future::try_join(
+                WasmWebSocketTransport::connect(&self.hint_server_url),
+                WasmWebSocketTransport::connect(&self.query_server_url),
+            )
+            .await?;
+            Ok((
+                Box::new(h) as Box<dyn PirTransport>,
+                Box::new(q) as Box<dyn PirTransport>,
+            ))
+        }
+        .await;
+
+        let (hint_conn, query_conn) = match dial_result {
+            Ok(v) => v,
+            Err(e) => {
+                // Handshake failed — fall back to `Disconnected`, not
+                // `Connecting`, so observers don't get stuck on an
+                // intermediate state if they didn't install a catch-all.
+                self.notify_state(ConnectionState::Disconnected);
+                return Err(e);
+            }
+        };
 
         self.hint_conn = Some(hint_conn);
         self.query_conn = Some(query_conn);
         log::info!("Connected to both HarmonyPIR servers");
+        self.notify_state(ConnectionState::Connected);
         Ok(())
     }
 
@@ -1206,6 +2264,7 @@ impl PirClient for HarmonyClient {
         self.query_conn = None;
         self.catalog = None;
         self.invalidate_groups();
+        self.notify_state(ConnectionState::Disconnected);
         Ok(())
     }
 
@@ -1608,8 +2667,11 @@ fn format_hash_short(h: &[u8]) -> String {
 /// sibling rounds and `20 + merkle_level` for CHUNK, matching the server
 /// convention (see `runtime::protocol::HarmonyBatchQuery`).
 struct HarmonySiblingQuerier<'a> {
-    /// Query server connection — held mutably across the verification.
-    query_conn: &'a mut WsConnection,
+    /// Query server transport — held mutably across the verification.
+    /// Typed as `&mut dyn PirTransport` so the verifier works against
+    /// any PirTransport impl (WsConnection in production; MockTransport
+    /// in tests; a future WASM WebSocket impl without a code change).
+    query_conn: &'a mut dyn PirTransport,
     /// INDEX sibling groups keyed by `(merkle_level, group_id)`.
     /// Populated by `HarmonyClient::ensure_sibling_groups_ready`.
     index_sib_groups: &'a mut HashMap<(usize, u8), HarmonyGroup>,
@@ -1780,5 +2842,492 @@ mod tests {
         let v = bytes_to_u32_vec(&bytes).unwrap();
         assert_eq!(v, vec![1u32, 2u32]);
         assert!(bytes_to_u32_vec(&[1, 2, 3]).is_err());
+    }
+
+    /// Demonstrates the test-injection escape hatch: a client built with a
+    /// pair of [`MockTransport`](crate::transport::mock::MockTransport)s
+    /// reports `is_connected()` without ever opening a real socket. This is
+    /// the core value prop of the `PirTransport` trait.
+    #[test]
+    fn connect_with_transport_marks_connected() {
+        use crate::transport::mock::MockTransport;
+        let mut client =
+            HarmonyClient::new("wss://mock-hint", "wss://mock-query");
+        assert!(!client.is_connected());
+        client.connect_with_transport(
+            Box::new(MockTransport::new("wss://mock-hint")),
+            Box::new(MockTransport::new("wss://mock-query")),
+        );
+        assert!(client.is_connected());
+    }
+
+    // ─── Hint cache plumbing tests ─────────────────────────────────────────
+
+    fn sample_db_info() -> DatabaseInfo {
+        DatabaseInfo {
+            db_id: 0,
+            kind: DatabaseKind::Full,
+            name: "test".into(),
+            height: 100,
+            // Keep params tiny so HarmonyGroup::new runs in milliseconds.
+            // INDEX + CHUNK bins don't need to be realistic; we only
+            // exercise state round-trip, not PIR correctness.
+            index_bins: 32,
+            chunk_bins: 32,
+            index_k: 2,
+            chunk_k: 2,
+            tag_seed: 0x1234_5678_9ABC_DEF0,
+            dpf_n_index: 5,
+            dpf_n_chunk: 5,
+            has_bucket_merkle: false,
+        }
+    }
+
+    /// Populate a client's main groups locally without touching the
+    /// network — mirrors what `ensure_groups_ready` does on a cache
+    /// miss, minus the `fetch_and_load_hints` network roundtrips.
+    /// This lets us exercise `save_hints_bytes` / `load_hints_bytes`
+    /// purely in-process.
+    fn populate_main_groups(client: &mut HarmonyClient, info: &DatabaseInfo) {
+        let k_index = info.index_k as usize;
+        let k_chunk = info.chunk_k as usize;
+        let index_w = (INDEX_SLOTS_PER_BIN * INDEX_SLOT_SIZE) as u32;
+        let chunk_w = (CHUNK_SLOTS_PER_BIN * CHUNK_SLOT_SIZE) as u32;
+
+        for g in 0..k_index {
+            let group = HarmonyGroup::new_with_backend(
+                info.index_bins,
+                index_w,
+                0,
+                &client.master_prp_key,
+                g as u32,
+                client.prp_backend,
+            )
+            .expect("HarmonyGroup init");
+            client.index_groups.insert(g as u8, group);
+        }
+        for g in 0..k_chunk {
+            let group = HarmonyGroup::new_with_backend(
+                info.chunk_bins,
+                chunk_w,
+                0,
+                &client.master_prp_key,
+                (k_index + g) as u32,
+                client.prp_backend,
+            )
+            .expect("HarmonyGroup init");
+            client.chunk_groups.insert(g as u8, group);
+        }
+        client.loaded_db_id = Some(info.db_id);
+    }
+
+    #[test]
+    fn with_hint_cache_dir_sets_and_reads() {
+        let client = HarmonyClient::new("wss://h", "wss://q")
+            .with_hint_cache_dir("/tmp/pir-test-cache");
+        assert_eq!(
+            client.hint_cache_dir(),
+            Some(std::path::Path::new("/tmp/pir-test-cache"))
+        );
+    }
+
+    #[test]
+    fn set_hint_cache_dir_mutates_and_clears() {
+        let mut client = HarmonyClient::new("wss://h", "wss://q");
+        assert!(client.hint_cache_dir().is_none());
+        client.set_hint_cache_dir(Some(PathBuf::from("/tmp/x")));
+        assert_eq!(
+            client.hint_cache_dir(),
+            Some(std::path::Path::new("/tmp/x"))
+        );
+        client.set_hint_cache_dir(None);
+        assert!(client.hint_cache_dir().is_none());
+    }
+
+    #[test]
+    fn save_hints_bytes_returns_none_when_nothing_loaded() {
+        let client = HarmonyClient::new("wss://h", "wss://q");
+        // Even though loaded_db_id is None by default, also require a
+        // populated catalog to avoid false positives.
+        let out = client.save_hints_bytes().unwrap();
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn save_hints_bytes_errors_when_catalog_missing() {
+        let mut client = HarmonyClient::new("wss://h", "wss://q");
+        client.loaded_db_id = Some(0);
+        // No catalog installed → InvalidState.
+        let err = client.save_hints_bytes().unwrap_err();
+        assert!(matches!(err, PirError::InvalidState(_)));
+    }
+
+    #[test]
+    fn save_and_load_hints_bytes_round_trips_main_groups() {
+        let info = sample_db_info();
+        let mut client = HarmonyClient::new("wss://h", "wss://q");
+        client.set_master_key([0x42u8; 16]);
+        client.catalog = Some(DatabaseCatalog {
+            databases: vec![info.clone()],
+        });
+        populate_main_groups(&mut client, &info);
+
+        let bytes = client.save_hints_bytes().unwrap().expect("some bytes");
+        assert!(!bytes.is_empty());
+
+        // Reset the client and reload from the blob.
+        let mut client2 = HarmonyClient::new("wss://h", "wss://q");
+        client2.set_master_key([0x42u8; 16]);
+        client2.catalog = Some(DatabaseCatalog {
+            databases: vec![info.clone()],
+        });
+        client2.load_hints_bytes(&bytes, &info).unwrap();
+
+        assert_eq!(client2.loaded_db_id, Some(info.db_id));
+        assert_eq!(client2.index_groups.len(), info.index_k as usize);
+        assert_eq!(client2.chunk_groups.len(), info.chunk_k as usize);
+        // Sibling state wasn't populated; shouldn't be claimed.
+        assert!(client2.sibling_hints_loaded.is_none());
+    }
+
+    #[test]
+    fn load_hints_bytes_rejects_master_key_mismatch() {
+        let info = sample_db_info();
+        let mut client = HarmonyClient::new("wss://h", "wss://q");
+        client.set_master_key([0x11u8; 16]);
+        client.catalog = Some(DatabaseCatalog {
+            databases: vec![info.clone()],
+        });
+        populate_main_groups(&mut client, &info);
+        let bytes = client.save_hints_bytes().unwrap().expect("some bytes");
+
+        // Second client with a different master key should refuse.
+        let mut client2 = HarmonyClient::new("wss://h", "wss://q");
+        client2.set_master_key([0x22u8; 16]);
+        let err = client2.load_hints_bytes(&bytes, &info).unwrap_err();
+        assert!(
+            matches!(err, PirError::InvalidState(_)),
+            "expected InvalidState, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn load_hints_bytes_rejects_shape_mismatch() {
+        let info_a = sample_db_info();
+        let mut info_b = sample_db_info();
+        info_b.index_bins *= 2;
+
+        let mut client = HarmonyClient::new("wss://h", "wss://q");
+        client.set_master_key([0x33u8; 16]);
+        client.catalog = Some(DatabaseCatalog {
+            databases: vec![info_a.clone()],
+        });
+        populate_main_groups(&mut client, &info_a);
+        let bytes = client.save_hints_bytes().unwrap().expect("bytes");
+
+        // Load with db info that has different shape → fingerprint
+        // mismatch.
+        let mut client2 = HarmonyClient::new("wss://h", "wss://q");
+        client2.set_master_key([0x33u8; 16]);
+        let err = client2.load_hints_bytes(&bytes, &info_b).unwrap_err();
+        assert!(matches!(err, PirError::InvalidState(_)));
+    }
+
+    #[test]
+    fn persist_and_restore_hints_to_cache_round_trips() {
+        let info = sample_db_info();
+        let tmp = std::env::temp_dir().join(format!(
+            "pir-sdk-harmony-cache-{}-{}",
+            std::process::id(),
+            pir_core::merkle::sha256(b"persist-restore")[0]
+        ));
+        // Fresh client writes a cache file.
+        let mut client = HarmonyClient::new("wss://h", "wss://q")
+            .with_hint_cache_dir(&tmp);
+        client.set_master_key([0x77u8; 16]);
+        client.catalog = Some(DatabaseCatalog {
+            databases: vec![info.clone()],
+        });
+        populate_main_groups(&mut client, &info);
+        client.persist_hints_to_cache(&info).unwrap();
+
+        // Second client reads it back.
+        let mut client2 = HarmonyClient::new("wss://h", "wss://q")
+            .with_hint_cache_dir(&tmp);
+        client2.set_master_key([0x77u8; 16]);
+        // No catalog needed on restore — fingerprint includes db shape
+        // + master key, both of which we supply here directly.
+        let restored = client2.restore_hints_from_cache(&info).unwrap();
+        assert!(restored);
+        assert_eq!(client2.loaded_db_id, Some(info.db_id));
+        assert_eq!(client2.index_groups.len(), info.index_k as usize);
+        assert_eq!(client2.chunk_groups.len(), info.chunk_k as usize);
+
+        // Cold-cache path: different master key → fingerprint mismatch
+        // → `restore_hints_from_cache` returns false (not an error),
+        // the groups stay invalidated.
+        let mut client3 = HarmonyClient::new("wss://h", "wss://q")
+            .with_hint_cache_dir(&tmp);
+        client3.set_master_key([0x88u8; 16]); // different key
+        let restored3 = client3.restore_hints_from_cache(&info).unwrap();
+        assert!(!restored3);
+        assert!(client3.loaded_db_id.is_none());
+        assert!(client3.index_groups.is_empty());
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn restore_hints_from_cache_returns_false_when_dir_unset() {
+        let info = sample_db_info();
+        let mut client = HarmonyClient::new("wss://h", "wss://q");
+        assert!(!client.restore_hints_from_cache(&info).unwrap());
+    }
+
+    #[test]
+    fn restore_hints_from_cache_returns_false_when_file_missing() {
+        let info = sample_db_info();
+        let tmp = std::env::temp_dir().join(format!(
+            "pir-sdk-harmony-missing-{}-{}",
+            std::process::id(),
+            pir_core::merkle::sha256(b"missing")[0]
+        ));
+        let mut client = HarmonyClient::new("wss://h", "wss://q")
+            .with_hint_cache_dir(&tmp);
+        // No file yet → cold cache returns false.
+        let restored = client.restore_hints_from_cache(&info).unwrap();
+        assert!(!restored);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn persist_hints_to_cache_is_noop_when_nothing_loaded() {
+        // Sanity: if we haven't loaded anything, persist is a no-op
+        // even with a cache directory set (no panics, no stray files).
+        let info = sample_db_info();
+        let tmp = std::env::temp_dir().join(format!(
+            "pir-sdk-harmony-noop-{}-{}",
+            std::process::id(),
+            pir_core::merkle::sha256(b"noop")[0]
+        ));
+        let client = HarmonyClient::new("wss://h", "wss://q")
+            .with_hint_cache_dir(&tmp);
+        client.persist_hints_to_cache(&info).unwrap();
+        // No file should have been written.
+        let path = client.cache_path_for(&info).unwrap();
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn cache_path_for_is_none_when_dir_unset() {
+        let client = HarmonyClient::new("wss://h", "wss://q");
+        assert!(client.cache_path_for(&sample_db_info()).is_none());
+    }
+
+    #[test]
+    fn cache_path_for_uses_fingerprint_filename() {
+        let info = sample_db_info();
+        let client = HarmonyClient::new("wss://h", "wss://q")
+            .with_hint_cache_dir("/tmp/dir");
+        let path = client.cache_path_for(&info).unwrap();
+        assert_eq!(path.parent(), Some(std::path::Path::new("/tmp/dir")));
+        let filename = path.file_name().unwrap().to_string_lossy();
+        assert!(filename.ends_with(".hints"));
+        assert_eq!(filename.len(), 32 + ".hints".len());
+    }
+
+    // ─── Session 5: state listener + server_urls + db_id tests ─────────────
+
+    /// Recorder impl of [`StateListener`] — records every transition in a
+    /// mutex-guarded vec so assertions can check ordering across the
+    /// async connect/disconnect transitions.
+    struct RecordingListener {
+        events: std::sync::Mutex<Vec<ConnectionState>>,
+    }
+
+    impl StateListener for RecordingListener {
+        fn on_state_change(&self, state: ConnectionState) {
+            self.events.lock().unwrap().push(state);
+        }
+    }
+
+    /// `connect_with_transport` fires a `Connected` event on the
+    /// registered listener. This is the main state-listener contract
+    /// the WASM `onStateChange` surface relies on.
+    #[test]
+    fn state_listener_fires_on_connect_with_transport() {
+        use crate::transport::mock::MockTransport;
+        let listener = Arc::new(RecordingListener {
+            events: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut client = HarmonyClient::new("wss://mock-hint", "wss://mock-query");
+        client.set_state_listener(Some(listener.clone()));
+        client.connect_with_transport(
+            Box::new(MockTransport::new("wss://mock-hint")),
+            Box::new(MockTransport::new("wss://mock-query")),
+        );
+        let events = listener.events.lock().unwrap();
+        assert_eq!(&*events, &[ConnectionState::Connected]);
+    }
+
+    /// `set_state_listener(None)` silences a previously registered
+    /// listener — subsequent transitions must not reach it.
+    #[test]
+    fn set_state_listener_none_silences_listener() {
+        use crate::transport::mock::MockTransport;
+        let listener = Arc::new(RecordingListener {
+            events: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut client = HarmonyClient::new("wss://mock-hint", "wss://mock-query");
+        client.set_state_listener(Some(listener.clone()));
+        client.set_state_listener(None);
+        client.connect_with_transport(
+            Box::new(MockTransport::new("wss://mock-hint")),
+            Box::new(MockTransport::new("wss://mock-query")),
+        );
+        assert!(listener.events.lock().unwrap().is_empty());
+    }
+
+    /// Replacing the listener must swap the sink cleanly — only the
+    /// new listener sees subsequent events.
+    #[test]
+    fn set_state_listener_replaces_previous() {
+        use crate::transport::mock::MockTransport;
+        let old = Arc::new(RecordingListener {
+            events: std::sync::Mutex::new(Vec::new()),
+        });
+        let new = Arc::new(RecordingListener {
+            events: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut client = HarmonyClient::new("wss://mock-hint", "wss://mock-query");
+        client.set_state_listener(Some(old.clone()));
+        client.set_state_listener(Some(new.clone()));
+        client.connect_with_transport(
+            Box::new(MockTransport::new("wss://mock-hint")),
+            Box::new(MockTransport::new("wss://mock-query")),
+        );
+        assert!(old.events.lock().unwrap().is_empty());
+        assert_eq!(
+            &*new.events.lock().unwrap(),
+            &[ConnectionState::Connected]
+        );
+    }
+
+    /// Smoke test: `server_urls()` echoes the constructor arguments in
+    /// `(hint, query)` order — mirrors DPF's `(server0, server1)`.
+    #[test]
+    fn server_urls_returns_configured_urls() {
+        let client = HarmonyClient::new("wss://hint.example", "wss://query.example");
+        let (h, q) = client.server_urls();
+        assert_eq!(h, "wss://hint.example");
+        assert_eq!(q, "wss://query.example");
+    }
+
+    /// `db_id()` initially None, becomes `Some(id)` after hints populate,
+    /// and `set_db_id(same)` is an idempotent no-op.
+    #[test]
+    fn db_id_roundtrip_with_same_id_is_noop() {
+        let info = sample_db_info();
+        let mut client = HarmonyClient::new("wss://h", "wss://q");
+        assert_eq!(client.db_id(), None);
+        populate_main_groups(&mut client, &info);
+        assert_eq!(client.db_id(), Some(info.db_id));
+        // Same id → groups stay loaded.
+        client.set_db_id(info.db_id);
+        assert_eq!(client.db_id(), Some(info.db_id));
+        assert!(!client.index_groups.is_empty());
+    }
+
+    /// `set_db_id(different)` must invalidate ALL group maps — main
+    /// AND sibling. Different db has different tree tops, so stale
+    /// siblings would fail verification on next use.
+    #[test]
+    fn set_db_id_different_invalidates_all_groups() {
+        let info = sample_db_info();
+        let mut client = HarmonyClient::new("wss://h", "wss://q");
+        populate_main_groups(&mut client, &info);
+        // Simulate some sibling state being loaded too.
+        client.sibling_hints_loaded = Some(info.db_id);
+
+        client.set_db_id(info.db_id + 1);
+        assert_eq!(client.db_id(), None);
+        assert!(client.index_groups.is_empty());
+        assert!(client.chunk_groups.is_empty());
+        assert!(client.index_sib_groups.is_empty());
+        assert!(client.chunk_sib_groups.is_empty());
+        assert!(client.sibling_hints_loaded.is_none());
+    }
+
+    /// `min_queries_remaining()` is None when no groups are loaded, and
+    /// returns the *min* across all loaded group maps once populated.
+    #[test]
+    fn min_queries_remaining_aggregates_across_group_maps() {
+        let info = sample_db_info();
+        let mut client = HarmonyClient::new("wss://h", "wss://q");
+        assert_eq!(client.min_queries_remaining(), None);
+        populate_main_groups(&mut client, &info);
+        // All freshly-populated groups carry `max_queries` budget; the
+        // min must be Some and equal the group budget.
+        let min = client.min_queries_remaining();
+        assert!(min.is_some());
+        let max_q = client
+            .index_groups
+            .values()
+            .next()
+            .unwrap()
+            .max_queries();
+        assert_eq!(min, Some(max_q));
+    }
+
+    /// `estimate_hint_size_bytes` is 0 when nothing is loaded, and
+    /// positive (and matches `save_hints_bytes().len()`) when loaded.
+    #[test]
+    fn estimate_hint_size_bytes_matches_save_hints_length() {
+        let info = sample_db_info();
+        let mut client = HarmonyClient::new("wss://h", "wss://q");
+        client.set_master_key([0x55u8; 16]);
+        assert_eq!(client.estimate_hint_size_bytes(), 0);
+
+        client.catalog = Some(DatabaseCatalog {
+            databases: vec![info.clone()],
+        });
+        populate_main_groups(&mut client, &info);
+        let bytes = client.save_hints_bytes().unwrap().expect("bytes");
+        assert_eq!(client.estimate_hint_size_bytes(), bytes.len());
+        assert!(bytes.len() > 0);
+    }
+
+    /// `cache_fingerprint` is a pure function of `(master_key,
+    /// prp_backend, db_info)` — calling it twice returns identical bytes,
+    /// and it matches the fingerprint embedded in the save-hints blob
+    /// header (bytes 6..22 after `PSH1` magic + 2-byte version + 32-byte
+    /// schema-hash).
+    #[test]
+    fn cache_fingerprint_is_stable_and_matches_blob_header() {
+        let info = sample_db_info();
+        let mut client = HarmonyClient::new("wss://h", "wss://q");
+        client.set_master_key([0xA5u8; 16]);
+
+        let fp1 = client.cache_fingerprint(&info);
+        let fp2 = client.cache_fingerprint(&info);
+        assert_eq!(fp1, fp2);
+
+        // Different master key → different fingerprint.
+        let mut other = HarmonyClient::new("wss://h", "wss://q");
+        other.set_master_key([0xB6u8; 16]);
+        assert_ne!(fp1, other.cache_fingerprint(&info));
+
+        // Cross-check against hint_cache::CacheKey directly — that's
+        // the authoritative source for the blob-header fingerprint.
+        let expected = hint_cache::CacheKey::from_db_info(
+            client.master_prp_key,
+            client.prp_backend,
+            &info,
+        )
+        .fingerprint();
+        assert_eq!(fp1, expected);
     }
 }

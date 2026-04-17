@@ -706,7 +706,7 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
     </div>
 
     <script type="module">
-        import { BatchPirClient, OnionPirWebClient, HarmonyPirClient, hexToBytes, bytesToHex, scriptHash, scriptPubKeyToAddress, addressToScriptPubKey, decompileScript, decodeDeltaData, computeSyncPlan, mergeDeltaIntoSnapshot, mergeDeltaIntoHarmonySnapshot, SyncController, describeStep, initSdkWasm, isSdkWasmReady } from './src/index.ts';
+        import { BatchPirClientAdapter, OnionPirWebClient, HarmonyPirClientAdapter, hexToBytes, bytesToHex, scriptHash, scriptPubKeyToAddress, addressToScriptPubKey, decompileScript, decodeDeltaData, computeSyncPlan, mergeDeltaIntoSnapshot, mergeDeltaIntoHarmonySnapshot, SyncController, describeStep, initSdkWasm, isSdkWasmReady } from './src/index.ts';
         import { fetchResidency } from './src/server-info.ts';
 
         // Initialize SDK WASM (optional - falls back to TS if unavailable)
@@ -1276,7 +1276,7 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
             try {
                 log(`Connecting to servers...`);
 
-                client = new BatchPirClient({
+                client = new BatchPirClientAdapter({
                     server0Url,
                     server1Url,
                     onConnectionStateChange: (state, message) => {
@@ -2709,21 +2709,24 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                 statusDiv.className = 'status connecting';
                 log('HarmonyPIR: Loading WASM + connecting...');
 
-                hpClient = new HarmonyPirClient({
+                hpClient = new HarmonyPirClientAdapter({
                     hintServerUrl,
                     queryServerUrl,
                     prpBackend: hpCurrentPrp,
                     onProgress: (msg) => {
                         log(`HarmonyPIR: ${msg}`);
-                        // Update offline indicator from hint progress messages.
-                        const match = msg.match(/Hints:\s+(\d+)\/(\d+)/);
-                        if (match) {
-                            const [, received, total] = match;
-                            const pct = Math.round((parseInt(received) / parseInt(total)) * 100);
-                            const fill = document.getElementById('hp-offlineFill');
-                            const label = document.getElementById('hp-offlineLabel');
-                            if (fill) fill.style.width = `${pct}%`;
-                            if (label) label.textContent = `${received}/${total} groups (${pct}%)`;
+                        // Legacy progress text ("Hints: N/155") is no longer
+                        // emitted — the native HarmonyClient fetches hints
+                        // inside a single call. Flip the offline bar to
+                        // an indeterminate 100% when hints are ready.
+                        const fill = document.getElementById('hp-offlineFill');
+                        const label = document.getElementById('hp-offlineLabel');
+                        if (msg.startsWith('Hints: downloading')) {
+                            if (fill) fill.style.width = `0%`;
+                            if (label) label.textContent = 'Downloading hints…';
+                        } else if (msg.startsWith('Hints: ready') || msg.startsWith('Hints restored')) {
+                            if (fill) fill.style.width = `100%`;
+                            if (label) label.textContent = 'Hints loaded';
                         }
                     },
                 });

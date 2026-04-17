@@ -49,15 +49,27 @@
 //! let updated = client.sync(&script_hashes, Some(height)).await?;
 //! ```
 
+// `connection` hosts the tokio-tungstenite + rustls native WebSocket client.
+// It is native-only: its deps (`tokio::net::TcpStream`, `rustls`,
+// `tokio_tungstenite::connect_async`) don't compile to
+// `wasm32-unknown-unknown`. On wasm32 the equivalent role is played by
+// [`wasm_transport::WasmWebSocketTransport`], which wraps `web_sys::WebSocket`
+// and bridges its callback-driven API to `async/.await` via an mpsc channel.
+#[cfg(not(target_arch = "wasm32"))]
 mod connection;
 mod dpf;
 mod harmony;
+pub mod hint_cache;
 mod merkle_verify;
 mod onion;
 #[cfg(feature = "onion")]
 mod onion_merkle;
 mod protocol;
+mod transport;
+#[cfg(target_arch = "wasm32")]
+mod wasm_transport;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use connection::{
     RetryPolicy, WsConnection, DEFAULT_CONNECT_TIMEOUT, DEFAULT_INITIAL_BACKOFF_DELAY,
     DEFAULT_MAX_BACKOFF_DELAY, DEFAULT_MAX_CONNECT_ATTEMPTS, DEFAULT_REQUEST_TIMEOUT,
@@ -65,6 +77,9 @@ pub use connection::{
 pub use dpf::DpfClient;
 pub use harmony::{HarmonyClient, PRP_ALF, PRP_FASTPRP, PRP_HOANG};
 pub use onion::OnionClient;
+pub use transport::PirTransport;
+#[cfg(target_arch = "wasm32")]
+pub use wasm_transport::WasmWebSocketTransport;
 
 // Re-export SDK types
 pub use pir_sdk::{

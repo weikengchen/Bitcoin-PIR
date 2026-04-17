@@ -15,8 +15,8 @@
  * `decodeDeltaData` from codec.ts.
  */
 
-import type { QueryResult, UtxoEntry } from './client.js';
-import type { HarmonyQueryResult, HarmonyUtxoEntry } from './harmonypir_client.js';
+import type { QueryResult, UtxoEntry } from './types.js';
+import type { HarmonyQueryResult, HarmonyUtxoEntry } from './harmony-types.js';
 import { decodeDeltaData, type DeltaData, type SpentRef } from './codec.js';
 import { bytesToHex } from './hash.js';
 
@@ -136,7 +136,7 @@ export function mergeDeltaBatch(
  * The delta decoding is shared with DPF/OnionPIR via `decodeDeltaData` — only
  * the snapshot type differs. Delta `amount: bigint` is downcast to
  * `value: number` to match HarmonyPIR's internal representation (which is
- * already lossy at the client level; see harmonypir_client.ts:55–59).
+ * already lossy at the client level; see harmony-types.ts `HarmonyUtxoEntry`).
  */
 export function mergeDeltaIntoHarmonySnapshot(
   snapshot: HarmonyQueryResult | null,

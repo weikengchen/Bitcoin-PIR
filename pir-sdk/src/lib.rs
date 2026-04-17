@@ -44,9 +44,12 @@ pub mod sync;
 
 // Re-export main types at crate root
 pub use types::*;
-pub use error::{PirError, PirResult};
+pub use error::{ErrorKind, PirError, PirResult};
 pub use backend::PirBackend;
-pub use client::{PirClient, PirClientConfig, SyncProgress, NoProgress, PrintProgress};
+pub use client::{
+    ConnectionState, NoProgress, PirClient, PirClientConfig, PrintProgress, StateListener,
+    SyncProgress,
+};
 pub use sync::{SyncPlan, SyncStep, compute_sync_plan, merge_delta, merge_delta_batch, DeltaData, decode_delta_data};
 
 // Re-export pir-core for convenience

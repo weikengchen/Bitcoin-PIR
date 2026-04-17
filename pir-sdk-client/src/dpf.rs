@@ -3,18 +3,21 @@
 //! This implements the two-level Batch PIR protocol using Distributed Point Functions.
 //! Queries are split across two servers; XORing their responses reveals the actual data.
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::connection::WsConnection;
 use crate::merkle_verify::{
     fetch_tree_tops, verify_bucket_merkle_batch_dpf, BucketMerkleItem,
 };
 use crate::protocol::{decode_catalog, encode_request, REQ_GET_DB_CATALOG, RESP_DB_CATALOG};
+use crate::transport::PirTransport;
 use async_trait::async_trait;
 use libdpf::Dpf;
 use pir_sdk::{
-    compute_sync_plan, merge_delta_batch, DatabaseCatalog, DatabaseInfo, DatabaseKind,
-    PirBackendType, PirClient, PirError, PirResult, QueryResult, ScriptHash, SyncPlan, SyncResult,
-    SyncStep, UtxoEntry,
+    compute_sync_plan, merge_delta_batch, BucketRef, ConnectionState, DatabaseCatalog,
+    DatabaseInfo, DatabaseKind, PirBackendType, PirClient, PirError, PirResult, QueryResult,
+    ScriptHash, StateListener, SyncPlan, SyncProgress, SyncResult, SyncStep, UtxoEntry,
 };
+use std::sync::Arc;
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -96,15 +99,141 @@ struct QueryTraces {
     chunk_bins: Vec<ChunkBinTrace>,
 }
 
+/// Build `BucketMerkleItem`s for one query from its internal trace —
+/// emits one item per probed INDEX cuckoo bin, with CHUNK bins attached
+/// only to the matched INDEX item (or none, if not matched). This layout
+/// preserves the 🔒 Merkle INDEX Item-Count Symmetry invariant: every
+/// query contributes exactly `INDEX_CUCKOO_NUM_HASHES` items regardless
+/// of found / not-found / whale.
+fn items_from_trace(trace: &QueryTraces) -> Vec<BucketMerkleItem> {
+    trace
+        .index_bins
+        .iter()
+        .enumerate()
+        .map(|(bi, bin)| {
+            let mut it = BucketMerkleItem {
+                index_pbc_group: bin.pbc_group,
+                index_bin_index: bin.bin_index,
+                index_bin_content: bin.bin_content.clone(),
+                chunk_pbc_groups: Vec::new(),
+                chunk_bin_indices: Vec::new(),
+                chunk_bin_contents: Vec::new(),
+            };
+            if trace.matched_index_idx == Some(bi) {
+                for cb in &trace.chunk_bins {
+                    it.chunk_pbc_groups.push(cb.pbc_group);
+                    it.chunk_bin_indices.push(cb.bin_index);
+                    it.chunk_bin_contents.push(cb.bin_content.clone());
+                }
+            }
+            it
+        })
+        .collect()
+}
+
+/// Flatten a per-query traces list into a padded item list plus the
+/// `item_index → query_index` backmapping the verifier needs to fold
+/// per-item verdicts back to per-query verdicts.
+fn collect_merkle_items_from_traces(
+    traces: &[QueryTraces],
+) -> (Vec<BucketMerkleItem>, Vec<usize>) {
+    let mut items = Vec::new();
+    let mut item_to_query = Vec::new();
+    for (qi, trace) in traces.iter().enumerate() {
+        for it in items_from_trace(trace) {
+            items.push(it);
+            item_to_query.push(qi);
+        }
+    }
+    (items, item_to_query)
+}
+
+/// Build `BucketMerkleItem`s for one query from a `QueryResult`'s
+/// inspector-populated fields (`index_bins`, `chunk_bins`,
+/// `matched_index_idx`). Symmetric with [`items_from_trace`] — same
+/// per-query-item layout, same ordering — but works on the public type
+/// so callers can reverify persisted results via
+/// [`DpfClient::verify_merkle_batch_for_results`].
+fn items_from_inspector_result(result: &QueryResult) -> Vec<BucketMerkleItem> {
+    result
+        .index_bins
+        .iter()
+        .enumerate()
+        .map(|(bi, bin)| {
+            let mut it = BucketMerkleItem {
+                index_pbc_group: bin.pbc_group as usize,
+                index_bin_index: bin.bin_index,
+                index_bin_content: bin.bin_content.clone(),
+                chunk_pbc_groups: Vec::new(),
+                chunk_bin_indices: Vec::new(),
+                chunk_bin_contents: Vec::new(),
+            };
+            if result.matched_index_idx == Some(bi) {
+                for cb in &result.chunk_bins {
+                    it.chunk_pbc_groups.push(cb.pbc_group as usize);
+                    it.chunk_bin_indices.push(cb.bin_index);
+                    it.chunk_bin_contents.push(cb.bin_content.clone());
+                }
+            }
+            it
+        })
+        .collect()
+}
+
+/// Flatten a per-query `QueryResult` list into a padded item list plus
+/// the `item_index → query_index` backmapping. `None` results contribute
+/// zero items (nothing to verify).
+fn collect_merkle_items_from_results(
+    results: &[Option<QueryResult>],
+) -> (Vec<BucketMerkleItem>, Vec<usize>) {
+    let mut items = Vec::new();
+    let mut item_to_query = Vec::new();
+    for (qi, maybe_r) in results.iter().enumerate() {
+        if let Some(r) = maybe_r {
+            for it in items_from_inspector_result(r) {
+                items.push(it);
+                item_to_query.push(qi);
+            }
+        }
+    }
+    (items, item_to_query)
+}
+
+/// Convert an internal `IndexBinTrace` / `ChunkBinTrace` into the public
+/// `BucketRef` shape. The public type widens `pbc_group` to `u32` and
+/// drops the internal `ChunkBinTrace` vs `IndexBinTrace` distinction —
+/// the discriminant is already encoded by which vec the ref lives on
+/// (`QueryResult.index_bins` vs `QueryResult.chunk_bins`).
+fn index_trace_to_bucket_ref(t: &IndexBinTrace) -> BucketRef {
+    BucketRef {
+        pbc_group: t.pbc_group as u32,
+        bin_index: t.bin_index,
+        bin_content: t.bin_content.clone(),
+    }
+}
+
+fn chunk_trace_to_bucket_ref(t: &ChunkBinTrace) -> BucketRef {
+    BucketRef {
+        pbc_group: t.pbc_group as u32,
+        bin_index: t.bin_index,
+        bin_content: t.bin_content.clone(),
+    }
+}
+
 // ─── DPF Client ─────────────────────────────────────────────────────────────
 
 /// DPF-PIR client for two-server PIR queries.
 pub struct DpfClient {
     server0_url: String,
     server1_url: String,
-    conn0: Option<WsConnection>,
-    conn1: Option<WsConnection>,
+    conn0: Option<Box<dyn PirTransport>>,
+    conn1: Option<Box<dyn PirTransport>>,
     catalog: Option<DatabaseCatalog>,
+    /// Optional observer invoked on every `ConnectionState` transition.
+    /// `Arc` instead of `Box` so one listener can be shared between a
+    /// DPF client, a Harmony client, a logger, etc. — mirrors how the
+    /// WASM side stores an `Rc<RefCell<Closure>>` behind a `SendWrapper`.
+    state_listener: Option<Arc<dyn StateListener>>,
 }
 
 impl DpfClient {
@@ -116,7 +245,52 @@ impl DpfClient {
             conn0: None,
             conn1: None,
             catalog: None,
+            state_listener: None,
         }
+    }
+
+    /// Register a callback that will be invoked on every
+    /// [`ConnectionState`] transition (`Connecting` → `Connected` /
+    /// `Disconnected`). Replaces any previously registered listener —
+    /// only one listener per client; share one `Arc<dyn StateListener>`
+    /// across multiple clients if you need a fan-in sink.
+    ///
+    /// No-op invocation if the listener is `None`; passing a fresh
+    /// `None` clears the slot.
+    pub fn set_state_listener(&mut self, listener: Option<Arc<dyn StateListener>>) {
+        self.state_listener = listener;
+    }
+
+    /// Emit a state transition to the registered listener, if any.
+    /// Kept as an inherent method so the async `connect`/`disconnect`
+    /// trait impls can fire it without re-borrowing `self`.
+    fn notify_state(&self, state: ConnectionState) {
+        if let Some(listener) = &self.state_listener {
+            listener.on_state_change(state);
+        }
+    }
+
+    /// Install pre-built transports directly, bypassing the URL-based
+    /// [`PirClient::connect`] path.
+    ///
+    /// This is the test-injection escape hatch the `PirTransport` trait was
+    /// designed around: state-machine tests can hand in a [`MockTransport`]
+    /// (or any other impl) and drive the client without opening a real
+    /// WebSocket. `PirClient::is_connected` returns `true` after this call,
+    /// so `fetch_catalog` / `sync_with_plan` work as usual.
+    ///
+    /// [`MockTransport`]: crate::transport::MockTransport
+    pub fn connect_with_transport(
+        &mut self,
+        conn0: Box<dyn PirTransport>,
+        conn1: Box<dyn PirTransport>,
+    ) {
+        self.conn0 = Some(conn0);
+        self.conn1 = Some(conn1);
+        // Same `Connected` event a URL-driven `connect()` fires — lets
+        // injection-driven tests exercise the state listener without a
+        // real WebSocket handshake.
+        self.notify_state(ConnectionState::Connected);
     }
 
     /// Fetch server info and build catalog entry for legacy servers.
@@ -207,28 +381,26 @@ impl DpfClient {
     /// in one padded batch.
     ///
     /// On any bin failing verification, the corresponding query is coerced to
-    /// `None` to signal an unverified/untrusted result — the caller cannot
-    /// tell whether the server lied or the data simply isn't there.
+    /// `Some(QueryResult::merkle_failed())` (empty entries, `merkle_verified =
+    /// false`) so the caller can distinguish verification failure from a
+    /// genuine not-found.
+    ///
+    /// Implementation is a thin shim over the two helpers that also power
+    /// the standalone [`verify_merkle_batch_for_results`](Self::verify_merkle_batch_for_results)
+    /// API — items come from the per-query [`QueryTraces`], but the verifier
+    /// itself is shared.
     async fn run_merkle_verification(
         &mut self,
         results: &mut [Option<QueryResult>],
         traces: &[QueryTraces],
         db_info: &DatabaseInfo,
     ) -> PirResult<()> {
-        // Build items + mapping from item back to the query it covers.
-        let mut items: Vec<BucketMerkleItem> = Vec::new();
-        let mut item_to_query: Vec<usize> = Vec::new();
-
+        // Log the per-query outcome/item-count summary — kept here (not in
+        // `collect_merkle_items_from_traces`) because this is the path that
+        // feeds `[PIR-AUDIT]` audit logs. The `verify_merkle_batch_for_results`
+        // path rebuilds items from already-audited query results, so it
+        // doesn't need to re-log the bin counts.
         for (qi, trace) in traces.iter().enumerate() {
-            // Emit one BucketMerkleItem per probed INDEX bin so the Merkle
-            // item count is uniform (INDEX_CUCKOO_NUM_HASHES items per query)
-            // across found / not-found / whale. CHUNK bins attach only to
-            // the matched INDEX item; the other item(s) get empty chunk
-            // vectors and exercise only the INDEX Merkle tree.
-            //
-            // Whales are verified on the INDEX side — the bin content with
-            // num_chunks=0 is committed to the INDEX Merkle root, so verifying
-            // it proves the server-reported whale status.
             let outcome = match trace.matched_index_idx {
                 Some(_) => {
                     let is_whale = results
@@ -246,32 +418,65 @@ impl DpfClient {
                 trace.index_bins.len(),
                 trace.chunk_bins.len()
             );
+        }
 
-            for (bi, bin) in trace.index_bins.iter().enumerate() {
-                let is_matched = trace.matched_index_idx == Some(bi);
-                let mut it = BucketMerkleItem {
-                    index_pbc_group: bin.pbc_group,
-                    index_bin_index: bin.bin_index,
-                    index_bin_content: bin.bin_content.clone(),
-                    chunk_pbc_groups: Vec::new(),
-                    chunk_bin_indices: Vec::new(),
-                    chunk_bin_contents: Vec::new(),
-                };
-                if is_matched {
-                    for cb in &trace.chunk_bins {
-                        it.chunk_pbc_groups.push(cb.pbc_group);
-                        it.chunk_bin_indices.push(cb.bin_index);
-                        it.chunk_bin_contents.push(cb.bin_content.clone());
-                    }
+        let (items, item_to_query) = collect_merkle_items_from_traces(traces);
+        let verdicts = self
+            .verify_merkle_items(&items, &item_to_query, results.len(), db_info)
+            .await?;
+
+        for (qi, verdict) in verdicts.into_iter().enumerate() {
+            match verdict {
+                None => continue, // not touched (no items attached to this query)
+                Some(true) => {
+                    log::info!("[PIR-AUDIT] Merkle PASSED for query #{}", qi);
+                    // merkle_verified is already `true` by construction in query_single.
                 }
-                items.push(it);
-                item_to_query.push(qi);
+                Some(false) => {
+                    log::warn!(
+                        "[PIR-AUDIT] Merkle FAILED for query #{}: \
+                         emitting QueryResult {{ merkle_verified: false, entries: [] }} (untrusted)",
+                        qi
+                    );
+                    // Surface the failure as a distinct signal from "not found"
+                    // (the old behaviour collapsed both to `None`). Entries are
+                    // wiped so downstream callers cannot accidentally trust
+                    // unverified data even if they ignore `merkle_verified`.
+                    results[qi] = Some(QueryResult::merkle_failed());
+                }
             }
         }
 
+        Ok(())
+    }
+
+    /// Shared verifier backend used by both [`run_merkle_verification`]
+    /// (inline, over fresh `QueryTraces`) and
+    /// [`verify_merkle_batch_for_results`](Self::verify_merkle_batch_for_results)
+    /// (standalone, over persisted `QueryResult.index_bins/chunk_bins`).
+    ///
+    /// Runs the full Merkle pipeline: `REQ_BUCKET_MERKLE_TREE_TOPS` fetch
+    /// on server 0, then [`verify_bucket_merkle_batch_dpf`] (K-padded
+    /// sibling rounds across both servers, XOR fold, walk to root).
+    /// Returns one verdict per query:
+    /// * `None`    — no items attached (query skipped verification).
+    /// * `Some(true)`  — all attached items verified.
+    /// * `Some(false)` — at least one item failed.
+    ///
+    /// Padding invariant: per-item Merkle work is uniform by construction
+    /// — callers must always attach `INDEX_CUCKOO_NUM_HASHES` INDEX items
+    /// per query, regardless of found/not-found (see CLAUDE.md "Merkle
+    /// INDEX Item-Count Symmetry").
+    async fn verify_merkle_items(
+        &mut self,
+        items: &[BucketMerkleItem],
+        item_to_query: &[usize],
+        num_queries: usize,
+        db_info: &DatabaseInfo,
+    ) -> PirResult<Vec<Option<bool>>> {
         if items.is_empty() {
             log::info!("[PIR-AUDIT] Merkle: no items to verify — nothing to do");
-            return Ok(());
+            return Ok(vec![None; num_queries]);
         }
 
         // Fetch tree-tops blob (server 0 only — both servers share it).
@@ -287,7 +492,7 @@ impl DpfClient {
         let per_item = verify_bucket_merkle_batch_dpf(
             conn0,
             conn1,
-            &items,
+            items,
             db_info.index_bins,
             db_info.chunk_bins,
             index_k,
@@ -299,38 +504,15 @@ impl DpfClient {
 
         // Aggregate per-item outcomes back to per-query verdicts:
         // a query passes iff ALL its items pass.
-        let mut per_query_ok = vec![true; results.len()];
-        let mut per_query_touched = vec![false; results.len()];
+        let mut per_query: Vec<Option<bool>> = vec![None; num_queries];
         for (ii, ok) in per_item.iter().enumerate() {
             let qi = item_to_query[ii];
-            per_query_touched[qi] = true;
-            if !ok {
-                per_query_ok[qi] = false;
-            }
+            per_query[qi] = match per_query[qi] {
+                None => Some(*ok),
+                Some(prev) => Some(prev && *ok),
+            };
         }
-
-        for qi in 0..results.len() {
-            if !per_query_touched[qi] {
-                continue; // whale-without-INDEX-items or skipped
-            }
-            if !per_query_ok[qi] {
-                log::warn!(
-                    "[PIR-AUDIT] Merkle FAILED for query #{}: \
-                     emitting QueryResult {{ merkle_verified: false, entries: [] }} (untrusted)",
-                    qi
-                );
-                // Surface the failure as a distinct signal from "not found"
-                // (the old behaviour collapsed both to `None`). Entries are
-                // wiped so downstream callers cannot accidentally trust
-                // unverified data even if they ignore `merkle_verified`.
-                results[qi] = Some(QueryResult::merkle_failed());
-            } else {
-                log::info!("[PIR-AUDIT] Merkle PASSED for query #{}", qi);
-                // merkle_verified is already true by construction in query_single.
-            }
-        }
-
-        Ok(())
+        Ok(per_query)
     }
 
     /// Query a single script hash against a database.
@@ -368,6 +550,12 @@ impl DpfClient {
                     // this to `false` if the INDEX proof fails.
                     merkle_verified: true,
                     raw_chunk_data: None,
+                    // Inspector fields stay empty here — only the inspector
+                    // path (`query_batch_with_inspector`) populates them
+                    // from `traces`.
+                    index_bins: Vec::new(),
+                    chunk_bins: Vec::new(),
+                    matched_index_idx: None,
                 }),
                 traces,
             ));
@@ -394,6 +582,12 @@ impl DpfClient {
                 } else {
                     None
                 },
+                // Inspector fields stay empty here — only the inspector
+                // path (`query_batch_with_inspector`) copies them from
+                // `traces` into the result.
+                index_bins: Vec::new(),
+                chunk_bins: Vec::new(),
+                matched_index_idx: None,
             }),
             traces,
         ))
@@ -727,6 +921,265 @@ impl DpfClient {
 
         Ok((all_data, chunk_bins))
     }
+
+    /// The two server URLs this client was configured with, in
+    /// `(server0, server1)` order. Useful for display-only surfaces that
+    /// want to show "connected to …" without reconstructing the URLs
+    /// from caller state.
+    pub fn server_urls(&self) -> (&str, &str) {
+        (&self.server0_url, &self.server1_url)
+    }
+
+    /// Run a batch of PIR queries against `db_id` and return the raw
+    /// per-query results **with inspector state populated**, deferring
+    /// Merkle verification to a later
+    /// [`verify_merkle_batch_for_results`](Self::verify_merkle_batch_for_results)
+    /// call.
+    ///
+    /// # Shape vs. the trait-level `query_batch`
+    ///
+    /// The `PirClient::query_batch` method runs Merkle verification
+    /// inline and collapses failed proofs to
+    /// `Some(QueryResult::merkle_failed())`, so the inspector fields on
+    /// its returned `QueryResult`s stay empty (the hot path keeps the
+    /// trace off the public type). This method is the opposite:
+    ///
+    /// * Every successful query (found, not-found, or whale) returns
+    ///   `Some(QueryResult)` with `index_bins` / `chunk_bins` /
+    ///   `matched_index_idx` populated from the query's internal
+    ///   `QueryTraces`. `None` entries should not occur in practice —
+    ///   protocol errors propagate via `Err`.
+    /// * `matched_index_idx == None && entries.is_empty()` encodes
+    ///   "not found" (the caller must still honour the
+    ///   `INDEX_CUCKOO_NUM_HASHES` padding in `index_bins` for a valid
+    ///   absence proof — that invariant is preserved end-to-end by
+    ///   `query_index_level`).
+    /// * `merkle_verified` is `true` — Merkle was **not** attempted.
+    ///   Callers that care MUST pass the results to
+    ///   `verify_merkle_batch_for_results`, which returns the real
+    ///   verdicts.
+    ///
+    /// # 🔒 Padding invariant
+    ///
+    /// The underlying PIR batch is unchanged — K=75 INDEX / K_CHUNK=80
+    /// CHUNK groups per round, random dummy DPF keys fill empty slots.
+    /// This method only changes whether the client further requests
+    /// Merkle siblings, not what the server sees at the query layer.
+    pub async fn query_batch_with_inspector(
+        &mut self,
+        script_hashes: &[ScriptHash],
+        db_id: u8,
+    ) -> PirResult<Vec<Option<QueryResult>>> {
+        if !self.is_connected() {
+            return Err(PirError::NotConnected);
+        }
+
+        let catalog = self
+            .catalog
+            .clone()
+            .ok_or_else(|| PirError::InvalidState("no catalog".into()))?;
+
+        let db_info = catalog
+            .get(db_id)
+            .ok_or_else(|| PirError::DatabaseNotFound(db_id))?
+            .clone();
+
+        let mut results: Vec<Option<QueryResult>> = Vec::with_capacity(script_hashes.len());
+        for script_hash in script_hashes {
+            let (qr, trace) = self.query_single(script_hash, &db_info).await?;
+
+            // Translate the trace into public `BucketRef`s. For not-found
+            // we synthesise an empty `QueryResult` so the inspector state
+            // isn't lost to the `None` return convention.
+            let with_inspector = match qr {
+                Some(mut r) => {
+                    r.index_bins = trace.index_bins.iter().map(index_trace_to_bucket_ref).collect();
+                    r.chunk_bins = trace.chunk_bins.iter().map(chunk_trace_to_bucket_ref).collect();
+                    r.matched_index_idx = trace.matched_index_idx;
+                    Some(r)
+                }
+                None => {
+                    // NOT FOUND — emit an empty, inspector-populated
+                    // QueryResult so callers can verify absence via
+                    // `verify_merkle_batch_for_results`. Sentinel values:
+                    // `entries.is_empty()`, `!is_whale`,
+                    // `matched_index_idx.is_none()`, and (by the symmetry
+                    // invariant) `index_bins.len() == INDEX_CUCKOO_NUM_HASHES`.
+                    let mut r = QueryResult::empty();
+                    r.index_bins = trace.index_bins.iter().map(index_trace_to_bucket_ref).collect();
+                    // chunk_bins empty by construction for not-found.
+                    r.matched_index_idx = trace.matched_index_idx;
+                    Some(r)
+                }
+            };
+            results.push(with_inspector);
+        }
+
+        Ok(results)
+    }
+
+    /// Standalone per-bucket Merkle verifier for results previously
+    /// returned by [`query_batch_with_inspector`](Self::query_batch_with_inspector)
+    /// (or reconstructed by the caller from persisted storage — the
+    /// verifier only needs `QueryResult.index_bins`, `chunk_bins`, and
+    /// `matched_index_idx`).
+    ///
+    /// Rebuilds the same `BucketMerkleItem` set the inline
+    /// [`run_merkle_verification`](Self::run_merkle_verification) path
+    /// builds, then runs the networked verifier via the shared
+    /// [`verify_merkle_items`](Self::verify_merkle_items) helper.
+    ///
+    /// Returns one `bool` per input query:
+    /// * `true`  — all items verified, or no items attached (e.g. the
+    ///   caller passed a `None` for that index, so there is nothing to
+    ///   contradict).
+    /// * `false` — at least one attached item failed the proof; the
+    ///   corresponding result must be treated as untrusted and should
+    ///   be discarded or surfaced as `QueryResult::merkle_failed()`.
+    ///
+    /// # 🔒 Padding invariant
+    ///
+    /// The underlying Merkle round is uniform by construction — the
+    /// caller supplies items built from INDEX_CUCKOO_NUM_HASHES probes
+    /// per query, and the shared verifier pads each level's sibling
+    /// batch to 25 siblings (see CLAUDE.md "Query Padding").
+    pub async fn verify_merkle_batch_for_results(
+        &mut self,
+        results: &[Option<QueryResult>],
+        db_id: u8,
+    ) -> PirResult<Vec<bool>> {
+        if !self.is_connected() {
+            return Err(PirError::NotConnected);
+        }
+
+        let catalog = self
+            .catalog
+            .clone()
+            .ok_or_else(|| PirError::InvalidState("no catalog".into()))?;
+
+        let db_info = catalog
+            .get(db_id)
+            .ok_or_else(|| PirError::DatabaseNotFound(db_id))?
+            .clone();
+
+        // If the database doesn't publish bucket Merkle, "verify" is a
+        // no-op — mirrors `execute_step`'s skip branch so callers can
+        // always call `verify_merkle_batch_for_results` without needing
+        // to pre-check `has_bucket_merkle` first. Matches the
+        // `QueryResult::merkle_verified` semantics ("no failure
+        // detected").
+        if !db_info.has_bucket_merkle {
+            log::info!(
+                "[PIR-AUDIT] verify_merkle_batch_for_results SKIPPED: db_id={} has no bucket Merkle",
+                db_id
+            );
+            return Ok(vec![true; results.len()]);
+        }
+
+        let (items, item_to_query) = collect_merkle_items_from_results(results);
+        let verdicts = self
+            .verify_merkle_items(&items, &item_to_query, results.len(), &db_info)
+            .await?;
+
+        // Translate `Option<bool>` to `bool` for the public surface:
+        // `None` (no items attached) maps to `true` — consistent with
+        // the "nothing to falsify" reading above.
+        Ok(verdicts
+            .into_iter()
+            .map(|v| v.unwrap_or(true))
+            .collect())
+    }
+
+    /// Like [`PirClient::sync`], but drives a [`SyncProgress`] observer
+    /// through every step of the computed [`SyncPlan`]. Intended for UI
+    /// surfaces (terminal spinner, JS `onProgress` callback) that want
+    /// granular feedback on multi-step sync chains.
+    ///
+    /// Progress events fire in this order:
+    /// 1. Per step, `on_step_start(step_index, total_steps, description)`
+    ///    where `description` is the [`SyncStep::name`]
+    ///    (e.g. `"full @940611"` or `"delta 940611→944000"`).
+    /// 2. Per step, `on_step_progress(step_index, 1.0)` once the step's
+    ///    PIR + Merkle work returns (step granularity — sub-step progress
+    ///    isn't wired through the current `execute_step` because the
+    ///    inner loop is bounded by `script_hashes.len()` × K and driven
+    ///    synchronously).
+    /// 3. Per step, `on_step_complete(step_index)`.
+    /// 4. Once all steps succeed, `on_complete(synced_height)`.
+    /// 5. On any error, `on_error(&e)` before the error is propagated.
+    ///
+    /// Padding invariants are preserved — progress is purely
+    /// observational and doesn't change what's sent on the wire.
+    pub async fn sync_with_progress(
+        &mut self,
+        script_hashes: &[ScriptHash],
+        last_height: Option<u32>,
+        progress: &dyn SyncProgress,
+    ) -> PirResult<SyncResult> {
+        let run = async {
+            if !self.is_connected() {
+                self.connect().await?;
+            }
+
+            let catalog = match &self.catalog {
+                Some(c) => c.clone(),
+                None => self.fetch_catalog().await?,
+            };
+
+            let plan = self.compute_sync_plan(&catalog, last_height)?;
+
+            if plan.is_empty() {
+                return Ok(SyncResult {
+                    results: vec![None; script_hashes.len()],
+                    synced_height: plan.target_height,
+                    was_fresh_sync: false,
+                });
+            }
+
+            let catalog = self
+                .catalog
+                .clone()
+                .ok_or_else(|| PirError::InvalidState("no catalog".into()))?;
+
+            let total = plan.steps.len();
+            let mut merged: Vec<Option<QueryResult>> = vec![None; script_hashes.len()];
+            for (step_idx, step) in plan.steps.iter().enumerate() {
+                progress.on_step_start(step_idx, total, &step.name);
+
+                let db_info = catalog
+                    .get(step.db_id)
+                    .ok_or_else(|| PirError::DatabaseNotFound(step.db_id))?
+                    .clone();
+
+                let step_results = self.execute_step(script_hashes, step, &db_info).await?;
+
+                // Single coarse tick per step — see doc comment above for why
+                // finer granularity isn't wired yet.
+                progress.on_step_progress(step_idx, 1.0);
+
+                if step.is_full() {
+                    merged = step_results;
+                } else {
+                    merged = merge_delta_batch(&merged, &step_results)?;
+                }
+                progress.on_step_complete(step_idx);
+            }
+
+            let result = SyncResult {
+                results: merged,
+                synced_height: plan.target_height,
+                was_fresh_sync: plan.is_fresh_sync,
+            };
+            progress.on_complete(result.synced_height);
+            Ok(result)
+        }
+        .await;
+
+        if let Err(e) = &run {
+            progress.on_error(e);
+        }
+        run
+    }
 }
 
 #[async_trait]
@@ -741,16 +1194,56 @@ impl PirClient for DpfClient {
             self.server0_url,
             self.server1_url
         );
+        self.notify_state(ConnectionState::Connecting);
 
-        let (conn0, conn1) = tokio::try_join!(
-            WsConnection::connect(&self.server0_url),
-            WsConnection::connect(&self.server1_url),
-        )?;
+        // Dial both servers in parallel. On native we use `tokio::try_join!`
+        // (runs on the tokio reactor); on wasm32 we use
+        // `futures::future::try_join` (runs on the browser's single-threaded
+        // event loop via `wasm-bindgen-futures`). Both complete when the
+        // second handshake finishes, short-circuiting on the first error.
+        #[cfg(not(target_arch = "wasm32"))]
+        let dial_result: PirResult<(Box<dyn PirTransport>, Box<dyn PirTransport>)> = async {
+            let (c0, c1) = tokio::try_join!(
+                WsConnection::connect(&self.server0_url),
+                WsConnection::connect(&self.server1_url),
+            )?;
+            Ok((
+                Box::new(c0) as Box<dyn PirTransport>,
+                Box::new(c1) as Box<dyn PirTransport>,
+            ))
+        }
+        .await;
+        #[cfg(target_arch = "wasm32")]
+        let dial_result: PirResult<(Box<dyn PirTransport>, Box<dyn PirTransport>)> = async {
+            use crate::wasm_transport::WasmWebSocketTransport;
+            let (c0, c1) = futures::future::try_join(
+                WasmWebSocketTransport::connect(&self.server0_url),
+                WasmWebSocketTransport::connect(&self.server1_url),
+            )
+            .await?;
+            Ok((
+                Box::new(c0) as Box<dyn PirTransport>,
+                Box::new(c1) as Box<dyn PirTransport>,
+            ))
+        }
+        .await;
+
+        let (conn0, conn1) = match dial_result {
+            Ok(v) => v,
+            Err(e) => {
+                // Handshake failed — fall back to `Disconnected`, not
+                // `Connecting`, so observers don't get stuck on an
+                // intermediate state if they didn't install a catch-all.
+                self.notify_state(ConnectionState::Disconnected);
+                return Err(e);
+            }
+        };
 
         self.conn0 = Some(conn0);
         self.conn1 = Some(conn1);
 
         log::info!("Connected to both servers");
+        self.notify_state(ConnectionState::Connected);
         Ok(())
     }
 
@@ -764,6 +1257,7 @@ impl PirClient for DpfClient {
         self.conn0 = None;
         self.conn1 = None;
         self.catalog = None;
+        self.notify_state(ConnectionState::Disconnected);
         Ok(())
     }
 
@@ -1160,5 +1654,122 @@ impl SimpleRng {
     fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(0x9e3779b97f4a7c15);
         pir_core::hash::splitmix64(self.state)
+    }
+}
+
+// ─── Tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::mock::MockTransport;
+    use std::sync::Mutex;
+
+    /// Demonstrates the test-injection escape hatch: a client built with a
+    /// pair of [`MockTransport`]s reports `is_connected()` without ever
+    /// opening a real socket. This is the core value prop of the
+    /// `PirTransport` trait — without it, unit tests would need a live
+    /// WebSocket to even exercise client state.
+    #[test]
+    fn connect_with_transport_marks_connected() {
+        let mut client = DpfClient::new("wss://mock-0", "wss://mock-1");
+        assert!(!client.is_connected());
+        client.connect_with_transport(
+            Box::new(MockTransport::new("wss://mock-0")),
+            Box::new(MockTransport::new("wss://mock-1")),
+        );
+        assert!(client.is_connected());
+    }
+
+    /// Recorder impl of [`StateListener`] — records every transition in a
+    /// mutex-guarded vec so assertions can check ordering across the
+    /// async connect/disconnect transitions.
+    struct RecordingListener {
+        events: Mutex<Vec<ConnectionState>>,
+    }
+
+    impl StateListener for RecordingListener {
+        fn on_state_change(&self, state: ConnectionState) {
+            self.events.lock().unwrap().push(state);
+        }
+    }
+
+    /// `connect_with_transport` fires a `Connected` event on the
+    /// registered listener. This is the main state-listener contract
+    /// the WASM `onStateChange` surface relies on.
+    #[test]
+    fn state_listener_fires_on_connect_with_transport() {
+        let listener = Arc::new(RecordingListener {
+            events: Mutex::new(Vec::new()),
+        });
+        let mut client = DpfClient::new("wss://mock-0", "wss://mock-1");
+        client.set_state_listener(Some(listener.clone()));
+        client.connect_with_transport(
+            Box::new(MockTransport::new("wss://mock-0")),
+            Box::new(MockTransport::new("wss://mock-1")),
+        );
+        let events = listener.events.lock().unwrap();
+        assert_eq!(&*events, &[ConnectionState::Connected]);
+    }
+
+    /// `set_state_listener(None)` silences a previously registered
+    /// listener — subsequent transitions must not reach it.
+    #[test]
+    fn set_state_listener_none_silences_listener() {
+        let listener = Arc::new(RecordingListener {
+            events: Mutex::new(Vec::new()),
+        });
+        let mut client = DpfClient::new("wss://mock-0", "wss://mock-1");
+        client.set_state_listener(Some(listener.clone()));
+        client.set_state_listener(None);
+        client.connect_with_transport(
+            Box::new(MockTransport::new("wss://mock-0")),
+            Box::new(MockTransport::new("wss://mock-1")),
+        );
+        assert!(listener.events.lock().unwrap().is_empty());
+    }
+
+    /// Replacing the listener must swap the sink cleanly — only the
+    /// new listener sees subsequent events.
+    #[test]
+    fn set_state_listener_replaces_previous() {
+        let old = Arc::new(RecordingListener {
+            events: Mutex::new(Vec::new()),
+        });
+        let new = Arc::new(RecordingListener {
+            events: Mutex::new(Vec::new()),
+        });
+        let mut client = DpfClient::new("wss://mock-0", "wss://mock-1");
+        client.set_state_listener(Some(old.clone()));
+        client.set_state_listener(Some(new.clone()));
+        client.connect_with_transport(
+            Box::new(MockTransport::new("wss://mock-0")),
+            Box::new(MockTransport::new("wss://mock-1")),
+        );
+        assert!(old.events.lock().unwrap().is_empty());
+        assert_eq!(
+            &*new.events.lock().unwrap(),
+            &[ConnectionState::Connected]
+        );
+    }
+
+    /// Smoke test: `server_urls()` echoes the constructor arguments in
+    /// `(server0, server1)` order.
+    #[test]
+    fn server_urls_returns_configured_urls() {
+        let client = DpfClient::new("wss://a.example", "wss://b.example");
+        let (a, b) = client.server_urls();
+        assert_eq!(a, "wss://a.example");
+        assert_eq!(b, "wss://b.example");
+    }
+
+    /// [`ConnectionState::as_str`] contract: the JS-side `onStateChange`
+    /// callback switches on these exact strings. Any rename here must
+    /// be reflected in web/src/ TS consumers.
+    #[test]
+    fn connection_state_as_str_contract() {
+        assert_eq!(ConnectionState::Connecting.as_str(), "connecting");
+        assert_eq!(ConnectionState::Connected.as_str(), "connected");
+        assert_eq!(ConnectionState::Disconnected.as_str(), "disconnected");
     }
 }

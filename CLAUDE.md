@@ -232,14 +232,42 @@ forgotten. Padding/privacy invariants (🔒 items in the roadmap) must
 not be optimized away — see "Query Padding" above.
 
 Short-term active work:
-- _(none — all P0 and P1 items closed. Four P1 items completed in
-  one batch: **HarmonyClient REQ_GET_DB_CATALOG**, **Connection
-  resilience**, **OnionPIR LRU-eviction retry**, and **Thread-safety
-  audit for `unsafe impl Sync for SendClient`**.)_ Next work should
-  pick from the P2 list in [SDK_ROADMAP.md](SDK_ROADMAP.md) —
-  `pir-sdk-wasm` full client wrappers is the highest-leverage item
-  since it would unify Rust + TS query paths and drop the web
-  client's duplicate Merkle-verification implementations.
+- **TS retirement plan is complete.** All six sessions have landed —
+  see "TS retirement Session 6 — Harmony web-side cutover" in
+  Completed milestones below for the final landing note. The web
+  client's DPF and Harmony halves now run through thin adapter
+  shims over `WasmDpfClient` / `WasmHarmonyClient`; ~1880 LOC of
+  hand-rolled Harmony TS was retired in Session 6 (on top of the
+  ~1300 LOC retired across Sessions 1-3). `web/src/onionpir_client.ts`
+  stays indefinitely — the upstream `onionpir` crate requires C++
+  SEAL which doesn't compile to wasm32, so there's no
+  `WasmOnionClient` to replace it.
+
+- **Error taxonomy refinement is complete.** `PirError` now exposes
+  a categorical `ErrorKind` classifier (`TransientNetwork` /
+  `SessionEvicted` / `ProtocolSkew` / `MerkleVerificationFailed` /
+  `ServerError` / `ClientError` / `DataError` / `Other`) plus four
+  new variants (`Transient { origin, context }`, `ProtocolSkew {
+  expected, actual }`, `SessionEvicted(String)`,
+  `MerkleVerificationFailed(String)`) and four new retry/inspection
+  helpers (`is_transient_network`, `is_session_lost`,
+  `is_verification_failure`, `is_protocol_skew`). Three concrete
+  call-site migrations landed: OnionPIR's retry-exhausted eviction
+  now raises `SessionEvicted` instead of `ServerError`;
+  `merkle_verify::decode_sibling_batch` now raises
+  `MerkleVerificationFailed` on mid-round `RESP_ERROR`; and
+  `fetch_tree_tops` + the tree-top count check now raise
+  `ProtocolSkew` when the catalog and server disagree on
+  `has_bucket_merkle` or K_INDEX+K_CHUNK. See the "Error taxonomy
+  refinement" entry in Completed milestones below for the full
+  breakdown.
+
+- Other unblocked P2 items:
+  * **Observability** — `tracing` spans + per-client metrics +
+    progress callbacks for long syncs.
+  * **Post-Session-6 worker-pool measurement follow-up** — revisit
+    if real-world p95 query latency exceeds the ~200ms budget
+    that Session 5's main-thread decision was predicated on.
 
 ### Completed milestones
 - PIR SDK + WASM bindings + web integration (commit `19cbf5f`).
@@ -403,13 +431,517 @@ Short-term active work:
   job; plain `cargo test -p pir-sdk-client` doesn't need the C++
   toolchain). `onion_merkle.rs::SibSendClient` picked up a matching
   `assert_send` probe and a cross-reference to the audit.
+- **`pir-sdk-wasm` per-bucket Merkle verifier (P2 #2)**: new module
+  [`pir-sdk-wasm/src/merkle_verify.rs`](pir-sdk-wasm/src/merkle_verify.rs)
+  ships the pure-crypto half of the verifier as `wasm_bindgen` bindings
+  — `WasmBucketMerkleTreeTops.fromBytes` parses the
+  `REQ_BUCKET_MERKLE_TREE_TOPS` (0x34) blob (same wire format as
+  `pir-sdk-client::merkle_verify::parse_tree_tops` and
+  `web/src/merkle-verify-bucket.ts::parseTreeTops`), and
+  `verifyBucketMerkleItem(bin_index, content, pbc_group,
+  sibling_rows_flat, tree_tops)` walks one proof from leaf to cached
+  root given pre-fetched XOR'd sibling rows. Supporting primitives:
+  `bucketMerkleLeafHash`, `bucketMerkleParentN`, `bucketMerkleSha256`,
+  `xorBuffers`. Thirteen unit tests cover parsing (empty/truncated),
+  primitive agreement with `pir_core::merkle`, happy-path walks (fully
+  cached + one-sibling-level), tamper rejection (bin content, bin
+  index, group index, tampered sibling row), and malformed-input
+  graceful failure — wasm-pack build succeeds and the new bindings
+  show up in `pkg/pir_sdk_wasm.d.ts`. **Deliberate scope limit**:
+  the *network* half (K-padded sibling batches over DPF, XOR fold
+  across servers, multi-pass for items sharing a PBC group) stays in
+  JS. `pir-sdk-client`'s transport layer (tokio-tungstenite, rustls,
+  multi-threaded tokio) doesn't compile to `wasm32-unknown-unknown`,
+  so a WASM-side transport requires pulling `send`/`recv`/`roundtrip`
+  out of `WsConnection` into a `PirTransport` trait (tracked as
+  roadmap P2 #1a, must land before `Wasm{Dpf,Harmony,Onion}Client`
+  wrappers are possible). Shipping the pure-crypto half first still
+  wins: it's the ~400-LOC TS verifier's bulk and the part most likely
+  to drift out of spec. `web/src/sdk-bridge.ts` now declares the new
+  `PirSdkWasm` surface; retiring
+  [`web/src/merkle-verify-bucket.ts`](web/src/merkle-verify-bucket.ts)
+  in favour of the WASM bindings is a follow-up that can land
+  independently.
+- **`pir-sdk-client` transport abstraction (P2 #1a, fully landed)**:
+  delivered in three checkpoints.
+
+  *Checkpoint 1 — trait + `WsConnection` impl + Merkle-verifier
+  plumbing.* New module
+  [`pir-sdk-client/src/transport.rs`](pir-sdk-client/src/transport.rs)
+  defines a `PirTransport: Send + Sync` trait (`send` / `recv` /
+  `roundtrip` / `close` / `url`) via `async_trait`, with a blanket
+  `impl<T: PirTransport + ?Sized> PirTransport for Box<T>` so
+  `&mut Box<dyn PirTransport>` coerces to `&mut dyn PirTransport` at
+  call sites. `WsConnection` picked up a delegating impl (zero
+  behaviour change — the inherent methods stay primary because they
+  own connect / reconnect / retry / backoff, which don't generalize).
+  An in-memory `MockTransport` (test-only,
+  `#[cfg(test)] pub(crate) mod mock`) enqueues canned responses and
+  records every `send`/`roundtrip` payload, letting state-machine
+  tests run without a WebSocket or tokio runtime. The Merkle-verifier
+  helpers (`fetch_tree_tops`, `DpfSiblingQuerier`,
+  `verify_bucket_merkle_batch_dpf`, `HarmonySiblingQuerier.query_conn`,
+  OnionPIR's `verify_onion_merkle_batch` + `verify_sub_tree`) now take
+  `&mut dyn PirTransport` instead of `&mut WsConnection`.
+
+  *Checkpoint 2 — client struct refactor.* The three clients
+  (`DpfClient.conn0`/`conn1`, `HarmonyClient.hint_conn`/`query_conn`,
+  `OnionClient.conn`) now hold `Option<Box<dyn PirTransport>>`
+  instead of `Option<WsConnection>`. Each picked up a
+  `connect_with_transport(...)` escape hatch for injecting arbitrary
+  `Box<dyn PirTransport>` values (`MockTransport` in tests,
+  `WasmWebSocketTransport` on wasm32, etc.), and `connect()` now
+  cfg-branches on `target_arch = "wasm32"` — native uses
+  `tokio::try_join!` with `WsConnection::connect`, wasm32 uses
+  `futures::future::try_join` with `WasmWebSocketTransport::connect`.
+  New `connect_with_transport_marks_connected` unit tests in each
+  client's `mod tests` prove the injection path.
+
+  *Checkpoint 3 — WASM transport impl.* New module
+  [`pir-sdk-client/src/wasm_transport.rs`](pir-sdk-client/src/wasm_transport.rs)
+  (`#![cfg(target_arch = "wasm32")]`) implements a
+  `web-sys::WebSocket`-backed `PirTransport`. The callback-driven
+  DOM API is bridged to async via `futures::channel::mpsc` for
+  ongoing binary frames + `futures::channel::oneshot` for the
+  open/error race during handshake. `web_sys::WebSocket`,
+  `Closure<_>`, and `Rc<RefCell<_>>` are all `!Send + !Sync`, but
+  `#[async_trait]` demands `Send` futures and the trait requires
+  `Send + Sync`; resolved by wrapping those fields in
+  `send_wrapper::SendWrapper<T>` (unsafely impls `Send + Sync`,
+  panics on cross-thread access — sound on wasm32 since that target
+  is single-threaded). `connect` is split into a synchronous
+  `build_transport` helper that constructs all `!Send` locals before
+  any `.await` to keep the generated future `Send`. 🔒 Padding
+  invariants preserved: the WASM transport is padding-agnostic, it
+  just shuttles opaque byte frames; K / K_CHUNK / 25-MERKLE padding
+  stays in the client structs above it.
+
+  Features deliberately omitted from the WASM transport (follow-ups):
+  per-request deadlines (`setTimeout` + cancellation), reconnect with
+  backoff, and anything requiring a tokio reactor. The browser's
+  `WebSocket` handles ping/pong control frames invisibly, so nothing
+  is needed there. Close/error events still propagate as
+  `PirError::ConnectionClosed` / `PirError::ConnectionFailed` so a
+  wedged peer can't hang a caller indefinitely.
+
+  `Cargo.toml` split into `[target.'cfg(not(target_arch =
+  "wasm32"))'.dependencies]` (tokio, tokio-tungstenite, rustls) and
+  `[target.'cfg(target_arch = "wasm32")'.dependencies]`
+  (wasm-bindgen, wasm-bindgen-futures, js-sys, web-sys with
+  `WebSocket`/`MessageEvent`/`CloseEvent`/etc. features, futures,
+  futures-channel, send_wrapper). `cargo test -p pir-sdk-client`
+  = 50/50 passing (native); `cargo build --target
+  wasm32-unknown-unknown -p pir-sdk-client` succeeds; `cargo check
+  --features onion` (C++/SEAL) passes. P2 #1b
+  (`Wasm{Dpf,Harmony,Onion}Client` wrappers in `pir-sdk-wasm`) is
+  now unblocked.
+- **`Wasm{Dpf,Harmony}Client` wrappers in `pir-sdk-wasm` (P2 #1b)**:
+  new module
+  [`pir-sdk-wasm/src/client.rs`](pir-sdk-wasm/src/client.rs) exposes
+  two `wasm-bindgen` classes — `WasmDpfClient` and `WasmHarmonyClient`
+  — that wrap the native `DpfClient` / `HarmonyClient` from
+  `pir-sdk-client`. JS-facing API per class: `constructor(url, url)`,
+  async `connect()` / `disconnect()` / `fetchCatalog(): Promise<WasmDatabaseCatalog>`,
+  async `sync(Uint8Array, last_height?): Promise<WasmSyncResult>`,
+  async `queryBatch(Uint8Array, db_id): Promise<any>`, and a
+  `isConnected` getter. `WasmHarmonyClient` additionally has
+  `setMasterKey(Uint8Array[16])` + `setPrpBackend(u8)`, and the PRP
+  backend constants are exposed as `PRP_HOANG()` / `PRP_FASTPRP()` /
+  `PRP_ALF()` free functions. A new `WasmSyncResult` class wraps
+  `pir_sdk::SyncResult`: `resultCount` / `syncedHeight` /
+  `wasFreshSync` getters, `getResult(i) → WasmQueryResult | null`,
+  and `toJson()`. Script hashes cross the JS boundary as a packed
+  `Uint8Array` of length `20 * N` (HASH160 = 20 bytes per scripthash);
+  `unpack_script_hashes` validates length-is-multiple-of-20 and
+  errors loudly on mismatch. `WasmDatabaseCatalog` picked up a
+  `pub(crate) fn from_native` so the wrappers return catalogs without
+  a JSON round-trip. `Cargo.toml` added `pir-sdk-client` and
+  `wasm-bindgen-futures` as cross-target deps (needed so native
+  `cargo test -p pir-sdk-wasm` still builds; the Promise bridging
+  only activates on wasm32). Under the hood, `WasmDpfClient::connect`
+  uses `WasmWebSocketTransport::connect` on wasm32 (via the
+  cfg-branch added in P2 #1a) and `WsConnection::connect` on native —
+  the wrapper itself is transport-agnostic. 🔒 Padding invariants
+  stay in the native `DpfClient`/`HarmonyClient` (K=75 INDEX,
+  K_CHUNK=80 CHUNK, 25-MERKLE); the wrapper is a thin translation
+  layer and cannot bypass them. Implementation detail to watch out
+  for: the validation helpers (`unpack_script_hashes`,
+  `validate_prp_backend`, `validate_master_key_len`,
+  `sync_result_to_json`) return `Result<_, String>` rather than
+  `Result<_, JsError>` so native unit tests can call them —
+  `JsError::new` is a wasm-bindgen import and panics on non-wasm
+  targets. The `#[wasm_bindgen]` methods convert at the boundary via
+  `.map_err(|e| JsError::new(&e))`. 10 new unit tests cover unpack
+  round-trip + error paths, both validators, both client
+  constructors, PRP constant distinctness, and `SyncResult → JSON`
+  shape (including `merkleVerified = false` round-trip for
+  `QueryResult::merkle_failed()`). Build: `cargo test -p pir-sdk-wasm
+  --lib` = 23/23 passing; `cargo build --target
+  wasm32-unknown-unknown -p pir-sdk-wasm` succeeds; `wasm-pack build
+  --target web` generates `pkg/pir_sdk_wasm.d.ts` with
+  `export class WasmDpfClient { sync(script_hashes: Uint8Array,
+  last_height?: number | null): Promise<WasmSyncResult>; ... }` and
+  the `WasmHarmonyClient` / `WasmSyncResult` counterparts. **No
+  `WasmOnionClient`**: the upstream `onionpir` crate depends on a
+  C++ SEAL build which does not compile to wasm32, so OnionPIR in
+  the browser continues to use `web/src/onionpir_client.ts` for the
+  foreseeable future.
+- **TS retirement Session 2 — DPF surface extensions** (see
+  [SDK_ROADMAP.md](SDK_ROADMAP.md) Completed section for the full
+  breakdown). Landed in three layers: (a) a new `BucketRef` struct
+  + three optional inspector fields (`index_bins`, `chunk_bins`,
+  `matched_index_idx`) on `pir_sdk::QueryResult`, with
+  `#[serde(default)]` so pre-Session-2 JSON round-trips stay
+  byte-identical; (b) `DpfClient::query_batch_with_inspector` /
+  `verify_merkle_batch_for_results` split-verify pair that lets
+  callers run PIR now and Merkle-verify later (or against
+  rehydrated persisted results), plus a new `ConnectionState` +
+  `StateListener` trait fired from `connect` / `disconnect`, a
+  `server_urls()` accessor, and a `sync_with_progress` variant
+  that drives the pre-existing `SyncProgress` trait; (c) WASM
+  bindings wiring all of the above to JS — new
+  `WasmDpfClient.{serverUrls, queryBatchRaw, verifyMerkleBatch,
+  syncWithProgress, onStateChange}`, `WasmQueryResult.{indexBins,
+  chunkBins, matchedIndexIdx}` accessors, `WasmDatabaseCatalog.
+  {getEntry, hasBucketMerkle}` accessors, with the wasm32-only
+  `syncWithProgress` / `onStateChange` using
+  `SendWrapper<js_sys::Function>` to bridge `!Send` JS callbacks
+  across the `SyncProgress` / `StateListener` trait bounds.
+  16 new unit tests: 5 in `pir-sdk-client/src/dpf.rs` (state
+  listener recorder, server URLs, state-string contract), 11 in
+  `pir-sdk-wasm/src/lib.rs` (bucket-ref round-trip, query-result
+  JSON with/without inspector fields, catalog `getEntry`
+  by-db_id vs positional).
+  Test totals now: `pir-sdk` 14/14, `pir-sdk-client` 55/55,
+  `pir-sdk-wasm` 34/34. 🔒 Padding invariants preserved — new
+  surfaces route through the same native `DpfClient` that owns
+  K / K_CHUNK / 25-MERKLE padding. `WasmHarmonyClient` untouched
+  (Session 5 scope); `WasmOnionClient` doesn't exist
+  (C++/SEAL wasm32 incompatibility). **Unblocks Session 3** (DPF
+  cutover of `BatchPirClient` → `WasmDpfClient` adapter in
+  `web/index.html`, plus deletion of `web/src/client.ts` and
+  `web/src/merkle-verify-bucket.ts`).
+- **TS retirement Session 3 — DPF cutover** (see
+  [SDK_ROADMAP.md](SDK_ROADMAP.md) Completed section for the full
+  breakdown). The DPF half of the web client is now a thin adapter
+  over `WasmDpfClient`. Three artefacts landed:
+  * *New adapter shim* `web/src/dpf-adapter.ts` (~400 LOC) —
+    `BatchPirClientAdapter` exposes the same public surface as the
+    old `BatchPirClient` (`connect` / `disconnect` / `isConnected` /
+    `getConnectedSockets` / `getCatalog` / `getCatalogEntry` /
+    `hasMerkle` / `hasMerkleForDb` / `getMerkleRootHex` /
+    `getMerkleRootHexForDb` / `queryBatch` / `queryDelta` /
+    `verifyMerkleBatch` + `onConnectionStateChange` / `onLog` /
+    `onSyncProgress` config hooks). Internally owns two
+    `ManagedWebSocket` side-channels (for diagnostic frames:
+    `REQ_GET_INFO_JSON` / `REQ_GET_DB_CATALOG` / `REQ_RESIDENCY`)
+    plus a single `WasmDpfClient` for PIR query + Merkle verify.
+    A `WeakMap<QueryResult, WasmQueryResult>` stash lets verify-time
+    JSON round-trips reuse the original `WasmQueryResult` handle;
+    externally-sourced results fall through a `queryResultToJson`
+    helper. A `translateWasmResult` helper converts
+    `WasmQueryResult` → legacy `QueryResult` (hex-decode `txid` /
+    `binContent`, lift `matchedIdx` to the UI's primary-bin
+    convention, derive `allIndexBins` / `chunkPbcGroups` /
+    `chunkBinIndices` / `chunkBinContents` from inspector fields).
+  * *WASM raw-chunk-byte round-trip* — `parse_query_result_json` in
+    `pir-sdk-wasm/src/lib.rs` picked up hex-decode of
+    `rawChunkData` (symmetric with `WasmQueryResult.toJson`'s
+    hex-encode of `raw_chunk_data`), so persisted results survive
+    `fromJson` → `verifyMerkleBatch` byte-exact. New unit test
+    `parse_query_result_json_round_trips_raw_chunk_data` locks in
+    the positive round-trip; the invalid-hex error path is not
+    unit-tested because `JsError::new(...)` panics on non-wasm32
+    targets (same pattern already guards the `txid` hex field).
+  * *File deletions + re-exports* — `web/src/client.ts`
+    (35,391 bytes) and `web/src/merkle-verify-bucket.ts`
+    (16,411 bytes) are gone. `web/index.html` swapped `new
+    BatchPirClient({ ... })` → `new BatchPirClientAdapter({ ... })`
+    (config shape unchanged). `web/src/index.ts` dropped
+    `BatchPirClient` / `createBatchPirClient` / `BatchPirClientConfig`
+    from `./client.js` and added `BatchPirClientAdapter` /
+    `BatchPirClientConfig` from `./dpf-adapter.js` plus direct
+    re-exports of `ConnectionState` / `UtxoEntry` / `QueryResult`
+    from `./types.js`. `web/src/__tests__/sync-merge.test.ts`
+    migrated its type imports from `../client.js` to `../types.js`.
+  *Accepted regressions (documented in SDK_ROADMAP.md):*
+  (1) `[PIR-AUDIT]` logs from native `DpfClient` go to
+  `console.info` rather than the web UI's log panel (no `onLog`
+  hook on `WasmDpfClient`);
+  (2) `queryBatch` per-batch progress is coarse (begin/end) because
+  `queryBatchRaw` is a single `Promise` without inner progress
+  ticks; (3) `getConnectedSockets()` returns only the two side-channel
+  `ManagedWebSocket`s because the WASM transport's internal
+  sockets are hidden behind the `wasm-bindgen` boundary —
+  functionally equivalent for residency purposes since both hit
+  the same origin.
+  Verification: `npx tsc --noEmit` → no new TS errors (same three
+  pre-existing ones); `npx vite build` → clean
+  (`✓ built in ~270ms`, 5 assets); `npx vitest run` → 88/88 passing
+  across 7 test files; `cargo test -p pir-sdk-wasm --lib` →
+  35/35 passing; `cargo test -p pir-sdk-client --lib` → 55/55;
+  `cargo test -p pir-sdk --lib` → 14/14.
+  🔒 Padding invariants preserved — PIR rounds still run through
+  native `DpfClient` (K=75 INDEX / K_CHUNK=80 CHUNK / 25-MERKLE),
+  INDEX-Merkle item-count symmetry invariant lives in the same
+  native code path. The adapter is a translation shim; it cannot
+  bypass the padding.
+  LOC impact: -883 (`client.ts`) -420 (`merkle-verify-bucket.ts`)
+  +~400 (`dpf-adapter.ts`) +~30 (`sdk-bridge.ts` interface
+  extensions) +~15 (`lib.rs` WASM plumbing). Net: ~900 LOC of
+  hand-rolled TS retired.
+  **Unblocks Sessions 4-6 for the Harmony retirement path.** Session
+  4 (native `HarmonyClient` hint persistence) is Rust-side only and
+  independent; Session 5 (Harmony WASM surface extensions) wraps
+  Session 4; Session 6 (web-side Harmony cutover) mirrors Session
+  3's pattern. OnionPIR stays on TS indefinitely — SEAL doesn't
+  compile to wasm32.
+- **TS retirement Session 4 — native HarmonyClient hint persistence**
+  (see [SDK_ROADMAP.md](SDK_ROADMAP.md) Completed section for the
+  full breakdown). Closes the first-query-latency gap for HarmonyPIR:
+  every `ensure_*_groups_ready` that previously downloaded dozens of
+  MiB of hint parities now short-circuits on a cache hit, and any
+  `persist_hints_to_cache` after a sync preserves
+  `HarmonyGroup::query_count` + the relocation log so a restarted
+  client resumes mid-session instead of starting fresh. Three
+  artefacts landed:
+  * *New module* [`pir-sdk-client/src/hint_cache.rs`](pir-sdk-client/src/hint_cache.rs)
+    (~640 LOC). Self-describing binary format: magic bytes `PSH1`,
+    a `u16` format version, a 32-byte SHA-256 of a private
+    `SCHEMA_STRING` constant (mismatched schemas re-fetch cleanly),
+    a 16-byte `CacheKey::fingerprint` that folds
+    `(master_prp_key, prp_backend, db_id, height, index_bins,
+    chunk_bins, tag_seed, index_k, chunk_k)` through
+    `pir_core::merkle::sha256`. Main + sibling `HarmonyGroup` blobs
+    follow in length-prefixed records with sorted group IDs
+    (deterministic encode output locked in by unit test). Keyed on
+    fingerprint only — the master PRP key itself never hits disk as
+    cleartext, not even in the filename. `decode_hints` takes an
+    optional `expected_fingerprint` cross-check so a stale cache
+    with the wrong key/shape fails `PirError::InvalidState` instead
+    of returning zeros. `resolve_default_cache_dir` follows XDG
+    (`$XDG_CACHE_HOME/pir-sdk/hints/` with `~/.cache/pir-sdk/hints/`
+    fallback); `write_cache_file` uses `<path>.tmp` + rename for
+    POSIX-atomic writes. 21 unit tests cover round-trip, encode
+    determinism, cross-check mismatch, schema/magic/version/length
+    tampering rejection, XDG + home-dir fallback logic.
+  * *`HarmonyClient` persistence surface* (~430 new LOC in
+    [`pir-sdk-client/src/harmony.rs`](pir-sdk-client/src/harmony.rs)).
+    New field `hint_cache_dir: Option<PathBuf>` + 8 new public
+    methods: `with_hint_cache_dir` / `set_hint_cache_dir` /
+    `hint_cache_dir` accessor, `save_hints_bytes() ->
+    PirResult<Option<Vec<u8>>>` (in-memory export for the browser's
+    IndexedDB bridge, `None` when no groups are loaded),
+    `load_hints_bytes(&mut self, bytes, &DatabaseInfo)` (importer
+    with fingerprint cross-check), `persist_hints_to_cache` +
+    `restore_hints_from_cache` (filesystem-backed pair; no-op on
+    wasm32). The group-ID layout baked into encode/decode follows
+    the documented per-group key offsets: main INDEX = `g`, main
+    CHUNK = `k_index + g`, INDEX sib L = `(k_index + k_chunk) +
+    L*k_index + g`, CHUNK sib L = `(k_index + k_chunk) +
+    index_sib_levels*k_index + L*k_chunk + g`.
+  * *`ensure_*_groups_ready` integration.* Both `ensure_groups_ready`
+    (main) and `ensure_sibling_groups_ready` (per-level Merkle
+    siblings) now try `restore_hints_from_cache` before the network
+    fetch, then persist after a successful fetch (errors logged and
+    ignored so a read-only cache dir can't brick the client). The
+    sibling variant tightened its early-return check from
+    "not empty" to `index_sib_groups.len() == index_sib_levels *
+    k_index` (plus chunk counterpart) — closes a latent bug where a
+    stale cache with fewer levels would serve stale proofs.
+    12 new `harmony::tests` unit tests cover each surface.
+  Verification: `cargo test -p pir-sdk-client --lib` = 89/89
+  passing (native); `cargo build --target wasm32-unknown-unknown -p
+  pir-sdk-client` succeeds; `cargo check -p pir-sdk-client
+  --features onion` passes. 🔒 Padding invariants preserved — the
+  hint cache just shuttles `HarmonyGroup::serialize()` bytes, it
+  cannot bypass the K=75 INDEX / K_CHUNK=80 CHUNK / 25-MERKLE
+  padding which lives in the query path above it. **Unblocks
+  Session 5** (`WasmHarmonyClient.saveHints` / `loadHints` wrapping
+  these byte-level APIs, plus inspector + Merkle-verify parity with
+  DPF reusing Session 2's machinery).
+- **TS retirement Session 5 — Harmony WASM surface extensions**
+  (see [SDK_ROADMAP.md](SDK_ROADMAP.md) Completed section for the
+  full breakdown). Extends the native `HarmonyClient` with the
+  full DPF-parity surface and bridges it through
+  `WasmHarmonyClient`, unblocking Session 6 (the Harmony web-side
+  cutover). Three artefacts landed:
+  * *Native `HarmonyClient` surface parity with DPF (Session 2)*
+    in [`pir-sdk-client/src/harmony.rs`](pir-sdk-client/src/harmony.rs).
+    Six new translator helpers convert Harmony's `QueryTraces`
+    into SDK-level `BucketMerkleItem` / `BucketRef` values.
+    Existing `run_merkle_verification` refactored to delegate to
+    a new `verify_merkle_items` shared backend (tree-top fetch +
+    sibling-group ensure + `HarmonySiblingQuerier`-driven
+    `verify_bucket_merkle_batch_generic` with the existing
+    `std::mem::take` borrow-split) — same behaviour, now reusable
+    from the new split-verify path. New public methods:
+    `server_urls(&self) -> (&str, &str)`,
+    `set_state_listener(Option<Arc<dyn StateListener>>)` +
+    private `notify_state(ConnectionState)` fired in `connect` /
+    `connect_with_transport` / `disconnect`,
+    `query_batch_with_inspector(...)` (front-loads
+    `ensure_groups_ready`, translates traces to inspector fields,
+    synthesises empty `QueryResult` for not-found),
+    `verify_merkle_batch_for_results(...)` (no-op when
+    `!has_bucket_merkle`, otherwise runs the shared backend),
+    `sync_with_progress(...)` (drives `SyncProgress` observer
+    through plan steps), `db_id(&self)` / `set_db_id(u8)` /
+    `min_queries_remaining(&self)` / `estimate_hint_size_bytes(&self)` /
+    `cache_fingerprint(&DatabaseInfo) -> [u8; 16]` (the
+    DB-switch + hint-stats API new to this session). Nine new
+    unit tests.
+  * *`WasmHarmonyClient` bindings* in
+    [`pir-sdk-wasm/src/client.rs`](pir-sdk-wasm/src/client.rs).
+    New JS-visible methods: `serverUrls()`, `queryBatchRaw()`,
+    `verifyMerkleBatch()`, `dbId()`, `setDbId()`,
+    `minQueriesRemaining()`, `estimateHintSizeBytes()`,
+    `fingerprint(catalog, db_id)`,
+    `saveHints() -> Uint8Array | null`,
+    `loadHints(bytes, catalog, db_id)`, plus wasm32-only
+    `syncWithProgress(...)` and `onStateChange(...)` bridges
+    (same `SendWrapper<js_sys::Function>` pattern as
+    `WasmDpfClient`). A new `pub(crate) fn inner()` on
+    `WasmDatabaseCatalog` lets the Harmony wrapper look up
+    `DatabaseInfo` by `db_id` for the cache-key-derivation paths.
+    Four new native-safe unit tests (`Uint8Array`-returning
+    methods can't be native-tested because the wasm-bindgen
+    import panics outside wasm32).
+  * *Worker-pool strategy decision: main thread.* Deferred to a
+    post-Session-6 follow-up if real-world p95 measurements
+    exceed the ~200ms budget. Rationale: native `HarmonyClient`
+    bulk-processes groups inside one Rust call without TS↔WASM
+    boundary crossings, so per-round CPU budget drops well below
+    what the TS worker pool's amortized cost covered. Exposing
+    sub-group lifecycle to JS would break `HarmonyClient`'s
+    encapsulation of padding-critical state transitions.
+  Verification: `cargo test -p pir-sdk` = 14/14,
+  `cargo test -p pir-sdk-client --lib` = 98/98 (9 new Session 5
+  tests), `cargo test -p pir-sdk-wasm --lib` = 39/39 (5 new
+  Session 5 tests), `cargo build --target wasm32-unknown-unknown
+  -p pir-sdk-wasm` succeeds, `wasm-pack build --target web`
+  emits `pkg/pir_sdk_wasm.d.ts` with the full Session 5 Harmony
+  surface visible. 🔒 Padding invariants preserved — all new
+  inspector/verify paths delegate to the same native
+  `HarmonyClient` query code that owns K=75 INDEX / K_CHUNK=80
+  CHUNK / 25-MERKLE and the INDEX-Merkle item-count symmetry
+  invariant. **Unblocks Session 6** — the WASM surface this
+  session exposes is the exact set a `HarmonyPirClientAdapter`
+  needs to drop in over `harmonypir_client.ts`.
+- **Error taxonomy refinement in `PirError` (P2 follow-up after
+  TS retirement)**: landed a categorical
+  [`ErrorKind`](pir-sdk/src/error.rs) enum that lets callers
+  dispatch on cause without matching every variant. Three layers:
+  * *New variants* on `PirError`:
+    - `Transient { origin: &'static str, context: String }` —
+      general transient-blip path for retry-layer code (field
+      named `origin`, not `source`, so `thiserror` doesn't
+      coerce it into a `std::error::Error` source chain; the
+      `&'static str` type would otherwise fail the
+      `AsDynError` trait bound with a cryptic
+      "`as_dyn_error` exists but trait bounds not satisfied"
+      compile error).
+    - `ProtocolSkew { expected: String, actual: String }` —
+      version/feature mismatch that a caller can't recover from
+      without an upgrade. Distinct from `Protocol` (malformed
+      wire data *within* the agreed protocol).
+    - `SessionEvicted(String)` — server lost our session
+      (OnionPIR LRU eviction after in-session retry failed;
+      future: stale Harmony hint session). Dedicated variant so
+      reconnect-then-retry loops can target this cause
+      specifically instead of lumping with generic
+      `ServerError`.
+    - `MerkleVerificationFailed(String)` — pipeline-level Merkle
+      failure. Explicitly distinct from the per-query
+      `QueryResult::merkle_failed()` coercion, which stays in
+      place (per-query failures don't abort the batch; pipeline
+      failures do). The legacy `VerificationFailed(String)`
+      variant still exists and classifies the same way, for
+      back-compat with anyone who matches on it directly.
+  * *Classification API*: `PirError::kind() -> ErrorKind`
+    returns one of eight categorical kinds
+    (`TransientNetwork` / `SessionEvicted` / `ProtocolSkew` /
+    `MerkleVerificationFailed` / `ServerError` / `ClientError`
+    / `DataError` / `Other`). Callers can match on the enum
+    instead of the many specific variants. Four new helpers
+    (`is_transient_network`, `is_session_lost`,
+    `is_verification_failure`, `is_protocol_skew`) wrap the
+    common patterns. `is_retryable` broadened from the old
+    `Timeout | ConnectionClosed` match to
+    `TransientNetwork | SessionEvicted`, and
+    `is_connection_error` / `is_protocol_error` picked up the
+    new `Transient` / `ProtocolSkew` variants respectively —
+    the existing retry loop in
+    `pir-sdk-client/src/connection.rs::connect_with_backoff`
+    uses `is_connection_error` as its "retry this attempt"
+    predicate and continues to work.
+  * *Three concrete call-site migrations*:
+    - `pir-sdk-client/src/onion.rs::onionpir_batch_rpc` now
+      returns `PirError::SessionEvicted` when the all-empty
+      eviction signal (`batch_looks_evicted`) fires twice in a
+      row — once initially, once after re-registering keys.
+      Previously this produced a generic `ServerError` that
+      naive retry loops could spin on; the new variant gives
+      callers a clean signal to reconnect.
+    - `pir-sdk-client/src/merkle_verify.rs::decode_sibling_batch`
+      now returns `PirError::MerkleVerificationFailed` when the
+      server sends `RESP_ERROR = 0xFF` mid-Merkle-round. By
+      that point tree-tops are already fetched, so a mid-round
+      error means the server can't produce the evidence needed
+      to verify. Unit test
+      `test_decode_sibling_batch_error_variant` updated to
+      assert the new variant + `kind() ==
+      ErrorKind::MerkleVerificationFailed`.
+    - `pir-sdk-client/src/merkle_verify.rs::fetch_tree_tops`
+      now returns `PirError::ProtocolSkew` when the server
+      rejects the tree-tops request despite the catalog
+      advertising `has_bucket_merkle = true`. The tree-tops
+      count check in `verify_bucket_merkle_batch_dpf` also
+      raises `ProtocolSkew` when the server's blob has fewer
+      entries than the declared `K_INDEX + K_CHUNK` — client
+      and server disagree on PBC group count, which is a
+      version/feature gap rather than a transient corruption.
+  * *Docs*: module-level docs in `pir-sdk/src/error.rs` include
+    a cause-to-action mapping table, and per-variant docs
+    cross-link to preferred more-specific variants (e.g.
+    `ServerError` notes LRU eviction should use
+    `SessionEvicted` instead; `VerificationFailed` is marked as
+    legacy in favour of `MerkleVerificationFailed`). `ErrorKind`
+    is re-exported from `pir_sdk` crate root alongside
+    `PirError` / `PirResult`.
+
+  Verification: `cargo test -p pir-sdk --lib` = 31/31 passing
+  (was 14/14; 17 new error-taxonomy tests cover every
+  `ErrorKind` classification, all four new retry helpers, both
+  new variants' `Display` format, and `is_connection_error` /
+  `is_protocol_error` back-compat). `cargo test -p
+  pir-sdk-client --lib` = 98/98 passing. `cargo test -p
+  pir-sdk-wasm --lib` = 39/39 passing. `cargo build --target
+  wasm32-unknown-unknown -p pir-sdk-client` and `-p
+  pir-sdk-wasm` both succeed; `cargo check -p pir-sdk-client
+  --features onion` (C++/SEAL) succeeds. Web suites unchanged:
+  `npx vitest run` = 88/88 across 7 files, `npx vite build`
+  clean in ~300ms. 🔒 Padding invariants preserved — the
+  taxonomy sits above the query code that owns K=75 INDEX /
+  K_CHUNK=80 CHUNK / 25-MERKLE padding, and the three
+  migrations are error-raising-only changes (no wire-format or
+  query-logic shifts).
 
 ---
 
 ## Key Files
 - `pir-sdk/src/lib.rs` - SDK entry point
+- `pir-sdk/src/error.rs` - `PirError` + `ErrorKind` taxonomy + classification helpers
 - `pir-sdk-wasm/src/lib.rs` - WASM bindings
+- `pir-sdk-wasm/src/merkle_verify.rs` - WASM per-bucket Merkle verifier
+- `pir-sdk-wasm/src/client.rs` - `WasmDpfClient` + `WasmHarmonyClient` wrappers
+- `pir-sdk-client/src/transport.rs` - `PirTransport` trait (+ `MockTransport`)
+- `pir-sdk-client/src/connection.rs` - `WsConnection` (native `PirTransport` impl)
+- `pir-sdk-client/src/wasm_transport.rs` - `WasmWebSocketTransport` (wasm32 `PirTransport` impl)
+- `pir-sdk-client/src/hint_cache.rs` - HarmonyPIR hint cache format + fingerprint (Session 4)
 - `web/src/sdk-bridge.ts` - JS/TS bridge to WASM
+- `web/src/dpf-adapter.ts` - `BatchPirClientAdapter` over `WasmDpfClient` (Session 3)
+- `web/src/types.ts` - Neutral `ConnectionState` / `UtxoEntry` / `QueryResult` types (Session 1)
 - `web/src/sync-controller.ts` - Uses SDK for sync planning
 
 ## Build Commands

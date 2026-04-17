@@ -22,6 +22,43 @@ interface PirSdkWasm {
     new(): WasmQueryResult;
     fromJson(json: any): WasmQueryResult;
   };
+  // Native-WASM DPF client — used by `dpf-adapter.ts` to retire the pure-TS
+  // `BatchPirClient`. The class is constructed with two server URLs; its
+  // `connect()` opens both WebSockets via the wasm32 transport layer in
+  // `pir-sdk-client::wasm_transport`. The adapter owns padding invariants
+  // (K=75 INDEX / K_CHUNK=80 CHUNK / 25-MERKLE) by delegating the query
+  // machinery to the native `DpfClient` underneath — there is no way the
+  // adapter could bypass them.
+  WasmDpfClient: {
+    new(server0Url: string, server1Url: string): WasmDpfClient;
+  };
+  // Native-WASM HarmonyPIR client — used by `harmonypir-adapter.ts` to
+  // retire the pure-TS `HarmonyPirClient`. Constructed with two server
+  // URLs (hint server + query server). Generates a fresh random master
+  // PRP key at construction; callers that want to resume from a cached
+  // hint blob must `setMasterKey(bytes)` before `loadHints(...)`. The
+  // adapter owns HarmonyPIR's padding invariants (K=75 INDEX / K_CHUNK=80
+  // CHUNK / 25-MERKLE) by delegating to the native `HarmonyClient`
+  // underneath — the wrapper cannot bypass them.
+  WasmHarmonyClient: {
+    new(hintServerUrl: string, queryServerUrl: string): WasmHarmonyClient;
+  };
+  PRP_HOANG: () => number;
+  PRP_FASTPRP: () => number;
+  PRP_ALF: () => number;
+  /**
+   * Opaque wrapper around a parsed tree-tops blob. Obtain via
+   * `WasmBucketMerkleTreeTops.fromBytes(...)` and reuse across all items that
+   * belong to the same (db_id, height) — reparsing for every item is wasted
+   * work.
+   *
+   * Remember to call `.free()` once you're done with it (or when the
+   * containing FinalizationRegistry fires) so the WASM-side allocation can
+   * be released.
+   */
+  WasmBucketMerkleTreeTops: {
+    fromBytes(data: Uint8Array): WasmBucketMerkleTreeTops;
+  };
   computeSyncPlan(catalog: WasmDatabaseCatalog, lastSyncedHeight?: number | null): WasmSyncPlan;
   mergeDelta(snapshot: WasmQueryResult, deltaRaw: Uint8Array): WasmQueryResult;
   decodeDeltaData(raw: Uint8Array): DeltaDataJson;
@@ -39,6 +76,39 @@ interface PirSdkWasm {
   // Codec
   readVarint(data: Uint8Array, offset: number): Uint32Array;
   decodeUtxoData(data: Uint8Array): UtxoEntryRaw[];
+  // Per-bucket bin-Merkle primitives. The network-facing half of the verifier
+  // (K-padded sibling batches over DPF) stays in JS; these bindings cover the
+  // pure SHA-256 walk so the web client can drop its duplicate TS
+  // implementation.
+  bucketMerkleSha256(data: Uint8Array): Uint8Array;
+  bucketMerkleLeafHash(binIndex: number, binContent: Uint8Array): Uint8Array;
+  /** Arity-N parent hash. `childrenFlat.length` must be a multiple of 32. */
+  bucketMerkleParentN(childrenFlat: Uint8Array): Uint8Array;
+  /** XOR two equal-length buffers (for DPF `server0 ⊕ server1` folds). */
+  xorBuffers(a: Uint8Array, b: Uint8Array): Uint8Array;
+  /**
+   * Verify one per-bucket Merkle proof from leaf → cached root.
+   *
+   * `siblingRowsFlat` is one 256B row per level below `cacheFromLevel`,
+   * bottom-up, already XOR'd across server0 and server1. Returns `false`
+   * (not throw) on any mismatch or shape error — treat `false` as a
+   * verification failure and coerce the corresponding `QueryResult` to
+   * `merkleFailed()`.
+   */
+  verifyBucketMerkleItem(
+    binIndex: number,
+    binContent: Uint8Array,
+    pbcGroup: number,
+    siblingRowsFlat: Uint8Array,
+    treeTops: WasmBucketMerkleTreeTops,
+  ): boolean;
+}
+
+interface WasmBucketMerkleTreeTops {
+  free(): void;
+  readonly treeCount: number;
+  cacheFromLevel(groupIdx: number): number;
+  root(groupIdx: number): Uint8Array;
 }
 
 interface WasmDatabaseCatalog {
@@ -46,7 +116,38 @@ interface WasmDatabaseCatalog {
   readonly count: number;
   readonly latestTip: number | undefined;
   getDatabase(index: number): any;
+  /** Look up a database by `db_id`; returns `null` if not in the catalog. */
+  getEntry(dbId: number): any;
+  /** Does the database with `db_id` publish per-bucket Merkle commitments? */
+  hasBucketMerkle(dbId: number): boolean;
   toJson(): any;
+}
+
+/**
+ * Native-WASM DPF client. See `PirSdkWasm.WasmDpfClient` for the constructor
+ * signature. Only the subset used by `dpf-adapter.ts` is typed here; other
+ * surfaces (`sync`, `syncWithProgress`, `queryBatch`, `fetchCatalog`) exist
+ * on the actual class but aren't needed by the adapter.
+ */
+interface WasmDpfClient {
+  free(): void;
+  readonly isConnected: boolean;
+  connect(): Promise<void>;
+  disconnect(): Promise<void>;
+  /** Inspector-path batch query. Returns an `Array<WasmQueryResult>` of
+   * length `N` (one per packed scripthash). Every slot is non-null —
+   * not-found queries are synthesised as empty inspector-populated
+   * results so absence-proof bins are preserved. */
+  queryBatchRaw(scriptHashes: Uint8Array, dbId: number): Promise<WasmQueryResult[]>;
+  /** Standalone Merkle verifier — consumes inspector-populated results as
+   * JSON (typically `wqr.toJson()`-serialised). Returns `boolean[]`. */
+  verifyMerkleBatch(resultsJson: any[], dbId: number): Promise<boolean[]>;
+  /** Register a JS callback for every `ConnectionState` transition; the
+   * callback receives a single string (`"connecting"` / `"connected"` /
+   * `"disconnected"`). Replaces any previously registered listener. */
+  onStateChange(cb: (state: string) => void): void;
+  /** Returns `[server0Url, server1Url]`. */
+  serverUrls(): [string, string];
 }
 
 interface WasmSyncPlan {
@@ -59,12 +160,76 @@ interface WasmSyncPlan {
   toJson(): any;
 }
 
+/**
+ * Native-WASM HarmonyPIR client. See `PirSdkWasm.WasmHarmonyClient` for the
+ * constructor signature. Fields used by `harmonypir-adapter.ts`; the full
+ * surface exposed by `pir-sdk-wasm/src/client.rs::WasmHarmonyClient` is a
+ * superset (notably `queryBatch` + `fetchCatalog`, which the adapter doesn't
+ * need because PIR rounds go through `queryBatchRaw`).
+ */
+interface WasmHarmonyClient {
+  free(): void;
+  readonly isConnected: boolean;
+  connect(): Promise<void>;
+  disconnect(): Promise<void>;
+  serverUrls(): [string, string];
+  /** Returns the active `db_id`, or `undefined` if no hints are loaded. */
+  dbId(): number | undefined;
+  setDbId(dbId: number): void;
+  /** Overwrite the random 16-byte master PRP key. Must happen before
+   *  `loadHints(...)`. Throws on non-16-byte input. */
+  setMasterKey(key: Uint8Array): void;
+  setPrpBackend(backend: number): void;
+  /** Inspector-path batch query — populates `indexBins`/`chunkBins`
+   *  on every returned `WasmQueryResult`. Not-found slots are
+   *  synthesised as empty inspector-populated results (never null)
+   *  so Merkle absence proofs have something to verify against. */
+  queryBatchRaw(scriptHashes: Uint8Array, dbId: number): Promise<WasmQueryResult[]>;
+  /** Standalone Merkle verifier (mirrors `WasmDpfClient.verifyMerkleBatch`). */
+  verifyMerkleBatch(resultsJson: any[], dbId: number): Promise<boolean[]>;
+  /** 16-byte fingerprint derived from `(masterKey, prpBackend, catalog.get(dbId))`.
+   *  Embedded in `saveHints()` output; exposed here so the IndexedDB
+   *  bridge can tag cache entries for debugging. */
+  fingerprint(catalog: WasmDatabaseCatalog, dbId: number): Uint8Array;
+  /** Serialize the currently-loaded hint state to a self-describing
+   *  binary blob. Returns `null` / `undefined` when nothing is loaded. */
+  saveHints(): Uint8Array | undefined | null;
+  /** Restore hint state from a `saveHints()` blob. Fingerprint is
+   *  cross-checked against `(masterKey, prpBackend, catalog.get(dbId))`;
+   *  a mismatch throws rather than silently loading stale hints. */
+  loadHints(bytes: Uint8Array, catalog: WasmDatabaseCatalog, dbId: number): void;
+  /** Minimum per-group query budget across every loaded HarmonyGroup.
+   *  `undefined` when nothing is loaded. */
+  minQueriesRemaining(): number | undefined;
+  /** Size of the `saveHints()` blob that would be produced right now. */
+  estimateHintSizeBytes(): number;
+  /** Register a `ConnectionState` transition listener. */
+  onStateChange(cb: (state: string) => void): void;
+  /** Progress-reporting variant of `sync`; currently unused by the
+   *  adapter (queryBatchRaw is the primary path). */
+  syncWithProgress(
+    scriptHashes: Uint8Array,
+    lastHeight: number | null | undefined,
+    progress: (step: string, detail: string) => void,
+  ): Promise<any>;
+}
+
 interface WasmQueryResult {
   free(): void;
   readonly entryCount: number;
   readonly totalBalance: bigint;
   readonly isWhale: boolean;
+  readonly merkleVerified: boolean;
+  /** Returns `{txid: hexString, vout, amountSats}` or `null`. */
   getEntry(index: number): any;
+  /** Inspector state: `[{pbcGroup, binIndex, binContent: hexString}, ...]`. */
+  indexBins(): any;
+  chunkBins(): any;
+  /** The matched INDEX bin's position in `indexBins()`, or `undefined`
+   * for not-found / inspector-free results. */
+  matchedIndexIdx(): number | undefined;
+  /** Raw chunk bytes for delta-database queries, else `undefined`. */
+  rawChunkData(): Uint8Array | undefined;
   toJson(): any;
 }
 
@@ -301,6 +466,135 @@ export function sdkCuckooHashInt(
   const [hi, lo] = bigintToHiLo(key);
   return sdkWasm.cuckooHashInt(chunkId, hi, lo, numBins);
 }
+
+// ─── Per-bucket Merkle primitives ───────────────────────────────────────────
+//
+// These are the pure-crypto half of the per-bucket bin-Merkle verifier. They
+// are thin wrappers around the `pir-sdk-wasm` bindings (which themselves
+// delegate to `pir_core::merkle`), exposed so that `web/src/merkle-verify-bucket.ts`
+// can drop its ~100+ LOC of duplicated TS crypto (tree-top parse, leaf hash,
+// parent hash, walk-to-root) in favour of a single implementation shared with
+// the native Rust and WASM verifiers.
+//
+// Unlike the hash functions above, these require the WASM module to be loaded
+// — they `throw` rather than return `undefined` on a missing SDK, because the
+// caller (the Merkle verifier wire loop) has no TS fallback worth keeping.
+// `initSdkWasm()` must have been awaited at app startup (see `web/index.html`).
+
+function requireSdkForMerkle(): PirSdkWasm {
+  if (!sdkWasm) {
+    throw new Error(
+      '[PIR-SDK] WASM module required for bucket Merkle primitives. ' +
+        'Call initSdkWasm() at app startup.',
+    );
+  }
+  return sdkWasm;
+}
+
+/** SDK-backed SHA-256 (matches `pir_core::merkle::sha256`). */
+export function sdkBucketMerkleSha256(data: Uint8Array): Uint8Array {
+  return requireSdkForMerkle().bucketMerkleSha256(data);
+}
+
+/** SDK-backed bin leaf hash: `SHA256(bin_index_u32_LE || bin_content)`. */
+export function sdkBucketMerkleLeafHash(
+  binIndex: number,
+  binContent: Uint8Array,
+): Uint8Array {
+  return requireSdkForMerkle().bucketMerkleLeafHash(binIndex, binContent);
+}
+
+/**
+ * SDK-backed arity-N parent hash. Takes an array of 32-byte child hashes
+ * (length = arity) and returns `SHA256(child_0 || child_1 || …)`. Flattens
+ * the input before handing it to WASM.
+ */
+export function sdkBucketMerkleParentN(children: Uint8Array[]): Uint8Array {
+  const flat = new Uint8Array(children.length * 32);
+  for (let i = 0; i < children.length; i++) flat.set(children[i], i * 32);
+  return requireSdkForMerkle().bucketMerkleParentN(flat);
+}
+
+/**
+ * SDK-backed XOR of two equal-length buffers. Returns an empty `Uint8Array`
+ * on length mismatch (so the caller can surface it as a verification failure).
+ */
+export function sdkXorBuffers(a: Uint8Array, b: Uint8Array): Uint8Array {
+  return requireSdkForMerkle().xorBuffers(a, b);
+}
+
+/**
+ * Parse a per-bucket Merkle tree-tops blob (payload of `REQ_BUCKET_MERKLE_TREE_TOPS`,
+ * excluding the variant byte). Returns an opaque `WasmBucketMerkleTreeTops`
+ * handle that can be passed to `sdkVerifyBucketMerkleItem` repeatedly.
+ *
+ * Remember to call `.free()` on the returned handle when done (or lean on a
+ * `FinalizationRegistry`). Callers should wrap verification in
+ * `try { … } finally { handle.free(); }` to avoid leaking WASM allocations.
+ */
+export function sdkParseBucketMerkleTreeTops(
+  data: Uint8Array,
+): WasmBucketMerkleTreeTops {
+  return requireSdkForMerkle().WasmBucketMerkleTreeTops.fromBytes(data);
+}
+
+/**
+ * SDK-backed per-item Merkle verifier.
+ *
+ * Walks one proof from leaf to the published per-group root. `siblingRowsFlat`
+ * is the server0 ⊕ server1 XOR'd sibling-batch responses, one 256B row per
+ * level below `cacheFromLevel`, concatenated bottom-up.
+ *
+ * Returns `false` (never throws) on any shape / cryptographic mismatch — the
+ * caller should coerce a failed result to the equivalent of
+ * `QueryResult::merkle_failed()`.
+ */
+export function sdkVerifyBucketMerkleItem(
+  binIndex: number,
+  binContent: Uint8Array,
+  pbcGroup: number,
+  siblingRowsFlat: Uint8Array,
+  treeTops: WasmBucketMerkleTreeTops,
+): boolean {
+  return requireSdkForMerkle().verifyBucketMerkleItem(
+    binIndex,
+    binContent,
+    pbcGroup,
+    siblingRowsFlat,
+    treeTops,
+  );
+}
+
+// Re-export the opaque handle type so consumers don't have to reach into the
+// `PirSdkWasm` interface directly.
+export type { WasmBucketMerkleTreeTops };
+
+// ─── DPF client accessor ───────────────────────────────────────────────────
+//
+// `dpf-adapter.ts` needs the loaded `PirSdkWasm` module to construct a
+// `WasmDpfClient` at connect-time. This export mirrors the pattern used by
+// the Merkle primitives above (`requireSdkForMerkle`) — `throw` rather than
+// returning `undefined`, because the adapter has no TS fallback since
+// `web/src/client.ts` is being deleted in Session 3.
+
+/**
+ * Return the loaded `PirSdkWasm` module, throwing if `initSdkWasm()` has
+ * not resolved yet. Intended for consumers that cannot operate without
+ * the WASM surface (e.g. `BatchPirClientAdapter`).
+ */
+export function requireSdkWasm(): PirSdkWasm {
+  if (!sdkWasm) {
+    throw new Error(
+      '[PIR-SDK] WASM module required. Call initSdkWasm() at app startup.',
+    );
+  }
+  return sdkWasm;
+}
+
+// Re-export the adapter-facing interface types so `dpf-adapter.ts` can
+// import them without having to reach into this module's type-only
+// `PirSdkWasm` shape.
+export type { WasmDpfClient, WasmHarmonyClient, WasmQueryResult, WasmDatabaseCatalog };
 
 // ─── Re-exports for convenience ─────────────────────────────────────────────
 

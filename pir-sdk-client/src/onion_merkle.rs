@@ -29,7 +29,7 @@
 
 #![cfg(feature = "onion")]
 
-use crate::connection::WsConnection;
+use crate::transport::PirTransport;
 use pir_core::hash::{cuckoo_hash_int, derive_cuckoo_key, derive_int_groups_3, splitmix64, GOLDEN_RATIO};
 use pir_core::merkle::{compute_parent_n, sha256, Hash256};
 use pir_core::pbc::pbc_plan_rounds;
@@ -631,7 +631,7 @@ pub type OnionMerkleVerdicts = HashMap<(OnionTreeKind, usize), bool>;
 /// On decode / protocol error the function propagates; on individual leaf
 /// verification failure the verdict map entry is `false` (not an error).
 pub async fn verify_onion_merkle_batch(
-    conn: &mut WsConnection,
+    conn: &mut dyn PirTransport,
     info: &OnionMerkleInfo,
     leaves: &[OnionMerkleLeaf],
     client_id: u64,
@@ -689,7 +689,7 @@ pub async fn verify_onion_merkle_batch(
 /// Verify a single sub-tree (INDEX or DATA). Returns `leaf_pos → verified`.
 #[allow(clippy::too_many_arguments)]
 async fn verify_sub_tree(
-    conn: &mut WsConnection,
+    conn: &mut dyn PirTransport,
     tree: OnionTreeKind,
     sub_tree: &OnionMerkleSubTree,
     arity: usize,

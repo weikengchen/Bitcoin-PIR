@@ -14,15 +14,21 @@ alf = ["harmonypir-wasm/alf"]
 # Enable the real OnionPIR client. Off by default because the upstream
 # `onionpir` crate requires a C++ toolchain + cmake + Homebrew GCC on macOS
 # and pulls in the SEAL submodule. Without this feature, `OnionClient` keeps
-# its placeholder behavior (warn + return None).
+# its placeholder behavior (warn + return None). Native-only — the `onion`
+# feature is not compatible with `wasm32` targets (SEAL does not build there).
 onion = ["dep:onionpir", "dep:rand"]
+
+# ─── Cross-target dependencies ──────────────────────────────────────────────
+# These compile on both native (tokio) and wasm32 (web-sys). Anything that
+# pulls in tokio / tokio-tungstenite / rustls / a C toolchain must live in the
+# target-specific sections below.
 
 [dependencies]
 # Core SDK types and traits
 pir-sdk = { path = "../pir-sdk" }
 pir-core = { path = "../pir-core" }
 
-# DPF library
+# DPF library — pure Rust, works on any target.
 libdpf = { git = "https://github.com/weikengchen/libdpf.git" }
 
 # HarmonyPIR stateful per-group wrapper (reusable native rlib).
@@ -34,7 +40,28 @@ harmonypir-wasm = { path = "../harmonypir-wasm" }
 onionpir = { git = "https://github.com/Bitcoin-PIR/OnionPIRv2-fork.git", rev = "946550a836c28c1b00805f99805a2873ba47074e", optional = true }
 rand = { version = "0.8", optional = true }
 
-# Async runtime
+# `async_trait` is pure-Rust and works on any target — both the native
+# WsConnection impl and the WASM WebSocket transport impl share it.
+async-trait = "0.1"
+
+# futures-util combinators are cross-target. The native WebSocket path uses
+# `StreamExt`/`SinkExt`; the WASM path uses channel combinators.
+futures-util = "0.3"
+
+# Logging
+log = "0.4"
+
+# Error handling
+thiserror = "1.0"
+
+# ─── Native (tokio + tungstenite) target deps ───────────────────────────────
+# The tokio reactor does not run on `wasm32-unknown-unknown`. Everything that
+# needs `net` / `time` / multi-threaded I/O lives here so the crate can still
+# compile to wasm32 with the new `WasmWebSocketTransport` (see the wasm32
+# section below).
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Async runtime.
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "io-util", "time"] }
 # `rustls-tls-webpki-roots` enables `wss://` with the bundled Mozilla root
 # store. No system OpenSSL/schannel dependency — works identically in CI
@@ -47,14 +74,40 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 # installed at `WsConnection::connect()` time via
 # `install_default_crypto_provider()`.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-futures-util = "0.3"
-async-trait = "0.1"
 
-# Logging
-log = "0.4"
+# ─── WASM (wasm32-unknown-unknown) target deps ──────────────────────────────
+# Browsers expose `WebSocket` as a callback-driven DOM object; we bridge it
+# to async via a `futures_channel::mpsc` receiver. `wasm-bindgen-futures`
+# lets the client's `async fn` surface run on the JS event loop.
 
-# Error handling
-thiserror = "1.0"
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "BinaryType",
+    "Blob",
+    "CloseEvent",
+    "ErrorEvent",
+    "Event",
+    "FileReader",
+    "MessageEvent",
+    "ProgressEvent",
+    "WebSocket",
+] }
+# `futures` brings the cross-task join / select combinators that replace
+# `tokio::try_join!` on the WASM single-threaded event loop.
+futures = "0.3"
+futures-channel = "0.3"
+# `web_sys::WebSocket` and `Rc<RefCell<_>>` are `!Send + !Sync`, but
+# `PirTransport: Send + Sync` is required so the trait object satisfies
+# `PirClient: Send + Sync` on the native side of the codebase (and because
+# `#[async_trait]` futures have a Send bound by default). `SendWrapper<T>`
+# unsafely impls `Send + Sync` for any `T`, panicking on access from a
+# thread other than the one that constructed it — which on
+# `wasm32-unknown-unknown` is always the main thread. This lets us keep
+# one PirTransport trait shape across both targets.
+send_wrapper = "0.6"
 
 [dev-dependencies]
 env_logger = "0.11"

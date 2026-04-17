@@ -34,7 +34,7 @@ import {
   type TreeTopCache,
 } from './merkle.js';
 
-import type { UtxoEntry, QueryResult, ConnectionState } from './client.js';
+import type { UtxoEntry, QueryResult, ConnectionState } from './types.js';
 import type {
   DatabaseCatalog,
   OnionPirMerkleInfoJson,

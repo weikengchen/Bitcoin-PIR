@@ -356,6 +356,12 @@ pub fn merge_delta(snapshot: &QueryResult, delta_raw: &[u8]) -> PirResult<QueryR
         // on the returned value; `merge_delta_batch` does this automatically.
         merkle_verified: snapshot.merkle_verified,
         raw_chunk_data: None,
+        // Inspector fields stay empty after a merge — the Merkle-trace view
+        // is per-query, not per-merged-history, and re-verifying a merged
+        // result would require re-querying anyway.
+        index_bins: Vec::new(),
+        chunk_bins: Vec::new(),
+        matched_index_idx: None,
     })
 }
 
@@ -435,6 +441,9 @@ pub fn merge_delta_batch(
                         is_whale: false,
                         merkle_verified: del.merkle_verified,
                         raw_chunk_data: None,
+                        index_bins: Vec::new(),
+                        chunk_bins: Vec::new(),
+                        matched_index_idx: None,
                     })
                 } else {
                     None

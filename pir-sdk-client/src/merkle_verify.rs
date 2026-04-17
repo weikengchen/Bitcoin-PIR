@@ -30,7 +30,7 @@
 //! each pass is itself fully padded to K. Never optimize this away — it is a
 //! privacy requirement, not an artifact.
 
-use crate::connection::WsConnection;
+use crate::transport::PirTransport;
 use async_trait::async_trait;
 use libdpf::Dpf;
 use pir_core::merkle::{compute_bin_leaf_hash, compute_parent_n, Hash256, ZERO_HASH};
@@ -244,13 +244,24 @@ pub fn decode_sibling_batch(data: &[u8]) -> PirResult<SiblingResults> {
     match data[0] {
         RESP_BUCKET_MERKLE_SIB_BATCH => {}
         0xFF => {
-            // RESP_ERROR — surface the message for audit logs.
+            // RESP_ERROR in the middle of a Merkle sibling round is a
+            // pipeline-level verification failure — by the time we're here
+            // we've already fetched tree-tops successfully, so a mid-round
+            // error means the server can't produce the sibling evidence
+            // needed to verify. Surface as `MerkleVerificationFailed` so
+            // callers can distinguish "untrusted data" from generic
+            // server errors.
             if data.len() < 5 {
-                return Err(PirError::ServerError("bucket merkle: short error".into()));
+                return Err(PirError::MerkleVerificationFailed(
+                    "bucket merkle: short error".into(),
+                ));
             }
             let len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
             let msg = String::from_utf8_lossy(&data[5..5 + len.min(data.len() - 5)]).to_string();
-            return Err(PirError::ServerError(format!("bucket merkle: {}", msg)));
+            return Err(PirError::MerkleVerificationFailed(format!(
+                "bucket merkle: {}",
+                msg
+            )));
         }
         v => {
             return Err(PirError::Decode(format!(
@@ -303,8 +314,12 @@ pub fn decode_sibling_batch(data: &[u8]) -> PirResult<SiblingResults> {
 ///
 /// Returns all trees concatenated: indices `[0..K)` are INDEX trees,
 /// `[K..K+K_CHUNK)` are CHUNK trees (matching web client layout).
+///
+/// Takes `&mut dyn PirTransport` so tests can drive this against a mock
+/// transport, and a future WASM build can plug in a `web-sys::WebSocket`
+/// impl without changing this call site.
 pub async fn fetch_tree_tops(
-    conn0: &mut WsConnection,
+    conn0: &mut dyn PirTransport,
     db_id: u8,
 ) -> PirResult<Vec<TreeTop>> {
     let req = encode_tree_tops_request(db_id);
@@ -318,9 +333,14 @@ pub async fn fetch_tree_tops(
     }
     let variant = raw[4];
     if variant == 0xFF {
-        return Err(PirError::ServerError(
-            "server does not support bucket Merkle (no tree-tops)".into(),
-        ));
+        // Catalog advertised `has_bucket_merkle = true` but the server
+        // rejects the tree-tops request — that's a skew between what
+        // the catalog claims and what the server actually implements.
+        return Err(PirError::ProtocolSkew {
+            expected: "bucket_merkle support (per catalog has_bucket_merkle=true)"
+                .into(),
+            actual: "RESP_ERROR from REQ_BUCKET_MERKLE_TREE_TOPS".into(),
+        });
     }
     if variant != RESP_BUCKET_MERKLE_TREE_TOPS {
         return Err(PirError::UnexpectedResponse {
@@ -380,17 +400,22 @@ pub trait BucketMerkleSiblingQuerier: Send {
 /// `BucketMerkleSiblingQuerier` impl that fulfils each pass with a two-server
 /// DPF sibling batch (variant `REQ_BUCKET_MERKLE_SIB_BATCH = 0x33`).
 ///
-/// Borrows both `WsConnection`s mutably for its lifetime so one pass =
-/// exactly one request/response per server.
+/// Borrows both transports mutably for its lifetime so one pass = exactly
+/// one request/response per server. Generic over `&mut dyn PirTransport` so
+/// callers can plug in `WsConnection` (the production path) or any other
+/// transport (tests, future WASM WebSocket impl).
 pub struct DpfSiblingQuerier<'a> {
-    conn0: &'a mut WsConnection,
-    conn1: &'a mut WsConnection,
+    conn0: &'a mut dyn PirTransport,
+    conn1: &'a mut dyn PirTransport,
     dpf: Dpf,
     rng: SimpleRng,
 }
 
 impl<'a> DpfSiblingQuerier<'a> {
-    pub fn new(conn0: &'a mut WsConnection, conn1: &'a mut WsConnection) -> Self {
+    pub fn new(
+        conn0: &'a mut dyn PirTransport,
+        conn1: &'a mut dyn PirTransport,
+    ) -> Self {
         Self {
             conn0,
             conn1,
@@ -476,8 +501,8 @@ impl BucketMerkleSiblingQuerier for DpfSiblingQuerier<'_> {
 /// share a PBC group, multiple passes are run — each pass itself padded.
 #[allow(clippy::too_many_arguments)]
 pub async fn verify_bucket_merkle_batch_dpf(
-    conn0: &mut WsConnection,
-    conn1: &mut WsConnection,
+    conn0: &mut dyn PirTransport,
+    conn1: &mut dyn PirTransport,
     items: &[BucketMerkleItem],
     index_bins: u32,
     chunk_bins: u32,
@@ -532,11 +557,19 @@ pub async fn verify_bucket_merkle_batch_generic(
     tree_tops: &[TreeTop],
 ) -> PirResult<Vec<bool>> {
     if tree_tops.len() < index_k + chunk_k {
-        return Err(PirError::Protocol(format!(
-            "tree-tops has {} entries, expected at least {}",
-            tree_tops.len(),
-            index_k + chunk_k
-        )));
+        // Catalog declared K_INDEX / K_CHUNK but the server's tree-tops
+        // blob has fewer entries — client and server disagree on the
+        // PBC group count. This is a version/feature skew, not a
+        // transient wire corruption.
+        return Err(PirError::ProtocolSkew {
+            expected: format!(
+                "at least {} tree-top entries (K_INDEX={}, K_CHUNK={})",
+                index_k + chunk_k,
+                index_k,
+                chunk_k
+            ),
+            actual: format!("{} tree-top entries", tree_tops.len()),
+        });
     }
 
     log::info!(
@@ -986,12 +1019,17 @@ mod tests {
 
     #[test]
     fn test_decode_sibling_batch_error_variant() {
+        use pir_sdk::ErrorKind;
         let msg = b"not supported";
         let mut body = vec![0xFF];
         body.extend_from_slice(&(msg.len() as u32).to_le_bytes());
         body.extend_from_slice(msg);
         let err = decode_sibling_batch(&body).unwrap_err();
-        assert!(matches!(err, PirError::ServerError(_)));
+        // Mid-Merkle-round server error ⇒ MerkleVerificationFailed so
+        // callers can distinguish untrusted data from generic server
+        // errors via `PirError::kind()`.
+        assert!(matches!(err, PirError::MerkleVerificationFailed(_)));
+        assert_eq!(err.kind(), ErrorKind::MerkleVerificationFailed);
     }
 
     #[test]

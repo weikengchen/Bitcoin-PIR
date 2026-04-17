@@ -26,13 +26,15 @@ if (typeof window !== 'undefined') {
 }
 
 export {
-  BatchPirClient,
-  createBatchPirClient,
+  BatchPirClientAdapter,
   type BatchPirClientConfig,
-  type ConnectionState,
-  type UtxoEntry,
-  type QueryResult,
-} from './client.js';
+} from './dpf-adapter.js';
+
+export type {
+  ConnectionState,
+  UtxoEntry,
+  QueryResult,
+} from './types.js';
 
 export {
   encodeRequest,
@@ -107,12 +109,17 @@ export {
 } from './onionpir_client.js';
 
 export {
-  HarmonyPirClient,
-  createHarmonyPirClient,
+  HarmonyPirClientAdapter,
+  createHarmonyPirClientAdapter,
   type HarmonyPirClientConfig,
-  type HarmonyQueryResult,
-  type HarmonyUtxoEntry,
-} from './harmonypir_client.js';
+} from './harmonypir-adapter.js';
+
+export type {
+  HarmonyQueryResult,
+  HarmonyUtxoEntry,
+  QueryInspectorData,
+  RoundTimingData,
+} from './harmony-types.js';
 
 export {
   initWasm,

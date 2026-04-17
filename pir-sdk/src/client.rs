@@ -293,3 +293,49 @@ impl SyncProgress for PrintProgress {
         eprintln!("Sync error: {}", error);
     }
 }
+
+/// Connection-level state transitions emitted through
+/// [`StateListener::on_state_change`].
+///
+/// The exact set of values is intentionally narrow so the WASM
+/// bindings can stringify a value to a stable JS-side contract (see
+/// [`Self::as_str`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ConnectionState {
+    /// `connect()` has been called and the underlying transport is
+    /// mid-handshake — the client is not yet usable.
+    Connecting,
+    /// Handshake completed, transport is up, catalog has been fetched.
+    /// The client is ready to accept queries.
+    Connected,
+    /// `disconnect()` has completed, or a connect attempt failed.
+    /// Callers must call `connect()` (or inject new transports) before
+    /// further queries.
+    Disconnected,
+}
+
+impl ConnectionState {
+    /// Stable string label used by the WASM bindings' `onStateChange`
+    /// surface. Must match the strings `web/src/` TypeScript callers
+    /// switch on — bump the TS consumers if you add a variant.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ConnectionState::Connecting => "connecting",
+            ConnectionState::Connected => "connected",
+            ConnectionState::Disconnected => "disconnected",
+        }
+    }
+}
+
+/// Observer callback invoked whenever a client moves between
+/// [`ConnectionState`] values.
+///
+/// Wired into the WASM side's `onStateChange(cb)` by wrapping the JS
+/// `Function` in a `send_wrapper::SendWrapper<Rc<RefCell<Function>>>`
+/// bridge (see `pir-sdk-wasm/src/client.rs`). On native, callers
+/// typically implement this with a channel sender or a simple `Arc<Mutex<_>>`.
+pub trait StateListener: Send + Sync {
+    /// Invoked on every transition. Will be called from the async
+    /// task that drives the client — implementations MUST NOT block.
+    fn on_state_change(&self, state: ConnectionState);
+}

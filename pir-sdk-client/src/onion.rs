@@ -48,8 +48,10 @@
 //! mandatory per `CLAUDE.md` and is implemented identically to the DPF
 //! client — never "optimize" it away.
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::connection::WsConnection;
 use crate::protocol::{decode_catalog, encode_request, REQ_GET_DB_CATALOG, RESP_DB_CATALOG};
+use crate::transport::PirTransport;
 use async_trait::async_trait;
 use pir_sdk::{
     compute_sync_plan, merge_delta_batch, DatabaseCatalog, DatabaseInfo, DatabaseKind,
@@ -291,7 +293,7 @@ struct FheState {
 /// on systems without a C++ toolchain.
 pub struct OnionClient {
     server_url: String,
-    conn: Option<WsConnection>,
+    conn: Option<Box<dyn PirTransport>>,
     catalog: Option<DatabaseCatalog>,
     /// Per-DB OnionPIR-specific parameters. Keyed by db_id.
     onion_params: std::collections::HashMap<u8, OnionDbParams>,
@@ -321,6 +323,24 @@ impl OnionClient {
             #[cfg(feature = "onion")]
             fhe: None,
         }
+    }
+
+    /// Install a pre-built transport directly, bypassing the URL-based
+    /// [`PirClient::connect`] path.
+    ///
+    /// This is the test-injection escape hatch the `PirTransport` trait was
+    /// designed around: state-machine tests can hand in a
+    /// [`MockTransport`](crate::transport::MockTransport) (or any other
+    /// impl) and drive the client without opening a real WebSocket.
+    /// `PirClient::is_connected` returns `true` after this call.
+    ///
+    /// Note: with the `onion` feature, real queries also require FHE state
+    /// (Galois + GSW keys) which is populated during
+    /// [`PirClient::fetch_catalog`]. Tests that want to bypass the wire
+    /// entirely should drive query primitives directly, not through
+    /// `sync_with_plan`.
+    pub fn connect_with_transport(&mut self, conn: Box<dyn PirTransport>) {
+        self.conn = Some(conn);
     }
 
     /// Fetch the JSON server info and (best-effort) the DPF-format catalog,
@@ -446,6 +466,15 @@ impl OnionClient {
                         // flips this to `false` if the INDEX proof fails.
                         merkle_verified: true,
                         raw_chunk_data: None,
+                        // OnionPIR inspector state isn't part of Session 2
+                        // scope (DPF-only). Kept empty so the struct shape
+                        // matches across backends; OnionPIR's per-bin
+                        // Merkle trace lives inside `index_traces` /
+                        // `data_merkle` which are consumed by
+                        // `run_merkle_verification` directly.
+                        index_bins: Vec::new(),
+                        chunk_bins: Vec::new(),
+                        matched_index_idx: None,
                     })
                 }
                 Some(ir) => {
@@ -472,6 +501,11 @@ impl OnionClient {
                         } else {
                             None
                         },
+                        // See whale-case comment above — OnionPIR inspector
+                        // state is out of scope for Session 2.
+                        index_bins: Vec::new(),
+                        chunk_bins: Vec::new(),
+                        matched_index_idx: None,
                     })
                 }
             };
@@ -767,9 +801,17 @@ impl OnionClient {
     /// [`batch_looks_evicted`]), we treat it as eviction: mark
     /// `db_id` as un-registered, call `register_keys(db_id)`, and retry
     /// the exact same query once. A second all-empty response is
-    /// surfaced as a `PirError::ServerError` — at that point something
-    /// more fundamental is wrong (server doesn't accept our keys, DB is
-    /// misconfigured, etc.) and a retry loop would just spin.
+    /// surfaced as a [`PirError::SessionEvicted`] — classified as
+    /// [`ErrorKind::SessionEvicted`], distinct from a generic
+    /// [`ErrorKind::ServerError`], so a caller can reconnect and
+    /// retry specifically on this cause without retrying on every
+    /// server error. A second straight eviction after re-registering
+    /// keys usually means FHE param drift or DB misconfig; the
+    /// reconnect logic should cap retries at that point rather than
+    /// spin.
+    ///
+    /// [`ErrorKind::SessionEvicted`]: pir_sdk::ErrorKind::SessionEvicted
+    /// [`ErrorKind::ServerError`]: pir_sdk::ErrorKind::ServerError
     ///
     /// This is the single chokepoint for both `query_index_level` and
     /// `query_chunk_level`; keeping it in one place means the Merkle
@@ -810,7 +852,12 @@ impl OnionClient {
             .onionpir_batch_rpc_once(msg, expected_variant, variant_name)
             .await?;
         if batch_looks_evicted(&batch) {
-            return Err(PirError::ServerError(format!(
+            // Two consecutive empty batches ⇒ eviction signal even
+            // after re-registering. Classified as
+            // `ErrorKind::SessionEvicted` so a calling retry loop can
+            // reconnect + re-register and try again, distinct from a
+            // generic `ServerError` that a retry loop should NOT spin on.
+            return Err(PirError::SessionEvicted(format!(
                 "OnionPIR {} returned all-empty batch for db_id={} \
                  even after re-registering keys — server may be \
                  overloaded, or FHE params may have drifted",
@@ -1150,7 +1197,19 @@ impl PirClient for OnionClient {
 
     async fn connect(&mut self) -> PirResult<()> {
         log::info!("Connecting to OnionPIR server: {}", self.server_url);
-        let conn = WsConnection::connect(&self.server_url).await?;
+
+        // Native → tokio-tungstenite; WASM → web-sys WebSocket. OnionPIR
+        // has a single server so no try_join is needed.
+        #[cfg(not(target_arch = "wasm32"))]
+        let conn: Box<dyn PirTransport> = {
+            Box::new(WsConnection::connect(&self.server_url).await?)
+        };
+        #[cfg(target_arch = "wasm32")]
+        let conn: Box<dyn PirTransport> = {
+            use crate::wasm_transport::WasmWebSocketTransport;
+            Box::new(WasmWebSocketTransport::connect(&self.server_url).await?)
+        };
+
         self.conn = Some(conn);
         #[cfg(not(feature = "onion"))]
         log::warn!(
@@ -2240,5 +2299,20 @@ mod tests {
         for h in handles {
             h.join().expect("thread panicked — possible data race in &self FFI path");
         }
+    }
+
+    /// Demonstrates the test-injection escape hatch: a client built with a
+    /// [`MockTransport`](crate::transport::mock::MockTransport) reports
+    /// `is_connected()` without ever opening a real socket. This is the
+    /// core value prop of the `PirTransport` trait.
+    #[test]
+    fn connect_with_transport_marks_connected() {
+        use crate::transport::mock::MockTransport;
+        let mut client = OnionClient::new("wss://mock-onion");
+        assert!(!client.is_connected());
+        client.connect_with_transport(Box::new(MockTransport::new(
+            "wss://mock-onion",
+        )));
+        assert!(client.is_connected());
     }
 }

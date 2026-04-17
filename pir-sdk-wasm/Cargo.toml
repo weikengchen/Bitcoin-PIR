@@ -16,11 +16,31 @@ include-core = []
 [dependencies]
 pir-sdk = { path = "../pir-sdk" }
 pir-core = { path = "../pir-core" }
+# Native PIR client — on wasm32 its transport layer becomes
+# `WasmWebSocketTransport` (web-sys WebSocket), so the same client structs
+# work in the browser. On native it stays tokio-tungstenite; we only hit
+# the native path in `cargo test -p pir-sdk-wasm`, so the tokio pull-in is
+# acceptable.
+pir-sdk-client = { path = "../pir-sdk-client" }
 wasm-bindgen = "0.2"
+# Bridges Rust `Future` → JS `Promise` for the client's async methods
+# (`connect` / `sync` / `fetch_catalog`). Builds on native too (the macros
+# no-op on non-wasm32), so no cfg gating needed here.
+wasm-bindgen-futures = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde-wasm-bindgen = "0.6"
 js-sys = "0.3"
+
+# `send_wrapper` is wasm32-only: it's the bridge that lets us hold a
+# `!Send + !Sync` `js_sys::Function` (JS callback) inside a trait object
+# that demands `Send + Sync` (`StateListener`, `SyncProgress`). The
+# wrapper unsafely asserts Send + Sync and panics on cross-thread access
+# — sound on wasm32 where the runtime is single-threaded. Not needed on
+# native (the recorder impls in `#[cfg(test)]` modules use plain
+# `Arc<Mutex<_>>`).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+send_wrapper = "0.6"
 
 [profile.release]
 opt-level = "s"
