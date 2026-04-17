@@ -1206,6 +1206,46 @@ change near them needs extra care — do not optimize away padding.
   K_CHUNK=80 CHUNK / 25-MERKLE padding, and the migrations are
   error-raising changes only (no wire-format or logic shifts).
 
+- **Observability beyond `[PIR-AUDIT]` — Phases 1 & 2 landed.**
+  Phase 1 (commit `e34d93e`): `tracing` is an additive dep on
+  `pir-sdk-client` (with the `log` feature so existing
+  `[PIR-AUDIT]` `log::info!` calls keep flowing through any
+  installed subscriber). Every public method on `DpfClient`,
+  `HarmonyClient`, `OnionClient`, and `WsConnection::{connect,
+  connect_once, connect_with_backoff, reconnect}` carries
+  `#[tracing::instrument(level = …, skip_all, fields(backend =
+  "dpf"/"harmony"/"onion", …))]`. Three-tier level scheme:
+  `info` for top-level ops (`sync` / `connect` / `disconnect` /
+  `reconnect`), `debug` for sub-ops (step execution, catalog
+  fetch, inspector/verify paths), `trace` for per-query inner
+  loops. One smoke test per client captures formatted span
+  output through a `MakeWriter` so rename/removal fails at test
+  time. `pir-sdk-client` 98 → 101 tests.
+  Phase 2 (commit `3ad01b3`): `pir-sdk` ships a `PirMetrics`
+  observer trait with six defaulted callbacks (`on_query_start`
+  / `on_query_end` / `on_bytes_sent` / `on_bytes_received` /
+  `on_connect` / `on_disconnect`) plus `NoopMetrics` +
+  `AtomicMetrics` (lock-free `AtomicU64` counters, `Copy`
+  `Snapshot`). `PirTransport` gained
+  `set_metrics_recorder(recorder, backend)`; `WsConnection` /
+  `MockTransport` / `WasmWebSocketTransport` fire per-frame byte
+  callbacks (send counts after confirmed-OK result, recv counts
+  full raw frame with length prefix). `DpfClient`,
+  `HarmonyClient`, `OnionClient` each propagate the recorder to
+  every owned transport with `&'static str` backend label, and
+  fire `on_connect` per-transport + `on_disconnect` once per
+  client + `on_query_start` / `on_query_end` around every
+  `query_batch`. Pre- and post-connect install both work.
+  `pir-sdk` 31 → 39, `pir-sdk-client` 101 → 116,
+  `--features onion` 138/138, `pir-sdk-wasm` 39/39 unchanged.
+  wasm32 + onion builds clean. 🔒 Padding invariants preserved
+  — metrics are strictly observational, sit above the K=75
+  INDEX / K_CHUNK=80 CHUNK / 25-MERKLE padding invariants, and
+  callbacks receive scalars / static labels only. Phase 2+ tail
+  (latency histograms with wasm32-compatible `Instant`
+  substitute, WASM `tracing` subscriber bindings,
+  `WasmAtomicMetrics` bridge for browser tools panels) deferred.
+
 ## P0 — Blockers for "production-ready"
 
 _(none — all P0 items closed.)_
