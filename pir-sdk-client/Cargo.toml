@@ -37,7 +37,7 @@ harmonypir-wasm = { path = "../harmonypir-wasm" }
 # OnionPIR v2 FFI bindings — C++ SEAL-based FHE. Pulled in only under the
 # `onion` feature because it requires a native toolchain (cmake, GCC, SEAL
 # submodule). Pinned to the same rev used by the `runtime` crate.
-onionpir = { git = "https://github.com/Bitcoin-PIR/OnionPIRv2-fork.git", rev = "946550a836c28c1b00805f99805a2873ba47074e", optional = true }
+onionpir = { git = "https://github.com/Bitcoin-PIR/OnionPIRv2-fork.git", rev = "f18e4985ba835c5563ff804b3fa2c74722d17f6c", optional = true }
 rand = { version = "0.8", optional = true }
 
 # `async_trait` is pure-Rust and works on any target — both the native

@@ -157,6 +157,6 @@ txoutset = "0.4"
 memmap2 = "0.9"
 rayon = "1.10"
 libdpf = { git = "https://github.com/weikengchen/libdpf.git" }
-onionpir = { git = "https://github.com/Bitcoin-PIR/OnionPIRv2-fork.git", rev = "946550a836c28c1b00805f99805a2873ba47074e" }
+onionpir = { git = "https://github.com/Bitcoin-PIR/OnionPIRv2-fork.git", rev = "f18e4985ba835c5563ff804b3fa2c74722d17f6c" }
 brk_reader = "0.2"
 brk_rpc = "0.2"
