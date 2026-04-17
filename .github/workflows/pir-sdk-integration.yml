@@ -90,7 +90,22 @@ jobs:
     # separately keeps the DPF/Harmony smoke tests fast on PRs while still
     # giving us end-to-end OnionPIR coverage.
     name: pir-sdk-client OnionPIR integration tests
-    runs-on: ubuntu-latest
+    # Pinned to ubuntu-22.04 (GCC 11) instead of ubuntu-latest (GCC 13).
+    # Intel HEXL's CMake auto-detects AVX512 from /proc/cpuinfo on the
+    # runner host and enables AVX512 codegen, but on GCC 13 the per-
+    # translation-unit target-attribute scoping is inconsistent — non-
+    # AVX512 .cpp files include AVX512-flagged headers marked
+    # `always_inline`, and GCC 13 errors out with
+    #   "inlining failed in call to 'always_inline' '__m512i
+    #    _mm512_add_epi64(...)': target specific option mismatch"
+    # This fires any time the Cargo cache is cold (e.g. after a
+    # Cargo.lock hash shift) and HEXL rebuilds from scratch. GCC 11 on
+    # ubuntu-22.04 doesn't hit this. The upstream onionpir build.rs
+    # hardcodes -DUSE_HEXL=ON on Linux x86_64 with no env-var escape
+    # and explicitly wipes CXXFLAGS, so workflow-level flag injection
+    # doesn't help. Revisit once the fork exposes a
+    # ONIONPIR_DISABLE_HEXL env var (tracked separately).
+    runs-on: ubuntu-22.04
     timeout-minutes: 45
     env:
       CARGO_TERM_COLOR: always
