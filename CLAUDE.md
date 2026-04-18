@@ -1877,6 +1877,74 @@ Short-term active work:
   [`save_hints_bytes`]: pir-sdk-client/src/harmony.rs
   [`PirError::SessionEvicted`]: pir-sdk/src/error.rs
 
+- **Publishing prep landed (P3 #2 + #3 in
+  [SDK_ROADMAP.md](SDK_ROADMAP.md)).** Five publishable crates
+  (`pir-core`, `pir-sdk`, `pir-sdk-client`, `pir-sdk-server`,
+  `pir-sdk-wasm`) now ship with full crates.io / npm metadata,
+  dual-license blocks, READMEs, Keep-a-Changelog v1.1.0
+  CHANGELOGs, plus workspace-level `FEATURES.md` (per-crate
+  feature × default × compat × description matrix + platform
+  compatibility matrix) and `PUBLISHING.md` (readiness matrix
+  with 🟢/🟡/🔴 tags, two documented blockers each with two
+  suggested fixes, publish order, per-crate checklist, npm
+  workflow, version-bump procedure, unpublishing notes, and a
+  PIR invariant preservation gate). Landed in four logical
+  commits on `main`:
+  * `5d4e8da chore(publishing): add LICENSE files and align
+    Cargo.toml metadata for crates.io` — workspace-root
+    LICENSE-MIT + LICENSE-APACHE + per-crate symlinks +
+    Cargo.toml metadata fill-in (description / license /
+    repository / homepage / documentation / readme / keywords
+    / categories / authors / rust-version) + explicit `version
+    = "0.1.0"` on every cross-publishable path dep + `publish
+    = false` on `block_reader` / `build` / `runtime` /
+    `harmonypir-wasm`.
+  * `c5bf8cd docs(publishing): write per-crate READMEs for
+    crates.io` — per-crate README.md files that render on
+    crates.io and docs.rs, each pointing readers at the right
+    level of the stack.
+  * `4f5dee2 docs(publishing): add per-crate CHANGELOGs +
+    FEATURES.md + PUBLISHING.md` — five Keep-a-Changelog
+    files, the workspace `FEATURES.md`, the workspace
+    `PUBLISHING.md`. The `pir-sdk` and `pir-sdk-client`
+    CHANGELOGs each carry an explicit Security section
+    re-stating the K=75 INDEX / K_CHUNK=80 CHUNK / 25-MERKLE
+    padding invariant and the INDEX-Merkle item-count
+    symmetry rule.
+  * `bb41ab0 chore(publishing): add pir-sdk-wasm npm-publish
+    helper script` — `scripts/prepare-wasm-publish.sh`
+    (executable). wasm-pack copies only `name` / `version` /
+    `description` / `license` from Cargo.toml; the script
+    uses `jq --arg` (strings) + `--argjson` (keywords array)
+    to add `repository` / `homepage` / `bugs` / `keywords` /
+    `author`, and appends `CHANGELOG.md` + `LICENSE-MIT` +
+    `LICENSE-APACHE` to the `files` array via `unique` (npm
+    auto-includes `LICENSE`/`LICENCE` but not the hyphenated
+    variants, and never auto-includes `CHANGELOG.md`).
+    Cross-checks the version in `pir-sdk-wasm/Cargo.toml`
+    against `pkg/package.json` to prevent publishing a stale
+    pkg/. Exit codes: 0 success, 1 pkg missing, 2 version
+    mismatch, 3 jq missing.
+
+  The actual `cargo publish` / `npm publish` invocations are
+  deliberately not run pending blocker resolution (unpinned
+  `libdpf` git dep, pinned-rev `harmonypir` git dep,
+  `runtime`/`build` path deps inside `pir-sdk-server`); see
+  [PUBLISHING.md](PUBLISHING.md) for the documented fix paths.
+  Verification: full test surface stayed green throughout —
+  `cargo test -p pir-core --lib` 25/25, `pir-sdk --lib`
+  48/48, `pir-sdk-client --lib` 125/125 (147/147 with
+  `--features onion`), `pir-sdk-wasm --lib` 51/51. `cargo
+  build --target wasm32-unknown-unknown -p pir-sdk-client`
+  and `-p pir-sdk-wasm` both clean. `wasm-pack build --target
+  web --out-dir pkg` succeeds. 🔒 Padding invariants
+  unaffected — the entire prep series is metadata + docs +
+  tooling, no query path was touched. The "Security" sections
+  in the pir-sdk and pir-sdk-client CHANGELOGs and the
+  invariant-preservation gate in PUBLISHING.md re-state
+  (don't relax) the padding + INDEX-Merkle symmetry rules
+  from this file's CRITICAL SECURITY REQUIREMENTS section.
+
 ---
 
 ## Key Files

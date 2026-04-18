@@ -11,6 +11,91 @@ change near them needs extra care — do not optimize away padding.
 
 ## Completed
 
+- **Publishing prep landed (P3 #2 + #3).** Five publishable crates
+  (`pir-core`, `pir-sdk`, `pir-sdk-client`, `pir-sdk-server`,
+  `pir-sdk-wasm`) now carry the full set of metadata, docs, and
+  tooling needed to ship to crates.io + npm without re-discovering
+  the requirements every time. Landed in four logical commits on
+  `main`:
+
+  *Commit 1 — `chore(publishing): add LICENSE files and align
+  Cargo.toml metadata for crates.io` (22 files, +322/-13).*
+  Workspace-root `LICENSE-MIT` + `LICENSE-APACHE` (Rust ecosystem
+  dual-license standard), with one-line symlinks into each
+  publishable crate dir so `cargo package` picks them up from the
+  crate context. Filled in `description` / `license` / `repository`
+  / `homepage` / `documentation` / `readme` / `keywords` /
+  `categories` / `authors` / `rust-version` on the five
+  publishable Cargo.toml files. Pinned explicit `version =
+  "0.1.0"` on every in-workspace path dep that crosses publishable
+  boundaries (cargo refuses to package without this even when the
+  registry version equals the workspace one). Marked
+  `block_reader`, `build`, `runtime`, `harmonypir-wasm` as
+  `publish = false` — first three are app/bin crates, fourth has
+  a git dep on upstream `harmonypir` that blocks crates.io.
+
+  *Commit 2 — `docs(publishing): write per-crate READMEs for
+  crates.io` (5 files, +868/-335).* Per-crate `README.md` files
+  that render on crates.io and docs.rs. `pir-core` README points
+  at the higher-level crates with a module-overview table.
+  `pir-sdk` refresh covers `PirClient`/`PirBackend` traits + sync
+  planning + delta merge + error taxonomy + observability entry
+  points. `pir-sdk-client` documents the three backends + transport
+  trait + connection resilience + feature flags (with the `onion`
+  C++/SEAL warning prominent). `pir-sdk-server` carries the
+  upfront "not yet on crates.io" pointer to PUBLISHING.md
+  Blocker 2. `pir-sdk-wasm` refresh documents the
+  `WasmDpfClient` + `WasmHarmonyClient` + merkle verifier +
+  atomic metrics + tracing subscriber surface, with the
+  `WasmOnionClient`-doesn't-exist note (SEAL ≠ wasm32).
+
+  *Commit 3 — `docs(publishing): add per-crate CHANGELOGs +
+  FEATURES.md + PUBLISHING.md` (7 files, +821).* Per-crate
+  `CHANGELOG.md` in Keep-a-Changelog v1.1.0 format (`[Unreleased]`
+  + `[0.1.0]` sections + bottom compare links), one per
+  publishable crate. The `pir-sdk` and `pir-sdk-client` ones each
+  carry an explicit Security section re-stating the K=75 INDEX /
+  K_CHUNK=80 CHUNK / 25-MERKLE padding invariant and the
+  INDEX-Merkle item-count symmetry rule from CLAUDE.md.
+  `FEATURES.md` ships the summary table + per-crate detail blocks
+  + platform compatibility matrix. `PUBLISHING.md` documents the
+  readiness matrix (🟢/🟡/🔴), two blockers each with two
+  suggested fixes, the publish order
+  (`pir-core → pir-sdk → upstream → pir-sdk-client → pir-sdk-wasm
+  → pir-sdk-server`) with a 30s index-propagation note between
+  steps, per-crate publish checklist, version-bump procedure,
+  unpublishing notes (cargo yank, npm 72h window), and a PIR
+  invariant preservation gate that re-states the padding rules
+  as a publish prerequisite.
+
+  *Commit 4 — `chore(publishing): add pir-sdk-wasm npm-publish
+  helper script` (1 file, +144).*
+  `scripts/prepare-wasm-publish.sh` (executable) patches the
+  generated `pkg/package.json` after `wasm-pack build`. wasm-pack
+  copies only `name` / `version` / `description` / `license`
+  from Cargo.toml, so the script uses `jq --arg` (strings) +
+  `--argjson` (keywords array) to add `repository` / `homepage`
+  / `bugs` / `keywords` / `author`, and appends `CHANGELOG.md` +
+  `LICENSE-MIT` + `LICENSE-APACHE` to the `files` array via
+  `unique` (npm's auto-include catches `LICENSE`/`LICENCE` but
+  not the hyphenated variants, and never auto-includes
+  `CHANGELOG.md`). Cross-checks the version in
+  `pir-sdk-wasm/Cargo.toml` against `pkg/package.json` to prevent
+  publishing a stale `pkg/`. Exit codes: 0 success, 1 pkg
+  missing, 2 version mismatch, 3 jq missing.
+
+  Verification: full test surface stayed green throughout —
+  `cargo test -p pir-core --lib` 25/25, `pir-sdk --lib` 48/48,
+  `pir-sdk-client --lib` 125/125 (147/147 with `--features
+  onion`), `pir-sdk-wasm --lib` 51/51. `cargo build --target
+  wasm32-unknown-unknown -p pir-sdk-client` and `-p pir-sdk-wasm`
+  both clean. `wasm-pack build --target web --out-dir pkg`
+  succeeds. The actual `cargo publish` / `npm publish`
+  invocations are deliberately not run pending blocker
+  resolution (see PUBLISHING.md). 🔒 Padding invariants
+  unaffected — the entire prep series is metadata + docs +
+  tooling. No query path was touched.
+
 - **P3 sweep: rustdoc + dead-code + clippy.** Three P3 items landed
   together as a polish pass:
   * *Rustdoc examples per client.* `DpfClient`, `HarmonyClient`, and
@@ -2106,12 +2191,32 @@ _(none — all P1 items closed.)_
       `set_prp_backend` for Harmony; `PirError::SessionEvicted` for
       Onion). See "P3 sweep: rustdoc + dead-code + clippy" in
       Completed milestones below.
-- [ ] **Publishing story.** Decide if/how this ships to crates.io
-      (`pir-sdk`, `pir-sdk-client`, `pir-sdk-server`) and npm
-      (`pir-sdk-wasm`). Pin versioning scheme, write `CHANGELOG.md`.
-- [ ] **Feature flag doc page.** `fastprp`, `alf`, `onion` — what
-      each enables, what each costs (build-time, link-time),
-      compatibility matrix.
+- [x] **Publishing story.** Five publishable crates have full
+      crates.io / npm metadata, dual-license blocks, READMEs,
+      Keep-a-Changelog v1.1.0 `CHANGELOG.md` files, and
+      `PUBLISHING.md` documenting the publish order +
+      blockers (git deps, `pir-sdk-server` runtime/build
+      factoring) + per-crate checklists. The
+      `scripts/prepare-wasm-publish.sh` helper patches the
+      generated npm `pkg/package.json` with the metadata that
+      `wasm-pack` doesn't propagate. Versioning scheme is
+      per-crate SemVer pre-1.0 (minor bumps may break,
+      patches don't). The actual `cargo publish` /
+      `npm publish` invocations are deliberately not run
+      until the upstream blockers (unpinned `libdpf` git dep,
+      pinned-rev `harmonypir` git dep, `runtime`/`build` path
+      deps inside `pir-sdk-server`) clear. See the
+      "Publishing prep landed" entry in Completed milestones
+      for the full breakdown.
+- [x] **Feature flag doc page.** `FEATURES.md` ships a per-crate
+      summary table (crate × feature × default × compat ×
+      description), per-feature detail blocks (semantics, cost,
+      what depends on it), and a platform compatibility matrix
+      (Linux/macOS/Windows × `wasm32-unknown-unknown` ×
+      `wasm32-wasi`). The `onion` feature's 5–10 min cold SEAL
+      build cost and `wasm32` incompatibility are flagged
+      explicitly; padding-invariant preservation across all
+      feature combinations is called out at the bottom.
 - [ ] **Delta sync chain optimizations.** `compute_sync_plan`
       BFS-to-5-steps is conservative. Benchmark against realistic
       delta graphs; consider caching chain computations.
