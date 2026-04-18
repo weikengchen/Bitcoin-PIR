@@ -2,8 +2,16 @@
 name = "pir-sdk-client"
 version = "0.1.0"
 edition = "2021"
-description = "PIR SDK Client: Native Rust client for PIR queries"
+rust-version = "1.78"
+authors = ["Bitcoin PIR contributors"]
+description = "Native Rust PIR client for DPF, HarmonyPIR, and OnionPIR backends (two-server and single-server FHE)"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/Bitcoin-PIR/Bitcoin-PIR"
+homepage = "https://github.com/Bitcoin-PIR/Bitcoin-PIR"
+documentation = "https://docs.rs/pir-sdk-client"
+readme = "README.md"
+keywords = ["pir", "privacy", "bitcoin", "cryptography", "websocket"]
+categories = ["cryptography", "cryptography::cryptocurrencies", "network-programming"]
 
 [features]
 default = []
@@ -25,13 +33,17 @@ onion = ["dep:onionpir", "dep:rand"]
 
 [dependencies]
 # Core SDK types and traits
-pir-sdk = { path = "../pir-sdk" }
-pir-core = { path = "../pir-core" }
+pir-sdk = { version = "0.1.0", path = "../pir-sdk" }
+pir-core = { version = "0.1.0", path = "../pir-core" }
 
 # DPF library — pure Rust, works on any target.
 libdpf = { git = "https://github.com/weikengchen/libdpf.git" }
 
 # HarmonyPIR stateful per-group wrapper (reusable native rlib).
+# Note: no `version` because harmonypir-wasm is not publishable to
+# crates.io today (git dep on upstream `harmonypir`). The path dep
+# works for workspace development; `cargo publish -p pir-sdk-client`
+# is gated on resolving this per PUBLISHING.md "Blocker 1".
 harmonypir-wasm = { path = "../harmonypir-wasm" }
 
 # OnionPIR v2 FFI bindings — C++ SEAL-based FHE. Pulled in only under the

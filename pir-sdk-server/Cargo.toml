@@ -2,8 +2,22 @@
 name = "pir-sdk-server"
 version = "0.1.0"
 edition = "2021"
-description = "PIR SDK Server: load databases and serve PIR requests"
+rust-version = "1.78"
+authors = ["Bitcoin PIR contributors"]
+description = "PIR server-side SDK: load pre-built PIR databases and serve DPF, HarmonyPIR, and OnionPIR requests"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/Bitcoin-PIR/Bitcoin-PIR"
+homepage = "https://github.com/Bitcoin-PIR/Bitcoin-PIR"
+documentation = "https://docs.rs/pir-sdk-server"
+readme = "README.md"
+keywords = ["pir", "privacy", "bitcoin", "cryptography", "server"]
+categories = ["cryptography", "cryptography::cryptocurrencies", "network-programming::server"]
+
+# Not currently publishable to crates.io because `runtime` and `build` are
+# workspace-internal binary crates (not library crates) that cannot
+# themselves be published. Factoring out a publishable server-core library
+# is tracked as future work in PUBLISHING.md.
+publish = false
 
 [dependencies]
 # Core SDK types and traits

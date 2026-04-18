@@ -3,6 +3,10 @@ name = "build"
 version = "0.1.0"
 edition = "2021"
 
+# Workspace-internal tooling crate (database build pipeline binaries).
+# Not a library — not published to crates.io.
+publish = false
+
 # ─── Essential pipeline (required for server/client) ─────────────────────────
 # Run in order: gen_0 → gen_1 → gen_2 → gen_3
 

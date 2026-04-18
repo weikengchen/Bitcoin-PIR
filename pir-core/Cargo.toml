@@ -2,6 +2,15 @@
 name = "pir-core"
 version = "0.1.0"
 edition = "2021"
-description = "Core PIR hash functions, parameters, codec, and cuckoo utilities"
+rust-version = "1.78"
+authors = ["Bitcoin PIR contributors"]
+description = "Core PIR primitives: hash functions, parameters, codec, cuckoo placement, and Merkle utilities"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Bitcoin-PIR/Bitcoin-PIR"
+homepage = "https://github.com/Bitcoin-PIR/Bitcoin-PIR"
+documentation = "https://docs.rs/pir-core"
+readme = "README.md"
+keywords = ["pir", "privacy", "bitcoin", "cryptography", "cuckoo"]
+categories = ["cryptography", "cryptography::cryptocurrencies", "no-std"]
 
 [dependencies]

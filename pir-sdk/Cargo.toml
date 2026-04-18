@@ -2,14 +2,20 @@
 name = "pir-sdk"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.78"
+authors = ["Bitcoin PIR contributors"]
 description = "PIR SDK: core types, traits, and abstractions for Private Information Retrieval"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/pir-project/BitcoinPIR"
-keywords = ["pir", "privacy", "bitcoin", "utxo"]
+repository = "https://github.com/Bitcoin-PIR/Bitcoin-PIR"
+homepage = "https://github.com/Bitcoin-PIR/Bitcoin-PIR"
+documentation = "https://docs.rs/pir-sdk"
+readme = "README.md"
+keywords = ["pir", "privacy", "bitcoin", "cryptography", "utxo"]
+categories = ["cryptography", "cryptography::cryptocurrencies", "network-programming"]
 
 [dependencies]
 # Re-export core primitives
-pir-core = { path = "../pir-core" }
+pir-core = { version = "0.1.0", path = "../pir-core" }
 
 # Async runtime traits
 async-trait = "0.1"

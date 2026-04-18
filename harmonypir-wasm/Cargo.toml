@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "WASM bindings for HarmonyPIR stateful PIR client"
 
+# Not publishable: has a git dep on the upstream `harmonypir` crate.
+# Once `harmonypir` is on crates.io, drop this line and pin a semver
+# version on the dep. See PUBLISHING.md "Blocker 1".
+publish = false
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 

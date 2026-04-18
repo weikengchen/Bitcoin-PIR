@@ -3,6 +3,10 @@ name = "block_reader"
 version = "0.1.0"
 edition = "2021"
 
+# Workspace-internal tooling crate (block-chain ingest helpers).
+# Not a library — not published to crates.io.
+publish = false
+
 [[bin]]
 name = "block_stats"
 path = "src/block_stats.rs"
