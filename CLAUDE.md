@@ -297,13 +297,99 @@ Short-term active work:
   "Native Rust metrics observer (P2 observability Phase 2)" entry
   in Completed milestones below for the full breakdown.
 
+- **Observability Phase 2+ `WasmAtomicMetrics` bridge is
+  complete.** `pir-sdk-wasm` now ships a `#[wasm_bindgen]`
+  `WasmAtomicMetrics` class wrapping `Arc<pir_sdk::AtomicMetrics>`
+  (lock-free atomic counters shared with any client that holds
+  an `Arc` clone). JS surface: `new()`, `snapshot()` returning
+  a plain object with nine `bigint` fields (`queriesStarted` /
+  `queriesCompleted` / `queryErrors` / `bytesSent` /
+  `bytesReceived` / `framesSent` / `framesReceived` / `connects`
+  / `disconnects`). `WasmDpfClient` and `WasmHarmonyClient` each
+  picked up `setMetricsRecorder(metrics) / clearMetricsRecorder()`
+  — the native client then propagates the handle to every owned
+  transport (DPF: 2, Harmony: 2) with the matching
+  `&'static str` backend label, so all pre-existing Phase 2
+  byte / frame / connect / disconnect / query-lifecycle
+  callbacks start firing on the shared counters. Pre-connect
+  and post-connect install both work. `web/src/sdk-bridge.ts`
+  exposes `sdkCreateAtomicMetrics()` helper + typed
+  `WasmAtomicMetrics` / `AtomicMetricsSnapshot` interfaces with
+  `setMetricsRecorder` / `clearMetricsRecorder` typed on both
+  client interfaces. See the "Native Rust `WasmAtomicMetrics`
+  bridge (P2 observability Phase 2+ tail, first item)" entry
+  in Completed milestones below for the full breakdown.
+
+- **Observability Phase 2+ `tracing-wasm` subscriber is
+  complete.** `pir-sdk-wasm` now ships a new `tracing_bridge`
+  module with a `#[wasm_bindgen]` `initTracingSubscriber()`
+  function that installs `tracing-wasm::set_as_global_default`
+  as the browser's global `tracing` subscriber. Guarded by
+  `std::sync::Once` so repeat calls from multiple init paths
+  are no-ops (without the guard, `tracing-wasm` panics on the
+  second call because `tracing` allows one global subscriber
+  per process). All Phase 1 `#[tracing::instrument]` spans on
+  `DpfClient` / `HarmonyClient` / `OnionClient` / `WsConnection`
+  / `WasmWebSocketTransport` now surface in the browser DevTools
+  console with the consistent `backend="dpf"/"harmony"/"onion"`
+  field. `web/src/sdk-bridge.ts` exposes an `initSdkTracing()`
+  helper that follows the `sdkCreateAtomicMetrics()` pattern —
+  throws if `initSdkWasm()` hasn't resolved. Bundle cost:
+  +35 kB uncompressed / +14 kB gzipped for the
+  `tracing-subscriber` + `tracing-wasm` + `sharded-slab`
+  transitive deps. See the "Native Rust `tracing-wasm`
+  subscriber bridge (P2 observability Phase 2+ tail, second
+  item)" entry in Completed milestones below for the full
+  breakdown.
+
+- **Observability Phase 2+ per-client latency histograms is
+  complete.** `pir-sdk` now depends on `web-time = "1.1"`
+  (drop-in `Instant` / `Duration` replacement that uses
+  `performance.now()` on `wasm32-unknown-unknown` and
+  `std::time` on native), re-exporting `Instant` / `Duration`
+  from the crate root alongside `PirMetrics` / `AtomicMetrics`.
+  `PirMetrics::on_query_end` gained a sixth parameter
+  `duration: Duration`; `AtomicMetrics` gained three new
+  lock-free `AtomicU64` counters (`total_query_latency_micros`
+  / `min_query_latency_micros` / `max_query_latency_micros`)
+  with `min` initialised to a `MIN_LATENCY_SENTINEL =
+  u64::MAX` so `fetch_min(observed)` always wins on the first
+  measurement (no first-value-special-cased CAS loop needed).
+  The three native clients (`DpfClient`, `HarmonyClient`,
+  `OnionClient`) all switched their `fire_query_start` /
+  `fire_query_end` helpers to an `Option<Instant>`-threading
+  pattern: `fire_query_start` returns `Some(Instant::now())`
+  only when a recorder is installed (zero overhead — and zero
+  `performance.now()` JS↔WASM boundary calls — when none is),
+  `fire_query_end` consumes the `Option<Instant>` and surfaces
+  `t.elapsed()` (or `Duration::ZERO` if the recorder was
+  installed mid-query) on the per-recorder
+  `on_query_end(duration)` callback.
+  `WasmAtomicMetrics.snapshot()` grew from 9 to 12 `bigint`
+  fields — new fields `totalQueryLatencyMicros` /
+  `minQueryLatencyMicros` / `maxQueryLatencyMicros` join the
+  pre-existing nine. The TS bridge documents the
+  min-sentinel detection contract (`0xFFFF_FFFF_FFFF_FFFFn`
+  meaning "no measurements yet"). 🔒 Padding invariants
+  preserved — the latency layer is strictly observational
+  and cannot influence padding queries. See the "Native Rust
+  per-client latency histograms (P2 observability Phase 2+
+  tail, third item)" entry in Completed milestones below for
+  the full breakdown.
+
 - Other unblocked P2 items:
-  * **Observability Phase 2+ tail** — per-client latency histograms
-    (need a `performance.now()`-backed substitute for wasm32's lack
-    of `std::time::Instant`), WASM bindings for `tracing`
-    (`pir-sdk-wasm` needs a web-compatible subscriber adapter), and
-    a `WasmAtomicMetrics` bridge so a browser tools panel can read
-    the counters.
+  * **Observability Phase 2+ tail (remaining stretch)** —
+    per-frame round-trip latency tracking via
+    `WsConnection::send` / `recv` / `roundtrip`. Would
+    require capturing an `Instant` inside the
+    transport-level `roundtrip` future and surfacing it
+    through a new `PirMetrics::on_roundtrip_end` callback
+    — meaningful API extension, separate design decision
+    from the per-query-end latency that already landed.
+    The `WasmAtomicMetrics` bridge, `tracing-wasm`
+    subscriber, and per-client latency histograms items
+    from the original Phase 2+ tail list have all
+    landed — see above.
   * **Post-Session-6 worker-pool measurement follow-up** — revisit
     if real-world p95 query latency exceeds the ~200ms budget
     that Session 5's main-thread decision was predicated on.
@@ -1201,6 +1287,596 @@ Short-term active work:
   baseline). `cargo check -p pir-sdk-client --features onion`
   clean. 🔒 Padding invariants preserved — see Layer 4 above.
 
+- **Native Rust `WasmAtomicMetrics` bridge (P2 observability
+  Phase 2+ tail, first item)**: exposes the native
+  `pir_sdk::AtomicMetrics` lock-free counter recorder to
+  JavaScript via `wasm-bindgen` so a browser tools panel /
+  dashboard can poll live PIR query + transport counters
+  without leaving the Rust-native metrics path. Three layers
+  landed:
+
+  *Layer 1 — `WasmAtomicMetrics` class in `pir-sdk-wasm`.*
+  New module [`pir-sdk-wasm/src/metrics.rs`](pir-sdk-wasm/src/metrics.rs)
+  (~275 LOC) defines a `#[wasm_bindgen]`-annotated
+  `WasmAtomicMetrics` struct wrapping `Arc<AtomicMetrics>`. JS
+  surface is intentionally minimal: a zero-arg `new()`
+  constructor (every counter starts at zero) and a `snapshot()`
+  method that returns a plain JS object with nine `bigint`
+  fields (`queriesStarted` / `queriesCompleted` / `queryErrors`
+  / `bytesSent` / `bytesReceived` / `framesSent` /
+  `framesReceived` / `connects` / `disconnects`). The object is
+  built manually via `js_sys::Object::new() + Reflect::set`
+  rather than `serde_wasm_bindgen::to_value` so the `u64 →
+  BigInt` conversion is explicit and avoids any serializer
+  ambiguity; `js_sys::BigInt::from(u64)` lands on a real JS
+  `BigInt` via the `bigint_from_big!(i64 u64 i128 u128)` macro
+  expansion in js-sys 0.3.91. Using `bigint` rather than JS
+  `Number` is required because byte counters in a long-running
+  session could exceed 2^53 (the `Number.MAX_SAFE_INTEGER`
+  ceiling, ~9 PB). Callers can wrap with `Number(snap.bytesSent)`
+  if they prefer `Number` arithmetic and the value is known to
+  fit. Crate-visible `recorder_handle(&self) -> Arc<dyn
+  PirMetrics>` clones the inner `Arc` and returns it as a trait
+  object so it satisfies `DpfClient::set_metrics_recorder`'s
+  `Option<Arc<dyn PirMetrics>>` signature without the caller
+  having to know the concrete recorder type. `#[cfg(test)]
+  snapshot_raw() -> AtomicMetricsSnapshot` returns the native
+  snapshot type so unit tests can bypass the wasm-bindgen JS
+  layer — `js_sys::Object::new()` panics on native targets, so
+  the `snapshot()` wasm-bindgen method isn't directly
+  unit-testable. `Default` for `WasmAtomicMetrics` delegates to
+  `new()` for `Default::default()` convenience.
+
+  *Layer 2 — client wiring in `pir-sdk-wasm/src/client.rs`.*
+  `WasmDpfClient` and `WasmHarmonyClient` each gained two new
+  JS-visible methods: `setMetricsRecorder(metrics:
+  &WasmAtomicMetrics)` and `clearMetricsRecorder()`. Both
+  delegate to `self.inner.set_metrics_recorder(Some(metrics.
+  recorder_handle()))` or `...(None)` on the native `DpfClient`
+  / `HarmonyClient`. The native client then propagates the
+  handle to every owned transport (DPF: `conn0` + `conn1` with
+  backend label `"dpf"`; Harmony: `hint_conn` + `query_conn`
+  with backend label `"harmony"`), so all pre-existing Phase 2
+  byte / frame / connect / disconnect / query-lifecycle
+  callbacks start firing on the shared counters. Two methods
+  rather than a single nullable setter because
+  `Option<&WasmAtomicMetrics>` isn't supported as a
+  `wasm-bindgen` parameter type. Pre-connect install (store the
+  handle, propagate at `connect`) and post-connect install
+  (propagate immediately to already-populated transport slots)
+  both work — this is the native-client behaviour documented
+  in the Phase 2 entry above, inherited unchanged. Dropping the
+  JS-side `WasmAtomicMetrics` handle does NOT detach the
+  recorder from installed clients, because each client holds
+  its own `Arc` clone; callers that want to stop recording must
+  call `clearMetricsRecorder()` on the client (tested via
+  `uninstall_preserves_js_handle`).
+
+  *Layer 3 — TypeScript surface in `web/src/sdk-bridge.ts`.*
+  `WasmAtomicMetrics` class added to the `PirSdkWasm` interface;
+  a dedicated `WasmAtomicMetrics` interface (with `free()` +
+  `snapshot(): AtomicMetricsSnapshot`) documents the handle,
+  and an `AtomicMetricsSnapshot` interface carries nine
+  `readonly bigint` fields matching the native snapshot shape.
+  `setMetricsRecorder(metrics: WasmAtomicMetrics): void` and
+  `clearMetricsRecorder(): void` added to both `WasmDpfClient`
+  and `WasmHarmonyClient` interfaces. Public helper
+  `sdkCreateAtomicMetrics(): WasmAtomicMetrics` follows the
+  pattern of `sdkParseBucketMerkleTreeTops` — throws if
+  `initSdkWasm()` hasn't resolved yet, since the metrics bridge
+  has no TS fallback (and none is wanted — counters without
+  native client backing would silently be zero). Both
+  `WasmAtomicMetrics` and `AtomicMetricsSnapshot` types are
+  re-exported so downstream TS code gets IntelliSense without
+  reaching into the generated `pkg/pir_sdk_wasm.d.ts` directly.
+
+  Unit tests (7 new, all in `metrics::tests` in
+  `pir-sdk-wasm`): `new_starts_at_zero` (constructor baseline),
+  `recorder_handle_is_shared_arc` (fire events through the
+  `Arc<dyn PirMetrics>` trait object and observe them on the
+  JS-side handle — proves the Arc clone is aliased, not zeroed),
+  `recorder_handle_installs_on_dpf_client` and
+  `recorder_handle_installs_on_harmony_client` (install +
+  compile + no panic — end-to-end wire-level behaviour is
+  covered by the `MockTransport` tests in Phase 2),
+  `multiple_clients_share_one_recorder` (one
+  `WasmAtomicMetrics` installed on both a DpfClient and a
+  HarmonyClient aggregates bytes across them), `default_equals_new`
+  (convenience `Default::default` produces equal zeroed state
+  with distinct Arc identities), `uninstall_preserves_js_handle`
+  (`client.set_metrics_recorder(None)` drops the client's Arc
+  reference but the JS-side handle keeps reading the
+  last-observed counters — this is the contract that lets a
+  dashboard survive a mid-session client reconnect).
+
+  Verification: `cargo test -p pir-sdk-wasm --lib` = 46/46
+  passing (up from 39/39; 7 new metrics tests). `cargo build
+  --target wasm32-unknown-unknown -p pir-sdk-wasm` clean (3
+  pre-existing warnings unchanged). `wasm-pack build --target
+  web --out-dir pkg` in `pir-sdk-wasm/` emits the new surface
+  in `pir_sdk_wasm.d.ts`: `WasmAtomicMetrics` class at line
+  170, `snapshot(): any` at line 201,
+  `setMetricsRecorder(metrics: WasmAtomicMetrics): void` on
+  `WasmDpfClient` at line 446 and on `WasmHarmonyClient` at
+  line 672, `clearMetricsRecorder(): void` at lines 343 and
+  528. Raw wasm imports at lines 1099-1143 (`wasmdpfclient_
+  setMetricsRecorder`, `wasmatomicmetrics_snapshot`, etc.)
+  confirm the wasm-bindgen binding table is wired through. Web
+  suite: `npx tsc --noEmit` shows only the two pre-existing
+  errors unchanged (`ws.test.ts` SharedArrayBuffer type,
+  `onionpir_client.ts` null/undefined); `npx vitest run` =
+  88/88 passing across 7 files; `npx vite build` clean in
+  ~300ms (WASM bundle `pir_sdk_wasm_bg-Fgpy-jiq.wasm` =
+  973.94 kB, gzip 327.26 kB; JS wrapper `pir_sdk_wasm-
+  BfXewFv4.js` = 30.02 kB, gzip 7.51 kB). 🔒 Padding
+  invariants preserved — the metrics bridge is a pure JS↔Rust
+  marshalling layer over the already-landed Phase 2 observer,
+  which is itself strictly observational. It sits above the
+  native-client query code that owns K=75 INDEX / K_CHUNK=80
+  CHUNK / 25-MERKLE padding and the INDEX-Merkle item-count
+  symmetry invariant; there is no code path by which a
+  recorder can influence the number or content of padding
+  queries sent. Installing no recorder (the default) means the
+  `Option<Arc<dyn PirMetrics>>` on every client is `None` and
+  every `fire_*` helper is a single null-check.
+
+  Remaining Phase 2+ tail (still deferred): per-client latency
+  histograms (need a `performance.now()`-backed `Duration`
+  substitute for wasm32's missing `std::time::Instant`, likely
+  behind a cfg-branch in a new `pir-sdk::timing` module), and
+  WASM bindings for `tracing` (`pir-sdk-wasm` needs a
+  web-compatible subscriber adapter since `tracing-subscriber::
+  fmt` writes to `io::Write` which doesn't exist on
+  `wasm32-unknown-unknown`).
+
+- **Native Rust `tracing-wasm` subscriber bridge (P2
+  observability Phase 2+ tail, second item)**: installs a
+  browser-compatible `tracing::Subscriber` so the Phase 1
+  `#[tracing::instrument]` spans on the native
+  `DpfClient` / `HarmonyClient` / `OnionClient` / `WsConnection`
+  / `WasmWebSocketTransport` actually surface in the browser's
+  DevTools console (Phase 1 added the span attributes but the
+  spans were invisible on wasm32 because `tracing-subscriber::
+  fmt::fmt()` writes to `io::Write`, and the only working
+  `io::Write` on `wasm32-unknown-unknown` is the tokio-io
+  shim from pir-sdk-client's native-only deps). Three layers
+  landed:
+
+  *Layer 1 — `tracing_bridge` module in `pir-sdk-wasm`.* New
+  module [`pir-sdk-wasm/src/tracing_bridge.rs`](pir-sdk-wasm/src/tracing_bridge.rs)
+  (~130 LOC, mostly docs) exposes a single `#[wasm_bindgen]`
+  function `initTracingSubscriber()` that calls
+  `tracing_wasm::set_as_global_default()` inside a
+  `std::sync::Once::call_once(|| { ... })`. The `Once` guard
+  is essential — `tracing-wasm 0.2.1`'s
+  `set_as_global_default` internally `.expect()`s the
+  `tracing::subscriber::set_global_default` result, and the
+  second call returns `Err` (the global default is already
+  set) which unwraps to a panic. Wrapping in `Once` means
+  init-from-multiple-paths is safe, which matters because a
+  web app may initialize observability from both the main
+  thread's startup and a potential worker-pool reinit
+  (Session 6 main-thread decision notwithstanding).
+  The inner body is `#[cfg(target_arch = "wasm32")]`-gated
+  so `cargo test -p pir-sdk-wasm` on native compiles it as
+  an empty `Once`-guarded block (no-op). Module docstring
+  documents the "install both" relationship with
+  `WasmAtomicMetrics` — they answer different questions
+  ("what is happening now" vs. "how many of each thing has
+  happened") and are independent opt-ins.
+
+  *Layer 2 — `Cargo.toml` dep.* Added
+  `tracing-wasm = "0.2"` under
+  `[target.'cfg(target_arch = "wasm32")'.dependencies]`,
+  alongside the existing `send_wrapper` entry. Gated on
+  wasm32 because `tracing-wasm` transitively depends on
+  `web-sys::console` which doesn't link on native. Not
+  gated behind a cargo feature — the first cut always
+  links the dep on wasm32, paying ~35 KB uncompressed /
+  ~14 KB gzipped for callers who don't install the
+  subscriber. If bundle size becomes a concern, gating
+  behind `features = ["tracing-subscriber"]` is a
+  follow-up. New transitive deps pulled in for wasm32-only
+  builds: `tracing-wasm 0.2.1`, `tracing-subscriber 0.3.23`,
+  `sharded-slab 0.1.7`.
+
+  *Layer 3 — TypeScript surface in
+  `web/src/sdk-bridge.ts`.* Added
+  `initTracingSubscriber(): void` to the `PirSdkWasm`
+  interface and a public `initSdkTracing(): void` helper
+  that wraps `requireSdkWasm().initTracingSubscriber()`.
+  The helper follows the `sdkCreateAtomicMetrics()` pattern
+  — throws `Error("WASM module required...")` if
+  `initSdkWasm()` hasn't resolved yet, since the bridge
+  has no TS fallback (the native `PIR-AUDIT` log-bridge
+  already surfaces some info via `log::info!`, but Phase 1
+  span structure is invisible without the subscriber).
+
+  Unit tests (3 new, all in `tracing_bridge::tests` in
+  `pir-sdk-wasm`): `init_tracing_subscriber_no_panic_on_native`
+  (fn is callable without panic — important because native
+  test suites exercise the same surface as wasm32),
+  `init_tracing_subscriber_idempotent` (three consecutive
+  calls complete without panic — proves the `Once` guard
+  holds; without it, tracing-wasm would panic on the second
+  call), `init_state_is_a_module_static_once` (compile-time
+  + runtime assertion that `INIT` remains a
+  `std::sync::Once`, catching any future refactor that
+  swaps in a different sync primitive with different
+  idempotency semantics).
+
+  Verification: `cargo test -p pir-sdk-wasm --lib` = **49/49**
+  passing (up from 46/46; 3 new `tracing_bridge` tests).
+  `cargo build --target wasm32-unknown-unknown -p pir-sdk-wasm`
+  clean (the 3 pre-existing warnings — `INDEX_RESULT_SIZE` /
+  `CHUNK_RESULT_SIZE` / `Path` unused on wasm32 — unchanged).
+  `wasm-pack build --target web --out-dir pkg` in
+  `pir-sdk-wasm/` emits `initTracingSubscriber(): void` at
+  line 996 of `pir_sdk_wasm.d.ts` with the full doc comment
+  preserved, and the raw wasm import table at line 1119
+  (`readonly initTracingSubscriber: () => void`) confirms
+  the wasm-bindgen binding is wired. Raw wasm bundle:
+  973.94 KB → 986 KB (**+12 KB**); vite-compiled output:
+  973.94 KB → 1009.23 KB uncompressed (**+35 KB**), gzip
+  327.26 KB → 341.50 KB (**+14 KB**). Web suite: `npx
+  tsc --noEmit` shows only the two pre-existing errors
+  unchanged; `npx vitest run` = 88/88 passing across 7
+  files; `npx vite build` clean in ~298ms. 🔒 Padding
+  invariants preserved — the tracing subscriber is strictly
+  observational. Span fields are filtered by
+  `#[tracing::instrument(skip_all, ...)]` attributes on the
+  native side, so only whitelisted scalars / URLs /
+  `&'static str` labels reach the subscriber — never
+  binary payloads, hint blobs, or secret keys. It sits
+  above the query code that owns K=75 INDEX / K_CHUNK=80
+  CHUNK / 25-MERKLE padding, with no code path by which a
+  subscriber can influence the number or content of
+  padding queries sent.
+
+  Remaining Phase 2+ tail at the time of this landing —
+  per-client latency histograms — has since landed (see
+  the next entry below). The remaining stretch follow-up
+  is per-frame round-trip latency tracking through
+  `WsConnection::{send,recv,roundtrip}`, which would need
+  a new `PirMetrics::on_roundtrip_end` callback and is a
+  separate API extension.
+
+- **Native Rust per-client latency histograms (P2
+  observability Phase 2+ tail, third item)**: closes the
+  last remaining Phase 2+ item by extending
+  `PirMetrics::on_query_end` with a `duration: Duration`
+  parameter and threading captured `Instant` values from
+  query start through to query end across all three
+  native clients. Before this landing, `AtomicMetrics`
+  could count completed queries but the time those
+  queries took was invisible — operators had no signal on
+  whether p50 or p95 was creeping up under load. Five
+  layers landed:
+
+  *Layer 1 — `web-time` dep + `Instant` / `Duration`
+  re-exports.* Added `web-time = "1.1"` as a `pir-sdk`
+  dep (cross-target, no cfg gating) — the crate provides
+  drop-in `Instant` / `Duration` types that delegate to
+  `std::time` on native and to `performance.now()` via
+  `web_sys::Performance` on `wasm32-unknown-unknown`.
+  This unblocks shipping a single timing-aware metrics
+  surface that compiles for both targets without
+  per-callsite cfg-branches. `pir-sdk/src/metrics.rs`
+  re-exports `web_time::{Instant, Duration}` at module
+  scope; the `pir-sdk` crate root then re-exports both
+  alongside `PirMetrics` / `AtomicMetrics` /
+  `AtomicMetricsSnapshot` / `NoopMetrics` so callers
+  don't need a direct `web-time` dep. (This re-export
+  was the source of an early `unresolved import
+  pir_sdk::Instant` E0432 during client wiring that
+  took one round to chase down.)
+
+  *Layer 2 — trait + recorder shape changes in
+  `pir-sdk`.* The `PirMetrics` trait's `on_query_end`
+  callback gained a sixth parameter — `duration: Duration`
+  — that all implementations now receive. The signature
+  change is source-breaking but additive in spirit (the
+  parameter has a meaningful default of `Duration::ZERO`
+  for best-effort observation, see Layer 3).
+  `AtomicMetrics` picked up three new lock-free counters:
+  `total_query_latency_micros: AtomicU64`,
+  `min_query_latency_micros: AtomicU64`,
+  `max_query_latency_micros: AtomicU64`. The min counter
+  is initialised to a `MIN_LATENCY_SENTINEL = u64::MAX`
+  constant — `fetch_min(observed)` always wins on the
+  first measurement (any observed value <= `u64::MAX`),
+  which sidesteps the alternative
+  "first-value-special-cased via CAS loop" pattern that
+  would have needed a separate observed-anything-yet
+  flag. `Default` is hand-written for both
+  `AtomicMetrics` and `AtomicMetricsSnapshot` to set
+  `min_query_latency_micros` to the sentinel rather than
+  to `0`; the autoderived `Default` would have zeroed
+  the field, which would then cause the very first
+  observation to miscompute as min=0. Both
+  `AtomicMetrics::on_query_end` and the snapshot's
+  atomic loads use `Ordering::Relaxed` (each counter is
+  independently atomic with no cross-counter invariant
+  — a snapshot is a momentary fuzzy read, not a
+  transaction). Snapshot consumers detect "no
+  measurements yet" by checking
+  `min_query_latency_micros == u64::MAX`; the JS-side
+  bridge (Layer 4) documents this with the literal
+  `0xFFFF_FFFF_FFFF_FFFFn` BigInt sentinel. 7 new
+  `metrics::tests` unit tests cover the latency surface
+  end-to-end: zero-state assertion, single-observation
+  agreement, multi-observation aggregation
+  (total / min / max), 16-thread concurrent
+  `Arc<AtomicMetrics>` hammer test, snapshot
+  determinism, `Default` correctness for the sentinel,
+  and `Copy` semantics on the snapshot struct.
+
+  *Layer 3 — `Option<Instant>` threading in client
+  helpers.* All three native clients (`DpfClient`,
+  `HarmonyClient`, `OnionClient`) replaced their
+  pre-existing `fire_query_start` / `fire_query_end`
+  inherent helpers with an `Option<Instant>`-threading
+  pair:
+  ```rust
+  fn fire_query_start(&self, db_id: u8, num_queries: usize)
+      -> Option<Instant> {
+      if let Some(rec) = &self.metrics_recorder {
+          rec.on_query_start("dpf", db_id, num_queries);
+          Some(Instant::now())
+      } else {
+          None
+      }
+  }
+  fn fire_query_end(&self, db_id: u8, num_queries: usize,
+                    success: bool,
+                    started_at: Option<Instant>) {
+      if let Some(rec) = &self.metrics_recorder {
+          let duration = started_at.map(|t| t.elapsed())
+              .unwrap_or_default();
+          rec.on_query_end("dpf", db_id, num_queries,
+                           success, duration);
+      }
+  }
+  ```
+  Three properties this design preserves: (a) **zero
+  overhead when no recorder is installed** —
+  `fire_query_start` returns `None` immediately without
+  touching the clock, so `Instant::now()` (which on
+  wasm32 hits `performance.now()`, a non-trivial
+  JS↔WASM boundary call) is skipped entirely; (b)
+  **best-effort observation when recorder installed
+  mid-query** — `fire_query_end` receiving
+  `started_at = None` (recorder absent at start) still
+  surfaces an `on_query_end` callback with
+  `duration = Duration::ZERO` rather than swallowing the
+  event silently, which keeps the `query_starts` /
+  `query_ends` counter pair consistent for callers that
+  compute "in-flight queries" via subtraction; (c) **no
+  allocation in the hot path** — `Option<Instant>` is
+  `Copy`, the clock value is captured once and consumed
+  via `.elapsed()`, no `Box` / `Arc` / heap interaction.
+  Each client's existing `query_batch` call site changed
+  from a single `self.fire_query_start(...)` to
+  `let started_at = self.fire_query_start(...);`
+  followed by `self.fire_query_end(..., started_at);` at
+  the return path. 9 new client-level tests landed (3
+  per client × 3 clients):
+  `fire_query_start_returns_instant_only_when_recorder_installed`
+  (proves `None` baseline + `Some(_)` post-install),
+  `fire_query_end_records_non_zero_duration_with_recorder`
+  (5 ms `tokio::time::sleep` between start + end,
+  asserts `min_query_latency_micros >= 1_000`),
+  `fire_query_end_with_none_start_records_zero_duration`
+  (locks in the best-effort `Duration::ZERO` semantics).
+  The Onion variants get `_onion` suffixes for parallel
+  test discovery in IDEs.
+
+  *Layer 4 — `WasmAtomicMetrics` snapshot bridge.*
+  `pir-sdk-wasm/src/metrics.rs::snapshot_to_js` now sets
+  three additional `bigint` fields on the returned JS
+  object: `totalQueryLatencyMicros`,
+  `minQueryLatencyMicros`, `maxQueryLatencyMicros`. The
+  field count on the snapshot grew from 9 to 12; the
+  module docstring's example moved from a 9-field
+  read-out to a 12-field one, with a new explanatory
+  paragraph on min-sentinel detection (JS side reads
+  `0xFFFF_FFFF_FFFF_FFFFn` to mean "no measurements
+  yet" and should display "—" rather than misleadingly
+  rendering the sentinel as a real measurement). The
+  existing `new_starts_at_zero` test was extended to
+  assert all three latency fields land at their
+  expected zero-state (`0`, `u64::MAX`, `0`); two new
+  tests landed:
+  `latency_through_recorder_handle_lands_in_snapshot`
+  (3 simulated query completions with synthetic
+  durations 20 ms / 50 ms / 80 ms; asserts
+  `total = 150_000`, `min = 20_000`, `max = 80_000`)
+  and `multiple_clients_aggregate_latency` (one
+  `WasmAtomicMetrics` installed on both a
+  `WasmDpfClient` and a `WasmHarmonyClient`, 4
+  simulated completions spread across both clients;
+  asserts the snapshot reflects the union — proves
+  the `Arc` clone aliases share state across client
+  backends). `WasmAtomicMetrics` test count: 49/49 →
+  51/51 passing.
+
+  *Layer 5 — TypeScript surface in
+  `web/src/sdk-bridge.ts`.* The `AtomicMetricsSnapshot`
+  interface gained three new `readonly bigint` fields
+  (`totalQueryLatencyMicros`, `minQueryLatencyMicros`,
+  `maxQueryLatencyMicros`) with TSDoc comments
+  documenting the latency-snapshot semantics: total =
+  sum of all completed query durations in microseconds;
+  min initialised to `0xFFFF_FFFF_FFFF_FFFFn`
+  (`u64::MAX`) sentinel meaning "no measurements yet";
+  max monotonically grows. The `snapshot()` doc comment
+  moved from "nine `bigint` counters" to "twelve
+  `bigint` counters". No new TS-side helpers needed —
+  the pre-existing `sdkCreateAtomicMetrics()` factory
+  returns the same `WasmAtomicMetrics` handle, just
+  with three more fields available on its `snapshot()`
+  output.
+
+  Verification: `cargo test -p pir-sdk --lib` =
+  **48/48** passing (up from 41/41; 7 new
+  `metrics::tests` including a thread-safety stress
+  test). `cargo test -p pir-sdk-client --lib` =
+  **125/125** passing (up from 116/116; 9 new
+  client-level tests, 3 per client). `cargo test -p
+  pir-sdk-client --features onion --lib` = **147/147**
+  passing. `cargo test -p pir-sdk-wasm --lib` =
+  **51/51** passing (up from 49/49; 2 new
+  `metrics::tests`). `cargo test -p pir-core --lib` =
+  25/25 (unchanged). `cargo build --target
+  wasm32-unknown-unknown -p pir-sdk-client` clean (3
+  pre-existing warnings unchanged); `cargo build
+  --target wasm32-unknown-unknown -p pir-sdk-wasm`
+  clean. `cargo check -p pir-sdk-client --features
+  onion` (C++/SEAL) clean. `wasm-pack build --target
+  web --out-dir pkg` in `pir-sdk-wasm/` succeeds; the
+  three new latency fields are visible in
+  `pir_sdk_wasm.d.ts` at lines 193-195 (interface) and
+  205-210 (snapshot return shape). Web suite:
+  `npx tsc --noEmit` shows only the two pre-existing
+  errors unchanged; `npx vitest run` = 88/88 passing
+  across 7 files; `npx vite build` clean in ~300ms
+  with bundle 1010.26 kB / 341.95 kB gzipped (the
+  +1 kB uncompressed / +0.5 kB gzip delta vs. the
+  `tracing-wasm` baseline reflects the small added
+  `web-time` integration).
+  🔒 Padding invariants preserved — the latency layer
+  is strictly observational. The new `Duration`
+  parameter on `on_query_end` is computed from
+  `Instant::now()` deltas, never from query payload
+  shape; `Option<Instant>` threading guarantees zero
+  overhead when no recorder is installed; the
+  per-client metrics handle is propagated to all
+  owned transports but never reaches the query encoder
+  / decoder paths that own K=75 INDEX / K_CHUNK=80
+  CHUNK / 25-MERKLE padding and the INDEX-Merkle
+  item-count symmetry invariant. There is no code path
+  by which an installed recorder can influence the
+  number or content of padding queries sent.
+
+  All three Phase 2+ tail items have now landed
+  (`WasmAtomicMetrics` bridge ✅, `tracing-wasm`
+  subscriber bridge ✅, per-client latency histograms
+  ✅). The single remaining stretch follow-up
+  (per-frame round-trip latency tracking via
+  `WsConnection::send` / `recv` / `roundtrip`) stays
+  deferred — it would require capturing an `Instant`
+  inside the transport-level `roundtrip` future and
+  surfacing it through a new
+  `PirMetrics::on_roundtrip_end` callback, a
+  meaningful API extension separate from the
+  per-query-end latency this entry closes.
+
+- **P3 sweep: rustdoc + dead-code + clippy polish.** Three
+  [SDK_ROADMAP.md](SDK_ROADMAP.md) P3 items landed together
+  as a pre-publish polish pass:
+  * *Rustdoc examples per client.* `DpfClient`,
+    `HarmonyClient`, and `OnionClient` each now carry a
+    struct-level rustdoc block with a runnable-looking
+    `ignore`'d `#[tokio::main]` example plus intra-doc
+    links into the methods that matter. `DpfClient`'s doc
+    covers the two-server DPF XOR basis and shows both a
+    basic `query_batch` call and a `sync` call driven by a
+    catalog. `HarmonyClient`'s doc covers the hint + query
+    two-server architecture, PRP backend selection (Hoang
+    default; `fastprp`/`alf` feature-gated), and
+    demonstrates the hint-cache-resume pattern via
+    [`with_hint_cache_dir`] + [`load_hints_bytes`] /
+    [`save_hints_bytes`]. `OnionClient`'s doc covers the
+    Microsoft SEAL BFV basis, Galois + GSW key lifecycle,
+    server LRU eviction and the
+    [`PirError::SessionEvicted`] retry surface (via
+    `onion_merkle.rs::onionpir_batch_rpc`), and the `onion`
+    cargo feature gating (native-only; SEAL doesn't compile
+    to wasm32). All three examples use `ignore` since they
+    require a live PIR server; they serve as shape /
+    signature documentation rather than doctests.
+  * *Dead code sweep.* Five removals + two feature-gated
+    allows: (1) unused `INDEX_RESULT_SIZE` /
+    `CHUNK_RESULT_SIZE` constants in
+    `pir-sdk-client/src/dpf.rs` replaced with NOTE comments
+    pointing to `runtime/src/eval.rs` for the canonical
+    values; (2) `use std::path::{Path, PathBuf}` in
+    `pir-sdk-client/src/hint_cache.rs` split so `Path` is
+    `#[cfg(not(target_arch = "wasm32"))]`-gated (only the
+    native filesystem helpers use it; `PathBuf` stays
+    unconditional for the XDG resolver which runs on both
+    targets); (3) dead `derived_key: [u8; 16]` and
+    `group_id: u32` fields on `HarmonyGroup` in
+    `harmonypir-wasm/src/lib.rs` removed — deserialize
+    takes them as args and re-derives the per-group RNG
+    seed, so storing them in the struct was a leftover
+    from an earlier factoring. Both construction sites
+    (`new_with_backend` and `deserialize`) now `let _ =
+    key; let _ = group_id;` before the `Ok(HarmonyGroup {
+    ... })` so the arguments are deliberately consumed;
+    (4) non-root `[profile.release]` stanzas in
+    `pir-sdk-wasm/Cargo.toml` and `harmonypir-wasm/Cargo
+    .toml` removed (Cargo ignores profile stanzas in
+    non-root packages, so these were misleading
+    documentation at best) and replaced with a
+    cross-reference comment block recommending the
+    canonical workspace-level `wasm-release` profile
+    pattern; (5) two onion-feature dead-code warnings
+    gated: `OnionTreeTopCache.cache_from_level` (parse-only
+    metadata — kept to preserve schema symmetry with the
+    per-bucket `merkle_verify.rs` version, which DOES
+    consume it, in case a future walker needs absolute
+    level indices) and `onion_leaf_hash` (public API
+    surface for external consumers of the `onion` feature
+    to reproduce leaf hashing without reaching into
+    `pir_core::merkle`; exercised by
+    `test_onion_leaf_hash_matches_sha256`), both with
+    `#[allow(dead_code)]` + multi-line justification
+    comments.
+  * *`pir-core` clippy cleanup.* All 5 pre-existing
+    warnings cleared so `-D warnings` can now safely go
+    into CI for the whole workspace. Three
+    `needless_range_loop` refactors:
+    (a) `pir-core/src/hash.rs`'s `derive_groups_3` and
+    `derive_int_groups_3` dup-rejection inner loops
+    collapsed to `groups.iter().take(count).any(|&g| g ==
+    group)`; (b) `pir-core/src/pbc.rs::pbc_plan_rounds`
+    refactored to `for (g, owner) in group_owner.iter().
+    enumerate().take(num_groups) { ... }` so `g` continues
+    to serve as both the `group_owner` index and the
+    pushed group ID (the canonical fix for this lint —
+    an explicit comment now explains why enumerate is the
+    right shape); (c) `pir-core/src/cuckoo.rs::build_int_
+    keyed_table` refactored to `for (i, id) in ids.iter().
+    enumerate() { ... }` since the panic message's
+    `ids[i]` lookup is satisfied by the `id` iter value.
+    Plus one `manual_div_ceil` fix:
+    `pir-core/src/merkle.rs::compute_tree_top_cache` at
+    line 301 changed from `(prev.len() + arity - 1) /
+    arity` to the stable (Rust 1.73+)
+    `prev.len().div_ceil(arity)`.
+
+  Verification: `cargo test -p pir-core --lib` = 25/25,
+  `cargo test -p pir-sdk --lib` = 41/41, `cargo test -p
+  pir-sdk-client --lib` = 116/116, `cargo test -p
+  pir-sdk-wasm --lib` = 49/49; `cargo build --target
+  wasm32-unknown-unknown -p pir-sdk-client` / `-p
+  pir-sdk-wasm` / `-p harmonypir-wasm` all clean; `cargo
+  check -p pir-sdk-client --features onion` (C++/SEAL)
+  clean. 🔒 Padding invariants unaffected — the sweep
+  is pure polish. Rustdoc additions are
+  documentation-only; dead-code removals never touched
+  the query path; clippy refactors are semantically
+  equivalent per-loop restructurings. None of the three
+  layers can influence K=75 INDEX / K_CHUNK=80 CHUNK /
+  25-MERKLE padding or the INDEX-Merkle item-count
+  symmetry invariant.
+
+  [`with_hint_cache_dir`]: pir-sdk-client/src/harmony.rs
+  [`load_hints_bytes`]: pir-sdk-client/src/harmony.rs
+  [`save_hints_bytes`]: pir-sdk-client/src/harmony.rs
+  [`PirError::SessionEvicted`]: pir-sdk/src/error.rs
+
 ---
 
 ## Key Files
@@ -1210,6 +1886,8 @@ Short-term active work:
 - `pir-sdk-wasm/src/lib.rs` - WASM bindings
 - `pir-sdk-wasm/src/merkle_verify.rs` - WASM per-bucket Merkle verifier
 - `pir-sdk-wasm/src/client.rs` - `WasmDpfClient` + `WasmHarmonyClient` wrappers
+- `pir-sdk-wasm/src/metrics.rs` - `WasmAtomicMetrics` JS bridge (Phase 2+ observability)
+- `pir-sdk-wasm/src/tracing_bridge.rs` - `initTracingSubscriber()` for browser-console spans (Phase 2+ observability)
 - `pir-sdk-client/src/transport.rs` - `PirTransport` trait (+ `MockTransport`)
 - `pir-sdk-client/src/connection.rs` - `WsConnection` (native `PirTransport` impl)
 - `pir-sdk-client/src/wasm_transport.rs` - `WasmWebSocketTransport` (wasm32 `PirTransport` impl)
