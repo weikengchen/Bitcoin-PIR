@@ -10,8 +10,6 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
-# Include pir-core-wasm functions for a single unified WASM module
-include-core = []
 
 [dependencies]
 pir-sdk = { path = "../pir-sdk" }

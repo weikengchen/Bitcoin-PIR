@@ -25,7 +25,7 @@ import {
 } from './hash.js';
 
 import { cuckooPlace, planRounds } from './pbc.js';
-import { readVarint, decodeUtxoData, DummyRng } from './codec.js';
+import { decodeUtxoData, DummyRng } from './codec.js';
 import { findEntryInOnionPirIndexResult } from './scan.js';
 import { ManagedWebSocket } from './ws.js';
 import { fetchServerInfoJson } from './server-info.js';
@@ -223,7 +223,7 @@ function planPbcRounds(
   return planRounds(candidateGroups, k, NUM_HASHES);
 }
 
-// DummyRng and readVarint imported from codec.ts
+// DummyRng imported from codec.ts
 
 // ─── Wire protocol helpers ────────────────────────────────────────────────
 

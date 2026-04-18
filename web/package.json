@@ -24,7 +24,6 @@
     "buffer": "^6.0.3",
     "hash.js": "^1.1.7",
     "libdpf": "github:weikengchen/libdpf",
-    "pir-core-wasm": "file:../pir-core-wasm/pkg",
     "pir-sdk-wasm": "file:../pir-sdk-wasm/pkg"
   },
   "devDependencies": {

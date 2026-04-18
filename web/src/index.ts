@@ -121,10 +121,14 @@ export type {
   RoundTimingData,
 } from './harmony-types.js';
 
+// Backwards-compat shims for the old `pir-core-wasm` bridge. The crate has
+// been retired and all primitives it exposed are now served by `pir-sdk-wasm`,
+// so these names forward to the SDK init. New callers should import
+// `initSdkWasm` / `isSdkWasmReady` directly.
 export {
-  initWasm,
-  isWasmReady,
-} from './wasm-bridge.js';
+  initSdkWasm as initWasm,
+  isSdkWasmReady as isWasmReady,
+} from './sdk-bridge.js';
 
 export {
   cuckooPlace,

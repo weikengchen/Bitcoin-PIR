@@ -5,6 +5,8 @@
  * These are pure functions with no protocol-specific dependencies.
  */
 
+import { sdkPlanRounds } from './sdk-bridge.js';
+
 /**
  * Attempt to place item `qi` into `groups` using cuckoo hashing with eviction.
  * Returns true if placed, false if maxKicks exceeded.
@@ -61,6 +63,13 @@ export function cuckooPlace(
 /**
  * Plan multi-round PBC placement for items with candidate groups.
  * Returns rounds, each round is an array of [itemIndex, groupId] pairs.
+ *
+ * WASM-first dispatch: when `pir-sdk-wasm` is loaded the Rust-native
+ * `pir_core::pbc::pbc_plan_rounds` runs with the TS-hardcoded `maxKicks = 500`;
+ * the pure-TS implementation below is the fallback. The WASM path cannot
+ * invoke the `onError` callback — the underlying Rust function returns
+ * silently — so the "could not place any remaining items" diagnostic only
+ * fires when the WASM module failed to load.
  */
 export function planRounds(
   itemGroups: number[][],
@@ -68,6 +77,11 @@ export function planRounds(
   numHashes: number,
   onError?: (msg: string) => void,
 ): [number, number][][] {
+  // Try WASM first; preserve the TS fallback so `onError` diagnostics still
+  // surface when the WASM module failed to load.
+  const viaSdk = sdkPlanRounds(itemGroups, numGroups, numHashes);
+  if (viaSdk !== undefined) return viaSdk;
+
   let remaining = itemGroups.map((_, i) => i);
   const rounds: [number, number][][] = [];
 

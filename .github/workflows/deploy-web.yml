@@ -36,13 +36,6 @@ jobs:
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
-      - name: Build pir-core-wasm
-        run: |
-          cp Cargo.toml Cargo.toml.bak
-          printf '[workspace]\nresolver = "2"\nmembers = ["pir-core", "pir-core-wasm"]\n' > Cargo.toml
-          wasm-pack build pir-core-wasm --target bundler --out-dir pkg
-          mv Cargo.toml.bak Cargo.toml
-
       - name: Build pir-sdk-wasm
         run: |
           cp Cargo.toml Cargo.toml.bak

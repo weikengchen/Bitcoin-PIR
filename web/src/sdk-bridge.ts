@@ -467,6 +467,187 @@ export function sdkCuckooHashInt(
   return sdkWasm.cuckooHashInt(chunkId, hi, lo, numBins);
 }
 
+// ─── Codec / PBC Wrappers ───────────────────────────────────────────────────
+//
+// These wrap the Rust-native UTXO decoder and multi-round PBC planner so the
+// web client can drop its duplicate TS implementations. Both wrappers return
+// `undefined` when the WASM module isn't loaded so callers can fall through
+// to the pure-TS implementation (same pattern as the hash wrappers above).
+//
+// Deliberately NOT wrapped:
+//   - `readVarint`: WASM version panics on truncation while TS throws a typed
+//     `Error('Unexpected end of data …')` that tests and error-handling code
+//     depend on. Marshalling cost per call also rivals the work saved.
+//   - `cuckooPlace`: TS API mutates a caller-supplied `groups` array for one
+//     item at a time with eviction tracking; WASM API does bulk batch
+//     placement and returns full assignments. Not a drop-in replacement.
+
+/** Hex-decode a hex string of any even length to a `Uint8Array`. */
+function hexToBytes(hex: string): Uint8Array {
+  const out = new Uint8Array(hex.length >>> 1);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(hex.substr(i * 2, 2), 16);
+  }
+  return out;
+}
+
+/**
+ * SDK-backed UTXO data decoder.
+ *
+ * WASM returns `{txid: hexString, vout: number, amount: number}[]`; this
+ * wrapper converts txids to `Uint8Array` (hex-decode) and amounts to `bigint`
+ * so the result is bit-identical to the TS `decodeUtxoData` output shape.
+ *
+ * Precision: WASM `amount` crosses the JS boundary as a `number`. Bitcoin's
+ * 21M BTC supply = 2.1e15 sats is well under JS `Number.MAX_SAFE_INTEGER`
+ * (2^53 ≈ 9e15), so real mainnet values preserve full precision.
+ *
+ * Note: unlike the TS version, the WASM path has no way to call `onError` on
+ * mid-stream truncation — the underlying `pir_core::codec::parse_utxo_data`
+ * silently truncates. Truncation is extremely rare in practice (the build
+ * pipeline zero-pads on BLOCK_SIZE boundaries), so callers that care about
+ * the warning should fall back to the TS implementation.
+ */
+export function sdkDecodeUtxoData(
+  data: Uint8Array,
+): { entries: { txid: Uint8Array; vout: number; amount: bigint }[]; totalSats: bigint } | undefined {
+  if (!sdkWasm) return undefined;
+  // WASM returns `Array<{txid: hexString, vout: number, amount: number}>`.
+  const raw = sdkWasm.decodeUtxoData(data) as unknown as Array<{
+    txid: string;
+    vout: number;
+    amount?: number;
+    amountSats?: number;
+  }>;
+  if (!Array.isArray(raw)) return undefined;
+  const entries: { txid: Uint8Array; vout: number; amount: bigint }[] = [];
+  let totalSats = 0n;
+  for (const e of raw) {
+    const amountNum = e.amount ?? e.amountSats ?? 0;
+    const amount = BigInt(amountNum);
+    entries.push({
+      txid: hexToBytes(e.txid),
+      vout: e.vout,
+      amount,
+    });
+    totalSats += amount;
+  }
+  return { entries, totalSats };
+}
+
+/**
+ * SDK-backed delta data decoder.
+ *
+ * WASM returns `{spent: hexString[], newUtxos: {txid: hexString, vout: number,
+ * amountSats: number}[]}` where each `spent` hex string is 72 chars (36 bytes
+ * = `[32B txid][4B vout_le]` — this is the in-memory shape `pir_sdk` packs
+ * for `apply_delta_data`'s `HashSet<[u8; 36]>` lookup, not the on-wire
+ * varint shape). This wrapper unpacks spent outpoints into the internal
+ * `SpentRef` shape (`{txid: Uint8Array, vout: number}`) and converts
+ * `amountSats` → `bigint` on each new UTXO so the result is bit-identical
+ * to the TS `decodeDeltaData` output.
+ *
+ * Precision: WASM `amountSats` crosses as a JS `number`. Bitcoin 21M BTC
+ * = 2.1e15 sats is well under `Number.MAX_SAFE_INTEGER` = 9e15.
+ *
+ * Errors: the underlying `pir_sdk::decode_delta_data` returns a typed
+ * `PirError::Decode` on truncation / varint overflow; the WASM binding
+ * wraps that in a `JsError` which surfaces here as a thrown exception.
+ * The wrapper catches and returns `undefined` so the caller falls back to
+ * the TS implementation, which throws its own typed `Error` — preserving
+ * the "decode failures throw" contract.
+ */
+export function sdkDecodeDeltaData(
+  data: Uint8Array,
+): {
+  spent: { txid: Uint8Array; vout: number }[];
+  newUtxos: { txid: Uint8Array; vout: number; amount: bigint }[];
+} | undefined {
+  if (!sdkWasm) return undefined;
+  let raw: {
+    spent: string[];
+    newUtxos: Array<{ txid: string; vout: number; amount?: number; amountSats?: number }>;
+  };
+  try {
+    raw = sdkWasm.decodeDeltaData(data) as unknown as typeof raw;
+  } catch {
+    return undefined;
+  }
+  if (!raw || !Array.isArray(raw.spent) || !Array.isArray(raw.newUtxos)) return undefined;
+
+  const spent: { txid: Uint8Array; vout: number }[] = [];
+  for (const opHex of raw.spent) {
+    // 36 bytes packed: [32B txid][4B vout_le]. Two hex chars per byte → 72.
+    if (typeof opHex !== 'string' || opHex.length !== 72) return undefined;
+    const full = hexToBytes(opHex);
+    const dv = new DataView(full.buffer, full.byteOffset, full.byteLength);
+    spent.push({
+      txid: full.slice(0, 32),
+      vout: dv.getUint32(32, true),
+    });
+  }
+
+  const newUtxos: { txid: Uint8Array; vout: number; amount: bigint }[] = [];
+  for (const e of raw.newUtxos) {
+    const amountNum = e.amountSats ?? e.amount ?? 0;
+    newUtxos.push({
+      txid: hexToBytes(e.txid),
+      vout: e.vout,
+      amount: BigInt(amountNum),
+    });
+  }
+
+  return { spent, newUtxos };
+}
+
+/**
+ * SDK-backed multi-round PBC placement planner.
+ *
+ * Flattens the TS `number[][]` candidate-groups table to a `Uint32Array` for
+ * the WASM binding, calls it with the TS-hardcoded `maxKicks = 500`, and
+ * returns the tuple-pair rounds in the same shape as `pbc.ts::planRounds`.
+ *
+ * Preconditions enforced here (return `undefined` on violation so the caller
+ * can fall back to TS):
+ *   - Every `itemGroups[i]` must have the same length, which in turn must
+ *     equal `numHashes`. The WASM binding derives `num_items` by dividing
+ *     `flat.len() / itemsPer`, so ragged arrays would be silently truncated.
+ *   - `numHashes > 0`.
+ *
+ * Empty `itemGroups` returns `[]` without calling WASM (WASM would need a
+ * non-zero `itemsPer` to slice into zero items).
+ *
+ * Note: the TS `planRounds` accepts an optional `onError` callback for the
+ * "could not place any remaining items" edge case. The WASM binding has no
+ * equivalent hook — that diagnostic is silently dropped on the WASM path.
+ */
+export function sdkPlanRounds(
+  itemGroups: number[][],
+  numGroups: number,
+  numHashes: number,
+): [number, number][][] | undefined {
+  if (!sdkWasm) return undefined;
+  if (numHashes <= 0) return undefined;
+  if (itemGroups.length === 0) return [];
+  // Every row must have exactly `numHashes` candidates — ragged input would
+  // desync the flat-array indexing inside the WASM binding.
+  for (let i = 0; i < itemGroups.length; i++) {
+    if (itemGroups[i].length !== numHashes) return undefined;
+  }
+  const flat = new Uint32Array(itemGroups.length * numHashes);
+  for (let i = 0; i < itemGroups.length; i++) {
+    const row = itemGroups[i];
+    const base = i * numHashes;
+    for (let h = 0; h < numHashes; h++) {
+      flat[base + h] = row[h] >>> 0;
+    }
+  }
+  // maxKicks = 500 matches the hardcoded constant in `pbc.ts::planRounds`.
+  const rounds = sdkWasm.planRounds(flat, numHashes, numGroups, numHashes, 500);
+  if (!Array.isArray(rounds)) return undefined;
+  return rounds;
+}
+
 // ─── Per-bucket Merkle primitives ───────────────────────────────────────────
 //
 // These are the pure-crypto half of the per-bucket bin-Merkle verifier. They
