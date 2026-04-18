@@ -167,7 +167,10 @@ pub fn build_int_keyed_table(
         hash::cuckoo_hash_int(ids[entry_idx as usize], keys[hf], num_bins)
     };
 
-    for i in 0..ids.len() {
+    // Enumerate to avoid clippy::needless_range_loop — both the
+    // `i as u32` cuckoo entry index and the panic's `ids[i]` lookup
+    // are satisfied by the (i, id) pair from enumerate.
+    for (i, id) in ids.iter().enumerate() {
         if !cuckoo_insert(
             &mut table,
             num_bins,
@@ -179,7 +182,7 @@ pub fn build_int_keyed_table(
         ) {
             panic!(
                 "Cuckoo insertion failed for chunk_id {} in group {} after {} kicks",
-                ids[i], group_id, CUCKOO_MAX_KICKS
+                id, group_id, CUCKOO_MAX_KICKS
             );
         }
     }

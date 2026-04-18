@@ -85,8 +85,12 @@ pub fn pbc_plan_rounds<C: AsRef<[usize]> + Clone>(
         }
 
         let mut round_entries = Vec::new();
-        for g in 0..num_groups {
-            if let Some(local_idx) = group_owner[g] {
+        // `group_owner` has exactly `num_groups` entries; iterate with
+        // enumerate to satisfy clippy::needless_range_loop. The loop
+        // body uses `g` both to index `group_owner` and as the pushed
+        // group id, so enumerate is the canonical fix.
+        for (g, owner) in group_owner.iter().enumerate().take(num_groups) {
+            if let Some(local_idx) = *owner {
                 round_entries.push((remaining[local_idx], g));
             }
         }

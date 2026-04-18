@@ -201,6 +201,14 @@ pub struct OnionMerkleLeaf {
 #[derive(Clone, Debug)]
 pub struct OnionTreeTopCache {
     /// Sibling-level depth below the first cached level.
+    ///
+    /// Parse-only metadata in the current OnionPIR walker — the walker derives
+    /// its stop depth from `levels.len()` directly. Kept in the struct to
+    /// preserve parse-shape symmetry with the shared per-bucket tree-top
+    /// schema (see `pir-sdk-client/src/merkle_verify.rs`, where the same field
+    /// IS consumed by the walker) and to leave the door open for a future
+    /// walker that needs to correlate absolute level indices across proofs.
+    #[allow(dead_code)]
     pub cache_from_level: usize,
     /// Merkle arity (number of children per internal node).
     pub arity: usize,
@@ -955,6 +963,13 @@ async fn verify_sub_tree(
 /// OnionPIR leaves are raw `SHA256` over the first `PACKED_ENTRY_SIZE` bytes
 /// of the decrypted bin — no `bin_idx` prefix (that's the per-bucket
 /// convention, not OnionPIR's).
+///
+/// Not currently called from the in-crate walker (which inlines `sha256`
+/// directly on the packed bin bytes), but exported as part of the public
+/// onion Merkle API surface so external consumers of the `onion` feature
+/// can reproduce leaf hashing without reaching into `pir_core::merkle`.
+/// Exercised by `test_onion_leaf_hash_matches_sha256` in the tests module.
+#[allow(dead_code)]
 #[inline]
 pub fn onion_leaf_hash(bin_bytes: &[u8]) -> Hash256 {
     sha256(bin_bytes)

@@ -34,8 +34,11 @@ const INDEX_SLOT_SIZE: usize = 13;
 /// Slots per index bin.
 const INDEX_SLOTS_PER_BIN: usize = 4;
 
-/// Index result size per group.
-const INDEX_RESULT_SIZE: usize = INDEX_SLOTS_PER_BIN * INDEX_SLOT_SIZE;
+// NOTE: `INDEX_RESULT_SIZE = INDEX_SLOTS_PER_BIN * INDEX_SLOT_SIZE` is
+// not tracked as a constant here — the XOR'd bin content arrives from
+// the server already sized, and the two component constants are what
+// downstream code indexes against. The equivalent constant lives in
+// `runtime/src/eval.rs` for the server-side table layout.
 
 /// Tag size in bytes.
 const TAG_SIZE: usize = 8;
@@ -49,8 +52,9 @@ const CHUNK_SLOT_SIZE: usize = 4 + CHUNK_SIZE;
 /// Slots per chunk bin.
 const CHUNK_SLOTS_PER_BIN: usize = 3;
 
-/// Chunk result size per group.
-const CHUNK_RESULT_SIZE: usize = CHUNK_SLOTS_PER_BIN * CHUNK_SLOT_SIZE;
+// NOTE: `CHUNK_RESULT_SIZE = CHUNK_SLOTS_PER_BIN * CHUNK_SLOT_SIZE` is
+// not tracked as a constant here for the same reason as
+// `INDEX_RESULT_SIZE` above — see the comment there.
 
 /// Number of PBC hash functions.
 const NUM_HASHES: usize = 3;
@@ -224,6 +228,58 @@ fn chunk_trace_to_bucket_ref(t: &ChunkBinTrace) -> BucketRef {
 // ─── DPF Client ─────────────────────────────────────────────────────────────
 
 /// DPF-PIR client for two-server PIR queries.
+///
+/// DPF-PIR is a non-colluding two-server PIR protocol based on
+/// Distributed Point Functions. The client splits each query into two
+/// DPF keys and sends one to each server; XORing the two servers'
+/// responses reveals the target row. Neither server alone learns the
+/// queried index, provided the servers don't collude.
+///
+/// # Examples
+///
+/// ```ignore
+/// use pir_sdk_client::{DpfClient, PirClient, ScriptHash};
+///
+/// #[tokio::main]
+/// async fn main() {
+///     let mut client = DpfClient::new(
+///         "ws://server0:8091",
+///         "ws://server1:8092",
+///     );
+///     client.connect().await.unwrap();
+///
+///     let script_hash: ScriptHash = [0u8; 20]; // your HASH160 script hash
+///     let result = client.sync(&[script_hash], None).await.unwrap();
+///
+///     if let Some(qr) = &result.results[0] {
+///         for entry in &qr.entries {
+///             println!("UTXO: {} sats at {}:{}",
+///                 entry.amount_sats,
+///                 hex::encode(entry.txid),
+///                 entry.vout);
+///         }
+///         println!("Balance: {} sats", qr.total_balance());
+///     }
+/// }
+/// ```
+///
+/// Delta sync — pass the last synced height to avoid re-querying
+/// unchanged rows:
+///
+/// ```ignore
+/// # use pir_sdk_client::{DpfClient, PirClient, ScriptHash};
+/// # #[tokio::main]
+/// # async fn main() {
+/// # let mut client = DpfClient::new("ws://s0", "ws://s1");
+/// # client.connect().await.unwrap();
+/// # let script_hashes: Vec<ScriptHash> = vec![[0u8; 20]];
+/// let result = client.sync(&script_hashes, None).await.unwrap();
+/// let height = result.synced_height;
+///
+/// // Later: only query what's changed since `height`.
+/// let updated = client.sync(&script_hashes, Some(height)).await.unwrap();
+/// # }
+/// ```
 pub struct DpfClient {
     server0_url: String,
     server1_url: String,

@@ -22,6 +22,7 @@ js-sys = "0.3"
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
 
-[profile.release]
-opt-level = "s"
-lto = true
+# Per-package profile overrides must live at the workspace root; Cargo
+# ignores `[profile.*]` here. See the note in `../pir-sdk-wasm/Cargo.toml`
+# for the recommended `wasm-release` profile pattern if size-optimized
+# builds are needed.

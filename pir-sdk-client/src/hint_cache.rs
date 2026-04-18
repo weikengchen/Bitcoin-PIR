@@ -37,7 +37,14 @@
 
 use pir_sdk::{DatabaseInfo, PirError, PirResult};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+// `Path` is only referenced by the native filesystem helpers
+// (`read_cache_file` / `write_cache_file`, both cfg-gated on
+// `not(target_arch = "wasm32")`). Importing it unconditionally produces
+// an `unused_imports` warning on wasm32. `PathBuf` is used by the
+// XDG-cache-dir resolver on both targets, so it stays unconditional.
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::Path;
+use std::path::PathBuf;
 
 /// Magic bytes identifying a hint-cache blob. `PSH` = "PIR Sync Hints",
 /// `1` = format family. Any future incompatible binary-layout change

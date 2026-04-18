@@ -49,6 +49,16 @@ js-sys = "0.3"
 send_wrapper = "0.6"
 tracing-wasm = "0.2"
 
-[profile.release]
-opt-level = "s"
-lto = true
+# Per-package profile overrides must live at the workspace root; Cargo
+# ignores `[profile.*]` here and emits a warning on every build. For
+# size-optimized WASM builds, use `wasm-pack build --release` which
+# already inherits the workspace root's `[profile.release]`. If a
+# future size-over-speed tradeoff is needed (currently the root picks
+# `opt-level = 3`), add a workspace-level `wasm-release` profile:
+#
+#   [profile.wasm-release]
+#   inherits = "release"
+#   opt-level = "s"
+#   lto = true
+#
+# and invoke `wasm-pack build -- --profile wasm-release`.

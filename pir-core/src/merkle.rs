@@ -298,7 +298,7 @@ impl MerkleTreeN {
             if prev.len() <= 1 {
                 break;
             }
-            let next_len = (prev.len() + arity - 1) / arity;
+            let next_len = prev.len().div_ceil(arity);
             let mut next_level = Vec::with_capacity(next_len);
             for i in 0..next_len {
                 let start = i * arity;

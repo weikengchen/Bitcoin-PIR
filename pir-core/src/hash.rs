@@ -93,14 +93,11 @@ pub fn derive_groups_3(script_hash: &[u8], k: usize) -> [usize; 3] {
         let group = (h % k as u64) as usize;
         nonce += 1;
 
-        let mut dup = false;
-        for i in 0..count {
-            if groups[i] == group {
-                dup = true;
-                break;
-            }
-        }
-        if dup {
+        // Reject duplicates of groups already chosen in this derivation.
+        // Iterating the first `count` slots via `.iter().take(count)` is
+        // semantically equivalent to the old `for i in 0..count` index
+        // loop and avoids the clippy::needless_range_loop warning.
+        if groups.iter().take(count).any(|&g| g == group) {
             continue;
         }
 
@@ -148,14 +145,9 @@ pub fn derive_int_groups_3(id: u32, k: usize) -> [usize; 3] {
         let group = (h % k as u64) as usize;
         nonce += 1;
 
-        let mut dup = false;
-        for i in 0..count {
-            if groups[i] == group {
-                dup = true;
-                break;
-            }
-        }
-        if dup {
+        // Mirror of `derive_groups_3` above — reject duplicates via
+        // a take-count iterator to satisfy clippy::needless_range_loop.
+        if groups.iter().take(count).any(|&g| g == group) {
             continue;
         }
 

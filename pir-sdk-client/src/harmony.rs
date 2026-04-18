@@ -268,6 +268,81 @@ fn chunk_trace_to_bucket_ref(t: &ChunkBinTrace) -> BucketRef {
 // ─── HarmonyPIR Client ──────────────────────────────────────────────────────
 
 /// HarmonyPIR client for two-server PIR queries.
+///
+/// HarmonyPIR is a stateful two-server PIR protocol that splits work
+/// between a **hint server** (streams precomputed parities once per
+/// database) and a **query server** (answers per-group cuckoo-bin
+/// lookups). The per-client `HarmonyGroup` state must stay in sync
+/// with the server's cuckoo table, so mid-session database switches
+/// rebuild the groups from scratch; cross-session continuity is
+/// provided by the hint cache (see [`with_hint_cache_dir`], plus
+/// [`save_hints_bytes`] / [`load_hints_bytes`] for browser-side
+/// IndexedDB mirrors).
+///
+/// # PRP backend selection
+///
+/// HarmonyPIR is parameterised by a pseudo-random permutation. The
+/// default is Hoang (portable, no extra deps); the `fastprp` cargo
+/// feature enables FastPRP (2-3× faster per-group encode with a
+/// precomputed cache) and the `alf` feature enables ALF. Select at
+/// runtime via [`set_prp_backend`] with one of [`PRP_HOANG`],
+/// [`PRP_FASTPRP`], or [`PRP_ALF`].
+///
+/// # Examples
+///
+/// Basic flow — create, connect, sync, use the results:
+///
+/// ```ignore
+/// use pir_sdk_client::{HarmonyClient, PirClient, ScriptHash, PRP_HOANG};
+///
+/// #[tokio::main]
+/// async fn main() {
+///     let mut client = HarmonyClient::new(
+///         "ws://hint-server:8091",
+///         "ws://query-server:8092",
+///     );
+///     client.set_prp_backend(PRP_HOANG);
+///     client.connect().await.unwrap();
+///
+///     let script_hash: ScriptHash = [0u8; 20]; // your HASH160 script hash
+///     let result = client.sync(&[script_hash], None).await.unwrap();
+///
+///     if let Some(qr) = &result.results[0] {
+///         println!("Balance: {} sats", qr.total_balance());
+///     }
+/// }
+/// ```
+///
+/// Resuming from a cached hint blob (avoids a full hint re-fetch on
+/// reconnect when the database fingerprint matches):
+///
+/// ```ignore
+/// use pir_sdk_client::{HarmonyClient, PirClient};
+///
+/// #[tokio::main]
+/// async fn main() {
+///     let mut client = HarmonyClient::new(
+///         "ws://hint-server:8091",
+///         "ws://query-server:8092",
+///     )
+///     .with_hint_cache_dir("/var/cache/pir-sdk/hints");
+///
+///     // First sync populates the cache.
+///     client.connect().await.unwrap();
+///     let _ = client.sync(&[[0u8; 20]], None).await.unwrap();
+///     client.disconnect().await.unwrap();
+///
+///     // Later reconnect: hint fetch short-circuits from the cache
+///     // when the (key, backend, db_id, height, …) fingerprint matches.
+///     client.connect().await.unwrap();
+///     let _ = client.sync(&[[0u8; 20]], None).await.unwrap();
+/// }
+/// ```
+///
+/// [`with_hint_cache_dir`]: HarmonyClient::with_hint_cache_dir
+/// [`save_hints_bytes`]: HarmonyClient::save_hints_bytes
+/// [`load_hints_bytes`]: HarmonyClient::load_hints_bytes
+/// [`set_prp_backend`]: HarmonyClient::set_prp_backend
 pub struct HarmonyClient {
     hint_server_url: String,
     query_server_url: String,

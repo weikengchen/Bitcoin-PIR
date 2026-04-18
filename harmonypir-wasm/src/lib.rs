@@ -177,10 +177,13 @@ pub struct HarmonyGroup {
     prp_backend: u8,
     /// Cached PRP data (for FastPRP). Empty for Hoang.
     prp_cache: Vec<u8>,
-    /// Derived per-group key (needed for serialization/reconstruction).
-    derived_key: [u8; 16],
-    /// Group ID (needed for serialization).
-    group_id: u32,
+    // NOTE: `derived_key` / `group_id` are intentionally NOT stored on
+    // the struct. `serialize()` doesn't persist them — instead,
+    // `deserialize(data, prp_key, group_id, ...)` takes them as
+    // explicit arguments and re-derives the per-group key via
+    // `derive_group_key(prp_key, group_id)`. The caller is responsible
+    // for remembering which `(prp_key, group_id)` pair was used at
+    // construction time.
     /// Original (unpadded) N — the actual number of DB rows.
     /// The PRP domain uses padded_n (>= real_n) so that 2*padded_n % T == 0.
     /// Rows in [real_n, padded_n) are virtual empty rows.
@@ -241,6 +244,13 @@ impl HarmonyGroup {
         let hints: Vec<Vec<u8>> = (0..m).map(|_| vec![0u8; w_usize]).collect();
         let seed = make_rng_seed(&key, group_id, 0);
 
+        // `key` and `group_id` are consumed by `make_rng_seed` above
+        // and by the `derive_group_key` call that produced `prp_cache` —
+        // neither is retained on the struct. See the NOTE on
+        // `HarmonyGroup` above for the rationale.
+        let _ = key;
+        let _ = group_id;
+
         Ok(HarmonyGroup {
             params,
             ds,
@@ -249,8 +259,6 @@ impl HarmonyGroup {
             rng: ChaCha20Rng::from_seed(seed),
             prp_backend,
             prp_cache,
-            derived_key: key,
-            group_id,
             real_n: n,
             relocated_segments: Vec::new(),
             last_segment: 0,
@@ -637,6 +645,12 @@ impl HarmonyGroup {
 
         let seed = make_rng_seed(&key, group_id, query_count as u32);
 
+        // `key` and `group_id` are consumed by `make_rng_seed` above —
+        // neither is retained on the struct. See the NOTE on
+        // `HarmonyGroup` above for the rationale.
+        let _ = key;
+        let _ = group_id;
+
         Ok(HarmonyGroup {
             params,
             ds,
@@ -645,8 +659,6 @@ impl HarmonyGroup {
             rng: ChaCha20Rng::from_seed(seed),
             prp_backend,
             prp_cache,
-            derived_key: key,
-            group_id,
             real_n,
             relocated_segments,
             last_segment: 0,

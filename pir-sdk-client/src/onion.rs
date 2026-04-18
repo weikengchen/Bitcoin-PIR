@@ -289,9 +289,57 @@ struct FheState {
 
 /// OnionPIR client for single-server FHE-based PIR queries.
 ///
-/// Requires the `onion` cargo feature to perform real queries. Without the
-/// feature, queries succeed as no-ops returning `None` — useful for builds
-/// on systems without a C++ toolchain.
+/// OnionPIR uses Microsoft SEAL's BFV scheme to let a single server
+/// operate on encrypted queries. The client generates Galois + GSW
+/// relin keys once at connect time (the server caches them in a
+/// per-client `KeyStore`), and every subsequent query is a ciphertext
+/// the server can fold against the database without learning its
+/// contents. The SDK transparently handles the server's FIFO client
+/// eviction (100-slot cap): if a batch comes back as all-empty, the
+/// client re-uploads its keys and retries once before surfacing
+/// [`PirError::SessionEvicted`] to the caller.
+///
+/// # Feature gating
+///
+/// The real implementation is gated behind the `onion` cargo feature,
+/// which pulls in the Microsoft SEAL C++ library via CMake + a recent
+/// GCC on macOS. Without the feature, `OnionClient` compiles but every
+/// query returns `None` and emits a warning — so the DPF and HarmonyPIR
+/// paths stay usable on systems without a C++ toolchain. OnionPIR is
+/// also native-only: SEAL's C++ build does not compile to
+/// `wasm32-unknown-unknown`, so browsers must stay on the TypeScript
+/// `onionpir_client.ts` reference implementation.
+///
+/// ```toml
+/// [dependencies]
+/// pir-sdk-client = { version = "0.1", features = ["onion"] }
+/// ```
+///
+/// # Examples
+///
+/// ```ignore
+/// use pir_sdk_client::{OnionClient, PirClient, ScriptHash};
+///
+/// #[tokio::main]
+/// async fn main() {
+///     let mut client = OnionClient::new("ws://onion-server:8093");
+///     client.connect().await.unwrap();
+///
+///     let script_hash: ScriptHash = [0u8; 20]; // your HASH160 script hash
+///     let result = client.sync(&[script_hash], None).await.unwrap();
+///
+///     if let Some(qr) = &result.results[0] {
+///         for entry in &qr.entries {
+///             println!("UTXO: {} sats at {}:{}",
+///                 entry.amount_sats,
+///                 hex::encode(entry.txid),
+///                 entry.vout);
+///         }
+///     }
+/// }
+/// ```
+///
+/// [`PirError::SessionEvicted`]: pir_sdk::PirError::SessionEvicted
 pub struct OnionClient {
     server_url: String,
     conn: Option<Box<dyn PirTransport>>,
