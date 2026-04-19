@@ -172,6 +172,11 @@ export class HarmonyPirClientAdapter {
     if (!this.wasmClient) throw new Error('loadWasm() must be called first');
     // WASM-side dual connection (hint + query).
     await this.wasmClient.connect();
+    // Populate the native-side catalog so subsequent hint fetches and
+    // query batches (which go through the native client) can resolve
+    // `db_id`. The side-channel `fetchServerInfo` below only populates
+    // the TS-side `this.catalog`. Matches the DPF adapter pattern.
+    await this.wasmClient.fetchCatalog();
 
     // Side-channel for residency / server-info JSON requests.
     this.queryWs = new ManagedWebSocket({
