@@ -104,7 +104,18 @@ strictly weaker than — the INDEX-Merkle leak closed above.
      `onion_merkle.rs` (INDEX + DATA flat trees, FHE sibling queries;
      see item 10 below). Feature-gated behind `onion`.
 
-4. **pir-sdk-server/** - Server-side SDK placeholder
+4. **pir-sdk-server/** - Server-side SDK (~700 LOC). Ships
+   `PirServerBuilder` (fluent: `port` / `add_full_db` / `add_delta_db`
+   / `role` / `warmup` / `from_config(toml)`), `PirServer` (`run` +
+   `shutdown_handle` + `local_addr` + `catalog`), `ServerConfig` /
+   `DatabaseEntry` (serde + TOML), `DatabaseLoader` (mmap'd
+   `MappedDatabase` over `runtime::table`), `ShutdownHandle`, plus a
+   `simple_server` example binary. Re-uses `runtime::handler::
+   RequestHandler` + `runtime::protocol::{Request, Response}` for the
+   wire protocol. **Currently `publish = false`** because `runtime/`
+   and `build/` are workspace-internal binary crates; publishing
+   requires factoring out a `pir-runtime-core` library — see
+   `PUBLISHING.md` for the documented refactoring sketch.
 
 5. **Web SDK Integration**:
    - `web/src/sdk-bridge.ts` - Bridge with automatic fallback to TypeScript
@@ -226,7 +237,7 @@ strictly weaker than — the INDEX-Merkle leak closed above.
 ## SDK Roadmap
 
 The full SDK work plan lives in [SDK_ROADMAP.md](SDK_ROADMAP.md) — P0
-through P4 priorities, with in-progress items tracked at the bottom.
+through P3 priorities, with in-progress items tracked at the bottom.
 Consult it before starting new SDK work so nothing gets duplicated or
 forgotten. Padding/privacy invariants (🔒 items in the roadmap) must
 not be optimized away — see "Query Padding" above.
@@ -377,19 +388,42 @@ Short-term active work:
   tail, third item)" entry in Completed milestones below for
   the full breakdown.
 
+- **Observability Phase 2+ per-frame round-trip latency
+  tracking is complete.** The seventh `PirMetrics`
+  callback `on_roundtrip_end(backend, bytes_out,
+  bytes_in, duration)` now fires from
+  `WsConnection::roundtrip`, `MockTransport::roundtrip`,
+  and `WasmWebSocketTransport::roundtrip` — only on
+  fully-successful roundtrips (both halves succeeded
+  AND length-prefix check passed). `AtomicMetrics`
+  gained four new lock-free counters
+  (`roundtrips_observed`,
+  `total_roundtrip_latency_micros`,
+  `min_roundtrip_latency_micros` initialised to
+  `MIN_LATENCY_SENTINEL = u64::MAX`,
+  `max_roundtrip_latency_micros`).
+  `WasmAtomicMetrics.snapshot()` grew from 12 to 16
+  `bigint` fields. `frames_sent - roundtrips_observed`
+  is the documented partial-failure-detection signal:
+  number of sends that succeeded but whose matching
+  response failed. Same `Option<Instant>`-threading
+  pattern as the per-query latency layer: zero
+  overhead — and zero JS↔WASM `performance.now()`
+  boundary calls on wasm32 — when no recorder is
+  installed. 🔒 Padding invariants preserved — the
+  per-frame latency layer is strictly observational.
+  See the "Native Rust per-frame round-trip latency
+  tracking (P2 observability Phase 2+ tail, fourth and
+  final item)" entry in Completed milestones below for
+  the full breakdown.
+
+  **All four Phase 2+ tail items have now landed**
+  (`WasmAtomicMetrics` bridge ✅, `tracing-wasm`
+  subscriber bridge ✅, per-client latency histograms
+  ✅, per-frame round-trip latency tracking ✅).
+  The Phase 2+ observability tail is complete.
+
 - Other unblocked P2 items:
-  * **Observability Phase 2+ tail (remaining stretch)** —
-    per-frame round-trip latency tracking via
-    `WsConnection::send` / `recv` / `roundtrip`. Would
-    require capturing an `Instant` inside the
-    transport-level `roundtrip` future and surfacing it
-    through a new `PirMetrics::on_roundtrip_end` callback
-    — meaningful API extension, separate design decision
-    from the per-query-end latency that already landed.
-    The `WasmAtomicMetrics` bridge, `tracing-wasm`
-    subscriber, and per-client latency histograms items
-    from the original Phase 2+ tail list have all
-    landed — see above.
   * **Post-Session-6 worker-pool measurement follow-up** — revisit
     if real-world p95 query latency exceeds the ~200ms budget
     that Session 5's main-thread decision was predicated on.
@@ -1758,18 +1792,180 @@ Short-term active work:
   by which an installed recorder can influence the
   number or content of padding queries sent.
 
-  All three Phase 2+ tail items have now landed
+  Three of four Phase 2+ tail items had landed at the
+  time of this entry (`WasmAtomicMetrics` bridge ✅,
+  `tracing-wasm` subscriber bridge ✅, per-client
+  latency histograms ✅). The fourth — per-frame
+  round-trip latency tracking via
+  `WsConnection::send` / `recv` / `roundtrip` — has
+  since landed via a new
+  `PirMetrics::on_roundtrip_end(backend, bytes_out,
+  bytes_in, duration)` callback. See the "Native Rust
+  per-frame round-trip latency tracking (P2 observability
+  Phase 2+ tail, fourth and final item)" entry below
+  for the full breakdown.
+
+- **Native Rust per-frame round-trip latency tracking
+  (P2 observability Phase 2+ tail, fourth and final
+  item)**: closes the Phase 2+ tail by extending
+  `PirMetrics` with a seventh callback,
+  `on_roundtrip_end(backend, bytes_out, bytes_in,
+  duration)`, fired from every `PirTransport::roundtrip`
+  impl on full success only. Operators now see a
+  per-frame latency signal — useful precisely because a
+  wedged peer manifests as a slow `recv` after a fast
+  `send`, which only reads as "slow" at the roundtrip
+  granularity (the per-query-end latency that landed
+  in the third item amortises that across however many
+  rounds a query takes; per-roundtrip is a tighter
+  signal). Five layers landed:
+
+  *Layer 1 — trait + recorder shape changes in
+  `pir-sdk`.* The `PirMetrics` trait grew a seventh
+  defaulted callback `on_roundtrip_end(_backend:
+  &'static str, _bytes_out: usize, _bytes_in: usize,
+  _duration: Duration)`. The choice of a dedicated
+  callback (rather than generalising per-frame
+  `on_bytes_sent` / `on_bytes_received` to optionally
+  carry a `Duration`) is deliberate: a roundtrip is
+  the natural unit that "completes" — one send + one
+  recv + one length-prefix check — and the byte
+  callbacks fire eagerly per-direction. `AtomicMetrics`
+  gained four new lock-free `AtomicU64` counters
+  (`roundtrips_observed`,
+  `total_roundtrip_latency_micros`,
+  `min_roundtrip_latency_micros` initialised to
+  `MIN_LATENCY_SENTINEL = u64::MAX`,
+  `max_roundtrip_latency_micros`) with mirror entries
+  on `AtomicMetricsSnapshot`. `Default` is hand-written
+  to set the min sentinel rather than zero, matching
+  the per-query-family pattern from the third Phase 2+
+  tail item. Two new helpers on the snapshot:
+  `mean_roundtrip_latency_micros() -> Option<u64>`
+  (returns `None` when no roundtrips observed) and
+  `min_roundtrip_latency_micros_or_zero() -> u64`
+  (sentinel → 0 normalisation). 8 new `metrics::tests`
+  unit tests including a 16-thread concurrency stress.
+
+  *Layer 2 — `Option<Instant>` threading through
+  `WsConnection::roundtrip`.* The native transport
+  reuses the `let started_at = self.metrics_recorder
+  .is_some().then(Instant::now);` pattern that the
+  third Phase 2+ tail item established at the
+  per-query level — zero overhead (and zero JS↔WASM
+  `performance.now()` boundary calls on wasm32) when
+  no recorder is installed. The borrow-checker
+  constraint (`self.sink` / `self.stream` mutably
+  borrowed inside the inner async block) is solved
+  by capturing `started_at` outside the block, the
+  same way `bytes_in` / `bytes_out` / `send_succeeded`
+  were already captured. **Firing semantics**:
+  `on_roundtrip_end` fires only on the
+  fully-successful path (both halves succeeded AND
+  `result.is_ok()` AND length-prefix check passed).
+  Partial success (e.g. `send` ok / `recv` err, or
+  short frame) deliberately does NOT fire the
+  roundtrip callback — the byte callbacks already
+  fired for whatever crossed the wire, and a
+  downstream consumer detects "send succeeded but
+  recv failed" as `frames_sent - roundtrips_observed
+  > 0` (documented in the snapshot docstring). New
+  inherent helper `fire_roundtrip_end` follows the
+  shape of the existing `fire_bytes_sent` /
+  `fire_bytes_received`.
+
+  *Layer 3 — `MockTransport::roundtrip`.* The test
+  transport got the same treatment to keep
+  state-machine tests honest. 4 new `transport::tests`
+  unit tests:
+  `mock_transport_roundtrip_fires_on_roundtrip_end`,
+  `mock_transport_roundtrip_no_recorder_no_fire`,
+  `mock_transport_uninstall_silences_roundtrip_end`,
+  and `mock_transport_roundtrip_partial_failure_no_on_roundtrip_end`.
+  The partial-failure test is the canonical proof of
+  the documented `frames_sent - roundtrips_observed`
+  partial-failure signal.
+
+  *Layer 4 — `WasmWebSocketTransport::roundtrip`.*
+  Same `Option<Instant>`-threading pattern as the
+  native transport. The wasm32-only file picked up
+  imports for `pir_sdk::{Duration, Instant}` (the
+  `web-time` re-exports through `pir-sdk` — no
+  separate dep needed since `pir-sdk-client` already
+  pulls in `pir-sdk`), a new `fire_roundtrip_end`
+  helper, and a `started_at: Option<Instant>` capture
+  in the `roundtrip` impl. `bytes_in` is `full.len()`
+  (raw frame including the 4-byte length prefix), to
+  match what `recv` already reports via
+  `fire_bytes_received` — a recorder sees a
+  consistent view across the byte and roundtrip
+  counters. Byte callbacks already fire automatically
+  through the nested `self.send` / `self.recv` calls.
+
+  *Layer 5 — `WasmAtomicMetrics` snapshot bridge.*
+  `pir-sdk-wasm/src/metrics.rs::snapshot_to_js` grew
+  from 12 to 16 `bigint` fields — new
+  `roundtripsObserved`,
+  `totalRoundtripLatencyMicros`,
+  `minRoundtripLatencyMicros`,
+  `maxRoundtripLatencyMicros` join the pre-existing
+  twelve. `web/src/sdk-bridge.ts`
+  `AtomicMetricsSnapshot` interface picked up
+  matching `readonly bigint` fields with TSDoc
+  cross-references to the partial-failure-detection
+  signal. The `WasmAtomicMetrics.snapshot()` doc
+  comment refreshed from "twelve `bigint` counters"
+  to "sixteen". 2 new `metrics::tests` unit tests
+  in `pir-sdk-wasm`:
+  `roundtrip_latency_through_recorder_handle_lands_in_snapshot`
+  (3 simulated roundtrips with synthetic durations
+  50ms / 20ms / 80ms; asserts
+  `roundtrips_observed = 3`, `total = 150_000`,
+  `min = 20_000`, `max = 80_000`) and
+  `multiple_clients_aggregate_roundtrip_latency`
+  (one `WasmAtomicMetrics` shared across a
+  `WasmDpfClient` + `WasmHarmonyClient`; proves the
+  Arc-clone aliasing extends to the new counters).
+
+  Verification: `cargo test -p pir-sdk --lib` =
+  **65/65** passing (8 new `metrics::tests`),
+  `pir-sdk --doc` = 1/1. `cargo test -p
+  pir-sdk-client --lib` = **129/129** (4 new
+  `transport::tests`). `cargo test -p
+  pir-sdk-client --features onion --lib` =
+  **151/151** passing (C++/SEAL build clean).
+  `cargo test -p pir-sdk-wasm --lib` = **53/53**
+  (2 new `metrics::tests`). `cargo build --target
+  wasm32-unknown-unknown -p pir-sdk-client` and
+  `-p pir-sdk-wasm` both clean. `wasm-pack build
+  --target web --out-dir pkg` succeeds with the four
+  new bigint fields visible at lines 196-199 of
+  `pir_sdk_wasm.d.ts`. Web suite: `npx vitest run`
+  = 88/88 across 7 files; `npx vite build` clean in
+  ~268ms with bundle 1011.51 kB / gzip 342.20 kB
+  (+1.28 kB / +0.25 kB delta vs. the per-query
+  histogram baseline — four extra `bigint` snapshot
+  fields plus the trait method body).
+
+  🔒 Padding invariants preserved — same
+  observational-only guarantee as the rest of the
+  Phase 2 + Phase 2+ work. The new `Duration`
+  parameter on `on_roundtrip_end` is computed from
+  `Instant::now()` deltas captured around an opaque
+  `roundtrip` future; `Option<Instant>` threading
+  guarantees zero overhead when no recorder is
+  installed; the per-transport metrics handle is
+  propagated to all owned transports but never
+  reaches the query encoder / decoder paths that
+  own K=75 INDEX / K_CHUNK=80 CHUNK / 25-MERKLE
+  padding and the INDEX-Merkle item-count symmetry
+  invariant.
+
+  All four Phase 2+ tail items have now landed
   (`WasmAtomicMetrics` bridge ✅, `tracing-wasm`
   subscriber bridge ✅, per-client latency histograms
-  ✅). The single remaining stretch follow-up
-  (per-frame round-trip latency tracking via
-  `WsConnection::send` / `recv` / `roundtrip`) stays
-  deferred — it would require capturing an `Instant`
-  inside the transport-level `roundtrip` future and
-  surfacing it through a new
-  `PirMetrics::on_roundtrip_end` callback, a
-  meaningful API extension separate from the
-  per-query-end latency this entry closes.
+  ✅, per-frame round-trip latency tracking ✅).
+  The Phase 2+ observability tail is complete.
 
 - **P3 sweep: rustdoc + dead-code + clippy polish.** Three
   [SDK_ROADMAP.md](SDK_ROADMAP.md) P3 items landed together
