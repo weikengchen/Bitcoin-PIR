@@ -2231,6 +2231,106 @@ Short-term active work:
   in the per-database query code that consumes the
   plan, untouched by this work.
 
+- **`pir-runtime-core` extraction — Blocker 2 resolved
+  (P3 publishability).** Factored the shared server-side
+  runtime primitives out of the workspace-internal
+  `runtime/` binary crate into a new publishable library
+  crate,
+  [`pir-runtime-core`](pir-runtime-core/src/lib.rs).
+  Closes the last remaining structural publishability
+  blocker for `pir-sdk-server`: it no longer depends on
+  any `publish = false` path crates. Four modules moved
+  with `git mv` from `runtime/src/`:
+  * [`protocol.rs`](pir-runtime-core/src/protocol.rs)
+    (885 LOC) — PIR wire format encoder/decoder for
+    DPF / HarmonyPIR / OnionPIR / bucket-Merkle /
+    catalog / info. Standalone, no import changes
+    needed.
+  * [`table.rs`](pir-runtime-core/src/table.rs)
+    (392 LOC) — mmap'd cuckoo table reader
+    (`DatabaseDescriptor`, `DatabaseType`,
+    `MappedDatabase`). Replaced `use build::common::*;`
+    with two direct `pir_core::params` imports plus
+    two 3-line wrapper fns for `read_cuckoo_header` /
+    `read_chunk_cuckoo_header` since `build/src/
+    common.rs` was 60 LOC of pir-core re-exports plus
+    thin wrappers.
+  * [`eval.rs`](pir-runtime-core/src/eval.rs) (306 LOC)
+    — DPF evaluation for INDEX + CHUNK PIR rounds plus
+    Merkle sibling evaluation. Same `use build::common::*;`
+    → direct `pir_core::params` rewrite.
+  * [`handler.rs`](pir-runtime-core/src/handler.rs)
+    (455 LOC) — `RequestHandler` dispatches decoded
+    `Request` variants against `Vec<MappedDatabase>`. No
+    import changes — the `use crate::{eval, protocol,
+    table}` paths resolve in the new location. Harmony
+    dispatch paths just memcpy bytes from
+    `sub_table.group_bytes(group_id)`, so no git-pinned
+    `harmonypir` dep needed in pir-runtime-core.
+  
+  Three callers rewired: (a)
+  [`runtime/src/lib.rs`](runtime/src/lib.rs) now
+  re-exports `pir_runtime_core::{eval, handler, protocol,
+  table}` so every binary in `runtime/src/bin/*` compiles
+  unchanged through the re-export shim; (b)
+  [`pir-sdk-server/Cargo.toml`](pir-sdk-server/Cargo.toml)
+  dropped both `runtime` + `build` path deps + the
+  `publish = false` gate, swapped in
+  `pir-runtime-core = { version = "0.1.0", path =
+  "../pir-runtime-core" }`. The `build` dep was entirely
+  unused (confirmed by grep for `build::` and `extern
+  crate build`); (c)
+  [`pir-sdk-server/src/loader.rs`](pir-sdk-server/src/loader.rs)
+  and
+  [`pir-sdk-server/src/server.rs`](pir-sdk-server/src/server.rs)
+  picked up one-line `use runtime::…` → `use
+  pir_runtime_core::…` swaps.
+  
+  `pir-runtime-core` ships with full crates.io metadata,
+  [`README.md`](pir-runtime-core/README.md),
+  [`CHANGELOG.md`](pir-runtime-core/CHANGELOG.md), and
+  LICENSE symlinks into the workspace root. Deps:
+  `pir-core` (path + version), `libdpf` (git — Blocker 1
+  transitive), `memmap2 = "0.9"`, `rayon = "1.10"`,
+  `libc = "0.2"`. [`PUBLISHING.md`](PUBLISHING.md) status
+  matrix updated — `pir-sdk-server` moved from 🔴
+  "permanently blocked under current factoring" to 🟡
+  "blocked transitively via `pir-runtime-core`". Once
+  Blocker 1 clears, publish order is `pir-core → pir-sdk
+  → pir-runtime-core → pir-sdk-server`.
+  [`FEATURES.md`](FEATURES.md) summary table and platform
+  compatibility matrix pick up `pir-runtime-core`.
+  
+  Dry-run outcomes: `cargo package --list -p
+  pir-runtime-core --allow-dirty` and `-p pir-sdk-server
+  --allow-dirty` both produce clean tarballs with the
+  expected metadata files. `cargo publish --dry-run -p
+  pir-runtime-core` fails on the libdpf version-requirement
+  check (expected — same Blocker 1 that gates
+  `pir-sdk-client`); `-p pir-sdk-server` dry-run fails on
+  `pir-core not found on crates.io` (expected — dry-run
+  requires deps resolvable from the registry).
+  
+  Verification: full workspace test surface preserved —
+  `cargo test -p pir-core --lib` = 25/25; `-p pir-sdk
+  --lib` = 56/56; `-p pir-sdk-client --lib` = 125/125;
+  `-p pir-sdk-wasm --lib` = 51/51; `-p pir-sdk-server
+  --lib` = 0/0 (unchanged); `-p pir-runtime-core --lib`
+  = 0/0 (library-only — the extracted code's semantic
+  coverage lives in `pir-core` and end-to-end coverage
+  lives in unchanged `runtime/src/bin/*` test binaries).
+  `cargo build -p runtime` clean — every binary compiles
+  unchanged through the re-export shim.
+  
+  🔒 Padding invariants preserved. The extraction is a
+  pure code move; the wire format, slot layout, DPF
+  evaluation, and request-dispatch semantics are
+  byte-identical to the pre-move `runtime/` sources.
+  K=75 INDEX / K_CHUNK=80 CHUNK / 25-MERKLE padding
+  continues to be enforced in `pir-sdk-client`, and
+  `pir-runtime-core` is the server-side counterpart that
+  answers padded queries uniformly.
+
 ---
 
 ## Key Files
@@ -2248,6 +2348,12 @@ Short-term active work:
 - `pir-sdk-client/src/connection.rs` - `WsConnection` (native `PirTransport` impl)
 - `pir-sdk-client/src/wasm_transport.rs` - `WasmWebSocketTransport` (wasm32 `PirTransport` impl)
 - `pir-sdk-client/src/hint_cache.rs` - HarmonyPIR hint cache format + fingerprint (Session 4)
+- `pir-runtime-core/src/lib.rs` - Shared server-side runtime primitives (protocol, table, eval, handler)
+- `pir-runtime-core/src/protocol.rs` - PIR wire format encoder/decoder (moved from `runtime/` — P3 Blocker 2)
+- `pir-runtime-core/src/table.rs` - mmap'd cuckoo table reader (moved from `runtime/` — P3 Blocker 2)
+- `pir-runtime-core/src/eval.rs` - DPF evaluation primitives (moved from `runtime/` — P3 Blocker 2)
+- `pir-runtime-core/src/handler.rs` - `RequestHandler` dispatch (moved from `runtime/` — P3 Blocker 2)
+- `pir-sdk-server/src/server.rs` - `PirServer` + `PirServerBuilder` over `pir-runtime-core` (P3 Blocker 2)
 - `web/src/sdk-bridge.ts` - JS/TS bridge to WASM
 - `web/src/dpf-adapter.ts` - `BatchPirClientAdapter` over `WasmDpfClient` (Session 3)
 - `web/src/types.ts` - Neutral `ConnectionState` / `UtxoEntry` / `QueryResult` types (Session 1)

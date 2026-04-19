@@ -2,8 +2,10 @@
 //!
 //! Ported from build test_batch_pir.rs and test_chunk_pir_batched.rs.
 
-use build::common::*;
 use libdpf::{Block, Dpf, DpfKey};
+use pir_core::params::{
+    CHUNK_SLOTS_PER_BIN, INDEX_SLOTS_PER_BIN, INDEX_SLOT_SIZE, TAG_SIZE, UNIT_DATA_SIZE,
+};
 use std::time::{Duration, Instant};
 
 // ─── Software prefetch intrinsics ────────────────────────────────────────────

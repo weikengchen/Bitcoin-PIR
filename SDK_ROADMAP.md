@@ -11,6 +11,97 @@ change near them needs extra care — do not optimize away padding.
 
 ## Completed
 
+- **`pir-runtime-core` extraction — Blocker 2 resolved (P3).**
+  Factored the shared server-side runtime primitives out of the
+  workspace-internal `runtime/` binary crate into a new publishable
+  library crate, `pir-runtime-core`. This closes the last remaining
+  structural publishability blocker for `pir-sdk-server`: it no
+  longer depends on `publish = false` path crates.
+
+  *Four modules moved* from `runtime/src/` to `pir-runtime-core/src/`:
+  * `protocol.rs` (885 LOC) — PIR wire format encoder/decoder
+    (requests + responses for DPF / HarmonyPIR / OnionPIR /
+    bucket-Merkle / catalog / info). Standalone, no transitive
+    deps on other workspace crates beyond `pir-core` (indirectly
+    via constants).
+  * `table.rs` (392 LOC) — mmap'd on-disk cuckoo table reader
+    (`DatabaseDescriptor`, `DatabaseType`, `MappedDatabase`).
+    Rewrote `use build::common::*;` to two direct pir_core imports
+    + two local wrapper fns (`read_cuckoo_header`,
+    `read_chunk_cuckoo_header`) since `build/src/common.rs` was
+    60 LOC of pir-core re-exports + thin wrappers.
+  * `eval.rs` (306 LOC) — DPF evaluation for INDEX and CHUNK PIR
+    rounds plus Merkle sibling evaluation. Same
+    `use build::common::*;` → direct pir_core imports rewrite.
+  * `handler.rs` (455 LOC) — `RequestHandler` dispatches decoded
+    `Request` variants against a `Vec<MappedDatabase>` and
+    produces `Response` values. No import changes needed — the
+    `use crate::{eval, protocol, table}` paths resolve in the new
+    location. Notably, the Harmony dispatch paths just memcpy
+    bytes from `sub_table.group_bytes(group_id)`; no dep on the
+    `harmonypir` git crate.
+
+  *Three callers rewired*:
+  * `runtime/src/lib.rs` now re-exports `pir_runtime_core::{eval,
+    handler, protocol, table}` so every `runtime/src/bin/*`
+    file compiles unchanged — the bins use `runtime::protocol::…`
+    / `runtime::eval::…` etc. which still resolve through the
+    re-export shim.
+  * `pir-sdk-server/Cargo.toml` dropped the `runtime` + `build`
+    path deps + the `publish = false` gate, swapped in
+    `pir-runtime-core = { version = "0.1.0", path =
+    "../pir-runtime-core" }`. The `build` dep was entirely unused
+    (confirmed by grep — no `build::` or `extern crate build`
+    anywhere in `pir-sdk-server/src/`).
+  * `pir-sdk-server/src/{loader.rs,server.rs}` picked up one-line
+    import swaps (`use runtime::…` → `use pir_runtime_core::…`).
+
+  *New crate shape*: `pir-runtime-core/Cargo.toml` with full
+  crates.io metadata, `README.md`, `CHANGELOG.md`, LICENSE symlinks
+  into the workspace root. Deps: `pir-core` (path + version),
+  `libdpf` (git — Blocker 1 transitive), `memmap2 = "0.9"`,
+  `rayon = "1.10"`, `libc = "0.2"`.
+
+  *Publishability status*: `pir-sdk-server` status in PUBLISHING.md
+  changed from 🔴 "permanently blocked under current factoring"
+  to 🟡 "blocked transitively via `pir-runtime-core`". Once
+  Blocker 1 (`libdpf` git dep) lands, publish order becomes
+  `pir-core → pir-sdk → pir-runtime-core → pir-sdk-server`.
+  `cargo package --list` produces clean tarballs for both crates.
+  `cargo publish --dry-run -p pir-runtime-core` fails on the
+  libdpf version-requirement check (expected — same blocker as
+  `pir-sdk-client`); `-p pir-sdk-server` dry-run fails on
+  `pir-core not found on crates.io` (expected — dry-run requires
+  deps resolvable from registry).
+
+  Verification: full workspace test surface preserved.
+  * `cargo test -p pir-core --lib` = 25/25
+  * `cargo test -p pir-sdk --lib` = 56/56
+  * `cargo test -p pir-sdk-client --lib` = 125/125
+  * `cargo test -p pir-sdk-wasm --lib` = 51/51
+  * `cargo test -p pir-sdk-server --lib` = 0/0 (unchanged)
+  * `cargo test -p pir-runtime-core --lib` = 0/0 (library-only,
+    extracted code's semantic coverage lives in `pir-core` and
+    its end-to-end coverage lives in `runtime/src/bin/*` test
+    binaries which are unchanged by the move).
+  * `cargo build -p runtime` clean — every `src/bin/*` binary
+    compiles unchanged through the re-export shim.
+
+  PUBLISHING.md updated to mark Blocker 2 as resolved with a
+  retrospective; FEATURES.md picks up `pir-runtime-core` in the
+  summary table + platform compatibility matrix; the
+  `pir-sdk-server` CHANGELOG `[Unreleased]` section documents the
+  dep swap; a new `pir-runtime-core/CHANGELOG.md` covers the
+  initial (unpublished) release.
+
+  🔒 Padding invariants preserved. The extraction is a pure code
+  move — the wire format, slot layout, DPF evaluation, and
+  request-dispatch semantics are byte-identical to the pre-move
+  `runtime/` sources. K=75 INDEX / K_CHUNK=80 CHUNK / 25-MERKLE
+  padding continues to be enforced in `pir-sdk-client`, and
+  `pir-runtime-core` is the server-side counterpart that answers
+  padded queries uniformly.
+
 - **Delta sync chain optimizations (P3 #4).** Refactored
   `pir-sdk/src/sync.rs::compute_sync_plan` and
   `find_delta_chain` around a new `SyncPlanner<'a>` type that

@@ -70,6 +70,7 @@ alf = ["harmonypir/alf", "harmonypir-wasm/alf"]
 
 [dependencies]
 pir-core = { path = "../pir-core" }
+pir-runtime-core = { path = "../pir-runtime-core" }
 build = { path = "../build" }
 libdpf = { git = "https://github.com/weikengchen/libdpf.git" }
 onionpir = { git = "https://github.com/Bitcoin-PIR/OnionPIRv2-fork.git", rev = "f18e4985ba835c5563ff804b3fa2c74722d17f6c" }

@@ -2,7 +2,7 @@
 
 use crate::config::DatabaseEntry;
 use pir_sdk::{DatabaseCatalog, DatabaseInfo, PirResult};
-use runtime::table::{DatabaseDescriptor, DatabaseType, MappedDatabase};
+use pir_runtime_core::table::{DatabaseDescriptor, DatabaseType, MappedDatabase};
 use std::path::Path;
 
 /// Loads PIR databases from disk.

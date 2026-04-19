@@ -13,6 +13,7 @@ and the toolchain cost of turning them on.
 | `pir-sdk-client`  | `fastprp`    |   off    | all       | FastPRP backend for HarmonyPIR — faster per-element.                  |
 | `pir-sdk-client`  | `alf`        |   off    | all       | ALF PRP backend for HarmonyPIR — fastest per-element.                 |
 | `pir-core`        | _(none)_     |   —      | all       | No feature flags; core primitives are always available.               |
+| `pir-runtime-core`| _(none)_     |   —      | native    | No feature flags; shared server primitives are always available.      |
 | `pir-sdk-wasm`    | _(none)_     |   —      | wasm32    | No cargo features; `wasm-pack --target` picks the JS module style.    |
 | `pir-sdk-server`  | _(none)_     |   —      | native    | No feature flags currently; builder + loader always compiled.         |
 
@@ -143,11 +144,11 @@ cargo build -p pir-sdk-client
 
 ## Cross-target compatibility at a glance
 
-| Target family               | `pir-sdk` | `pir-sdk-client`                    | `pir-sdk-wasm` | `pir-sdk-server` | `pir-core` |
-|-----------------------------|:---------:|-------------------------------------|:--------------:|:----------------:|:----------:|
-| Linux / macOS / Windows     | ✅         | ✅ (any feature combo)               | ❌              | ✅                | ✅          |
-| `wasm32-unknown-unknown`    | ✅         | ✅ without `onion`, ❌ with `onion`    | ✅              | ❌                | ✅          |
-| `wasm32-wasi`               | ✅         | ❌ (tokio-tungstenite is tokio-only) | ❌              | ❌                | ✅          |
+| Target family               | `pir-sdk` | `pir-sdk-client`                    | `pir-sdk-wasm` | `pir-runtime-core` | `pir-sdk-server` | `pir-core` |
+|-----------------------------|:---------:|-------------------------------------|:--------------:|:------------------:|:----------------:|:----------:|
+| Linux / macOS / Windows     | ✅         | ✅ (any feature combo)               | ❌              | ✅                  | ✅                | ✅          |
+| `wasm32-unknown-unknown`    | ✅         | ✅ without `onion`, ❌ with `onion`    | ✅              | ❌                  | ❌                | ✅          |
+| `wasm32-wasi`               | ✅         | ❌ (tokio-tungstenite is tokio-only) | ❌              | ❌                  | ❌                | ✅          |
 
 ## Preserving PIR padding invariants
 

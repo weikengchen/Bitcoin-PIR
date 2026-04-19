@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "pir-core",
     "pir-sdk",
+    "pir-runtime-core",
     "pir-sdk-server",
     "pir-sdk-client",
     "pir-sdk-wasm",

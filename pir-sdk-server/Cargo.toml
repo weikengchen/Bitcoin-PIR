@@ -13,20 +13,15 @@ readme = "README.md"
 keywords = ["pir", "privacy", "bitcoin", "cryptography", "server"]
 categories = ["cryptography", "cryptography::cryptocurrencies", "network-programming::server"]
 
-# Not currently publishable to crates.io because `runtime` and `build` are
-# workspace-internal binary crates (not library crates) that cannot
-# themselves be published. Factoring out a publishable server-core library
-# is tracked as future work in PUBLISHING.md.
-publish = false
-
 [dependencies]
 # Core SDK types and traits
-pir-sdk = { path = "../pir-sdk" }
-pir-core = { path = "../pir-core" }
+pir-sdk = { version = "0.1.0", path = "../pir-sdk" }
+pir-core = { version = "0.1.0", path = "../pir-core" }
 
-# Re-use existing runtime components
-runtime = { path = "../runtime" }
-build = { path = "../build" }
+# Shared server runtime primitives (wire protocol, mmap tables, DPF
+# evaluation, request dispatch). Lives in its own publishable crate so
+# `runtime/` binaries and `pir-sdk-server` both consume the same types.
+pir-runtime-core = { version = "0.1.0", path = "../pir-runtime-core" }
 
 # Configuration
 serde = { version = "1.0", features = ["derive"] }

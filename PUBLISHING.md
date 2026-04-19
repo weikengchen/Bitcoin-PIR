@@ -13,10 +13,11 @@ resolved first. Each blocker is listed below with a suggested fix.
 |-----------------------------------|------------|-----------------------------------------------------|
 | `pir-core`                        | crates.io  | 🟢 Ready (no git deps, no path-only deps).          |
 | `pir-sdk`                         | crates.io  | 🟢 Ready (path dep on `pir-core` only).             |
+| `pir-runtime-core`                | crates.io  | 🟡 Blocked — git dep on `libdpf`.                   |
 | `pir-sdk-client`                  | crates.io  | 🟡 Blocked — git deps on `libdpf` / `harmonypir`.   |
 | `pir-sdk-wasm` (as a crate)       | crates.io  | 🟡 Blocked — transitively via `pir-sdk-client`.     |
 | `pir-sdk-wasm` (as npm package)   | npm        | 🟢 Ready (wasm-pack bundles all Rust deps).         |
-| `pir-sdk-server`                  | crates.io  | 🔴 Permanently blocked under current factoring.     |
+| `pir-sdk-server`                  | crates.io  | 🟡 Blocked — transitively via `pir-runtime-core`.   |
 
 🟢 = ready; 🟡 = blocked, unblocking is tracked below; 🔴 = needs
 upstream refactoring, no ETA.
@@ -77,42 +78,45 @@ the `onionpir` crate ever lands on crates.io, switch the git URL to a
 semver range and `cargo install … --features onion` starts working
 from the registry too.
 
-## Blocker 2 — `pir-sdk-server` depends on internal binary crates
+## Blocker 2 — `pir-sdk-server` depends on internal binary crates (RESOLVED)
 
-### Current state
+### Resolution
 
-```toml
-# pir-sdk-server/Cargo.toml
-runtime = { path = "../runtime" }
-build = { path = "../build" }
-publish = false
+Extracted the shared server runtime primitives into a new publishable
+library crate `pir-runtime-core` (≈2 kLOC: `protocol` wire format,
+`table` mmap'd cuckoo reader, `eval` DPF evaluation, `handler` request
+dispatch). Both `pir-sdk-server` and the workspace-internal `runtime/`
+binary crate now depend on `pir-runtime-core` instead of maintaining
+parallel copies. `pir-sdk-server` dropped its unused `build` dep and
+the `publish = false` gate.
+
+Verification: `cargo package --list -p pir-runtime-core` and `-p
+pir-sdk-server` both produce clean tarballs with the expected metadata
+files. Full workspace test surface preserved:
+- `pir-core --lib` 25/25
+- `pir-sdk --lib` 56/56
+- `pir-sdk-client --lib` 125/125
+- `pir-sdk-wasm --lib` 51/51
+- `pir-sdk-server --lib` 0/0 (unchanged — no library tests)
+- `pir-runtime-core --lib` 0/0 (library-only, no unit tests in the
+  extracted modules — all semantic coverage lives in `pir-core`
+  and end-to-end coverage lives in the `runtime/` bin integration
+  tests, neither affected by the code move).
+
+`pir-sdk-server` is now blocked only transitively via Blocker 1
+(`libdpf` git dep in `pir-runtime-core`). Once `libdpf` lands on
+crates.io, the publish order is:
+
+```
+pir-core → pir-sdk → pir-runtime-core → pir-sdk-server
 ```
 
-`runtime/` and `build/` are workspace-internal binary-only crates
-(they have `[[bin]]` targets and are marked `publish = false`). They
-contain the PIR protocol wire format implementation, cuckoo
-placement, serialization, and the HarmonyPIR / OnionPIR server
-request handlers. `pir-sdk-server::PirServerBuilder` re-exports these
-primitives through a fluent builder API.
-
-### Fix
-
-Factor out a new `pir-runtime-core` library crate that exposes the
-subset of `runtime/` / `build/` used by `pir-sdk-server`:
-
-- `PirServer` / `ServerRole`
-- `DatabaseLoader` / `SnapshotDbWithLoaded` / `DeltaDbWithLoaded`
-- The `unified_server` dispatch tables for DPF / Harmony / Onion
-  request bytes.
-
-Approximate scope: ≈2-3 kLOC extraction, mostly mechanical. The
-existing binary crates then depend on `pir-runtime-core` the same way
-`pir-sdk-server` does. No wire-format changes required — it's a
-refactor, not a redesign.
-
-Until that lands, `pir-sdk-server` carries `publish = false` so a
-stray `cargo publish -p pir-sdk-server` won't silently half-publish a
-broken crate.
+🔒 PIR invariants preserved. The extraction is a pure code move; the
+wire format, slot layout, DPF evaluation, and request-dispatch
+semantics are byte-identical. K=75 INDEX / K_CHUNK=80 CHUNK /
+25-MERKLE padding continues to be enforced in `pir-sdk-client`, and
+`pir-runtime-core` is the server-side counterpart that answers padded
+queries uniformly.
 
 ## Publish order
 
@@ -122,9 +126,12 @@ the dependency graph:
 1. `pir-core` (no workspace deps).
 2. `pir-sdk` (depends on `pir-core`).
 3. `libdpf`, `harmonypir` (upstream — see Blocker 1).
-4. `pir-sdk-client` (depends on all of the above).
-5. `pir-sdk-wasm` (depends on everything above).
-6. `pir-sdk-server` (once Blocker 2 is cleared).
+4. `pir-runtime-core` (depends on `pir-core` + `libdpf`).
+5. `pir-sdk-client` (depends on `pir-core`, `pir-sdk`, `libdpf`,
+   `harmonypir`).
+6. `pir-sdk-wasm` (depends on everything above).
+7. `pir-sdk-server` (depends on `pir-core`, `pir-sdk`,
+   `pir-runtime-core`).
 
 Between each step, wait ~30 s for crates.io's index propagation
 before the next `cargo publish` so Cargo can resolve the

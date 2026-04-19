@@ -1,0 +1,21 @@
+[package]
+name = "pir-runtime-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+authors = ["Bitcoin PIR contributors"]
+description = "Server-side runtime primitives for Bitcoin PIR: wire protocol, mmap'd database tables, DPF evaluation, and the request handler shared by binary servers and pir-sdk-server"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Bitcoin-PIR/Bitcoin-PIR"
+homepage = "https://github.com/Bitcoin-PIR/Bitcoin-PIR"
+documentation = "https://docs.rs/pir-runtime-core"
+readme = "README.md"
+keywords = ["pir", "privacy", "bitcoin", "cryptography", "server"]
+categories = ["cryptography", "cryptography::cryptocurrencies", "network-programming::server"]
+
+[dependencies]
+pir-core = { version = "0.1.0", path = "../pir-core" }
+libdpf = { git = "https://github.com/weikengchen/libdpf.git" }
+memmap2 = "0.9"
+rayon = "1.10"
+libc = "0.2"

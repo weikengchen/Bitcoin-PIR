@@ -4,11 +4,24 @@
 //! and the new `MappedSubTable` / `MappedDatabase` types that support
 //! multiple databases with different parameters.
 
-use build::common::*;
 use memmap2::Mmap;
-use pir_core::params::TableParams;
+use pir_core::params::{
+    TableParams, CHUNK_CUCKOO_FILE, CHUNK_SIZE, CHUNK_SLOTS_PER_BIN, CUCKOO_FILE, HEADER_SIZE,
+    INDEX_SLOTS_PER_BIN, INDEX_SLOT_SIZE, MAGIC,
+};
 use std::fs::File;
 use std::path::Path;
+
+// Wrappers kept local (moved from the ex-`build::common`) so table.rs's
+// call sites stay readable — `read_cuckoo_header(bytes)` vs the full
+// pir-core signature with four arguments.
+fn read_cuckoo_header(data: &[u8]) -> (usize, u64) {
+    pir_core::hash::read_cuckoo_header(data, MAGIC, HEADER_SIZE, true)
+}
+
+fn read_chunk_cuckoo_header(data: &[u8]) -> usize {
+    pir_core::hash::read_chunk_cuckoo_header(data)
+}
 
 // ─── New generic types ─────────────────────────────────────────────────────
 
