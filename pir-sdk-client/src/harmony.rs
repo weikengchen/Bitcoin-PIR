@@ -91,6 +91,23 @@ enum HintTarget {
     ChunkSib(usize),
 }
 
+/// Per-group progress callback for the main-hint fetch path.
+///
+/// Fired once per group as its hint blob arrives over the wire and is
+/// loaded into the local `HarmonyGroup`. `done` ranges from `1..=total`,
+/// `total` is the constant `index_k + chunk_k` for the active database
+/// (typically 75 + 80 = 155). `phase` is `"index"` while INDEX groups
+/// stream in and `"chunk"` while CHUNK groups stream in.
+///
+/// Padding invariants are unaffected — the fetch wire shape is identical
+/// to the no-callback path; this trait only observes when each per-group
+/// response has been processed.
+pub trait HintProgress: Send + Sync {
+    /// Called after the `done`-th group's hints have been received and
+    /// loaded into local state. See trait doc for argument contract.
+    fn on_group_complete(&self, done: u32, total: u32, phase: &str);
+}
+
 // ─── Merkle verification traces ─────────────────────────────────────────────
 
 /// Record of one INDEX cuckoo bin we checked during a query.
@@ -1036,11 +1053,25 @@ impl HarmonyClient {
     /// [`ensure_sibling_groups_ready`](Self::ensure_sibling_groups_ready)
     /// has populated them (see that method for the second persist).
     #[tracing::instrument(level = "debug", skip_all, fields(backend = "harmony", db_id = db_info.db_id))]
-    async fn ensure_groups_ready(&mut self, db_info: &DatabaseInfo) -> PirResult<()> {
+    async fn ensure_groups_ready(
+        &mut self,
+        db_info: &DatabaseInfo,
+        progress: Option<&dyn HintProgress>,
+    ) -> PirResult<()> {
         if self.loaded_db_id == Some(db_info.db_id)
             && !self.index_groups.is_empty()
             && !self.chunk_groups.is_empty()
         {
+            // Fast path: hints already loaded from a prior call. Emit a
+            // single terminal `total/total` tick so a UI driving its
+            // progress bar off this callback flips to "done" rather than
+            // silently sitting at the previous percentage.
+            if let Some(p) = progress {
+                let total = db_info.index_k as u32 + db_info.chunk_k as u32;
+                if total > 0 {
+                    p.on_group_complete(total, total, "chunk");
+                }
+            }
             return Ok(());
         }
 
@@ -1053,6 +1084,15 @@ impl HarmonyClient {
         if self.restore_hints_from_cache(db_info)?
             && self.loaded_db_id == Some(db_info.db_id)
         {
+            // Cache hit: emit one terminal tick so progress observers
+            // mark the bar full even though no per-group wire roundtrips
+            // happened.
+            if let Some(p) = progress {
+                let total = db_info.index_k as u32 + db_info.chunk_k as u32;
+                if total > 0 {
+                    p.on_group_complete(total, total, "chunk");
+                }
+            }
             return Ok(());
         }
 
@@ -1088,8 +1128,38 @@ impl HarmonyClient {
             self.chunk_groups.insert(g as u8, group);
         }
 
-        self.fetch_and_load_hints(db_info.db_id, 0, k_index as u8).await?;
-        self.fetch_and_load_hints(db_info.db_id, 1, k_chunk as u8).await?;
+        let total = (k_index + k_chunk) as u32;
+        let mut done: u32 = 0;
+        {
+            let mut on_index = |_gid: u8| {
+                done += 1;
+                if let Some(p) = progress {
+                    p.on_group_complete(done, total, "index");
+                }
+            };
+            self.fetch_and_load_hints_with_callback(
+                db_info.db_id,
+                0,
+                k_index as u8,
+                &mut on_index,
+            )
+            .await?;
+        }
+        {
+            let mut on_chunk = |_gid: u8| {
+                done += 1;
+                if let Some(p) = progress {
+                    p.on_group_complete(done, total, "chunk");
+                }
+            };
+            self.fetch_and_load_hints_with_callback(
+                db_info.db_id,
+                1,
+                k_chunk as u8,
+                &mut on_chunk,
+            )
+            .await?;
+        }
 
         self.loaded_db_id = Some(db_info.db_id);
 
@@ -1107,13 +1177,17 @@ impl HarmonyClient {
         Ok(())
     }
 
-    /// Send a hint request for all groups at `level` (0=INDEX, 1=CHUNK)
-    /// and load each response into its owning `HarmonyGroup`.
-    async fn fetch_and_load_hints(
+    /// Send a hint request for all main groups at `level` (0=INDEX,
+    /// 1=CHUNK) and load each response into its owning `HarmonyGroup`,
+    /// invoking `on_group(group_id)` after each successful per-group
+    /// load. The callback fires in the order responses arrive over the
+    /// wire — usually but not strictly `0..num_groups`.
+    async fn fetch_and_load_hints_with_callback(
         &mut self,
         db_id: u8,
         level: u8,
         num_groups: u8,
+        on_group: &mut (dyn FnMut(u8) + Send),
     ) -> PirResult<()> {
         let target = if level == 0 {
             HintTarget::Index
@@ -1125,7 +1199,7 @@ impl HarmonyClient {
                 level
             )));
         };
-        self.fetch_and_load_hints_into(db_id, level, num_groups, target)
+        self.fetch_and_load_hints_into(db_id, level, num_groups, target, Some(on_group))
             .await
     }
 
@@ -1136,12 +1210,17 @@ impl HarmonyClient {
     /// The server derives per-group PRP keys using `(prp_key, level, group_id)`
     /// internally — the client only needs to pass the correct `level` byte;
     /// the `k_offset` accounting in the server is transparent here.
+    ///
+    /// If `on_group` is `Some`, it is invoked with the just-loaded
+    /// `group_id` after each per-group response is processed; sibling
+    /// callers and tests pass `None`.
     async fn fetch_and_load_hints_into(
         &mut self,
         db_id: u8,
         level: u8,
         num_groups: u8,
         target: HintTarget,
+        mut on_group: Option<&mut (dyn FnMut(u8) + Send)>,
     ) -> PirResult<()> {
         let mut payload = Vec::with_capacity(16 + 1 + 1 + 1 + num_groups as usize + 1);
         payload.extend_from_slice(&self.master_prp_key);
@@ -1209,6 +1288,10 @@ impl HarmonyClient {
                 .load_hints(hints_data)
                 .map_err(|e| PirError::BackendState(format!("load_hints: {:?}", e)))?;
 
+            if let Some(cb) = on_group.as_deref_mut() {
+                cb(group_id);
+            }
+
             received += 1;
         }
 
@@ -1241,7 +1324,7 @@ impl HarmonyClient {
         _step: &SyncStep,
         db_info: &DatabaseInfo,
     ) -> PirResult<Vec<Option<QueryResult>>> {
-        self.ensure_groups_ready(db_info).await?;
+        self.ensure_groups_ready(db_info, None).await?;
 
         log::info!(
             "[PIR-AUDIT] HarmonyPIR execute_step: db_id={}, name={}, height={}, queries={}, has_bucket_merkle={}",
@@ -1707,6 +1790,7 @@ impl HarmonyClient {
                 10 + sl as u8,
                 k_index as u8,
                 HintTarget::IndexSib(sl),
+                None,
             )
             .await?;
             log::info!(
@@ -1746,6 +1830,7 @@ impl HarmonyClient {
                 20 + sl as u8,
                 k_chunk as u8,
                 HintTarget::ChunkSib(sl),
+                None,
             )
             .await?;
             log::info!(
@@ -2001,7 +2086,7 @@ impl HarmonyClient {
         // `query_single` would do this per-call, but front-loading it
         // makes the inspector-path failure mode (hint-fetch errors)
         // cleaner — they surface as `Err` before any query runs.
-        self.ensure_groups_ready(&db_info).await?;
+        self.ensure_groups_ready(&db_info, None).await?;
 
         let mut results: Vec<Option<QueryResult>> = Vec::with_capacity(script_hashes.len());
         for script_hash in script_hashes {
@@ -2114,7 +2199,7 @@ impl HarmonyClient {
         // main groups to exist before sibling hints are fetched —
         // otherwise the HarmonySiblingQuerier would see empty
         // `index_sib_groups`/`chunk_sib_groups` maps.
-        self.ensure_groups_ready(&db_info).await?;
+        self.ensure_groups_ready(&db_info, None).await?;
 
         let (items, item_to_query) = collect_merkle_items_from_results(results);
         let verdicts = self
@@ -2235,6 +2320,38 @@ impl HarmonyClient {
     /// cache) before this matches again.
     pub fn db_id(&self) -> Option<u8> {
         self.loaded_db_id
+    }
+
+    /// Pre-fetch the main hint state for `db_info`, firing `progress`
+    /// after each per-group response is processed.
+    ///
+    /// On a fresh fetch the callback is invoked exactly
+    /// `db_info.index_k + db_info.chunk_k` times (typically 75 + 80 =
+    /// 155), with `(done, total, phase)` reflecting cumulative progress.
+    /// On a cache hit (or if hints for `db_info.db_id` are already
+    /// loaded in memory) the callback fires once with
+    /// `(total, total, "chunk")` so a UI driving its progress bar off
+    /// this signal flips to "done" rather than silently sitting at 0%.
+    ///
+    /// This is a public entry point used by the WASM bridge to expose
+    /// per-group progress to JS without forcing callers to issue a
+    /// dummy query just to warm the hint state. After a successful
+    /// call, [`db_id`](Self::db_id) returns `Some(db_info.db_id)` and
+    /// subsequent queries skip the hint-fetch roundtrips.
+    ///
+    /// 🔒 Padding invariants are preserved — the wire shape is
+    /// identical to the no-progress hint-fetch path; the callback is
+    /// purely observational.
+    #[tracing::instrument(level = "debug", skip_all, fields(backend = "harmony", db_id = db_info.db_id))]
+    pub async fn fetch_hints_with_progress(
+        &mut self,
+        db_info: &DatabaseInfo,
+        progress: &dyn HintProgress,
+    ) -> PirResult<()> {
+        if !self.is_connected() {
+            return Err(PirError::NotConnected);
+        }
+        self.ensure_groups_ready(db_info, Some(progress)).await
     }
 
     /// Invalidate any loaded hint state and pin subsequent queries to

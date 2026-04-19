@@ -76,7 +76,7 @@ pub use connection::{
     DEFAULT_MAX_BACKOFF_DELAY, DEFAULT_MAX_CONNECT_ATTEMPTS, DEFAULT_REQUEST_TIMEOUT,
 };
 pub use dpf::DpfClient;
-pub use harmony::{HarmonyClient, PRP_ALF, PRP_FASTPRP, PRP_HMR12};
+pub use harmony::{HarmonyClient, HintProgress, PRP_ALF, PRP_FASTPRP, PRP_HMR12};
 pub use onion::OnionClient;
 pub use transport::PirTransport;
 #[cfg(target_arch = "wasm32")]

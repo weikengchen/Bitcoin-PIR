@@ -34,6 +34,8 @@
 use js_sys::{Array, Uint8Array};
 use pir_sdk::{PirClient, QueryResult, ScriptHash, SyncResult};
 use pir_sdk_client::{DpfClient, HarmonyClient, PRP_ALF, PRP_FASTPRP, PRP_HMR12};
+#[cfg(target_arch = "wasm32")]
+use pir_sdk_client::HintProgress;
 use wasm_bindgen::prelude::*;
 
 use crate::{
@@ -242,6 +244,35 @@ impl SyncProgress for JsSyncProgress {
             "type": "error",
             "message": error.to_string(),
         }));
+    }
+}
+
+/// `HintProgress` adapter that serialises each per-group event as a
+/// plain JSON object and invokes the JS function with one argument.
+///
+/// Event shape: `{ done: number, total: number, phase: "index" | "chunk" }`.
+/// `done` is the running count of groups whose hints have been loaded;
+/// `total` is the constant `index_k + chunk_k` (typically 155 for the
+/// production HarmonyPIR config). The callback fires once per main
+/// group on a fresh fetch, or once with `done === total` on a cache
+/// hit / already-loaded state.
+#[cfg(target_arch = "wasm32")]
+struct JsHintProgress {
+    cb: SendWrapper<js_sys::Function>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl HintProgress for JsHintProgress {
+    fn on_group_complete(&self, done: u32, total: u32, phase: &str) {
+        let event = serde_json::json!({
+            "done": done,
+            "total": total,
+            "phase": phase,
+        });
+        let val = to_js_object(&event);
+        // Best-effort — a throwing JS callback shouldn't take the hint
+        // fetch down, so we drop the Result.
+        let _ = (*self.cb).call1(&JsValue::NULL, &val);
     }
 }
 
@@ -1098,6 +1129,43 @@ impl WasmHarmonyClient {
             cb: SendWrapper::new(cb),
         });
         self.inner.set_state_listener(Some(listener));
+    }
+
+    /// Pre-fetch the main hint state for `dbId`, firing `progress` after
+    /// each per-group response is loaded. Replaces the legacy "issue a
+    /// dummy query to warm hints" pattern with a dedicated entry point
+    /// that surfaces per-group progress directly.
+    ///
+    /// `progress` is invoked with one argument:
+    /// `{ done, total, phase }` (see `JsHintProgress` for the contract).
+    /// `total` equals `index_k + chunk_k` for the active database
+    /// (typically 75 + 80 = 155). On a cache hit / already-loaded
+    /// state, `progress` fires once with `done === total`.
+    ///
+    /// Rejects with `JsError` if the catalog doesn't carry `dbId` or
+    /// the client isn't connected.
+    ///
+    /// 🔒 Padding invariants are unaffected — wire shape matches the
+    /// no-progress hint-fetch path.
+    #[wasm_bindgen(js_name = fetchHintsWithProgress)]
+    pub async fn fetch_hints_with_progress(
+        &mut self,
+        catalog: &WasmDatabaseCatalog,
+        db_id: u8,
+        progress: js_sys::Function,
+    ) -> Result<(), JsError> {
+        let db_info = catalog
+            .inner()
+            .get(db_id)
+            .ok_or_else(|| JsError::new(&format!("no database with db_id={}", db_id)))?
+            .clone();
+        let prog = JsHintProgress {
+            cb: SendWrapper::new(progress),
+        };
+        self.inner
+            .fetch_hints_with_progress(&db_info, &prog)
+            .await
+            .map_err(err_to_js)
     }
 }
 

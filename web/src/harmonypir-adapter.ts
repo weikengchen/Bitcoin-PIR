@@ -213,27 +213,32 @@ export class HarmonyPirClientAdapter {
   }
 
   /**
-   * Download main hints for the active `dbId`. The native
-   * `HarmonyClient` fetches hints lazily inside `queryBatchRaw`, so we
-   * warm it up here by issuing a single dummy query against a
-   * zero-scripthash. That uses one of the ~256 per-group query budget
-   * but means the next real `queryBatch` skips the hint fetch.
+   * Download main hints for the active `dbId` and emit per-group
+   * progress as `"Hints: N/total (X%)"` log lines so the UI progress
+   * bar can fill incrementally as INDEX (75 groups) and CHUNK (80
+   * groups) responses arrive — a total of 155 groups in production.
    *
-   * Accepted regression: the legacy progress string
-   * `"Hints: N/155 (X%)"` was incrementally driven from per-group
-   * network callbacks. The WASM path has no equivalent streaming
-   * surface, so we emit a single begin/end message instead. The UI's
-   * progress-bar regex is adapted in `web/index.html` to recognise
-   * the new "Hints: ready" marker.
+   * Uses the native `fetchHintsWithProgress` entry point rather than
+   * issuing a dummy query, so no per-group query budget is consumed
+   * just to warm the hint state.
    */
   async fetchHints(): Promise<void> {
     if (!this.wasmClient) throw new Error('loadWasm() must be called first');
     this.log('Hints: downloading…');
     this.wasmClient.setDbId(this.dbId);
-    // Warm-up: one dummy zero-scripthash query triggers
-    // `ensure_groups_ready` in native, which downloads all hints.
-    const dummy = new Uint8Array(20);
-    await this.wasmClient.queryBatchRaw(dummy, this.dbId);
+    const sdkCatalog = this.catalogToSdkHandle();
+    try {
+      await this.wasmClient.fetchHintsWithProgress(
+        sdkCatalog,
+        this.dbId,
+        ({ done, total }) => {
+          const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+          this.log(`Hints: ${done}/${total} (${pct}%)`);
+        },
+      );
+    } finally {
+      sdkCatalog.free();
+    }
     this.hintsLoaded = true;
     this.log('Hints: ready');
   }

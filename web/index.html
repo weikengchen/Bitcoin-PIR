@@ -2715,18 +2715,32 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                     prpBackend: hpCurrentPrp,
                     onProgress: (msg) => {
                         log(`HarmonyPIR: ${msg}`);
-                        // Legacy progress text ("Hints: N/155") is no longer
-                        // emitted — the native HarmonyClient fetches hints
-                        // inside a single call. Flip the offline bar to
-                        // an indeterminate 100% when hints are ready.
                         const fill = document.getElementById('hp-offlineFill');
                         const label = document.getElementById('hp-offlineLabel');
+                        // Per-group progress lines from `fetchHints()`:
+                        // `Hints: N/total (X%)` — drive both the offline
+                        // hint bar and the in-flight hp-progress bar so
+                        // the UI fills incrementally instead of sitting
+                        // on "Downloading…" for the full hint download.
+                        const m = msg.match(/^Hints:\s+(\d+)\/(\d+)\s+\((\d+)%\)/);
+                        if (m) {
+                            const done = parseInt(m[1], 10);
+                            const total = parseInt(m[2], 10);
+                            const pct = parseInt(m[3], 10);
+                            if (fill) fill.style.width = `${pct}%`;
+                            if (label) label.textContent = `Downloading hints… ${done}/${total}`;
+                            hpSetProgress(pct, `Hints ${done}/${total}`);
+                            if (done >= total) hpHideProgress();
+                            return;
+                        }
                         if (msg.startsWith('Hints: downloading')) {
                             if (fill) fill.style.width = `0%`;
                             if (label) label.textContent = 'Downloading hints…';
+                            hpSetProgress(0, 'Downloading hints…');
                         } else if (msg.startsWith('Hints: ready') || msg.startsWith('Hints restored')) {
                             if (fill) fill.style.width = `100%`;
                             if (label) label.textContent = 'Hints loaded';
+                            hpHideProgress();
                         }
                     },
                 });

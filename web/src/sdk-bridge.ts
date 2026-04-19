@@ -198,6 +198,11 @@ interface WasmHarmonyClient {
   readonly isConnected: boolean;
   connect(): Promise<void>;
   disconnect(): Promise<void>;
+  /** Fetch + cache the database catalog over the WASM client's
+   *  internal connection. Returns a `WasmDatabaseCatalog` handle the
+   *  caller can pass back into `fetchHintsWithProgress` / `loadHints`
+   *  / `fingerprint`. */
+  fetchCatalog(): Promise<WasmDatabaseCatalog>;
   serverUrls(): [string, string];
   /** Returns the active `db_id`, or `undefined` if no hints are loaded. */
   dbId(): number | undefined;
@@ -238,6 +243,16 @@ interface WasmHarmonyClient {
     lastHeight: number | null | undefined,
     progress: (step: string, detail: string) => void,
   ): Promise<any>;
+  /** Pre-fetch the main hint state for `dbId`, firing `progress` after
+   *  each per-group response is loaded. `progress` receives a single
+   *  `{ done, total, phase }` argument; `total` is `index_k + chunk_k`
+   *  (typically 155). On a cache hit / already-loaded state the
+   *  callback fires once with `done === total`. */
+  fetchHintsWithProgress(
+    catalog: WasmDatabaseCatalog,
+    dbId: number,
+    progress: (event: { done: number; total: number; phase: string }) => void,
+  ): Promise<void>;
   /** Install a `WasmAtomicMetrics` recorder. Mirrors
    *  `WasmDpfClient.setMetricsRecorder`; the same recorder can be
    *  installed on multiple clients to aggregate counters across them. */
