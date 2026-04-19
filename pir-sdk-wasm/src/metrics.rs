@@ -94,22 +94,26 @@ impl WasmAtomicMetrics {
 
     /// Take a snapshot of every counter at the current instant.
     ///
-    /// Returns a plain JS object with twelve `bigint` fields:
+    /// Returns a plain JS object with sixteen `bigint` fields:
     ///
     /// ```text
     /// {
-    ///   queriesStarted:           bigint,
-    ///   queriesCompleted:         bigint,
-    ///   queryErrors:              bigint,
-    ///   bytesSent:                bigint,
-    ///   bytesReceived:            bigint,
-    ///   framesSent:               bigint,
-    ///   framesReceived:           bigint,
-    ///   connects:                 bigint,
-    ///   disconnects:              bigint,
-    ///   totalQueryLatencyMicros:  bigint,  // sum of every observed duration
-    ///   minQueryLatencyMicros:    bigint,  // u64::MAX before first completion
-    ///   maxQueryLatencyMicros:    bigint,  // 0 before first completion
+    ///   queriesStarted:               bigint,
+    ///   queriesCompleted:             bigint,
+    ///   queryErrors:                  bigint,
+    ///   bytesSent:                    bigint,
+    ///   bytesReceived:                bigint,
+    ///   framesSent:                   bigint,
+    ///   framesReceived:               bigint,
+    ///   connects:                     bigint,
+    ///   disconnects:                  bigint,
+    ///   totalQueryLatencyMicros:      bigint,  // sum of every observed query duration
+    ///   minQueryLatencyMicros:        bigint,  // u64::MAX before first completion
+    ///   maxQueryLatencyMicros:        bigint,  // 0 before first completion
+    ///   roundtripsObserved:           bigint,  // count of successful send+recv pairs
+    ///   totalRoundtripLatencyMicros:  bigint,  // sum of every observed roundtrip duration
+    ///   minRoundtripLatencyMicros:    bigint,  // u64::MAX before first roundtrip
+    ///   maxRoundtripLatencyMicros:    bigint,  // 0 before first roundtrip
     /// }
     /// ```
     ///
@@ -118,14 +122,19 @@ impl WasmAtomicMetrics {
     /// instants. See [`pir_sdk::AtomicMetrics::snapshot`] for the
     /// consistency caveat.
     ///
-    /// Latency-snapshot semantics:
-    /// - `totalQueryLatencyMicros` and `maxQueryLatencyMicros` are 0
-    ///   when no completions have been recorded.
-    /// - `minQueryLatencyMicros` is `0xFFFF_FFFF_FFFF_FFFFn` (the
-    ///   BigInt form of `u64::MAX`) when no completions have been
-    ///   recorded — callers should normalize via
+    /// Latency-snapshot semantics (apply to both the per-query and
+    /// per-roundtrip families):
+    /// - `total*LatencyMicros` and `max*LatencyMicros` are 0 when no
+    ///   measurements have been recorded.
+    /// - `min*LatencyMicros` is `0xFFFF_FFFF_FFFF_FFFFn` (the BigInt
+    ///   form of `u64::MAX`) when no measurements have been recorded —
+    ///   callers should normalize via
     ///   `snap.minQueryLatencyMicros === 0xFFFF_FFFF_FFFF_FFFFn ? 0n : snap.minQueryLatencyMicros`
     ///   if a 0-when-empty value is preferable.
+    ///
+    /// `framesSent - roundtripsObserved` is the number of sends that
+    /// succeeded but whose matching response failed (transient-network
+    /// signal — see [`pir_sdk::PirMetrics::on_roundtrip_end`]).
     #[wasm_bindgen(js_name = snapshot)]
     pub fn snapshot(&self) -> JsValue {
         snapshot_to_js(&self.inner.snapshot())
@@ -176,9 +185,10 @@ fn snapshot_to_js(s: &AtomicMetricsSnapshot) -> JsValue {
     set_bigint_field(&obj, "framesReceived", s.frames_received);
     set_bigint_field(&obj, "connects", s.connects);
     set_bigint_field(&obj, "disconnects", s.disconnects);
-    // Latency fields (Phase 2+ tail). `min_query_latency_micros` is
-    // u64::MAX (sentinel) until the first completion fires; callers
-    // can normalize with the documented BigInt comparison.
+    // Per-query latency fields (Phase 2+ tail, third item).
+    // `min_query_latency_micros` is u64::MAX (sentinel) until the
+    // first completion fires; callers can normalize with the
+    // documented BigInt comparison.
     set_bigint_field(
         &obj,
         "totalQueryLatencyMicros",
@@ -186,6 +196,27 @@ fn snapshot_to_js(s: &AtomicMetricsSnapshot) -> JsValue {
     );
     set_bigint_field(&obj, "minQueryLatencyMicros", s.min_query_latency_micros);
     set_bigint_field(&obj, "maxQueryLatencyMicros", s.max_query_latency_micros);
+    // Per-roundtrip latency fields (Phase 2+ tail, fourth item).
+    // Same sentinel semantics as the per-query family above.
+    // `roundtrips_observed` is the denominator for the running mean
+    // and the partial-failure-detection signal noted in the docstring
+    // on `snapshot()` above.
+    set_bigint_field(&obj, "roundtripsObserved", s.roundtrips_observed);
+    set_bigint_field(
+        &obj,
+        "totalRoundtripLatencyMicros",
+        s.total_roundtrip_latency_micros,
+    );
+    set_bigint_field(
+        &obj,
+        "minRoundtripLatencyMicros",
+        s.min_roundtrip_latency_micros,
+    );
+    set_bigint_field(
+        &obj,
+        "maxRoundtripLatencyMicros",
+        s.max_roundtrip_latency_micros,
+    );
     obj.into()
 }
 
@@ -214,6 +245,11 @@ mod tests {
         assert_eq!(s.min_query_latency_micros, u64::MAX);
         assert_eq!(s.max_query_latency_micros, 0);
         assert_eq!(s.total_query_latency_micros, 0);
+        // Roundtrip latency mirrors the per-query family.
+        assert_eq!(s.roundtrips_observed, 0);
+        assert_eq!(s.total_roundtrip_latency_micros, 0);
+        assert_eq!(s.min_roundtrip_latency_micros, u64::MAX);
+        assert_eq!(s.max_roundtrip_latency_micros, 0);
     }
 
     #[test]
@@ -357,5 +393,56 @@ mod tests {
         assert_eq!(s.total_query_latency_micros, 100_000);
         assert_eq!(s.min_query_latency_micros, 30_000);
         assert_eq!(s.max_query_latency_micros, 70_000);
+    }
+
+    /// Per-roundtrip latency observations made through the
+    /// `Arc<dyn PirMetrics>` trait object end up in the WASM-side
+    /// snapshot. Mirrors `latency_through_recorder_handle_lands_in_snapshot`
+    /// for the per-frame `on_roundtrip_end` callback that landed as the
+    /// fourth Phase 2+ tail item — the shape any transport-level recorder
+    /// actually exercises (the wrappers don't have direct access to the
+    /// inner `AtomicMetrics`, only the `recorder_handle()` Arc clone).
+    #[test]
+    fn roundtrip_latency_through_recorder_handle_lands_in_snapshot() {
+        let m = WasmAtomicMetrics::new();
+        let handle: Arc<dyn PirMetrics> = m.recorder_handle();
+
+        // Three roundtrips with varying durations and byte sizes.
+        // `on_roundtrip_end` is called from the transport on
+        // fully-successful roundtrips only — we simulate that here.
+        handle.on_roundtrip_end("dpf", 100, 200, Duration::from_millis(50));
+        handle.on_roundtrip_end("dpf", 80, 160, Duration::from_millis(20));
+        handle.on_roundtrip_end("dpf", 120, 240, Duration::from_millis(80));
+
+        let s = m.snapshot_raw();
+        assert_eq!(s.roundtrips_observed, 3);
+        assert_eq!(s.total_roundtrip_latency_micros, 150_000);
+        assert_eq!(s.min_roundtrip_latency_micros, 20_000);
+        assert_eq!(s.max_roundtrip_latency_micros, 80_000);
+    }
+
+    /// Multiple clients sharing one recorder aggregate roundtrip
+    /// latency too — same shared-state contract as
+    /// `multiple_clients_aggregate_latency` but for the
+    /// per-roundtrip family.
+    #[test]
+    fn multiple_clients_aggregate_roundtrip_latency() {
+        use pir_sdk_client::{DpfClient, HarmonyClient};
+
+        let m = WasmAtomicMetrics::new();
+        let mut d = DpfClient::new("wss://a", "wss://b");
+        let mut h = HarmonyClient::new("wss://h", "wss://q");
+        d.set_metrics_recorder(Some(m.recorder_handle()));
+        h.set_metrics_recorder(Some(m.recorder_handle()));
+
+        let handle = m.recorder_handle();
+        handle.on_roundtrip_end("dpf", 50, 100, Duration::from_millis(40));
+        handle.on_roundtrip_end("harmony", 60, 120, Duration::from_millis(60));
+
+        let s = m.snapshot_raw();
+        assert_eq!(s.roundtrips_observed, 2);
+        assert_eq!(s.total_roundtrip_latency_micros, 100_000);
+        assert_eq!(s.min_roundtrip_latency_micros, 40_000);
+        assert_eq!(s.max_roundtrip_latency_micros, 60_000);
     }
 }

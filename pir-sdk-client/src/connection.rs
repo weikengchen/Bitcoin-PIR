@@ -28,7 +28,11 @@
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
-use pir_sdk::{PirError, PirMetrics, PirResult};
+// `Instant` is re-exported from pir_sdk (under the hood it's `web_time::Instant`,
+// a drop-in for `std::time::Instant` that compiles to wasm32). Using the
+// pir_sdk re-export keeps the timing source the same as the metrics callback's
+// `Duration` argument across all transports.
+use pir_sdk::{Instant, PirError, PirMetrics, PirResult};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -400,6 +404,16 @@ impl WsConnection {
         }
     }
 
+    /// Fire `on_roundtrip_end` on the installed recorder, if any. No-op
+    /// when no recorder is installed. Only called from the success path
+    /// of `roundtrip` — partial-success is not surfaced as a roundtrip
+    /// observation (see `PirMetrics::on_roundtrip_end` docs).
+    fn fire_roundtrip_end(&self, bytes_out: usize, bytes_in: usize, duration: Duration) {
+        if let Some(rec) = &self.metrics_recorder {
+            rec.on_roundtrip_end(self.metrics_backend, bytes_out, bytes_in, duration);
+        }
+    }
+
     /// Send a binary message, subject to the per-request deadline.
     pub async fn send(&mut self, data: Vec<u8>) -> PirResult<()> {
         // Capture the read-only bits before `self.sink` is mutably
@@ -491,6 +505,14 @@ impl WsConnection {
         // — capturing it here lets us fire `on_bytes_sent` without having
         // to thread the count through the future.
         let bytes_out = request.len();
+        // Capture `Instant::now()` only when a recorder is installed; the
+        // `is_some().then(...)` branch elides the clock-read entirely
+        // when no recorder is installed, preserving the "no recorder =
+        // zero overhead" property for the no-roundtrip-metrics case
+        // (and avoiding a `performance.now()` JS↔WASM boundary call on
+        // the wasm transport via the same `pir_sdk::Instant`
+        // re-export).
+        let started_at: Option<Instant> = self.metrics_recorder.is_some().then(Instant::now);
         // Track whether the response future actually received something,
         // so we can fire `on_bytes_received` from outside the inner
         // `async` block (where we can't borrow `self.metrics_recorder`
@@ -532,6 +554,17 @@ impl WsConnection {
         }
         if let Some(n) = bytes_in {
             self.fire_bytes_received(n);
+        }
+        // Fire `on_roundtrip_end` only on full success (both halves +
+        // length prefix sanity check passed AND the result is `Ok`).
+        // Using `result.is_ok()` here is the cleanest predicate: the
+        // length-prefix check inside `fut` short-circuits with `Err`
+        // before setting `bytes_in`, so a recorded "complete" roundtrip
+        // implies a well-formed response. `started_at` being `Some`
+        // implies a recorder is still installed (no install/uninstall
+        // race in this single-threaded `&mut self` API).
+        if let (true, Some(start), Some(n)) = (result.is_ok(), started_at, bytes_in) {
+            self.fire_roundtrip_end(bytes_out, n, start.elapsed());
         }
         result
     }

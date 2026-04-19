@@ -64,7 +64,7 @@ use futures::channel::mpsc;
 use futures::channel::oneshot;
 use futures::StreamExt;
 use js_sys::{ArrayBuffer, Uint8Array};
-use pir_sdk::{PirError, PirMetrics, PirResult};
+use pir_sdk::{Duration, Instant, PirError, PirMetrics, PirResult};
 use send_wrapper::SendWrapper;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -298,6 +298,19 @@ impl WasmWebSocketTransport {
             rec.on_bytes_received(self.metrics_backend, bytes);
         }
     }
+
+    /// Fire `on_roundtrip_end` on the installed recorder, if any.
+    /// Called only on a fully-successful roundtrip (both halves succeeded
+    /// AND the length-prefix check passed). Partial-failure
+    /// (`send` ok / `recv` err, or short frame) deliberately *does not*
+    /// fire — the byte callbacks already fired for whatever crossed the
+    /// wire, and a downstream consumer can detect "frames sent but no
+    /// roundtrip" as `frames_sent - roundtrips_observed > 0`.
+    fn fire_roundtrip_end(&self, bytes_out: usize, bytes_in: usize, duration: Duration) {
+        if let Some(rec) = &self.metrics_recorder {
+            rec.on_roundtrip_end(self.metrics_backend, bytes_out, bytes_in, duration);
+        }
+    }
 }
 
 #[async_trait]
@@ -347,7 +360,13 @@ impl PirTransport for WasmWebSocketTransport {
 
     async fn roundtrip(&mut self, request: &[u8]) -> PirResult<Vec<u8>> {
         // `send` / `recv` already fire per-frame byte callbacks, so
-        // roundtrip inherits them for free — no extra wiring needed here.
+        // roundtrip inherits them for free — no extra wiring needed for
+        // those. We additionally measure end-to-end roundtrip latency
+        // when (and only when) a recorder is installed: capturing
+        // `Instant::now()` on every roundtrip would otherwise pay the
+        // `performance.now()` JS↔WASM boundary cost for nothing.
+        let started_at: Option<Instant> = self.metrics_recorder.is_some().then(Instant::now);
+        let bytes_out = request.len();
         self.send(request.to_vec()).await?;
         let full = self.recv().await?;
         // Match the `WsConnection::roundtrip` contract — the 4-byte LE
@@ -358,6 +377,14 @@ impl PirTransport for WasmWebSocketTransport {
                 "roundtrip frame too short for length prefix ({} bytes)",
                 full.len()
             )));
+        }
+        // `bytes_in` matches what `recv` already counted via
+        // `fire_bytes_received` (full raw frame including the 4-byte
+        // length prefix), so a recorder sees a consistent view across
+        // the byte and roundtrip counters.
+        let bytes_in = full.len();
+        if let Some(start) = started_at {
+            self.fire_roundtrip_end(bytes_out, bytes_in, start.elapsed());
         }
         Ok(full[4..].to_vec())
     }

@@ -254,14 +254,19 @@ interface WasmHarmonyClient {
  * `Number(snap.bytesSent)` if you prefer `Number` arithmetic and the
  * value is known to fit.
  *
- * Latency-snapshot semantics:
- * - `totalQueryLatencyMicros` and `maxQueryLatencyMicros` are `0n`
- *   when no completions have been recorded.
- * - `minQueryLatencyMicros` is `0xFFFF_FFFF_FFFF_FFFFn` (the BigInt
- *   form of `u64::MAX`) when no completions have been recorded.
+ * Latency-snapshot semantics (apply to both the per-query and
+ * per-roundtrip families):
+ * - `total*LatencyMicros` and `max*LatencyMicros` are `0n` when no
+ *   measurements have been recorded.
+ * - `min*LatencyMicros` is `0xFFFF_FFFF_FFFF_FFFFn` (the BigInt form
+ *   of `u64::MAX`) when no measurements have been recorded.
  *   Normalize via the comparison
  *   `snap.minQueryLatencyMicros === 0xFFFF_FFFF_FFFF_FFFFn ? 0n : snap.minQueryLatencyMicros`
  *   if a 0-when-empty value is preferable.
+ *
+ * `framesSent - roundtripsObserved` is the number of sends that
+ * succeeded but whose matching response failed (transient-network
+ * signal — `on_roundtrip_end` only fires on full success).
  */
 interface AtomicMetricsSnapshot {
   readonly queriesStarted: bigint;
@@ -281,6 +286,21 @@ interface AtomicMetricsSnapshot {
   /** Largest observed query duration in microseconds. `0n` when no
    *  completions have been recorded. */
   readonly maxQueryLatencyMicros: bigint;
+  /** Number of successful transport-level roundtrips observed
+   *  (matching pairs of send + receive). Distinct from `framesSent`
+   *  (which counts every successful send, even those whose response
+   *  failed); `framesSent - roundtripsObserved` is the count of
+   *  send-succeeded-but-recv-failed events. */
+  readonly roundtripsObserved: bigint;
+  /** Sum of every observed roundtrip duration in microseconds.
+   *  Divide by `roundtripsObserved` for the running mean. */
+  readonly totalRoundtripLatencyMicros: bigint;
+  /** Smallest observed roundtrip duration in microseconds. `u64::MAX`
+   *  (the sentinel) when no roundtrips have been observed. */
+  readonly minRoundtripLatencyMicros: bigint;
+  /** Largest observed roundtrip duration in microseconds. `0n` when
+   *  no roundtrips have been observed. */
+  readonly maxRoundtripLatencyMicros: bigint;
 }
 
 /**
@@ -297,15 +317,19 @@ interface AtomicMetricsSnapshot {
 interface WasmAtomicMetrics {
   free(): void;
   /**
-   * Return a snapshot object with twelve `bigint` counters: nine
+   * Return a snapshot object with sixteen `bigint` counters: nine
    * lifecycle / byte counters (`queriesStarted`, `queriesCompleted`,
    * `queryErrors`, `bytesSent`, `bytesReceived`, `framesSent`,
-   * `framesReceived`, `connects`, `disconnects`) plus three latency
-   * fields (`totalQueryLatencyMicros`, `minQueryLatencyMicros`,
-   * `maxQueryLatencyMicros`). Individual counters are atomic, but the
-   * snapshot as a whole is NOT — two counters may be observed at
-   * slightly different instants. See [`AtomicMetricsSnapshot`] for
-   * the latency-sentinel semantics.
+   * `framesReceived`, `connects`, `disconnects`), three per-query
+   * latency fields (`totalQueryLatencyMicros`, `minQueryLatencyMicros`,
+   * `maxQueryLatencyMicros`), and four per-roundtrip latency fields
+   * (`roundtripsObserved`, `totalRoundtripLatencyMicros`,
+   * `minRoundtripLatencyMicros`, `maxRoundtripLatencyMicros`).
+   * Individual counters are atomic, but the snapshot as a whole is
+   * NOT — two counters may be observed at slightly different
+   * instants. See [`AtomicMetricsSnapshot`] for the latency-sentinel
+   * semantics and the `framesSent - roundtripsObserved`
+   * partial-failure-detection signal.
    */
   snapshot(): AtomicMetricsSnapshot;
 }

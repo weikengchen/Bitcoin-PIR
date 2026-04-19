@@ -24,18 +24,31 @@
 //!
 //! # Latency tracking
 //!
-//! [`on_query_end`](PirMetrics::on_query_end) carries a [`Duration`]
-//! measured by the client between matching `on_query_start` and
-//! `on_query_end` calls. The clock source is [`Instant`] from the
+//! Two latency callbacks are layered on top of the lifecycle counters:
+//!
+//! - [`on_query_end`](PirMetrics::on_query_end) — wall-clock time for a
+//!   complete PIR query batch (INDEX + CHUNK + Merkle rounds for a
+//!   single `query_batch` call). Fired from each backend client.
+//! - [`on_roundtrip_end`](PirMetrics::on_roundtrip_end) — wall-clock
+//!   time for a single transport-level send-then-receive pair (one
+//!   request frame out, one response frame in). Fired from each
+//!   transport. Captures sub-query timing (each PIR query batch makes
+//!   multiple roundtrips), so `roundtrips_observed` divided into
+//!   `total_roundtrip_latency_micros` gives the per-frame mean
+//!   regardless of how queries are batched above the transport.
+//!
+//! Both clocks share the same source: [`Instant`] from the
 //! [`web-time`](https://crates.io/crates/web-time) crate — a drop-in
 //! `std::time::Instant` substitute that uses `performance.now()` on
 //! `wasm32-unknown-unknown` (where `std::time::Instant` is not
 //! available). Both [`Instant`] and [`Duration`] are re-exported at
 //! the crate root so callers don't need their own `web-time` dep.
 //!
-//! Clients only capture an [`Instant`] when a recorder is installed
-//! — when no recorder is present the timing path is fully optimized
-//! out, preserving the "no recorder = zero overhead" property.
+//! Clients and transports only capture an [`Instant`] when a recorder
+//! is installed — when no recorder is present the timing path is fully
+//! optimized out, preserving the "no recorder = zero overhead"
+//! property and avoiding `performance.now()` JS↔WASM boundary calls
+//! on the wasm32 target.
 //!
 //! # Thread safety
 //!
@@ -57,6 +70,7 @@
 //! recorder.on_connect("dpf", "wss://server0");
 //! recorder.on_bytes_sent("dpf", 1024);
 //! recorder.on_bytes_received("dpf", 2048);
+//! recorder.on_roundtrip_end("dpf", 1024, 2048, Duration::from_millis(15));
 //! recorder.on_query_end("dpf", 0, 10, true, Duration::from_millis(42));
 //!
 //! let snap = recorder.snapshot();
@@ -68,6 +82,10 @@
 //! assert_eq!(snap.total_query_latency_micros, 42_000);
 //! assert_eq!(snap.min_query_latency_micros, 42_000);
 //! assert_eq!(snap.max_query_latency_micros, 42_000);
+//! assert_eq!(snap.roundtrips_observed, 1);
+//! assert_eq!(snap.total_roundtrip_latency_micros, 15_000);
+//! assert_eq!(snap.min_roundtrip_latency_micros, 15_000);
+//! assert_eq!(snap.max_roundtrip_latency_micros, 15_000);
 //! ```
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -131,6 +149,49 @@ pub trait PirMetrics: Send + Sync {
     /// Symmetric to [`on_bytes_sent`](Self::on_bytes_sent).
     fn on_bytes_received(&self, _backend: &'static str, _bytes: usize) {}
 
+    /// Fired when a transport-level send-then-receive pair completes
+    /// successfully — one outgoing request frame, one matched response
+    /// frame.
+    ///
+    /// `bytes_out` is the request payload length, `bytes_in` is the
+    /// response payload length (matching the value passed to
+    /// [`on_bytes_sent`](Self::on_bytes_sent) and
+    /// [`on_bytes_received`](Self::on_bytes_received) for the same
+    /// frame pair). `duration` is the wall-clock time between the
+    /// `send` future being driven and the matching `recv` future
+    /// resolving.
+    ///
+    /// Only fired on full success — a timeout, send error, or
+    /// malformed-response error during the roundtrip suppresses this
+    /// callback. Per-frame byte callbacks
+    /// ([`on_bytes_sent`](Self::on_bytes_sent) /
+    /// [`on_bytes_received`](Self::on_bytes_received)) may still fire
+    /// for the successful half of a partially-failed roundtrip; the
+    /// difference `frames_sent - roundtrips_observed` therefore tells a
+    /// caller how many sends succeeded but the matching response
+    /// failed.
+    ///
+    /// Transports capture an [`Instant`] only when a recorder is
+    /// installed (so the timing path is free for the no-recorder
+    /// case). This is the per-frame counterpart to
+    /// [`on_query_end`](Self::on_query_end)'s per-batch latency — a
+    /// single PIR query batch makes multiple roundtrips (INDEX +
+    /// CHUNK + Merkle), so `total_roundtrip_latency_micros /
+    /// roundtrips_observed` gives the per-frame mean regardless of
+    /// batching above the transport.
+    ///
+    /// No `db_id` is recorded because the transport layer is
+    /// payload-agnostic — it sees opaque byte frames, not which
+    /// database a query targets.
+    fn on_roundtrip_end(
+        &self,
+        _backend: &'static str,
+        _bytes_out: usize,
+        _bytes_in: usize,
+        _duration: Duration,
+    ) {
+    }
+
     /// Fired on successful TLS/WebSocket handshake. `url` is the
     /// endpoint that was connected to (for display/logging only —
     /// recorders should avoid using it as a metric dimension since
@@ -171,19 +232,26 @@ const MIN_LATENCY_SENTINEL: u64 = u64::MAX;
 /// This is the recommended default for callers that want "give me
 /// numbers, I'll look at them later" without plugging in a full
 /// observability stack. All counters are `u64` and monotonically
-/// non-decreasing (with the exception of `min_query_latency_micros`,
-/// which is monotonically non-increasing once any completion is
-/// recorded — see [`Self::snapshot`] for sentinel semantics);
-/// callers snapshot via [`snapshot`](Self::snapshot) and diff two
-/// snapshots to get a rate.
+/// non-decreasing (with the exception of `min_query_latency_micros`
+/// and `min_roundtrip_latency_micros`, which are monotonically
+/// non-increasing once any measurement is recorded — see
+/// [`Self::snapshot`] for sentinel semantics); callers snapshot via
+/// [`snapshot`](Self::snapshot) and diff two snapshots to get a rate.
 ///
-/// Latency tracking lives alongside the counters: every successful
-/// or failed call to [`on_query_end`](PirMetrics::on_query_end)
-/// updates `total_query_latency_micros` (sum), `min_query_latency_micros`
-/// (lock-free `fetch_min`), and `max_query_latency_micros` (lock-free
-/// `fetch_max`). Compute mean = total / (queries_completed +
-/// query_errors). For percentile estimation, install a custom
-/// `PirMetrics` impl that maintains a histogram (e.g. via the
+/// Latency tracking lives alongside the counters at two granularities:
+/// - Per-batch: every successful or failed call to
+///   [`on_query_end`](PirMetrics::on_query_end) updates
+///   `total_query_latency_micros` (sum), `min_query_latency_micros`
+///   (lock-free `fetch_min`), and `max_query_latency_micros`
+///   (lock-free `fetch_max`). Mean = total /
+///   (queries_completed + query_errors).
+/// - Per-frame: every successful call to
+///   [`on_roundtrip_end`](PirMetrics::on_roundtrip_end) updates the
+///   four `*_roundtrip_*` counters analogously, plus
+///   `roundtrips_observed`. Mean = total / roundtrips_observed.
+///
+/// For percentile estimation, install a custom `PirMetrics` impl that
+/// maintains a histogram (e.g. via the
 /// [`hdrhistogram`](https://crates.io/crates/hdrhistogram) crate).
 #[derive(Debug)]
 pub struct AtomicMetrics {
@@ -207,12 +275,27 @@ pub struct AtomicMetrics {
     min_query_latency_micros: AtomicU64,
     /// Largest observed query duration, in microseconds.
     max_query_latency_micros: AtomicU64,
+    /// Number of successful transport-level roundtrips (matching
+    /// pairs of send + receive that both completed without error).
+    /// Use as the denominator for `total_roundtrip_latency_micros`.
+    roundtrips_observed: AtomicU64,
+    /// Sum of all observed roundtrip durations, in microseconds.
+    total_roundtrip_latency_micros: AtomicU64,
+    /// Smallest observed roundtrip duration. Initialized to
+    /// [`MIN_LATENCY_SENTINEL`] (`u64::MAX`) so the first real
+    /// measurement always wins via `fetch_min`. A snapshot reading
+    /// this value as `u64::MAX` indicates no roundtrips have been
+    /// observed yet.
+    min_roundtrip_latency_micros: AtomicU64,
+    /// Largest observed roundtrip duration, in microseconds.
+    max_roundtrip_latency_micros: AtomicU64,
 }
 
 impl Default for AtomicMetrics {
     fn default() -> Self {
         // Hand-written `Default` because `AtomicU64::default()` is 0
-        // but `min_query_latency_micros` needs to start at `u64::MAX`
+        // but `min_query_latency_micros` and
+        // `min_roundtrip_latency_micros` need to start at `u64::MAX`
         // for the lock-free `fetch_min` first-write logic to work.
         Self {
             queries_started: AtomicU64::new(0),
@@ -227,6 +310,10 @@ impl Default for AtomicMetrics {
             total_query_latency_micros: AtomicU64::new(0),
             min_query_latency_micros: AtomicU64::new(MIN_LATENCY_SENTINEL),
             max_query_latency_micros: AtomicU64::new(0),
+            roundtrips_observed: AtomicU64::new(0),
+            total_roundtrip_latency_micros: AtomicU64::new(0),
+            min_roundtrip_latency_micros: AtomicU64::new(MIN_LATENCY_SENTINEL),
+            max_roundtrip_latency_micros: AtomicU64::new(0),
         }
     }
 }
@@ -253,6 +340,13 @@ impl AtomicMetrics {
     ///   smallest observed duration in microseconds. Use the helper
     ///   [`AtomicMetricsSnapshot::min_query_latency_micros_or_zero`]
     ///   if a normalized 0-when-empty value is preferable.
+    /// - The four `*_roundtrip_*` counters follow the same pattern:
+    ///   `total_roundtrip_latency_micros` and
+    ///   `max_roundtrip_latency_micros` are 0 when no roundtrips have
+    ///   been observed; `min_roundtrip_latency_micros` is `u64::MAX`
+    ///   (the sentinel) — use
+    ///   [`AtomicMetricsSnapshot::min_roundtrip_latency_micros_or_zero`]
+    ///   for the normalized helper.
     pub fn snapshot(&self) -> AtomicMetricsSnapshot {
         AtomicMetricsSnapshot {
             queries_started: self.queries_started.load(Ordering::Relaxed),
@@ -269,6 +363,16 @@ impl AtomicMetrics {
                 .load(Ordering::Relaxed),
             min_query_latency_micros: self.min_query_latency_micros.load(Ordering::Relaxed),
             max_query_latency_micros: self.max_query_latency_micros.load(Ordering::Relaxed),
+            roundtrips_observed: self.roundtrips_observed.load(Ordering::Relaxed),
+            total_roundtrip_latency_micros: self
+                .total_roundtrip_latency_micros
+                .load(Ordering::Relaxed),
+            min_roundtrip_latency_micros: self
+                .min_roundtrip_latency_micros
+                .load(Ordering::Relaxed),
+            max_roundtrip_latency_micros: self
+                .max_roundtrip_latency_micros
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -320,6 +424,27 @@ impl PirMetrics for AtomicMetrics {
         self.frames_received.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn on_roundtrip_end(
+        &self,
+        _backend: &'static str,
+        _bytes_out: usize,
+        _bytes_in: usize,
+        duration: Duration,
+    ) {
+        self.roundtrips_observed.fetch_add(1, Ordering::Relaxed);
+
+        // Same saturation pattern as `on_query_end`: clamp to `u64`
+        // microseconds rather than wrapping a `u128` from `as_micros`.
+        let micros = u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
+
+        self.total_roundtrip_latency_micros
+            .fetch_add(micros, Ordering::Relaxed);
+        self.min_roundtrip_latency_micros
+            .fetch_min(micros, Ordering::Relaxed);
+        self.max_roundtrip_latency_micros
+            .fetch_max(micros, Ordering::Relaxed);
+    }
+
     fn on_connect(&self, _backend: &'static str, _url: &str) {
         self.connects.fetch_add(1, Ordering::Relaxed);
     }
@@ -354,13 +479,31 @@ pub struct AtomicMetricsSnapshot {
     /// Largest observed query duration in microseconds. 0 when no
     /// completions have been recorded.
     pub max_query_latency_micros: u64,
+    /// Number of successful transport-level roundtrips observed
+    /// (matching pairs of send + receive). Use as the denominator for
+    /// `total_roundtrip_latency_micros`. Distinct from `frames_sent`
+    /// (which counts every successful send, even those whose response
+    /// failed); `frames_sent - roundtrips_observed` is the number of
+    /// sends that succeeded but the matching response failed.
+    pub roundtrips_observed: u64,
+    /// Sum of every observed roundtrip duration in microseconds.
+    /// Divide by `roundtrips_observed` for the running mean.
+    pub total_roundtrip_latency_micros: u64,
+    /// Smallest observed roundtrip duration in microseconds.
+    /// `u64::MAX` when no roundtrips have been observed — see
+    /// [`Self::min_roundtrip_latency_micros_or_zero`] for a normalized
+    /// helper.
+    pub min_roundtrip_latency_micros: u64,
+    /// Largest observed roundtrip duration in microseconds. 0 when no
+    /// roundtrips have been observed.
+    pub max_roundtrip_latency_micros: u64,
 }
 
 impl Default for AtomicMetricsSnapshot {
     fn default() -> Self {
-        // Mirrors `AtomicMetrics::default()` — `min_query_latency_micros`
-        // starts at the sentinel so two snapshots from a fresh
-        // recorder compare equal.
+        // Mirrors `AtomicMetrics::default()` —
+        // `min_{query,roundtrip}_latency_micros` start at the sentinel
+        // so two snapshots from a fresh recorder compare equal.
         Self {
             queries_started: 0,
             queries_completed: 0,
@@ -374,6 +517,10 @@ impl Default for AtomicMetricsSnapshot {
             total_query_latency_micros: 0,
             min_query_latency_micros: MIN_LATENCY_SENTINEL,
             max_query_latency_micros: 0,
+            roundtrips_observed: 0,
+            total_roundtrip_latency_micros: 0,
+            min_roundtrip_latency_micros: MIN_LATENCY_SENTINEL,
+            max_roundtrip_latency_micros: 0,
         }
     }
 }
@@ -408,6 +555,30 @@ impl AtomicMetricsSnapshot {
             self.min_query_latency_micros
         }
     }
+
+    /// Mean roundtrip latency in microseconds, or `None` if no
+    /// roundtrips have been observed. Per-frame counterpart to
+    /// [`Self::mean_query_latency_micros`].
+    pub fn mean_roundtrip_latency_micros(&self) -> Option<u64> {
+        if self.roundtrips_observed == 0 {
+            None
+        } else {
+            Some(self.total_roundtrip_latency_micros / self.roundtrips_observed)
+        }
+    }
+
+    /// Returns the minimum observed roundtrip latency in microseconds,
+    /// or 0 if no roundtrips have been observed. Convenience helper
+    /// for callers that prefer a normalized 0-when-empty value over
+    /// the raw sentinel — per-frame counterpart to
+    /// [`Self::min_query_latency_micros_or_zero`].
+    pub fn min_roundtrip_latency_micros_or_zero(&self) -> u64 {
+        if self.min_roundtrip_latency_micros == MIN_LATENCY_SENTINEL {
+            0
+        } else {
+            self.min_roundtrip_latency_micros
+        }
+    }
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -423,6 +594,7 @@ mod tests {
         m.on_query_end("dpf", 0, 10, true, Duration::from_millis(5));
         m.on_bytes_sent("dpf", 1024);
         m.on_bytes_received("dpf", 2048);
+        m.on_roundtrip_end("dpf", 1024, 2048, Duration::from_millis(15));
         m.on_connect("dpf", "wss://example");
         m.on_disconnect("dpf");
         // Nothing to assert — the point of NoopMetrics is that it
@@ -440,6 +612,13 @@ mod tests {
         assert_eq!(s.total_query_latency_micros, 0);
         assert_eq!(s.mean_query_latency_micros(), None);
         assert_eq!(s.min_query_latency_micros_or_zero(), 0);
+        // Same shape for the per-frame roundtrip counters.
+        assert_eq!(s.roundtrips_observed, 0);
+        assert_eq!(s.total_roundtrip_latency_micros, 0);
+        assert_eq!(s.min_roundtrip_latency_micros, u64::MAX);
+        assert_eq!(s.max_roundtrip_latency_micros, 0);
+        assert_eq!(s.mean_roundtrip_latency_micros(), None);
+        assert_eq!(s.min_roundtrip_latency_micros_or_zero(), 0);
     }
 
     #[test]
@@ -692,5 +871,221 @@ mod tests {
         );
         let s = m.snapshot();
         assert_eq!(s.max_query_latency_micros, u64::MAX);
+    }
+
+    // ─── Roundtrip-latency tests ────────────────────────────────────────────
+
+    /// Single roundtrip sets all four roundtrip counters: observation
+    /// count = 1, total / min / max all equal to the observed value.
+    #[test]
+    fn atomic_metrics_records_first_roundtrip_latency() {
+        let m = AtomicMetrics::new();
+        m.on_roundtrip_end("dpf", 1024, 2048, Duration::from_millis(15));
+
+        let s = m.snapshot();
+        assert_eq!(s.roundtrips_observed, 1);
+        assert_eq!(s.total_roundtrip_latency_micros, 15_000);
+        assert_eq!(s.min_roundtrip_latency_micros, 15_000);
+        assert_eq!(s.max_roundtrip_latency_micros, 15_000);
+        assert_eq!(s.mean_roundtrip_latency_micros(), Some(15_000));
+
+        // bytes_out / bytes_in are NOT independently counted by
+        // on_roundtrip_end — the per-frame byte callbacks
+        // (on_bytes_sent / on_bytes_received) own that. So a recorder
+        // that only sees on_roundtrip_end leaves bytes_sent at 0.
+        assert_eq!(s.bytes_sent, 0);
+        assert_eq!(s.bytes_received, 0);
+        assert_eq!(s.frames_sent, 0);
+        assert_eq!(s.frames_received, 0);
+    }
+
+    /// Multiple roundtrips: total sums, min tracks smallest, max
+    /// tracks largest, mean works.
+    #[test]
+    fn atomic_metrics_tracks_roundtrip_min_max_total() {
+        let m = AtomicMetrics::new();
+        m.on_roundtrip_end("dpf", 100, 200, Duration::from_millis(50));
+        m.on_roundtrip_end("dpf", 100, 200, Duration::from_millis(20));
+        m.on_roundtrip_end("dpf", 100, 200, Duration::from_millis(80));
+        m.on_roundtrip_end("dpf", 100, 200, Duration::from_millis(10));
+
+        let s = m.snapshot();
+        assert_eq!(s.roundtrips_observed, 4);
+        assert_eq!(s.total_roundtrip_latency_micros, 160_000);
+        assert_eq!(s.min_roundtrip_latency_micros, 10_000);
+        assert_eq!(s.max_roundtrip_latency_micros, 80_000);
+        assert_eq!(s.mean_roundtrip_latency_micros(), Some(40_000));
+    }
+
+    /// `Duration::ZERO` is a valid observation — a recorder installed
+    /// mid-roundtrip surfaces it. Recording it still increments
+    /// `roundtrips_observed` but leaves min at zero.
+    #[test]
+    fn atomic_metrics_handles_zero_duration_roundtrip() {
+        let m = AtomicMetrics::new();
+        m.on_roundtrip_end("dpf", 100, 200, Duration::ZERO);
+
+        let s = m.snapshot();
+        assert_eq!(s.roundtrips_observed, 1);
+        assert_eq!(s.total_roundtrip_latency_micros, 0);
+        assert_eq!(s.min_roundtrip_latency_micros, 0);
+        assert_eq!(s.max_roundtrip_latency_micros, 0);
+        // Mean exists (1 observation, 0 micros) — distinct from "no
+        // observations" which would be `None`.
+        assert_eq!(s.mean_roundtrip_latency_micros(), Some(0));
+    }
+
+    /// `min_roundtrip_latency_micros` stays at the sentinel until the
+    /// first roundtrip fires. Per-query and per-frame sentinels are
+    /// independent — a recorder that observes queries but no
+    /// roundtrips (or vice versa) keeps the unused sentinel.
+    #[test]
+    fn atomic_metrics_min_sentinel_until_first_roundtrip() {
+        let m = AtomicMetrics::new();
+        // Pre-roundtrip: only a query completion fires.
+        m.on_query_end("dpf", 0, 10, true, Duration::from_millis(7));
+
+        let s = m.snapshot();
+        assert_eq!(s.queries_completed, 1);
+        assert_eq!(s.min_query_latency_micros, 7_000);
+        // Roundtrip min is still at the sentinel — no transport-level
+        // event has fired.
+        assert_eq!(s.roundtrips_observed, 0);
+        assert_eq!(s.min_roundtrip_latency_micros, u64::MAX);
+
+        // First roundtrip replaces the roundtrip-min sentinel.
+        m.on_roundtrip_end("dpf", 100, 200, Duration::from_millis(3));
+        let s = m.snapshot();
+        assert_eq!(s.min_roundtrip_latency_micros, 3_000);
+        assert_eq!(s.max_roundtrip_latency_micros, 3_000);
+        // Per-query latency is unchanged.
+        assert_eq!(s.min_query_latency_micros, 7_000);
+    }
+
+    /// `min_roundtrip_latency_micros_or_zero` normalizes the sentinel
+    /// for callers that prefer 0-when-empty. Once a real value is
+    /// recorded the helper returns it unchanged.
+    #[test]
+    fn min_roundtrip_or_zero_helper_normalizes_sentinel() {
+        let m = AtomicMetrics::new();
+        assert_eq!(m.snapshot().min_roundtrip_latency_micros_or_zero(), 0);
+
+        m.on_roundtrip_end("dpf", 100, 200, Duration::from_millis(3));
+        assert_eq!(
+            m.snapshot().min_roundtrip_latency_micros_or_zero(),
+            3_000
+        );
+    }
+
+    /// Roundtrip-latency counters are atomic across threads —
+    /// concurrent `on_roundtrip_end` from many threads converges to a
+    /// deterministic total.
+    #[test]
+    fn atomic_metrics_roundtrip_latency_thread_safe() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let m = Arc::new(AtomicMetrics::new());
+        let threads: Vec<_> = (0..8)
+            .map(|tid| {
+                let m = m.clone();
+                thread::spawn(move || {
+                    for i in 0..100 {
+                        // Mix in tid so durations vary across threads
+                        // and the min/max race is meaningful.
+                        let micros = (tid as u64 * 1000) + i as u64 + 1;
+                        m.on_roundtrip_end(
+                            "dpf",
+                            100,
+                            200,
+                            Duration::from_micros(micros),
+                        );
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let s = m.snapshot();
+        // 8 threads × 100 roundtrips
+        assert_eq!(s.roundtrips_observed, 800);
+        // Smallest possible: tid=0, i=0 → 0*1000 + 0 + 1 = 1
+        assert_eq!(s.min_roundtrip_latency_micros, 1);
+        // Largest possible: tid=7, i=99 → 7*1000 + 99 + 1 = 7100
+        assert_eq!(s.max_roundtrip_latency_micros, 7100);
+        // Identical sum to the per-query thread-safe test:
+        // 100_000 * (0+1+...+7) + 8*5050 = 2_840_400
+        assert_eq!(s.total_roundtrip_latency_micros, 2_840_400);
+    }
+
+    /// Saturation matches `on_query_end`: a `Duration` larger than
+    /// `u64::MAX` microseconds saturates instead of wrapping. Defensive
+    /// coding only — real roundtrips are sub-second.
+    #[test]
+    fn atomic_metrics_saturates_on_huge_roundtrip_duration() {
+        let m = AtomicMetrics::new();
+        m.on_roundtrip_end(
+            "dpf",
+            100,
+            200,
+            Duration::new(u64::MAX, 999_999_999),
+        );
+        let s = m.snapshot();
+        assert_eq!(s.max_roundtrip_latency_micros, u64::MAX);
+    }
+
+    /// Per-query and per-frame latency stats live in separate counters
+    /// — a recorder that sees both kinds of events can report each
+    /// independently, and the two means are distinct ratios.
+    #[test]
+    fn atomic_metrics_query_and_roundtrip_latency_independent() {
+        let m = AtomicMetrics::new();
+        // 1 query batch, 50ms total
+        m.on_query_end("dpf", 0, 10, true, Duration::from_millis(50));
+        // 5 roundtrips inside that batch — INDEX + CHUNK + 3 Merkle
+        // rounds, say. Sum well under the per-batch latency to
+        // simulate how a real recorder would observe both.
+        for ms in [5, 8, 10, 6, 9] {
+            m.on_roundtrip_end("dpf", 100, 200, Duration::from_millis(ms));
+        }
+
+        let s = m.snapshot();
+        assert_eq!(s.queries_completed, 1);
+        assert_eq!(s.total_query_latency_micros, 50_000);
+        assert_eq!(s.mean_query_latency_micros(), Some(50_000));
+
+        assert_eq!(s.roundtrips_observed, 5);
+        assert_eq!(s.total_roundtrip_latency_micros, 38_000);
+        assert_eq!(s.mean_roundtrip_latency_micros(), Some(38_000 / 5));
+        assert_eq!(s.min_roundtrip_latency_micros, 5_000);
+        assert_eq!(s.max_roundtrip_latency_micros, 10_000);
+    }
+
+    /// The `frames_sent - roundtrips_observed` invariant documented on
+    /// `roundtrips_observed`: every successful send increments
+    /// `frames_sent`, but only the matching successful response
+    /// increments `roundtrips_observed`. A simulated partial-success
+    /// roundtrip (send OK, recv failed) shows the difference.
+    #[test]
+    fn atomic_metrics_frames_minus_roundtrips_signals_partial_failures() {
+        let m = AtomicMetrics::new();
+        // Two complete roundtrips: bytes_sent + bytes_received +
+        // roundtrips_observed all bumped.
+        for _ in 0..2 {
+            m.on_bytes_sent("dpf", 100);
+            m.on_bytes_received("dpf", 200);
+            m.on_roundtrip_end("dpf", 100, 200, Duration::from_millis(10));
+        }
+        // One half-failed roundtrip: send OK (bytes_sent bumped) but
+        // recv failed (no on_bytes_received, no on_roundtrip_end).
+        m.on_bytes_sent("dpf", 100);
+
+        let s = m.snapshot();
+        assert_eq!(s.frames_sent, 3);
+        assert_eq!(s.frames_received, 2);
+        assert_eq!(s.roundtrips_observed, 2);
+        // The diff is the documented "partial-failure" signal.
+        assert_eq!(s.frames_sent - s.roundtrips_observed, 1);
     }
 }

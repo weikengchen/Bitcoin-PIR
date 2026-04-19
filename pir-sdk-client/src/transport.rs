@@ -227,8 +227,13 @@ impl PirTransport for WsConnection {
 #[cfg(test)]
 pub(crate) mod mock {
     use super::*;
-    use pir_sdk::PirError;
+    // `pir_sdk::Instant` is the wasm32-friendly re-export of `web_time::Instant`
+    // — same source used by `WsConnection::roundtrip` so the mock and the
+    // native transport produce comparable `Duration` values when the same
+    // recorder is installed against both.
+    use pir_sdk::{Instant, PirError};
     use std::collections::VecDeque;
+    use std::time::Duration;
 
     /// A scripted in-memory transport. Tests push canned responses onto the
     /// queue (one `Vec<u8>` per expected `recv` / response half of
@@ -278,6 +283,12 @@ pub(crate) mod mock {
                 rec.on_bytes_received(backend, bytes);
             }
         }
+
+        fn fire_roundtrip_end(&self, bytes_out: usize, bytes_in: usize, duration: Duration) {
+            if let Some((rec, backend)) = &self.metrics {
+                rec.on_roundtrip_end(backend, bytes_out, bytes_in, duration);
+            }
+        }
     }
 
     #[async_trait]
@@ -306,7 +317,13 @@ pub(crate) mod mock {
             if self.closed {
                 return Err(PirError::ConnectionClosed("mock closed".into()));
             }
-            self.fire_bytes_sent(request.len());
+            // Same `Option<Instant>`-threading pattern as
+            // `WsConnection::roundtrip` — the clock-read is elided when
+            // no recorder is installed, preserving the "no recorder =
+            // zero overhead" invariant for the mock too.
+            let started_at: Option<Instant> = self.metrics.is_some().then(Instant::now);
+            let bytes_out = request.len();
+            self.fire_bytes_sent(bytes_out);
             self.sent.push(request.to_vec());
             // Mimic WsConnection::roundtrip's "strip 4-byte length prefix"
             // behaviour — tests enqueue the full frame, the mock returns
@@ -315,6 +332,9 @@ pub(crate) mod mock {
                 PirError::Protocol("mock: no enqueued response".into())
             })?;
             if frame.len() < 4 {
+                // Short-frame: byte counts already fired for send, recv
+                // is suppressed (matches the WsConnection partial-success
+                // contract). No on_roundtrip_end either.
                 return Err(PirError::Protocol(
                     "mock: enqueued frame too short for length prefix".into(),
                 ));
@@ -322,7 +342,13 @@ pub(crate) mod mock {
             // Record the full frame length (what came off the wire),
             // not the post-strip payload — that matches what a real
             // transport would observe.
-            self.fire_bytes_received(frame.len());
+            let bytes_in = frame.len();
+            self.fire_bytes_received(bytes_in);
+            // Fire on_roundtrip_end only on full success — matches
+            // WsConnection::roundtrip's contract.
+            if let Some(start) = started_at {
+                self.fire_roundtrip_end(bytes_out, bytes_in, start.elapsed());
+            }
             Ok(frame[4..].to_vec())
         }
 
@@ -533,5 +559,121 @@ mod tests {
         // Recorder stays at 3 — the second send fired no callback.
         assert_eq!(recorder.snapshot().bytes_sent, 3);
         assert_eq!(recorder.snapshot().frames_sent, 1);
+    }
+
+    /// roundtrip fires `on_roundtrip_end` once on success, with both
+    /// byte counts AND a non-sentinel duration. The byte counts match
+    /// the per-frame `on_bytes_*` callbacks (by design — recorders
+    /// that look at both should see consistent numbers), but the
+    /// `roundtrips_observed` counter is independent from
+    /// `frames_sent` / `frames_received`.
+    #[tokio::test]
+    async fn mock_transport_roundtrip_fires_on_roundtrip_end() {
+        use pir_sdk::AtomicMetrics;
+
+        let recorder = Arc::new(AtomicMetrics::new());
+        let mut t = MockTransport::new("mock://metered-rt-end");
+        t.set_metrics_recorder(Some(recorder.clone()), "dpf");
+
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&3u32.to_le_bytes());
+        framed.extend_from_slice(b"abc");
+        t.enqueue_response(framed);
+
+        let _ = t.roundtrip(b"hi").await.unwrap();
+
+        let snap = recorder.snapshot();
+        assert_eq!(snap.roundtrips_observed, 1);
+        // Per-frame byte callbacks still fired (byte counts unchanged
+        // semantics).
+        assert_eq!(snap.bytes_sent, 2);
+        assert_eq!(snap.bytes_received, 7); // 4 prefix + 3 payload
+        assert_eq!(snap.frames_sent, 1);
+        assert_eq!(snap.frames_received, 1);
+        // Duration is non-zero (clock advanced between Instant::now()
+        // and start.elapsed()) — and well below the sentinel.
+        assert_ne!(snap.min_roundtrip_latency_micros, u64::MAX);
+        assert!(snap.total_roundtrip_latency_micros < 1_000_000); // <1s
+    }
+
+    /// No recorder = no `on_roundtrip_end` (and no `Instant` capture
+    /// — the `Option<Instant>` is `None`, so the clock is never read).
+    /// Functionally indistinguishable from the pre-tail behaviour for
+    /// callers who never install a recorder.
+    #[tokio::test]
+    async fn mock_transport_roundtrip_no_recorder_no_fire() {
+        let mut t = MockTransport::new("mock://no-rec");
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&3u32.to_le_bytes());
+        framed.extend_from_slice(b"abc");
+        t.enqueue_response(framed);
+
+        // Should just succeed — no recorder, no callback, no panic.
+        let reply = t.roundtrip(b"hi").await.unwrap();
+        assert_eq!(reply, b"abc");
+    }
+
+    /// Uninstalling the recorder mid-test silences subsequent
+    /// `on_roundtrip_end` callbacks. Same shape as the byte-callback
+    /// uninstall test above — proves the install/uninstall surface
+    /// covers the new latency path too.
+    #[tokio::test]
+    async fn mock_transport_uninstall_silences_roundtrip_end() {
+        use pir_sdk::AtomicMetrics;
+
+        let recorder = Arc::new(AtomicMetrics::new());
+        let mut t = MockTransport::new("mock://silenceable-rt");
+        t.set_metrics_recorder(Some(recorder.clone()), "dpf");
+
+        // Two queued responses so we can roundtrip twice.
+        for _ in 0..2 {
+            let mut framed = Vec::new();
+            framed.extend_from_slice(&3u32.to_le_bytes());
+            framed.extend_from_slice(b"abc");
+            t.enqueue_response(framed);
+        }
+
+        let _ = t.roundtrip(b"first").await.unwrap();
+        assert_eq!(recorder.snapshot().roundtrips_observed, 1);
+
+        t.set_metrics_recorder(None, "dpf");
+        let _ = t.roundtrip(b"second").await.unwrap();
+        // Counter stays at 1 — the second roundtrip fired no callback.
+        assert_eq!(recorder.snapshot().roundtrips_observed, 1);
+    }
+
+    /// Partial failure (short frame after a successful send): byte
+    /// callbacks may still fire for the send half, but
+    /// `on_roundtrip_end` does NOT — this is the documented
+    /// `frames_sent - roundtrips_observed = N` signal for half-failed
+    /// roundtrips.
+    #[tokio::test]
+    async fn mock_transport_roundtrip_partial_failure_no_on_roundtrip_end() {
+        use pir_sdk::AtomicMetrics;
+
+        let recorder = Arc::new(AtomicMetrics::new());
+        let mut t = MockTransport::new("mock://short-frame");
+        t.set_metrics_recorder(Some(recorder.clone()), "harmony");
+
+        // Frame too short for the 4-byte length prefix → roundtrip
+        // errors. The send half has already fired its byte callback.
+        t.enqueue_response(vec![1, 2, 3]);
+
+        match t.roundtrip(b"ping").await {
+            Err(PirError::Protocol(_)) => {}
+            other => panic!("expected Protocol error, got {:?}", other),
+        }
+
+        let snap = recorder.snapshot();
+        // Send half fired (4 bytes "ping" → bytes_sent=4, frames_sent=1).
+        assert_eq!(snap.bytes_sent, 4);
+        assert_eq!(snap.frames_sent, 1);
+        // Recv half NEVER fired (short-frame check fails before we
+        // touch fire_bytes_received). frames_received stays at 0.
+        assert_eq!(snap.frames_received, 0);
+        // No successful roundtrip → no on_roundtrip_end.
+        assert_eq!(snap.roundtrips_observed, 0);
+        // The diff signals a half-failure: send succeeded, recv didn't.
+        assert_eq!(snap.frames_sent - snap.roundtrips_observed, 1);
     }
 }
