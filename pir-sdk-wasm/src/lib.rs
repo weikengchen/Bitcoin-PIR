@@ -74,7 +74,30 @@ pub use metrics::WasmAtomicMetrics;
 pub mod tracing_bridge;
 pub use tracing_bridge::init_tracing_subscriber;
 
+// ─── Module init ────────────────────────────────────────────────────────────
+
+/// Auto-invoked by the wasm-bindgen loader once the module is
+/// instantiated. Installs a browser-friendly panic hook so Rust
+/// `panic!`s surface in the JS console with a readable message and
+/// stack trace instead of the bare `RuntimeError: unreachable` that
+/// `wasm32-unknown-unknown` emits by default.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen(start)]
+pub fn __wasm_init() {
+    console_error_panic_hook::set_once();
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+/// Serialize a value to `JsValue` with maps emitted as plain JS objects
+/// instead of `Map`s. `serde_wasm_bindgen::to_value`'s default behavior
+/// round-trips `serde_json::Value::Object` through `serialize_map`, which
+/// the crate encodes as a JS `Map` — breaking every TS caller that reads
+/// fields via property access (`step.dbId`) instead of `.get('dbId')`.
+pub(crate) fn to_js_object<T: serde::Serialize>(value: &T) -> JsValue {
+    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+    value.serialize(&serializer).unwrap_or(JsValue::NULL)
+}
 
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
@@ -413,8 +436,7 @@ impl WasmDatabaseCatalog {
         if index >= self.inner.databases.len() {
             return JsValue::NULL;
         }
-        serde_wasm_bindgen::to_value(&database_info_to_json(&self.inner.databases[index]))
-            .unwrap_or(JsValue::NULL)
+        to_js_object(&database_info_to_json(&self.inner.databases[index]))
     }
 
     /// Get a database's full info by `db_id`, returning the same JSON
@@ -427,8 +449,7 @@ impl WasmDatabaseCatalog {
     #[wasm_bindgen(js_name = getEntry)]
     pub fn get_entry(&self, db_id: u8) -> JsValue {
         match self.inner.get(db_id) {
-            Some(db) => serde_wasm_bindgen::to_value(&database_info_to_json(db))
-                .unwrap_or(JsValue::NULL),
+            Some(db) => to_js_object(&database_info_to_json(db)),
             None => JsValue::NULL,
         }
     }
@@ -459,8 +480,7 @@ impl WasmDatabaseCatalog {
             .iter()
             .map(database_info_to_json)
             .collect();
-        serde_wasm_bindgen::to_value(&serde_json::json!({ "databases": databases }))
-            .unwrap_or(JsValue::NULL)
+        to_js_object(&serde_json::json!({ "databases": databases }))
     }
 }
 
@@ -547,7 +567,7 @@ impl WasmSyncPlan {
             "baseHeight": step.base_height,
             "tipHeight": step.tip_height,
         });
-        serde_wasm_bindgen::to_value(&json).unwrap_or(JsValue::NULL)
+        to_js_object(&json)
     }
 
     /// Get all steps as JSON array.
@@ -567,12 +587,11 @@ impl WasmSyncPlan {
                 })
             })
             .collect();
-        serde_wasm_bindgen::to_value(&serde_json::json!({
+        to_js_object(&serde_json::json!({
             "steps": steps,
             "isFreshSync": self.inner.is_fresh_sync,
             "targetHeight": self.inner.target_height,
         }))
-        .unwrap_or(JsValue::NULL)
     }
 }
 
@@ -675,7 +694,7 @@ impl WasmQueryResult {
             "vout": entry.vout,
             "amountSats": entry.amount_sats,
         });
-        serde_wasm_bindgen::to_value(&json).unwrap_or(JsValue::NULL)
+        to_js_object(&json)
     }
 
     /// Inspector state: every INDEX cuckoo bin probed for this query,
@@ -688,8 +707,7 @@ impl WasmQueryResult {
     /// entries for an inspector-path result.
     #[wasm_bindgen(js_name = indexBins)]
     pub fn index_bins(&self) -> JsValue {
-        serde_wasm_bindgen::to_value(&bucket_refs_to_json(&self.inner.index_bins))
-            .unwrap_or(JsValue::NULL)
+        to_js_object(&bucket_refs_to_json(&self.inner.index_bins))
     }
 
     /// Inspector state: every CHUNK cuckoo bin that backed a decoded
@@ -697,8 +715,7 @@ impl WasmQueryResult {
     /// objects. Empty for not-found, whale, or zero-chunk matches.
     #[wasm_bindgen(js_name = chunkBins)]
     pub fn chunk_bins(&self) -> JsValue {
-        serde_wasm_bindgen::to_value(&bucket_refs_to_json(&self.inner.chunk_bins))
-            .unwrap_or(JsValue::NULL)
+        to_js_object(&bucket_refs_to_json(&self.inner.chunk_bins))
     }
 
     /// Inspector state: if this query resolved to a match, the index
@@ -783,7 +800,7 @@ impl WasmQueryResult {
         if let Some(bytes) = &self.inner.raw_chunk_data {
             obj["rawChunkData"] = serde_json::Value::String(hex_encode(bytes));
         }
-        serde_wasm_bindgen::to_value(&obj).unwrap_or(JsValue::NULL)
+        to_js_object(&obj)
     }
 }
 
@@ -812,13 +829,10 @@ pub fn decode_delta_data(raw: &[u8]) -> Result<JsValue, JsError> {
         })
         .collect();
 
-    Ok(
-        serde_wasm_bindgen::to_value(&serde_json::json!({
-            "spent": spent,
-            "newUtxos": new_utxos,
-        }))
-        .unwrap_or(JsValue::NULL),
-    )
+    Ok(to_js_object(&serde_json::json!({
+        "spent": spent,
+        "newUtxos": new_utxos,
+    })))
 }
 
 /// Merge delta into a snapshot result.
@@ -1005,7 +1019,7 @@ pub fn decode_utxo_data(data: &[u8]) -> JsValue {
             })
         })
         .collect();
-    serde_wasm_bindgen::to_value(&json_entries).unwrap_or(JsValue::NULL)
+    to_js_object(&json_entries)
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────

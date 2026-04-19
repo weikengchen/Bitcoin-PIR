@@ -56,6 +56,7 @@ js-sys = "0.3"
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 send_wrapper = "0.6"
 tracing-wasm = "0.2"
+console_error_panic_hook = "0.1"
 
 # Per-package profile overrides must live at the workspace root; Cargo
 # ignores `[profile.*]` here and emits a warning on every build. For

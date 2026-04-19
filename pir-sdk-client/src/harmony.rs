@@ -404,10 +404,7 @@ impl HarmonyClient {
     /// (useful for tests and for reusing cached hint state).
     pub fn new(hint_server_url: &str, query_server_url: &str) -> Self {
         let mut master_prp_key = [0u8; 16];
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+        let seed = crate::platform_time::seed_nanos();
         for i in 0..2 {
             let h = pir_core::hash::splitmix64(seed.wrapping_add(i as u64));
             master_prp_key[i * 8..(i + 1) * 8].copy_from_slice(&h.to_le_bytes());

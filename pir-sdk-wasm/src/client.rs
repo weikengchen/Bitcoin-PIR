@@ -36,7 +36,9 @@ use pir_sdk::{PirClient, QueryResult, ScriptHash, SyncResult};
 use pir_sdk_client::{DpfClient, HarmonyClient, PRP_ALF, PRP_FASTPRP, PRP_HMR12};
 use wasm_bindgen::prelude::*;
 
-use crate::{parse_query_result_json, WasmAtomicMetrics, WasmDatabaseCatalog, WasmQueryResult};
+use crate::{
+    parse_query_result_json, to_js_object, WasmAtomicMetrics, WasmDatabaseCatalog, WasmQueryResult,
+};
 
 // These symbols are only referenced from wasm32-gated bridges below, so
 // keep their imports gated too — on native we only compile recorder-impl
@@ -197,7 +199,7 @@ struct JsSyncProgress {
 #[cfg(target_arch = "wasm32")]
 impl JsSyncProgress {
     fn emit(&self, event: serde_json::Value) {
-        let val = serde_wasm_bindgen::to_value(&event).unwrap_or(JsValue::NULL);
+        let val = to_js_object(&event);
         let _ = (*self.cb).call1(&JsValue::NULL, &val);
     }
 }
@@ -317,8 +319,7 @@ impl WasmSyncResult {
     /// ```
     #[wasm_bindgen(js_name = toJson)]
     pub fn to_json(&self) -> JsValue {
-        serde_wasm_bindgen::to_value(&sync_result_to_json(&self.inner))
-            .unwrap_or(JsValue::NULL)
+        to_js_object(&sync_result_to_json(&self.inner))
     }
 }
 
@@ -459,7 +460,7 @@ impl WasmDpfClient {
                 }
             })
             .collect();
-        Ok(serde_wasm_bindgen::to_value(&json).unwrap_or(JsValue::NULL))
+        Ok(to_js_object(&json))
     }
 
     /// Return the two server URLs this client is connected to as a
@@ -824,7 +825,7 @@ impl WasmHarmonyClient {
                 }
             })
             .collect();
-        Ok(serde_wasm_bindgen::to_value(&json).unwrap_or(JsValue::NULL))
+        Ok(to_js_object(&json))
     }
 
     // ─── Session 5: inspector / verify / DB-switch / hint-cache surface ─────

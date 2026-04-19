@@ -1893,12 +1893,8 @@ struct SimpleRng {
 
 impl SimpleRng {
     fn new() -> Self {
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
         Self {
-            state: pir_core::hash::splitmix64(seed),
+            state: pir_core::hash::splitmix64(crate::platform_time::seed_nanos()),
         }
     }
 

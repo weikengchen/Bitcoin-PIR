@@ -137,6 +137,11 @@ export class BatchPirClientAdapter {
       });
 
       await this.wasmClient.connect();
+      // Populate the native-side catalog so subsequent `queryBatchRaw`
+      // calls (which go through `query_batch_with_inspector`) have an
+      // in-memory catalog to resolve `db_id` against. The side-channel
+      // fetch above only populates the TS-side `this.catalog`.
+      await this.wasmClient.fetchCatalog();
       this.connected = true;
       // Emit a final `connected` in case the native client's own
       // `onStateChange` fired before we registered the listener or got

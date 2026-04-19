@@ -602,10 +602,7 @@ struct SibRng {
 
 impl SibRng {
     fn new() -> Self {
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0xcafe_babe_dead_beef);
+        let seed = crate::platform_time::seed_nanos();
         Self {
             state: splitmix64(seed),
         }

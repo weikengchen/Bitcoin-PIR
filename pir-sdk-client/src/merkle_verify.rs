@@ -889,10 +889,7 @@ pub(crate) struct SimpleRng {
 
 impl SimpleRng {
     pub(crate) fn new() -> Self {
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let seed = crate::platform_time::seed_nanos();
         Self {
             state: pir_core::hash::splitmix64(seed.wrapping_add(0xbadc0ffee0ddf00d)),
         }

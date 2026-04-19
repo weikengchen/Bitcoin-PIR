@@ -64,6 +64,7 @@ mod merkle_verify;
 mod onion;
 #[cfg(feature = "onion")]
 mod onion_merkle;
+mod platform_time;
 mod protocol;
 mod transport;
 #[cfg(target_arch = "wasm32")]
