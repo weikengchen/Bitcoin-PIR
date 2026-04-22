@@ -179,14 +179,14 @@
         .sb-disclaimer {
             margin: 18px 2px 0;
             padding: 10px 12px;
-            border: 1px solid oklch(from var(--err) 86% 0.05 h);
-            background: var(--err-wash);
-            color: var(--err);
+            border: 1px solid oklch(82% 0.08 75);
+            background: oklch(97% 0.05 85);
+            color: oklch(38% 0.1 70);
             border-radius: var(--r);
             font-size: 11.5px;
             line-height: 1.5;
         }
-        .sb-disclaimer strong { color: var(--err); font-weight: 600; }
+        .sb-disclaimer strong { color: oklch(38% 0.1 70); font-weight: 600; }
         .sb-disclaimer em { font-style: italic; }
         .sb-row {
             display: flex; justify-content: space-between; align-items: center;
@@ -883,11 +883,9 @@
             </div>
 
             <div class="sb-disclaimer" role="note">
-                <strong>Demo only.</strong> Both two-server PIR schemes currently
-                run <em>on the same machine</em> — the non-collusion assumption
-                is not satisfied, so privacy against a curious operator is not
-                guaranteed. For a production deployment the two servers must be
-                operated by independent, non-colluding parties.
+                <strong>Demo only.</strong> Both two-server schemes run
+                <em>on the same machine</em> — the non-collusion assumption
+                does not hold.
             </div>
 
             <div class="sb-section">
