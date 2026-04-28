@@ -45,6 +45,7 @@
 
 use std::sync::Arc;
 
+use pir_core::hash::derive_groups_3;
 use pir_sdk::{BufferingLeakageRecorder, LeakageProfile, RoundKind, RoundProfile};
 use pir_sdk_client::{DpfClient, HarmonyClient, PirClient, ScriptHash};
 
@@ -414,6 +415,233 @@ async fn dpf_per_message_invariants_batch_2_not_found() {
     }
 }
 
+// ─── Multi-query simulator-property test (curated colliding pairs) ─────────
+
+/// Six scripthashes curated by `examples/find_colliding_scripthashes.rs`
+/// (seed = 0xCAFE_BABE_DEAD_BEEF, N = 1000, K = 75). The first four share
+/// `derive_groups_3(_, K)[0] = 0`, so `batch_A = (a1, a2)` and
+/// `batch_B = (b1, b2)` both place all four INDEX Merkle items in PBC
+/// group 0 → `max_items_per_group_per_level = 4`. The last two have
+/// distinct assigned groups (1 and 2) so `batch_C = (c1, c2)` gives
+/// `max_items_per_group_per_level = 2`.
+///
+/// If `K` ever changes, re-run `find_colliding_scripthashes` and
+/// re-pin these constants — `assert_curated_collision_pattern` below
+/// catches drift before the test makes any network call.
+const SH_A1_HEX: &str = "a35dd7fc68ee4028256a46afa1c30b82419a87fa";
+const SH_A2_HEX: &str = "b9b46c7234681edbc77cc4ffd06a86a7da087976";
+const SH_B1_HEX: &str = "6c3ffd393e1f1e604bad7880de2775893293aed5";
+const SH_B2_HEX: &str = "bfe0ca50f50454a38ff23a1376bd7409eeb5693c";
+const SH_C1_HEX: &str = "7c9844b54ece3bc47b34b6a081fddbb1f2eb7490";
+const SH_C2_HEX: &str = "a9cd440d7fe7f2c16686eab2351b620459f2958d";
+
+/// Decode the six hex constants into `ScriptHash`es and verify the
+/// collision pattern that the test relies on. Runs locally — no
+/// network — so any drift fires before we hit the server.
+fn curated_batches() -> ([ScriptHash; 2], [ScriptHash; 2], [ScriptHash; 2]) {
+    let a1 = hex_to_array(SH_A1_HEX);
+    let a2 = hex_to_array(SH_A2_HEX);
+    let b1 = hex_to_array(SH_B1_HEX);
+    let b2 = hex_to_array(SH_B2_HEX);
+    let c1 = hex_to_array(SH_C1_HEX);
+    let c2 = hex_to_array(SH_C2_HEX);
+    assert_curated_collision_pattern(&[a1, a2, b1, b2, c1, c2]);
+    ([a1, a2], [b1, b2], [c1, c2])
+}
+
+/// Re-derive `assigned_group = derive_groups_3(sh, K)[0]` for each pinned
+/// scripthash and assert the (4-collision, 2-distinct) pattern. Pinned
+/// values are tied to `K = INDEX_PARAMS.k = 75`; if either changes,
+/// `find_colliding_scripthashes` must be re-run.
+fn assert_curated_collision_pattern(shs: &[ScriptHash; 6]) {
+    let k = pir_core::params::INDEX_PARAMS.k;
+    let groups: Vec<usize> = shs.iter().map(|sh| derive_groups_3(sh, k)[0]).collect();
+    // a1, a2, b1, b2 must all share one group.
+    assert_eq!(
+        groups[0], groups[1],
+        "curated SH_A1 and SH_A2 should share assigned_group (got {} vs {}); \
+         re-run examples/find_colliding_scripthashes",
+        groups[0], groups[1],
+    );
+    assert_eq!(
+        groups[0], groups[2],
+        "curated SH_A1 and SH_B1 should share assigned_group (got {} vs {})",
+        groups[0], groups[2],
+    );
+    assert_eq!(
+        groups[0], groups[3],
+        "curated SH_A1 and SH_B2 should share assigned_group (got {} vs {})",
+        groups[0], groups[3],
+    );
+    // c1 != c2 != a1.
+    assert_ne!(
+        groups[4], groups[5],
+        "curated SH_C1 and SH_C2 should fall in distinct assigned_groups (both = {})",
+        groups[4],
+    );
+    assert_ne!(
+        groups[4], groups[0],
+        "curated SH_C1 should not share assigned_group {} with the colliding bucket",
+        groups[0],
+    );
+    assert_ne!(
+        groups[5], groups[0],
+        "curated SH_C2 should not share assigned_group {} with the colliding bucket",
+        groups[0],
+    );
+}
+
+/// Drive a multi-query batch through a fresh DPF client and capture its
+/// `LeakageProfile`. Mirror of `run_dpf_single_query` for the multi-query
+/// case used by the simulator-property collision test.
+async fn run_dpf_batch_query(scripthashes: &[ScriptHash]) -> LeakageProfile {
+    let recorder = Arc::new(BufferingLeakageRecorder::new());
+    let mut client = DpfClient::new(&dpf_server0_url(), &dpf_server1_url());
+    client.set_leakage_recorder(Some(recorder.clone()));
+    client.connect().await.expect("dpf connect");
+    let catalog = client.fetch_catalog().await.expect("dpf fetch_catalog");
+    let _ = client
+        .query_batch(scripthashes, catalog.databases[0].db_id)
+        .await
+        .expect("dpf query_batch");
+    client.disconnect().await.unwrap();
+    recorder.take_profile("dpf")
+}
+
+/// Assert two profiles agree on every round whose `kind` is NOT
+/// `IndexMerkleSiblings`. The order of remaining rounds is preserved
+/// because IndexMerkleSiblings rounds are emitted contiguously at the
+/// tail of the transcript (after `run_merkle_verification`), so
+/// filtering them out leaves the per-query INDEX/CHUNK rounds in the
+/// same wire order.
+fn assert_non_index_merkle_rounds_equal(a: &LeakageProfile, c: &LeakageProfile) {
+    let a_rest: Vec<&RoundProfile> = a
+        .rounds
+        .iter()
+        .filter(|r| !matches!(r.kind, RoundKind::IndexMerkleSiblings { .. }))
+        .collect();
+    let c_rest: Vec<&RoundProfile> = c
+        .rounds
+        .iter()
+        .filter(|r| !matches!(r.kind, RoundKind::IndexMerkleSiblings { .. }))
+        .collect();
+    assert_eq!(
+        a_rest.len(), c_rest.len(),
+        "non-IndexMerkleSiblings round count mismatch: A={} C={}",
+        a_rest.len(), c_rest.len(),
+    );
+    for (i, (ra, rc)) in a_rest.iter().zip(c_rest.iter()).enumerate() {
+        assert_eq!(ra.kind, rc.kind, "non-merkle round[{}] kind mismatch", i);
+        assert_eq!(ra.server_id, rc.server_id, "non-merkle round[{}] server_id mismatch", i);
+        assert_eq!(ra.db_id, rc.db_id, "non-merkle round[{}] db_id mismatch", i);
+        assert_eq!(
+            ra.request_bytes, rc.request_bytes,
+            "non-merkle round[{}] {:?} request_bytes mismatch ({} vs {})",
+            i, ra.kind, ra.request_bytes, rc.request_bytes,
+        );
+        assert_eq!(
+            ra.response_bytes, rc.response_bytes,
+            "non-merkle round[{}] {:?} response_bytes mismatch",
+            i, ra.kind,
+        );
+        assert_eq!(ra.items, rc.items, "non-merkle round[{}] items mismatch", i);
+    }
+}
+
+/// Cheap, no-network sanity check that the pinned hex constants still
+/// witness the (4-collision, 2-distinct) pattern. Runs on every
+/// `cargo test` invocation (no `--ignored` flag needed) so a `K` change
+/// in `INDEX_PARAMS` fires here long before the integration test would.
+#[test]
+fn curated_scripthashes_match_collision_pattern() {
+    let _ = curated_batches();
+}
+
+/// Multi-query simulator-property witness for the
+/// `index_max_items_per_group_per_level` axis admitted in
+/// `proofs/easycrypt/Leakage.ec`.
+///
+/// Drives three curated 2-query NOT-FOUND batches through DPF:
+///   - `batch_A`, `batch_B` — both have all four INDEX Merkle items
+///     in the same PBC group, so `max_items_per_group = 4`.
+///   - `batch_C` — items split across two PBC groups, so
+///     `max_items_per_group = 2`.
+///
+/// Asserts:
+///   1. `profile_A == profile_B` (byte-identical) — same per-batch
+///      leakage record produces the same wire transcript.
+///   2. `profile_A != profile_C` — different per-batch leakage record
+///      produces a distinguishable transcript.
+///   3. The diff is *localised* to `IndexMerkleSiblings` rounds:
+///      every other round (Info, Index PIR, Chunk PIR, MerkleTreeTops)
+///      agrees byte-for-byte.
+///   4. `count_of_kind(IndexMerkleSiblings)` for `batch_A` is exactly
+///      `2× count_of_kind(IndexMerkleSiblings)` for `batch_C` — driven
+///      by `max_items_per_group` doubling from 2 to 4.
+///
+/// This is the empirical complement to the (admit-stubbed)
+/// `simulator_property_multi_query` lemma in `proofs/easycrypt/Theorem.ec`.
+#[tokio::test]
+#[ignore = "requires running PIR servers"]
+async fn dpf_simulator_property_multi_query_collision() {
+    let (batch_a, batch_b, batch_c) = curated_batches();
+
+    let profile_a = run_dpf_batch_query(&batch_a).await;
+    let profile_b = run_dpf_batch_query(&batch_b).await;
+    let profile_c = run_dpf_batch_query(&batch_c).await;
+
+    let a_merkle = profile_a.count_of_kind(&RoundKind::IndexMerkleSiblings { level: 0 });
+    let b_merkle = profile_b.count_of_kind(&RoundKind::IndexMerkleSiblings { level: 0 });
+    let c_merkle = profile_c.count_of_kind(&RoundKind::IndexMerkleSiblings { level: 0 });
+    println!(
+        "dpf multi-query collision: total rounds A={} B={} C={}; \
+         IndexMerkleSiblings A={} B={} C={}",
+        profile_a.rounds.len(), profile_b.rounds.len(), profile_c.rounds.len(),
+        a_merkle, b_merkle, c_merkle,
+    );
+
+    // Assertion 1: A and B share the per-batch leakage record (both have
+    // max_items_per_group = 4 in the same colliding bucket) so their
+    // transcripts are byte-identical. Reuses the established helper.
+    assert_profiles_equivalent(&profile_a, &profile_b);
+
+    // Assertion 2: A and C have different per-batch leakage records
+    // (max_items_per_group = 4 vs 2) so their transcripts differ.
+    assert_ne!(
+        profile_a.rounds.len(), profile_c.rounds.len(),
+        "expected A and C to have different total round counts \
+         (max_items_per_group differs 4 vs 2); got equal = {} rounds",
+        profile_a.rounds.len(),
+    );
+
+    // Assertion 3: the diff between A and C is confined to the
+    // IndexMerkleSiblings rounds. Every other round agrees byte-for-byte.
+    assert_non_index_merkle_rounds_equal(&profile_a, &profile_c);
+
+    // Assertion 4: at the IndexMerkleSiblings axis, A has exactly 2× the
+    // pass count C does — `max_items_per_group` doubled from 2 to 4 and
+    // each pass becomes 2 servers × N levels worth of rounds.
+    assert!(
+        c_merkle > 0,
+        "expected ≥1 IndexMerkleSiblings round in batch_C profile (DB has Merkle?); got 0",
+    );
+    assert_eq!(
+        a_merkle, 2 * c_merkle,
+        "expected batch_A IndexMerkleSiblings count ({}) = 2 × batch_C count ({}) \
+         — max_items_per_group should be 4 for A vs 2 for C",
+        a_merkle, c_merkle,
+    );
+
+    // Assertion 1 already covered byte-identity for B vs A; print B's
+    // merkle count too as a sanity record.
+    assert_eq!(
+        a_merkle, b_merkle,
+        "expected batch_A and batch_B IndexMerkleSiblings counts to match \
+         (got {} vs {}) — same colliding bucket should produce same wire shape",
+        a_merkle, b_merkle,
+    );
+}
+
 // ─── Harmony tests ──────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -502,6 +730,83 @@ async fn run_harmony_single_query(sh: ScriptHash) -> LeakageProfile {
         .expect("harmony query_batch");
     client.disconnect().await.unwrap();
     recorder.take_profile("harmony")
+}
+
+async fn run_harmony_batch_query(scripthashes: &[ScriptHash]) -> LeakageProfile {
+    let recorder = Arc::new(BufferingLeakageRecorder::new());
+    let mut client = HarmonyClient::new(&harmony_hint_url(), &harmony_query_url());
+    client.set_leakage_recorder(Some(recorder.clone()));
+    client.connect().await.expect("harmony connect");
+    let catalog = client.fetch_catalog().await.expect("harmony fetch_catalog");
+    let _ = client
+        .query_batch(scripthashes, catalog.databases[0].db_id)
+        .await
+        .expect("harmony query_batch");
+    client.disconnect().await.unwrap();
+    recorder.take_profile("harmony")
+}
+
+/// Multi-query simulator-property witness for HarmonyPIR — same
+/// curated scripthash batches as the DPF analog, since HarmonyPIR's
+/// INDEX path also assigns each scripthash to
+/// `derive_groups_3(sh, K)[0]` (see
+/// `pir-sdk-client/src/harmony.rs::query_single`). For the colliding
+/// pair, both INDEX Merkle items per query land in the same PBC group,
+/// so `max_items_per_group_per_level = 4`; for the non-colliding pair
+/// it is 2. The DPF analog passed cleanly against Hetzner with
+/// `IndexMerkleSiblings A=24 B=24 C=12 (= 2 × A)`.
+///
+/// Known flake: HarmonyPIR runs against the public Hetzner deployment
+/// can intermittently time out on the hint-stream WebSocket — the same
+/// caveat documented in `harmony_simulator_property_two_not_found`.
+/// If this test fails with a connection / timeout error rather than
+/// an assertion mismatch, retry once before treating it as a real
+/// finding.
+#[tokio::test]
+#[ignore = "requires running PIR servers"]
+async fn harmony_simulator_property_multi_query_collision() {
+    let (batch_a, batch_b, batch_c) = curated_batches();
+
+    let profile_a = run_harmony_batch_query(&batch_a).await;
+    let profile_b = run_harmony_batch_query(&batch_b).await;
+    let profile_c = run_harmony_batch_query(&batch_c).await;
+
+    let a_merkle = profile_a.count_of_kind(&RoundKind::IndexMerkleSiblings { level: 0 });
+    let b_merkle = profile_b.count_of_kind(&RoundKind::IndexMerkleSiblings { level: 0 });
+    let c_merkle = profile_c.count_of_kind(&RoundKind::IndexMerkleSiblings { level: 0 });
+    println!(
+        "harmony multi-query collision: total rounds A={} B={} C={}; \
+         IndexMerkleSiblings A={} B={} C={}",
+        profile_a.rounds.len(), profile_b.rounds.len(), profile_c.rounds.len(),
+        a_merkle, b_merkle, c_merkle,
+    );
+
+    // Same four assertions as the DPF analog — see that test for the
+    // axis-by-axis rationale.
+    assert_profiles_equivalent(&profile_a, &profile_b);
+    assert_ne!(
+        profile_a.rounds.len(), profile_c.rounds.len(),
+        "expected A and C to have different total round counts \
+         (max_items_per_group differs 4 vs 2); got equal = {} rounds",
+        profile_a.rounds.len(),
+    );
+    assert_non_index_merkle_rounds_equal(&profile_a, &profile_c);
+    assert!(
+        c_merkle > 0,
+        "expected ≥1 IndexMerkleSiblings round in batch_C profile (DB has Merkle?); got 0",
+    );
+    assert_eq!(
+        a_merkle, 2 * c_merkle,
+        "expected harmony batch_A IndexMerkleSiblings count ({}) = 2 × batch_C count ({}) \
+         — max_items_per_group should be 4 for A vs 2 for C",
+        a_merkle, c_merkle,
+    );
+    assert_eq!(
+        a_merkle, b_merkle,
+        "expected harmony batch_A and batch_B IndexMerkleSiblings counts to match \
+         (got {} vs {})",
+        a_merkle, b_merkle,
+    );
 }
 
 // ─── OnionPIR tests (feature-gated) ─────────────────────────────────────────
