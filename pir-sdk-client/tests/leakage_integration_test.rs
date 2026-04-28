@@ -336,6 +336,84 @@ async fn run_dpf_single_query(sh: ScriptHash) -> LeakageProfile {
     recorder.take_profile("dpf")
 }
 
+// ─── Multi-query batch leakage observation ─────────────────────────────────
+
+/// Phase 2.2 hardening — multi-query batch profile capture.
+///
+/// Single-query corpora (every other test in this file) cannot exercise
+/// the `index_max_items_per_group_per_level` axis the EasyCrypt L-spec
+/// at `proofs/easycrypt/Leakage.ec` admits: that axis is meaningful
+/// only when ≥2 queries' `assigned_group = derive_groups_3(scripthash,
+/// K)[0]` values can collide. This test runs a 2-query NOT-FOUND batch
+/// and prints the captured profile so a reviewer can see what the
+/// wire actually reveals on the multi-query path.
+///
+/// Asserts the structural invariants we DO know hold:
+///   - K-padding on every Index / Chunk / Merkle round (per-message)
+///   - `Index` rounds emit `items_uniform(K, 2)` (CLAUDE.md INDEX-Merkle
+///     Item-Count Symmetry)
+///   - At least 2 Index rounds (one per server, single batched call)
+///
+/// Does NOT assert simulator-property equality across two different
+/// 2-query batches: that would require curated scripthashes whose
+/// assigned_groups collide identically across both batches, which we
+/// haven't constructed yet. The test prints the captured profile shape
+/// so future hardening can compare empirically.
+#[tokio::test]
+#[ignore = "requires running PIR servers"]
+async fn dpf_per_message_invariants_batch_2_not_found() {
+    let (sh_a, sh_b) = not_found_pair();
+    let recorder = Arc::new(BufferingLeakageRecorder::new());
+    let mut client = DpfClient::new(&dpf_server0_url(), &dpf_server1_url());
+    client.set_leakage_recorder(Some(recorder.clone()));
+
+    client.connect().await.expect("dpf connect");
+    let catalog = client.fetch_catalog().await.expect("dpf fetch_catalog");
+    let main = &catalog.databases[0];
+    let k_index = main.index_k as usize;
+    let k_chunk = main.chunk_k as usize;
+
+    let _ = client
+        .query_batch(&[sh_a, sh_b], main.db_id)
+        .await
+        .expect("dpf query_batch");
+
+    let profile = recorder.take_profile("dpf");
+    println!(
+        "dpf 2-query not-found profile: {} rounds — kinds: {:?}",
+        profile.rounds.len(),
+        profile.rounds.iter().map(|r| r.kind).collect::<Vec<_>>()
+    );
+    let merkle_index_rounds_per_level: std::collections::HashMap<u8, usize> =
+        profile
+            .rounds_of_kind(&RoundKind::IndexMerkleSiblings { level: 0 })
+            .fold(std::collections::HashMap::new(), |mut acc, r| {
+                if let RoundKind::IndexMerkleSiblings { level } = r.kind {
+                    *acc.entry(level).or_insert(0) += 1;
+                }
+                acc
+            });
+    println!(
+        "dpf 2-query IndexMerkleSiblings per level: {:?} \
+         (per-level pass count = leak.index_max_items_per_group_per_level × 2 servers)",
+        merkle_index_rounds_per_level,
+    );
+
+    assert_pir_k_padding(&profile, k_index, k_chunk);
+    assert_merkle_per_level_uniform(&profile);
+    assert!(
+        profile.count_of_kind(&RoundKind::Index) >= 2,
+        "expected ≥2 Index rounds (one per DPF server) for a single-call batch",
+    );
+    for r in profile.rounds_of_kind(&RoundKind::Index) {
+        assert!(
+            r.items_uniform(k_index, 2),
+            "DPF Index round violates items_uniform(K={}, 2): {:?}",
+            k_index, r.items,
+        );
+    }
+}
+
 // ─── Harmony tests ──────────────────────────────────────────────────────────
 
 #[tokio::test]
