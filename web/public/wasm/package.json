@@ -1,0 +1,4 @@
+{
+  "//": "Tells Node to treat .js files in this directory as CommonJS, regardless of the parent web/ package.json's type:module. Needed because the Emscripten-generated onionpir_client.js / harmonypir*.js wasm loaders use CommonJS module.exports = ... — we read them via require() in node tests (e.g. web/src/__tests__/onion_leakage_diff.test.ts). Vite serves the public/ tree verbatim and ignores this file at bundle time, so production is unaffected.",
+  "type": "commonjs"
+}

@@ -43,6 +43,8 @@ import type {
 } from './server-info.js';
 import { fetchDatabaseCatalog } from './server-info.js';
 
+import type { LeakageRecorder, RoundProfile } from './leakage.js';
+
 // ─── Constants for OnionPIR v2 layout ─────────────────────────────────────
 
 const PACKED_ENTRY_SIZE = 3840;
@@ -334,6 +336,13 @@ export class OnionPirWebClient {
   // HASH160. Production UI never sets this.
   private _scriptHashOverride: Uint8Array[] | undefined = undefined;
 
+  // Optional leakage recorder. When installed, every transport-level
+  // roundtrip emits a structured `RoundProfile` matching what the Rust
+  // `OnionClient` emits — Phase 2.3 of `PLAN_LEAKAGE_VERIFICATION.md`
+  // diff-tests Rust against TS using these profiles. `null` = no
+  // recording (zero overhead in the no-recorder case).
+  private leakageRecorder: LeakageRecorder | null = null;
+
   /**
    * Set a one-shot scripthash override for the NEXT queryBatch call.
    * The override[] replaces the computed scripthashes 1:1 (same length).
@@ -345,6 +354,21 @@ export class OnionPirWebClient {
 
   constructor(config: OnionPirClientConfig) {
     this.config = config;
+  }
+
+  /**
+   * Install (or replace) a leakage recorder. Pass `null` to uninstall.
+   * Mirrors `OnionClient::set_leakage_recorder` on the Rust side — same
+   * trait shape, same `server_id = 0` (single-server) convention. Used
+   * by the cross-language diff harness in Phase 2.3.
+   */
+  setLeakageRecorder(recorder: LeakageRecorder | null): void {
+    this.leakageRecorder = recorder;
+  }
+
+  /** Internal: emit a `RoundProfile` to the installed recorder, if any. */
+  private recordRound(round: RoundProfile): void {
+    this.leakageRecorder?.recordRound('onion', round);
   }
 
   /** Return the currently active database ID (0 = main). */
@@ -481,7 +505,16 @@ export class OnionPirWebClient {
   // ─── Server info (delegates to shared server-info.ts) ──────────────────
 
   private async fetchServerInfo(): Promise<void> {
-    const info = await fetchServerInfoJson(this.ws!);
+    const info = await fetchServerInfoJson(this.ws!, (req, resp) => {
+      this.recordRound({
+        kind: 'info',
+        server_id: 0,
+        db_id: null,
+        request_bytes: req,
+        response_bytes: resp,
+        items: [],
+      });
+    });
     this.serverInfo = info;
 
     // Default to main-DB params (active dbId defaults to 0). Fall back to
@@ -503,7 +536,16 @@ export class OnionPirWebClient {
 
     // Fetch the database catalog so the UI can populate a selector.
     try {
-      this.catalog = await fetchDatabaseCatalog(this.ws!);
+      this.catalog = await fetchDatabaseCatalog(this.ws!, (req, resp) => {
+        this.recordRound({
+          kind: 'info',
+          server_id: 0,
+          db_id: null,
+          request_bytes: req,
+          response_bytes: resp,
+          items: [],
+        });
+      });
       this.log(`Catalog: ${this.catalog.databases.length} database(s)`);
     } catch (e: any) {
       this.log(`Catalog fetch failed (non-fatal): ${e.message}`, 'info');
@@ -588,6 +630,14 @@ export class OnionPirWebClient {
         progress('Setup', `Registering keys (dbId=${dbId})...`);
         const regMsg = encodeRegisterKeys(galoisKeys, gswKeys, dbId);
         const ack = await this.sendRaw(regMsg);
+        this.recordRound({
+          kind: 'onion_key_register',
+          server_id: 0,
+          db_id: dbId,
+          request_bytes: regMsg.length,
+          response_bytes: ack.length,
+          items: [],
+        });
         if (ack[4] !== RESP_KEYS_ACK) throw new Error('Key registration failed');
         this.registeredDbs.add(dbId);
         this.log(`Keys registered for dbId=${dbId}`);
@@ -665,6 +715,18 @@ export class OnionPirWebClient {
         progress('Level 1', `Round ${roundNum}/${totalRounds}: querying server (${queries.length} FHE queries)...`);
         const batchMsg = encodeBatchQuery(REQ_ONIONPIR_INDEX_QUERY, totalIndexRounds, queries, dbId);
         const respRaw = await this.sendRaw(batchMsg);
+        // Per-group item count: every group sends INDEX_CUCKOO_NUM_HASHES
+        // FHE queries — matches the Rust shape (and DPF's INDEX shape).
+        // The Merkle INDEX item-count symmetry invariant lives in this
+        // uniform 2-per-group payload.
+        this.recordRound({
+          kind: 'index',
+          server_id: 0,
+          db_id: dbId,
+          request_bytes: batchMsg.length,
+          response_bytes: respRaw.length,
+          items: new Array(this.indexK).fill(INDEX_CUCKOO_NUM_HASHES),
+        });
         totalIndexRounds++;
 
         const respPayload = respRaw.slice(4);
@@ -831,6 +893,17 @@ export class OnionPirWebClient {
           progress('Level 2', `Chunk round ${ri + 1}/${chunkRounds.length}: querying server...`);
           const batchMsg = encodeBatchQuery(REQ_ONIONPIR_CHUNK_QUERY, ri, queries, dbId);
           const respRaw = await this.sendRaw(batchMsg);
+          // OnionPIR CHUNK shape: 1 FHE query per group, K_CHUNK groups.
+          // Differs from DPF/Harmony CHUNK (which send 2 per group); the
+          // Rust `OnionClient::query_chunk_level` pin matches this.
+          this.recordRound({
+            kind: 'chunk',
+            server_id: 0,
+            db_id: dbId,
+            request_bytes: batchMsg.length,
+            response_bytes: respRaw.length,
+            items: new Array(this.chunkK).fill(1),
+          });
 
           const respPayload = respRaw.slice(4);
           if (respPayload[0] !== RESP_ONIONPIR_CHUNK_RESULT) throw new Error('Unexpected chunk response');
@@ -933,7 +1006,10 @@ export class OnionPirWebClient {
           merkleDataRoot: this.getOnionPirMerkleForDb(this.dbId)?.data?.root,
           indexBinHash: indexBinHashes[qi] ?? undefined,
           indexLeafPos: indexLeafPos[qi] ?? undefined,
-          allIndexBinHashes: allBinsChecked.get(qi), // Bins checked (for found, just up to match)
+          // ALL probed cuckoo positions (always INDEX_CUCKOO_NUM_HASHES bins —
+          // see CLAUDE.md "Merkle INDEX Item-Count Symmetry"). Used by the
+          // Merkle item builder to emit one INDEX leaf per probed bin.
+          allIndexBinHashes: allBinsChecked.get(qi),
           dataBinHashes: addrDataBinHashes,
           dataLeafPositions: addrDataLeafPositions,
           scriptHash: scriptHashes[qi],
@@ -1187,6 +1263,19 @@ export class OnionPirWebClient {
 
           const batchMsg = encodeBatchQuery(reqCode, level * 100 + ri, queries, this.dbId);
           const respRaw = await this.sendRaw(batchMsg);
+          // OnionPIR sibling round: K (or K_CHUNK) FHE queries, one per
+          // PBC group. The Rust `verify_sub_tree` records `items[g] = 1`
+          // and tags `index` trees as `IndexMerkleSiblings { level }`,
+          // `data` trees as `ChunkMerkleSiblings { level }`.
+          this.recordRound({
+            kind: treeName === 'index' ? 'index_merkle_siblings' : 'chunk_merkle_siblings',
+            level,
+            server_id: 0,
+            db_id: this.dbId,
+            request_bytes: batchMsg.length,
+            response_bytes: respRaw.length,
+            items: new Array(levelInfo.k).fill(1),
+          });
           const respPayload = respRaw.slice(4);
           if (respPayload[0] !== respCode) {
             throw new Error(`Unexpected ${treeName} sibling response: 0x${respPayload[0].toString(16)}`);
@@ -1273,6 +1362,18 @@ export class OnionPirWebClient {
     req[4] = reqCode;
     if (this.dbId !== 0) req[5] = this.dbId;
     const raw = await this.sendRaw(req);
+    // Tree-top fetch is admitted to leak (public Merkle tops). Both
+    // INDEX and DATA tree-top fetches are tagged `merkle_tree_tops` —
+    // matches the Rust `RoundKind::MerkleTreeTops` (no per-tree split
+    // there either).
+    this.recordRound({
+      kind: 'merkle_tree_tops',
+      server_id: 0,
+      db_id: this.dbId,
+      request_bytes: req.length,
+      response_bytes: raw.length,
+      items: [],
+    });
 
     const variant = raw[4];
     if (variant !== respCode) {

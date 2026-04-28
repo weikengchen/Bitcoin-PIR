@@ -260,8 +260,12 @@ export function parseServerInfoJson(jsonStr: string): ServerInfoJson {
  *   Request:  [4B len=1 LE][1B 0x03]
  *   Response: [4B len LE][1B 0x03][JSON bytes...]
  */
-export async function fetchServerInfoJson(ws: ManagedWebSocket): Promise<ServerInfoJson> {
+export async function fetchServerInfoJson(
+  ws: ManagedWebSocket,
+  onRoundtrip?: (requestBytes: number, responseBytes: number) => void,
+): Promise<ServerInfoJson> {
   const raw = await ws.sendRaw(INFO_JSON_REQUEST);
+  onRoundtrip?.(INFO_JSON_REQUEST.length, raw.length);
 
   // Response: [4B length LE][1B variant][JSON payload...]
   if (raw.length < 6) {
@@ -402,8 +406,12 @@ export function decodeDatabaseCatalog(data: Uint8Array): DatabaseCatalog {
  *   Request:  [4B len=1 LE][1B 0x02]
  *   Response: [4B len LE][1B 0x02][catalog bytes...]
  */
-export async function fetchDatabaseCatalog(ws: ManagedWebSocket): Promise<DatabaseCatalog> {
+export async function fetchDatabaseCatalog(
+  ws: ManagedWebSocket,
+  onRoundtrip?: (requestBytes: number, responseBytes: number) => void,
+): Promise<DatabaseCatalog> {
   const raw = await ws.sendRaw(CATALOG_REQUEST);
+  onRoundtrip?.(CATALOG_REQUEST.length, raw.length);
   if (raw.length < 6) {
     throw new Error('Database catalog response too short');
   }
