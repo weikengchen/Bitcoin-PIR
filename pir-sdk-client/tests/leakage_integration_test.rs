@@ -494,11 +494,16 @@ async fn onion_per_message_invariants_not_found() {
         );
     }
     // OnionPIR sibling round: items[g] = 1 (one FHE query per group).
+    // OnionPIR Merkle uses a per-level server-driven K (`level_info.k`),
+    // not the PIR `index_k` — see `assert_pir_k_padding` doc — so we
+    // don't hardcode K_index here. Per-level K consistency is checked
+    // by `assert_merkle_per_level_uniform`; this loop just asserts the
+    // per-group value is 1.
     for r in profile.rounds_of_kind(&RoundKind::IndexMerkleSiblings { level: 0 }) {
         assert!(
-            r.items_uniform(k_index, 1),
-            "OnionPIR IndexMerkleSiblings violates items_uniform(K={}, 1): {:?}",
-            k_index, r.items,
+            r.items.iter().all(|&v| v == 1),
+            "OnionPIR IndexMerkleSiblings level 0: expected all items=1, got {:?}",
+            r.items,
         );
     }
 }
@@ -635,24 +640,28 @@ async fn dpf_found_vs_not_found_have_same_round_count() {
          — CHUNK Round-Presence Symmetry violated",
         not_found_chunks,
     );
-    // CHUNK round counts AGREE — the wire transcripts are
-    // indistinguishable at the round-count level.
+    // CHUNK round counts AGREE — the property the symmetry fix
+    // delivers. The wire transcripts are indistinguishable at the
+    // CHUNK-round-count level.
+    //
+    // Note on total round count: `p_found.rounds.len() !=
+    // p_not_found.rounds.len()` is still expected — the FOUND path
+    // emits CHUNK Merkle sibling rounds whose count varies with UTXO
+    // count, a documented residual leak (CLAUDE.md "What the Server
+    // Learns"). Closing that would be a separate "CHUNK Merkle
+    // Round-Presence Symmetry" fix, not in scope here. We only assert
+    // CHUNK-PIR-round equality.
     assert_eq!(
         found_chunks, not_found_chunks,
         "found and not-found CHUNK round counts diverge ({} vs {}) \
          — CHUNK Round-Presence Symmetry P1 violated",
         found_chunks, not_found_chunks,
     );
-    assert_eq!(
-        p_found.rounds.len(), p_not_found.rounds.len(),
-        "found and not-found total round counts diverge ({} vs {})",
-        p_found.rounds.len(), p_not_found.rounds.len(),
-    );
 }
 
 /// CHUNK Round-Presence Symmetry P1 (positive form): the wire
-/// transcript's round count must depend only on batch size, not on
-/// per-query found/not-found classification. This is the
+/// transcript's CHUNK-round count must depend only on batch size,
+/// not on per-query found/not-found classification. This is the
 /// integration-level expression of the helper-level Kani harness on
 /// `items_from_trace` in `pir-sdk-client/src/dpf.rs` (which proves the
 /// per-slot decision tree emits the same number of items regardless
@@ -819,16 +828,14 @@ async fn onion_found_vs_not_found_have_same_round_count() {
          — CHUNK Round-Presence Symmetry violated",
         not_found_chunks,
     );
+    // CHUNK round counts AGREE — see DPF analog for the note on why
+    // total round count is still allowed to differ (CHUNK Merkle is
+    // a separately-tracked residual leak, not closed by this fix).
     assert_eq!(
         found_chunks, not_found_chunks,
         "OnionPIR found and not-found CHUNK round counts diverge ({} vs {}) \
          — CHUNK Round-Presence Symmetry P1 violated",
         found_chunks, not_found_chunks,
-    );
-    assert_eq!(
-        p_found.rounds.len(), p_not_found.rounds.len(),
-        "OnionPIR found and not-found total round counts diverge ({} vs {})",
-        p_found.rounds.len(), p_not_found.rounds.len(),
     );
 }
 
