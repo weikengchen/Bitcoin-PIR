@@ -2007,6 +2007,159 @@ impl SimpleRng {
     }
 }
 
+// ─── Kani harnesses ────────────────────────────────────────────────────────
+//
+// Kani is a bounded-model-checker for Rust: `cargo kani` exhausts every input
+// up to a concrete bound and proves the harness's assertions. This complements
+// the integration tests in `pir-sdk-client/tests/leakage_integration_test.rs`,
+// which exercise specific corpus inputs against a live server but cannot
+// enumerate every possible (matched_index_idx, chunk_bins) shape.
+//
+// Install: `cargo install --locked kani-verifier && cargo kani setup`.
+// Run:     `cargo kani -p pir-sdk-client`.
+//
+// The harnesses live behind `#[cfg(kani)]` so a normal `cargo build` /
+// `cargo test` doesn't compile them — Kani's own driver injects the cfg
+// when running.
+
+#[cfg(kani)]
+mod kani_harnesses {
+    use super::*;
+
+    /// Prove that `items_from_trace` preserves the length of
+    /// `trace.index_bins` for every concrete trace shape in the bound.
+    ///
+    /// Why this matters: the Merkle INDEX Item-Count Symmetry invariant
+    /// (CLAUDE.md) requires every INDEX query to contribute exactly
+    /// `INDEX_CUCKOO_NUM_HASHES = 2` Merkle items. The integration tests
+    /// verify the *caller* invariant — that `query_index_level` populates
+    /// `trace.index_bins` with exactly 2 entries per query — but the
+    /// pure-function transformation in `items_from_trace` is a separate
+    /// preservation property: no matter what the caller hands in, the
+    /// output length must equal the input length. Kani exhaustively
+    /// verifies this preservation across every (`matched_index_idx`,
+    /// `chunk_bins.len()`) combination in the bound.
+    ///
+    /// Bound: `index_bins.len() == 2` (the documented invariant);
+    /// `chunk_bins.len() ≤ 3`. Total combinations explored: ~64.
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn items_from_trace_preserves_index_count() {
+        // Concrete index_bins of length 2 — the documented invariant.
+        // Content fields are symbolic (kani::any()) so the proof covers
+        // every possible bin payload, and `bin_content` stays empty
+        // because length preservation doesn't depend on bin bytes.
+        let index_bins = vec![
+            IndexBinTrace {
+                pbc_group: kani::any(),
+                bin_index: kani::any(),
+                bin_content: Vec::new(),
+            },
+            IndexBinTrace {
+                pbc_group: kani::any(),
+                bin_index: kani::any(),
+                bin_content: Vec::new(),
+            },
+        ];
+
+        // Symbolic chunk_bins with bounded length — Kani enumerates
+        // 0, 1, 2, 3 chunk bins.
+        let n_chunk: usize = kani::any();
+        kani::assume(n_chunk <= 3);
+        let mut chunk_bins = Vec::with_capacity(n_chunk);
+        for _ in 0..n_chunk {
+            chunk_bins.push(ChunkBinTrace {
+                pbc_group: kani::any(),
+                bin_index: kani::any(),
+                bin_content: Vec::new(),
+            });
+        }
+
+        // Symbolic matched_index_idx — None, Some(0), Some(1), or
+        // Some(out-of-range). The function must handle all four
+        // without losing length.
+        let matched_index_idx: Option<usize> = kani::any();
+
+        let trace = QueryTraces {
+            index_bins,
+            matched_index_idx,
+            chunk_bins,
+        };
+
+        let items = items_from_trace(&trace);
+
+        // The headline invariant: output length matches input
+        // `index_bins` length, which is INDEX_CUCKOO_NUM_HASHES = 2
+        // by the caller's contract.
+        assert_eq!(
+            items.len(),
+            INDEX_CUCKOO_NUM_HASHES,
+            "items_from_trace must emit INDEX_CUCKOO_NUM_HASHES items \
+             per query — Merkle INDEX Item-Count Symmetry invariant",
+        );
+
+        // Sanity: each emitted item carries the corresponding INDEX bin's
+        // PBC group (i.e. the `i`th item is bound to the `i`th bin).
+        // This catches a hypothetical reorder regression.
+        for i in 0..INDEX_CUCKOO_NUM_HASHES {
+            assert_eq!(items[i].index_pbc_group, trace.index_bins[i].pbc_group);
+            assert_eq!(items[i].index_bin_index, trace.index_bins[i].bin_index);
+        }
+    }
+
+    /// Prove that `collect_merkle_items_from_traces` preserves the
+    /// per-query item count: total items emitted equals
+    /// `traces.len() × INDEX_CUCKOO_NUM_HASHES`. This is the
+    /// batch-level analog of the per-query invariant above —
+    /// `verify_bucket_merkle_batch_dpf` relies on the per-query count
+    /// being uniform so the batch-Merkle padding (K queries per
+    /// pass) is correctly sized.
+    ///
+    /// Bound: `traces.len() ≤ 3` (covers single + small batches).
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn collect_merkle_items_preserves_per_query_count() {
+        let n_traces: usize = kani::any();
+        kani::assume(n_traces >= 1 && n_traces <= 3);
+
+        let mut traces = Vec::with_capacity(n_traces);
+        for _ in 0..n_traces {
+            traces.push(QueryTraces {
+                index_bins: vec![
+                    IndexBinTrace {
+                        pbc_group: kani::any(),
+                        bin_index: kani::any(),
+                        bin_content: Vec::new(),
+                    },
+                    IndexBinTrace {
+                        pbc_group: kani::any(),
+                        bin_index: kani::any(),
+                        bin_content: Vec::new(),
+                    },
+                ],
+                matched_index_idx: kani::any(),
+                chunk_bins: Vec::new(),
+            });
+        }
+
+        let (items, item_to_query) = collect_merkle_items_from_traces(&traces);
+
+        assert_eq!(
+            items.len(),
+            n_traces * INDEX_CUCKOO_NUM_HASHES,
+            "collect_merkle_items_from_traces must emit \
+             traces.len() * INDEX_CUCKOO_NUM_HASHES items",
+        );
+        assert_eq!(items.len(), item_to_query.len());
+
+        // Backmap is monotonic: items 0..2 belong to query 0,
+        // items 2..4 belong to query 1, etc.
+        for i in 0..items.len() {
+            assert_eq!(item_to_query[i], i / INDEX_CUCKOO_NUM_HASHES);
+        }
+    }
+}
+
 // ─── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

@@ -13,6 +13,12 @@ readme = "README.md"
 keywords = ["pir", "privacy", "bitcoin", "cryptography", "websocket"]
 categories = ["cryptography", "cryptography::cryptocurrencies", "network-programming"]
 
+# `kani` is a custom cfg used by `#[cfg(kani)]` harness modules for the
+# Kani bounded-model-checker (`cargo install kani-verifier`). Register it
+# here so a normal `cargo build` doesn't warn `unexpected cfg`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
 [features]
 default = []
 # Enable fast PRP backend (FastPRP) for HarmonyPIR — faster per-element but slower build.
