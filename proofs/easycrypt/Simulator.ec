@@ -43,24 +43,51 @@ module Sim : ProtocolRunner = {
      * distribution over byte-strings of the appropriate length).
      *
      * Per the modelling discussion in Protocol.ec:
+     *
      *   - Info / OnionKeyRegister: deterministic shape, fixed bytes
      *     (catalog content is public).
+     *
      *   - Index: K groups × index_items_per_group, each item is a
-     *     fresh uniform key.
-     *   - Chunk: K_chunk groups, fresh uniform per slot. The number
-     *     of Chunk rounds depends on `leak.chunk_merkle_item_count`
-     *     ONLY for the *Merkle* sibling-rounds — the PIR Chunk
-     *     round-count is fixed by CHUNK Round-Presence Symmetry.
+     *     fresh uniform key. Number of Index rounds is fixed per
+     *     backend (DPF: 2 — one per server; OnionPIR: 1; Harmony: 1)
+     *     and is independent of any axis in `leak`.
+     *
+     *   - Chunk: K_chunk groups, fresh uniform per slot. By the
+     *     CHUNK Round-Presence Symmetry invariant, every query
+     *     emits at least one Chunk round regardless of found vs
+     *     not-found — round count is fixed, not a function of
+     *     leak. Bytes are uniform.
+     *
      *   - MerkleTreeTops: deterministic, public bytes.
-     *   - IndexMerkleSiblings × number-of-levels: each pass is K
-     *     queries, fresh uniform. Number of passes is a function of
-     *     INDEX_CUCKOO_NUM_HASHES (= 2 by invariant) — therefore a
-     *     function of L(q) (specifically, L(q) is constant across
-     *     queries on this axis, so the passes count is L-independent
-     *     too).
-     *   - ChunkMerkleSiblings × number-of-levels: number of items
-     *     equals leak.chunk_merkle_item_count (the admitted leak),
-     *     so the simulator gets this right by construction. *)
+     *
+     *   - IndexMerkleSiblings × per-level passes:
+     *     Pass count per Merkle level = leak.index_max_items_per_group_per_level.
+     *     For single-query batches this is the constant 2 (the two
+     *     INDEX cuckoo positions both fall in `assigned_group`); for
+     *     multi-query batches the simulator reads it from `leak`.
+     *     Each pass emits K (or K_merkle for OnionPIR) queries with
+     *     fresh uniform bytes.
+     *
+     *   - ChunkMerkleSiblings × per-level passes:
+     *     Pass count per Merkle level = leak.chunk_max_items_per_group_per_level.
+     *     Determined by the admitted CHUNK-Merkle distribution axis;
+     *     simulator reads it from `leak`. Each pass emits K_chunk
+     *     queries with fresh uniform bytes.
+     *
+     *   - HarmonyHintRefresh: appears only when
+     *     leak.session_query_index hits a HarmonyPIR-specific
+     *     `max_queries` boundary. For DPF and OnionPIR this round
+     *     never fires; for Harmony it is gated on the session-level
+     *     position. Simulator reads `leak.session_query_index` to
+     *     decide whether to emit.
+     *
+     * Key invariant: the simulator NEVER reads `q` after the
+     * `leak <- L q` line. Any function of the transcript-shape
+     * that the body computes must be expressible from `leak` and
+     * fresh randomness alone. If a future maintainer re-introduces
+     * a `q`-dependent branch here that is not visible in `leak`,
+     * `simulator_property_constructive` (Theorem.ec) becomes
+     * unprovable — that's the proof's purpose. *)
     t <- empty_transcript;
     return t;
   }

@@ -70,27 +70,38 @@ proof.
    * For each backend, the proof discharges:
    *
    *   (a) Info / OnionKeyRegister rounds: deterministic, identical
-   *       across queries.
+   *       across queries (catalog and FHE keys are public-derivable
+   *       from the connection state, not query content).
    *
    *   (b) Index round: items vector is K-padded with INDEX_CUCKOO
-   *       per group (Kani-verified; cite in proof). Bytes are fresh
-   *       uniform — sampled identically distributed in both runs.
+   *       per group (Kani-verified by build_index_alphas in
+   *       pir-sdk-client/src/dpf.rs; cite in proof). Bytes are fresh
+   *       uniform — sampled identically distributed in both runs by
+   *       the ideal-primitive (DPF/PRP/FHE) hypothesis.
    *
    *   (c) Chunk round: items vector is K_CHUNK-padded
    *       (Kani-verified). Bytes are fresh uniform. Round-presence
    *       fixed by CHUNK Round-Presence Symmetry — both queries
-   *       emit at least one Chunk round.
+   *       emit at least one Chunk round, so the round count
+   *       trivially agrees.
    *
    *   (d) MerkleTreeTops: deterministic, identical bytes.
    *
-   *   (e) IndexMerkleSiblings: pass count depends on
-   *       INDEX_CUCKOO_NUM_HASHES (= 2, fixed). Items per pass = K.
-   *       Bytes uniform.
+   *   (e) IndexMerkleSiblings: pass count per Merkle level =
+   *       leak.index_max_items_per_group_per_level (admitted
+   *       leakage axis). L_eq q1 q2 implies the records are equal
+   *       implies this axis agrees implies same pass count. Items
+   *       per pass = K, fresh uniform bytes.
    *
-   *   (f) ChunkMerkleSiblings: pass count depends on the chunk
-   *       Merkle item count, which IS in L (admitted leak). So
-   *       L_eq q1 q2 ==> chunk_merkle_item_count agrees ==> same
-   *       number of passes ==> same transcript shape on this axis.
+   *   (f) ChunkMerkleSiblings: pass count per Merkle level =
+   *       leak.chunk_max_items_per_group_per_level (admitted
+   *       leakage axis, replacing the earlier coarser
+   *       `chunk_merkle_item_count`). Same agreement-via-L_eq
+   *       argument as (e).
+   *
+   *   (g) HarmonyHintRefresh: appears at session positions
+   *       determined by leak.session_query_index. L_eq agreement
+   *       implies same refresh schedule, so this axis aligns too.
    *
    * The proof reduces to a uniform-coupling argument: at each
    * randomized step, both runs sample from the same distribution,
