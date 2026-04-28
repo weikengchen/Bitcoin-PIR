@@ -162,6 +162,60 @@ struct QueryTraces {
 // `QueryResult.index_bins` / `chunk_bins`). Any drift between the two
 // sides would produce silent verification mismatches.
 
+/// Per-group role for a single CHUNK PIR round.
+///
+/// `Real(chunk_id)` — the group has a real chunk to retrieve; the
+/// caller computes the cuckoo target bin and dispatches via
+/// [`harmonypir_wasm::HarmonyGroup::build_request`].
+///
+/// `Dummy` — no real chunk is assigned to this group; caller falls
+/// back to [`harmonypir_wasm::HarmonyGroup::build_synthetic_dummy`],
+/// whose T-1-padded shape is byte-shape-identical to a real request
+/// per the existing "HarmonyPIR Per-Group Request-Count Symmetry"
+/// invariant. The two branches of `run_chunk_round` therefore emit
+/// indistinguishable per-group payloads on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChunkGroupRole {
+    Real(u32),
+    Dummy,
+}
+
+/// Classify each of the `k_chunk` groups for one HarmonyPIR CHUNK
+/// round.
+///
+/// Pure function: no I/O, no allocation outside the result `Vec`, no
+/// RNG. The structural witness for **CHUNK Round-Presence Symmetry
+/// P1** is `result.len() == k_chunk` regardless of
+/// `real_queries.len()`. The structural witness for **P2** is
+/// "every entry is `Dummy` when `real_queries.is_empty()`", which
+/// makes the all-dummy round byte-shape-identical to any real round
+/// (modulo fixed-shape `build_request` vs `build_synthetic_dummy`,
+/// already established by the per-group request-count symmetry).
+///
+/// **Semantics on duplicate group_ids** — when `real_queries`
+/// contains two entries with the same `group_id`, the *later* entry
+/// wins. This matches the original `HashMap::collect` semantics that
+/// `run_chunk_round` used pre-refactor; CHUNK PBC planning never
+/// produces such duplicates within a single round, but preserving
+/// the tie-break rule keeps the refactor observably equivalent.
+///
+/// **Out-of-range group_ids** — entries with `group_id >= k_chunk`
+/// are silently ignored (the original code's `for g in 0..k_chunk`
+/// loop never queried them). Same observable behaviour.
+pub(crate) fn classify_chunk_groups(
+    real_queries: &[(u32, u8)],
+    k_chunk: u8,
+) -> Vec<ChunkGroupRole> {
+    let mut roles = vec![ChunkGroupRole::Dummy; k_chunk as usize];
+    for &(cid, group) in real_queries {
+        if (group as usize) < (k_chunk as usize) {
+            // Last-wins matches HashMap::collect (pre-refactor behaviour).
+            roles[group as usize] = ChunkGroupRole::Real(cid);
+        }
+    }
+    roles
+}
+
 /// Build `BucketMerkleItem`s for one query from its internal trace —
 /// emits one item per probed INDEX cuckoo bin, with CHUNK bins attached
 /// only to the matched INDEX item (or none, if not matched). This
@@ -1520,11 +1574,25 @@ impl HarmonyClient {
                     real_group,
                     traces.index_bins.len()
                 );
+                // 🔒 CHUNK Round-Presence Symmetry (CLAUDE.md): not-found
+                // queries still issue one K_CHUNK-padded CHUNK PIR round so
+                // the server cannot infer found-vs-not-found from CHUNK
+                // round absence. Empty `chunk_ids` triggers the dummy-round
+                // path inside `query_chunk_level`.
+                let _ = self.query_chunk_level(&[], db_info).await?;
+                log::info!(
+                    "[PIR-AUDIT] HarmonyPIR CHUNK round-presence padding: not-found query issued 1 dummy CHUNK round"
+                );
                 return Ok((None, traces));
             }
         };
 
         if num_chunks == 0 {
+            // Whale: same dummy CHUNK round as not-found for indistinguishability.
+            let _ = self.query_chunk_level(&[], db_info).await?;
+            log::info!(
+                "[PIR-AUDIT] HarmonyPIR CHUNK round-presence padding: whale query issued 1 dummy CHUNK round"
+            );
             return Ok((
                 Some(QueryResult {
                     entries: Vec::new(),
@@ -1652,6 +1720,12 @@ impl HarmonyClient {
     /// * `chunk_bins` — per-chunk (pbc_group, bin_index, bin_content) for every
     ///   chunk we actually located. Used by the Merkle verifier to commit
     ///   the server to the chunk bin that served each slot.
+    ///
+    /// 🔒 CHUNK Round-Presence Symmetry (CLAUDE.md): if `chunk_ids` is
+    /// empty (not-found / whale callers), this function still issues
+    /// exactly one K_CHUNK-padded CHUNK round (all groups synthesised via
+    /// `build_synthetic_dummy`) so the server cannot infer
+    /// found-vs-not-found from absence of CHUNK traffic.
     async fn query_chunk_level(
         &mut self,
         chunk_ids: &[u32],
@@ -1659,6 +1733,20 @@ impl HarmonyClient {
     ) -> PirResult<(Vec<u8>, Vec<ChunkBinTrace>)> {
         let k_chunk = db_info.chunk_k as usize;
         let chunk_bins = db_info.chunk_bins as usize;
+
+        // CHUNK Round-Presence Symmetry: empty input still emits one
+        // K_CHUNK-padded round so the wire signature is uniform across
+        // found / not-found / whale. `run_chunk_round` with an empty
+        // `real_queries` slice falls into the all-dummy path
+        // (`build_synthetic_dummy` per group), exactly the wire shape
+        // we need.
+        if chunk_ids.is_empty() {
+            log::info!(
+                "[PIR-AUDIT] HarmonyPIR CHUNK round-presence padding: emitting 1 dummy K_CHUNK-padded round (all-synthetic, no real chunks)"
+            );
+            let _ = self.run_chunk_round(db_info.db_id, &[], chunk_bins, 0, 0).await?;
+            return Ok((Vec::new(), Vec::new()));
+        }
 
         // Map each chunk to its first candidate group. Two chunks may
         // collide on the same group — if so, only the first can be
@@ -2534,6 +2622,22 @@ impl HarmonyClient {
     }
 
     /// Build and send one CHUNK batch (K_CHUNK groups, 1 sub-query each).
+    ///
+    /// The per-group dispatch (`build_request` for real groups,
+    /// `build_synthetic_dummy` for the rest) is driven by the role
+    /// list returned by [`classify_chunk_groups`]. That helper is
+    /// `pub(crate)` and Kani-verified — see harness module
+    /// `kani_harnesses` at the bottom of this file. The structural
+    /// witnesses:
+    ///
+    /// * `roles.len() == k_chunk` regardless of `real_queries.len()`
+    ///   ⇒ batch length is `k_chunk` ⇒ wire round count is `k_chunk`
+    ///   sub-queries (CHUNK Round-Presence Symmetry P1).
+    /// * When `real_queries.is_empty()` every entry is `Dummy`, so
+    ///   every group routes through `build_synthetic_dummy`, whose
+    ///   T-1-padded shape (HarmonyPIR Per-Group Request-Count
+    ///   Symmetry) makes the wire bytes indistinguishable from a
+    ///   round with one or more real groups (P2).
     async fn run_chunk_round(
         &mut self,
         db_id: u8,
@@ -2543,25 +2647,30 @@ impl HarmonyClient {
         round_id: u16,
     ) -> PirResult<HashMap<u8, Vec<u8>>> {
         let k_chunk = self.chunk_groups.len() as u8;
-        let real_map: HashMap<u8, u32> = real_queries.iter().map(|&(c, g)| (g, c)).collect();
+        let roles = classify_chunk_groups(real_queries, k_chunk);
 
         let mut batch_items: Vec<BatchItem> = Vec::with_capacity(k_chunk as usize);
 
         for g in 0..k_chunk {
+            let role = roles[g as usize];
             let group = self
                 .chunk_groups
                 .get_mut(&g)
                 .ok_or_else(|| PirError::InvalidState(format!("missing CHUNK group {}", g)))?;
-            let bytes = if let Some(&cid) = real_map.get(&g) {
-                let key =
-                    pir_core::hash::derive_cuckoo_key(CHUNK_PARAMS.master_seed, g as usize, hash_fn);
-                let target_bin = pir_core::hash::cuckoo_hash_int(cid, key, chunk_bins);
-                let req = group.build_request(target_bin as u32).map_err(|e| {
-                    PirError::BackendState(format!("build_request (chunk): {:?}", e))
-                })?;
-                req.request()
-            } else {
-                group.build_synthetic_dummy()
+            let bytes = match role {
+                ChunkGroupRole::Real(cid) => {
+                    let key = pir_core::hash::derive_cuckoo_key(
+                        CHUNK_PARAMS.master_seed,
+                        g as usize,
+                        hash_fn,
+                    );
+                    let target_bin = pir_core::hash::cuckoo_hash_int(cid, key, chunk_bins);
+                    let req = group.build_request(target_bin as u32).map_err(|e| {
+                        PirError::BackendState(format!("build_request (chunk): {:?}", e))
+                    })?;
+                    req.request()
+                }
+                ChunkGroupRole::Dummy => group.build_synthetic_dummy(),
             };
             batch_items.push(BatchItem {
                 group_id: g,
@@ -2585,8 +2694,14 @@ impl HarmonyClient {
         });
         let raw_results = decode_batch_response(&response)?;
 
+        // Decode only the groups the role list marks as Real — same set
+        // of group_ids the original HashMap-based code processed (last
+        // duplicate wins, identical to `HashMap::collect` semantics).
         let mut out = HashMap::new();
-        for &g in real_map.keys() {
+        for g in 0..k_chunk {
+            if !matches!(roles[g as usize], ChunkGroupRole::Real(_)) {
+                continue;
+            }
             let data = raw_results.get(&g).ok_or_else(|| {
                 PirError::Protocol(format!("no CHUNK response for group {}", g))
             })?;
@@ -3281,6 +3396,162 @@ impl BucketMerkleSiblingQuerier for HarmonySiblingQuerier<'_> {
         }
 
         Ok(out)
+    }
+}
+
+// ─── Kani harnesses ─────────────────────────────────────────────────────────
+//
+// Bounded model checking for the CHUNK Round-Presence Symmetry
+// invariant (CLAUDE.md). The invariant says every HarmonyPIR INDEX
+// query — found, not-found, or whale — emits a K_CHUNK-padded CHUNK
+// PIR round on the wire. The structural witness lives in
+// `classify_chunk_groups`: its result length is `k_chunk` regardless
+// of how many real queries were passed in, and when no real queries
+// are passed every entry is `Dummy`.
+//
+// `run_chunk_round` consumes the role list directly, so verifying
+// `classify_chunk_groups` lifts to verifying the wire-batch length:
+// the dispatch loop pushes one `BatchItem` per role, so the resulting
+// `Vec<BatchItem>` has exactly `k_chunk` elements. Every group either
+// goes through `build_request` (real) or `build_synthetic_dummy`
+// (dummy) — both produce T-1 sorted indices per the existing
+// "HarmonyPIR Per-Group Request-Count Symmetry" invariant — so the
+// wire bytes are shape-uniform.
+//
+// The harnesses live behind `#[cfg(kani)]` so a normal build doesn't
+// compile them. Run with `cargo kani -p pir-sdk-client`.
+
+#[cfg(kani)]
+mod kani_harnesses {
+    use super::*;
+
+    /// **P1** — round-count uniformity. For any `(real_queries,
+    /// k_chunk)`, the role list has length exactly `k_chunk`. The
+    /// caller's dispatch loop in `run_chunk_round` pushes one
+    /// `BatchItem` per role, so the wire batch length equals
+    /// `k_chunk` regardless of `real_queries.len()`. This is the
+    /// structural witness that found / not-found / whale queries
+    /// all emit `k_chunk` per-group sub-queries on the wire.
+    ///
+    /// Bound: `k_chunk ∈ {1, 2, 3, 4}`, `real_queries.len() ∈
+    /// {0, 1, 2}` with each `(group_id < k_chunk)`. Bounds are
+    /// small to keep CBMC tractable; the property is a length
+    /// equality so the bound is illustrative — the proof
+    /// generalises by symbolic execution on each concrete `k_chunk`.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn classify_chunk_groups_emits_k_chunk_entries() {
+        let k_chunk: u8 = kani::any();
+        kani::assume(k_chunk >= 1 && k_chunk <= 4);
+        let n_real: usize = kani::any();
+        kani::assume(n_real <= 2);
+        let mut real_queries: Vec<(u32, u8)> = Vec::with_capacity(n_real);
+        for _ in 0..n_real {
+            let cid: u32 = kani::any();
+            let group: u8 = kani::any();
+            // Restrict group_ids to the valid range so we exercise
+            // the in-range branch (out-of-range is silently dropped
+            // — covered separately if a regression invents a panic).
+            kani::assume(group < k_chunk);
+            real_queries.push((cid, group));
+        }
+
+        let roles = classify_chunk_groups(&real_queries, k_chunk);
+
+        assert_eq!(
+            roles.len(),
+            k_chunk as usize,
+            "CHUNK Round-Presence Symmetry P1: role list length must \
+             equal k_chunk so the dispatch loop emits exactly k_chunk \
+             per-group sub-queries on the wire",
+        );
+    }
+
+    /// **P2** — wire indistinguishability of the all-dummy round.
+    /// When `real_queries` is empty (the not-found / whale path), the
+    /// role list is `[Dummy, Dummy, …, Dummy]` of length `k_chunk`.
+    /// `run_chunk_round` then routes every group through
+    /// `HarmonyGroup::build_synthetic_dummy`, which produces a
+    /// shape-identical payload to a real `build_request` (per the
+    /// existing per-group request-count symmetry). The result: a
+    /// CHUNK round driven purely by dummies is byte-shape-identical
+    /// to a CHUNK round with one or more real queries.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn classify_chunk_groups_all_dummy_when_no_real_queries() {
+        let k_chunk: u8 = kani::any();
+        kani::assume(k_chunk >= 1 && k_chunk <= 4);
+
+        let roles = classify_chunk_groups(&[], k_chunk);
+
+        assert_eq!(roles.len(), k_chunk as usize);
+        for g in 0..k_chunk as usize {
+            assert!(
+                matches!(roles[g], ChunkGroupRole::Dummy),
+                "CHUNK Round-Presence Symmetry P2: empty real_queries \
+                 must produce all-Dummy roles so every group routes \
+                 through build_synthetic_dummy on the wire",
+            );
+        }
+    }
+
+    /// Negative: a real query at a specific group must mark exactly
+    /// that group as `Real`, leaving every other group as `Dummy`.
+    /// Catches a hypothetical regression that mis-routes the role
+    /// (e.g. off-by-one on the group index, or marking too many
+    /// groups Real and shrinking the dummy padding).
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn classify_chunk_groups_marks_only_specified_group_real() {
+        let k_chunk: u8 = kani::any();
+        kani::assume(k_chunk >= 1 && k_chunk <= 4);
+        let target_group: u8 = kani::any();
+        kani::assume(target_group < k_chunk);
+        let cid: u32 = kani::any();
+
+        let roles = classify_chunk_groups(&[(cid, target_group)], k_chunk);
+
+        assert_eq!(roles.len(), k_chunk as usize);
+        for g in 0..k_chunk as usize {
+            if g == target_group as usize {
+                assert!(
+                    matches!(roles[g], ChunkGroupRole::Real(c) if c == cid),
+                    "target group must carry the supplied chunk_id",
+                );
+            } else {
+                assert!(
+                    matches!(roles[g], ChunkGroupRole::Dummy),
+                    "non-target groups must remain Dummy",
+                );
+            }
+        }
+    }
+
+    /// Out-of-range `group_id`s are silently dropped — same
+    /// observable behaviour as the pre-refactor
+    /// `for g in 0..k_chunk` loop, which never queried groups
+    /// `>= k_chunk` even if they were in the HashMap. Captured here
+    /// so a future regression that panics or grows the role list
+    /// fires loudly.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn classify_chunk_groups_drops_out_of_range_groups() {
+        let k_chunk: u8 = kani::any();
+        kani::assume(k_chunk >= 1 && k_chunk <= 3);
+        let bad_group: u8 = kani::any();
+        kani::assume(bad_group >= k_chunk);
+        let cid: u32 = kani::any();
+
+        let roles = classify_chunk_groups(&[(cid, bad_group)], k_chunk);
+
+        assert_eq!(roles.len(), k_chunk as usize);
+        for g in 0..k_chunk as usize {
+            assert!(
+                matches!(roles[g], ChunkGroupRole::Dummy),
+                "out-of-range group_id must not poison any in-range \
+                 role — every group stays Dummy",
+            );
+        }
     }
 }
 

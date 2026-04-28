@@ -763,11 +763,30 @@ impl DpfClient {
 
         let (start_chunk_id, num_chunks, is_whale) = match found_info {
             Some((start, num, whale)) => (start, num, whale),
-            None => return Ok((None, traces)),
+            None => {
+                // 🔒 CHUNK Round-Presence Symmetry (CLAUDE.md): not-found
+                // queries still issue one K_CHUNK-padded CHUNK PIR round so
+                // the server cannot infer found-vs-not-found from CHUNK
+                // round absence. Empty `chunk_ids` triggers the dummy-round
+                // path inside `query_chunk_level`. Returned data is
+                // discarded (no chunk_bins recorded into `traces`, so
+                // CHUNK Merkle items are not synthesised — the residual
+                // Merkle item-count leak is a separately-tracked decision).
+                let _ = self.query_chunk_level(&[], db_info).await?;
+                log::info!(
+                    "[PIR-AUDIT] CHUNK round-presence padding: not-found query issued 1 dummy CHUNK round"
+                );
+                return Ok((None, traces));
+            }
         };
 
         if num_chunks == 0 {
-            // Whale (matched tag but no chunks to retrieve).
+            // Whale (matched tag but no chunks to retrieve). Same padding
+            // as not-found — see invariant comment in the `None` arm above.
+            let _ = self.query_chunk_level(&[], db_info).await?;
+            log::info!(
+                "[PIR-AUDIT] CHUNK round-presence padding: whale query issued 1 dummy CHUNK round"
+            );
             return Ok((
                 Some(QueryResult {
                     entries: Vec::new(),
@@ -1029,8 +1048,14 @@ impl DpfClient {
     ///   full bin (all `CHUNK_SLOTS_PER_BIN` slots), which is what the per-bucket
     ///   Merkle tree commits to.
     ///
-    /// Padding invariant: each round emits exactly K_CHUNK DPF queries
-    /// regardless of how many real chunks that round carries.
+    /// Padding invariants:
+    /// 1. Each round emits exactly K_CHUNK DPF queries regardless of how
+    ///    many real chunks that round carries (per-round PBC padding).
+    /// 2. **CHUNK Round-Presence Symmetry** (CLAUDE.md): when `chunk_ids`
+    ///    is empty (not-found / whale callers), still issue exactly one
+    ///    K_CHUNK-padded round so the server cannot infer found-vs-not-found
+    ///    from absence of CHUNK traffic. The dummy round's response is
+    ///    discarded.
     #[tracing::instrument(
         level = "trace",
         skip_all,
@@ -1046,8 +1071,22 @@ impl DpfClient {
         let dpf_n = db_info.dpf_n_chunk;
         let master_seed = pir_core::params::CHUNK_PARAMS.master_seed;
 
-        // Plan multi-round chunk retrieval
-        let rounds = plan_chunk_rounds(chunk_ids, k);
+        // Plan multi-round chunk retrieval. When the caller passed an
+        // empty `chunk_ids` list (not-found or whale path), force one
+        // empty round so we still emit a K_CHUNK-padded DPF batch on
+        // the wire — see invariant 2 in the doc comment above. The
+        // padding lives in the small pure helper
+        // `pad_chunk_rounds_for_presence` so we can Kani-verify the
+        // `result.len() >= 1` postcondition in isolation.
+        let planned = plan_chunk_rounds(chunk_ids, k);
+        let was_empty = planned.is_empty();
+        let rounds = pad_chunk_rounds_for_presence(planned);
+        if was_empty {
+            log::info!(
+                "[PIR-AUDIT] CHUNK round-presence padding: chunk_ids empty → \
+                 emitting 1 dummy K_CHUNK-padded round (all-random alphas)"
+            );
+        }
 
         log::info!(
             "[PIR-AUDIT] CHUNK phase: {} chunks across {} rounds, k={}, bins={} (each round K_CHUNK-padded to {} groups)",
@@ -1913,6 +1952,31 @@ fn find_chunk_in_result(result: &[u8], chunk_id: u32) -> Option<&[u8]> {
     None
 }
 
+/// Force at least one CHUNK round on the wire.
+///
+/// CHUNK Round-Presence Symmetry (CLAUDE.md): a not-found / whale
+/// query passes an empty `chunk_ids` slice into `query_chunk_level`,
+/// which planned to zero rounds. To keep the wire transcript
+/// indistinguishable from a small-found query we upgrade an empty
+/// plan to a single empty round; the caller's `for g in 0..k_chunk`
+/// loop then emits one fully-synthetic K_CHUNK-padded batch (every
+/// group's α is drawn from `SimpleRng`).
+///
+/// This is a pure transformation on the planned-round list — kept in
+/// its own function so a Kani harness can verify the
+/// `result.len() >= 1` postcondition without modelling
+/// `plan_chunk_rounds` (which dispatches to `pir_core::pbc`).
+///
+/// Generic so the same helper services any `T` (the actual call site
+/// uses `Vec<(u32, usize)>` per round).
+fn pad_chunk_rounds_for_presence<T>(rounds: Vec<Vec<T>>) -> Vec<Vec<T>> {
+    if rounds.is_empty() {
+        vec![Vec::new()]
+    } else {
+        rounds
+    }
+}
+
 /// Plan multi-round chunk retrieval using PBC.
 fn plan_chunk_rounds(chunk_ids: &[u32], k: usize) -> Vec<Vec<(u32, usize)>> {
     let cand_groups: Vec<[usize; 3]> = chunk_ids
@@ -2130,6 +2194,101 @@ mod kani_harnesses {
         // Both items come from the single trace, so item_to_query is [0, 0].
         assert_eq!(item_to_query[0], 0);
         assert_eq!(item_to_query[1], 0);
+    }
+
+    // ─── CHUNK Round-Presence Symmetry (CLAUDE.md) ─────────────────────
+    //
+    // The "leak being closed" by the 2026-04-28 fix: not-found and whale
+    // queries used to skip the CHUNK PIR phase entirely, exposing
+    // found-vs-not-found per query at the wire level. The fix forces
+    // every INDEX query to emit ≥1 K_CHUNK-padded CHUNK round. The
+    // padding decision is split out into the pure helper
+    // `pad_chunk_rounds_for_presence`; the harnesses below verify
+    // both halves of the two-part theorem from
+    // PLAN_CHUNK_ROUND_PRESENCE_VERIFICATION:
+    //
+    //   P1 (round-count uniformity): for any planned round list (real
+    //       or empty), the post-padding round count is ≥ 1.
+    //
+    //   P2 (wire indistinguishability): when the input is empty, the
+    //       padding emits exactly one round whose `Vec<T>` is empty —
+    //       i.e. a fully-synthetic round whose downstream
+    //       `for g in 0..k_chunk` loop emits all-random alphas. The
+    //       payload bytes-per-group are then identical to a real
+    //       round's bytes-per-group (DPF gen returns fixed-length
+    //       keys).
+
+    /// **P1**: `pad_chunk_rounds_for_presence` always returns at least
+    /// one round, regardless of whether the input was empty or
+    /// already non-empty. Symbolically explores input lengths
+    /// `0..=2`. The bound is small because anything ≥ 0 is enough to
+    /// distinguish the empty case from a "nothing to upgrade" case;
+    /// 2 also covers the boundary where a single round is already
+    /// present (no padding needed).
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn pad_chunk_rounds_for_presence_emits_at_least_one_round() {
+        let n: usize = kani::any();
+        kani::assume(n <= 2);
+        let mut rounds: Vec<Vec<(u32, usize)>> = Vec::with_capacity(n);
+        for _ in 0..n {
+            // Inner content is irrelevant to the property; keep empty.
+            rounds.push(Vec::new());
+        }
+
+        let padded = pad_chunk_rounds_for_presence(rounds);
+
+        assert!(
+            !padded.is_empty(),
+            "CHUNK Round-Presence Symmetry: pad_chunk_rounds_for_presence \
+             must emit ≥1 round so the caller's K_CHUNK-padded loop \
+             always runs at least once",
+        );
+    }
+
+    /// **P2**: when the input is empty (the not-found / whale path),
+    /// the output is exactly `[Vec::new()]` — one round whose entries
+    /// list is empty, so the caller's `for g in 0..k_chunk` loop
+    /// finds no real chunks for any group and falls through to the
+    /// random-alpha branch for every group. The wire shape is then
+    /// identical to a real round (same K_CHUNK-padded `dpf.gen` calls,
+    /// same fixed-length key bytes per group). Anything other than
+    /// `[Vec::new()]` would either drop the round (P1 violation) or
+    /// inject phantom real entries that change per-group cuckoo
+    /// behaviour.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn pad_chunk_rounds_for_presence_empty_input_emits_one_empty_round() {
+        let rounds: Vec<Vec<(u32, usize)>> = Vec::new();
+        let padded = pad_chunk_rounds_for_presence(rounds);
+        assert_eq!(padded.len(), 1);
+        assert!(
+            padded[0].is_empty(),
+            "the dummy round must carry zero real entries so every group \
+             routes through the random-alpha branch (P2 wire shape)",
+        );
+    }
+
+    /// **P1 negative**: when the input already has ≥1 round,
+    /// padding is a no-op (length preserved). This rules out a
+    /// hypothetical regression where padding *replaces* a real plan
+    /// with an empty round.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn pad_chunk_rounds_for_presence_nonempty_input_is_identity() {
+        let n: usize = kani::any();
+        kani::assume(n >= 1 && n <= 2);
+        let mut rounds: Vec<Vec<(u32, usize)>> = Vec::with_capacity(n);
+        for _ in 0..n {
+            rounds.push(Vec::new());
+        }
+        let original_len = rounds.len();
+        let padded = pad_chunk_rounds_for_presence(rounds);
+        assert_eq!(
+            padded.len(),
+            original_len,
+            "padding must preserve length when input already non-empty",
+        );
     }
 }
 

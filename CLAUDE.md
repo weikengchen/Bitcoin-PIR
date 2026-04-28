@@ -64,6 +64,44 @@ level and leaks cuckoo-position (h=0 vs h=1) as well.
    CHUNK Merkle item counts still vary with UTXO count — that is a
    separate, documented trade-off (see "What the Server Learns" below).
 
+### CHUNK Round-Presence Symmetry (MANDATORY for Privacy)
+
+**Every INDEX query — found, not-found, or whale — MUST trigger at least
+one K_CHUNK-padded CHUNK PIR round.** Skipping CHUNK rounds when the
+INDEX returned no match leaks found-vs-not-found per query at the wire
+level (the server simply observes whether any CHUNK traffic followed
+the INDEX phase).
+
+This invariant is enforced in:
+- `pir-sdk-client/src/dpf.rs::query_single` — calls `query_chunk_level(&[], …)`
+  for the not-found and whale paths; `query_chunk_level` upgrades an empty
+  `chunk_ids` list to a single empty-round plan so the existing per-group
+  random-alpha padding code emits a fully synthetic K_CHUNK-padded batch.
+- `pir-sdk-client/src/harmony.rs::query_single` — same shape; the dummy
+  round is dispatched via `run_chunk_round(db_id, &[], …)` which already
+  takes the `build_synthetic_dummy` branch for every group when
+  `real_queries` is empty.
+- `pir-sdk-client/src/onion.rs::query_chunk_level` — adds one uniformly
+  random dummy `entry_id` to the unique-fetch list for each not-found /
+  whale query, keeping CHUNK round count proportional to batch size.
+- `web/src/onionpir_client.ts::queryBatch` — same per-query dummy
+  injection as the Rust OnionPIR client (uses `crypto.getRandomValues`).
+
+**Invariants implementations must preserve:**
+1. The padded round is byte-identical in shape to a real round on the
+   wire (K_CHUNK groups, real or `build_synthetic_dummy` per group;
+   indistinguishable to the server).
+2. Dummy responses are decrypted but their bin contents are never
+   surfaced to the caller — there is no `IndexResult` pointing at a
+   dummy entry_id, so result-assembly skips it naturally.
+3. **No CHUNK Merkle items are synthesised for the dummy round.** The
+   residual leak from CHUNK Merkle item counts (count varies with
+   UTXO count) is a separately tracked decision — see "What the
+   Server Learns" below.
+4. The dummy entry_id / chunk_id is generated from a fresh CSPRNG for
+   each query so the same not-found scripthash queried twice picks
+   different dummies (no correlation oracle).
+
 ### HarmonyPIR Per-Group Request-Count Symmetry (MANDATORY for Privacy)
 
 **Every HarmonyPIR per-group query slot (INDEX, CHUNK, or sibling) MUST
@@ -94,19 +132,22 @@ The server **cannot** learn:
 - Which specific scripthash was queried
 - Whether a query was found or not-found at the INDEX Merkle level
   (closed by the item-count symmetry invariant above)
+- Whether a query was found or not-found from CHUNK round presence
+  (closed by the CHUNK Round-Presence Symmetry invariant above)
 - Which cuckoo position (h=0 vs h=1) a found query matched at
 
 The server **can** observe (known trade-offs):
-- Whether CHUNK rounds occur (reveals found vs not-found for non-whale
-  queries — chunk rounds are skipped entirely when no INDEX match)
-- Whether CHUNK Merkle rounds occur, and how many CHUNK Merkle items
-  (reveals approximate UTXO count for found queries)
-- Timing patterns across rounds
+- How many CHUNK Merkle items each query contributes (reveals
+  approximate UTXO count for found queries; a not-found query
+  contributes zero CHUNK Merkle items today). Closing this requires
+  per-query item-count padding to a fixed `M`, separately tracked.
+- Timing patterns across rounds.
 
-To fully hide found/not-found, the client would need to send dummy chunk
-and chunk-Merkle rounds even when no results were found. This is a
-documented privacy/efficiency trade-off that is distinct from — and
-strictly weaker than — the INDEX-Merkle leak closed above.
+To also hide approximate UTXO count, the client would need to pad
+CHUNK Merkle item counts to a fixed `M` per query (forcing both
+not-found queries and small-found queries to emit the same number
+of items as a near-whale found query). This is a separate, more
+expensive privacy/efficiency trade-off.
 
 ---
 

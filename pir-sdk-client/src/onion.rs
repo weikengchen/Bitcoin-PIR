@@ -60,6 +60,83 @@ use pir_sdk::{
 };
 use std::sync::Arc;
 
+// ─── CHUNK Round-Presence Symmetry: per-slot classifier ────────────────────
+//
+// The classifier is feature-flag-free so its Kani harnesses can run
+// in the default `cargo kani -p pir-sdk-client` invocation (the
+// `onion` feature pulls in SEAL + onionpir, which Kani can't model).
+//
+// `ChunkSlotInput` is a small projection of the relevant fields of
+// `IndexResult` (full struct gated on `feature = "onion"`); the
+// caller projects `Option<&IndexResult>` onto this shape before
+// invoking `classify_chunk_slots`.
+
+/// Per-slot input to the OnionPIR CHUNK fetch-list classifier.
+///
+/// `num_entries == 0` represents both the not-found case (`None`
+/// from the INDEX scan) and the whale case (`Some(ir)` with
+/// `ir.num_entries == 0`). Both must produce a synthetic dummy
+/// entry on the wire — the classifier collapses them into the
+/// same `AppendDummy` action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChunkSlotInput {
+    pub entry_id: u32,
+    pub num_entries: u8,
+}
+
+/// Per-slot action emitted by the classifier. The OnionPIR CHUNK
+/// fetcher dispatches on this enum: `AppendReal` adds `num_entries`
+/// real entry_ids to the unique-fetch list; `AppendDummy` injects
+/// one uniformly random dummy entry_id (with up to 32 dedup retries).
+///
+/// Crucially, every input slot maps to *exactly one* action — there
+/// is no "skip" branch. Pre-fix, not-found / whale slots silently
+/// produced no action at all, leaking found-vs-not-found from CHUNK
+/// round absence. The fix is captured by `classify_chunk_slots`
+/// returning `slots.len()` actions for any input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChunkSlotAction {
+    AppendReal { entry_id: u32, num_entries: u8 },
+    AppendDummy,
+}
+
+/// Classify each per-query slot for the OnionPIR CHUNK round.
+///
+/// Pure: no I/O, no allocation outside the result `Vec`, no RNG.
+///
+/// Postconditions (Kani-verified — see `kani_harnesses` in this file):
+///
+/// * **P1 (round-count uniformity)** —
+///   `result.len() == slots.len()`. Combined with the call-site
+///   loop `for action in &actions { … push to unique … }`, this
+///   establishes that the OnionPIR CHUNK phase emits ≥ `slots.len()`
+///   unique entry_ids on the wire (modulo dedup collisions on the
+///   dummy path, which are probabilistically negligible with 32
+///   retries against `total_packed ≫ batch_size`).
+///
+/// * **P2 (no-skip)** — every slot produces either an `AppendReal`
+///   or an `AppendDummy`; there is no third "skip" branch. The
+///   distinction maps to `num_entries > 0`: `Real` iff the INDEX
+///   scan returned a non-whale match, `Dummy` otherwise (not-found
+///   or whale).
+pub(crate) fn classify_chunk_slots(
+    slots: &[ChunkSlotInput],
+) -> Vec<ChunkSlotAction> {
+    slots
+        .iter()
+        .map(|s| {
+            if s.num_entries > 0 {
+                ChunkSlotAction::AppendReal {
+                    entry_id: s.entry_id,
+                    num_entries: s.num_entries,
+                }
+            } else {
+                ChunkSlotAction::AppendDummy
+            }
+        })
+        .collect()
+}
+
 // `UtxoEntry` is only constructed by the feature-gated decode path.
 #[cfg(feature = "onion")]
 use pir_sdk::UtxoEntry;
@@ -1281,18 +1358,76 @@ impl OnionClient {
         params: &OnionDbParams,
     ) -> PirResult<(HashMap<u32, Vec<u8>>, HashMap<u32, (Hash256, usize)>)> {
         // Collect unique entry_ids to fetch.
+        //
+        // 🔒 CHUNK Round-Presence Symmetry (CLAUDE.md): every query in
+        // the batch contributes at least one entry_id to `unique` —
+        // real ones for found-with-entries, a uniformly random dummy
+        // for not-found and whale (`num_entries == 0`). This keeps
+        // CHUNK round count proportional to the batch size regardless
+        // of how many queries actually matched, so the server cannot
+        // infer found-vs-not-found from CHUNK round absence. The
+        // dummy's response is decrypted but its bin contents are
+        // discarded (no `IndexResult` ever pointed at it, so downstream
+        // result-assembly skips it naturally).
+        //
+        // Decision tree extracted into the Kani-verified helper
+        // `classify_chunk_slots` (top of this file): the helper
+        // returns one `ChunkSlotAction` per input slot, witnessing the
+        // P1 round-count and P2 no-skip properties of the symmetry
+        // invariant.
+        let slots: Vec<ChunkSlotInput> = index_results
+            .iter()
+            .map(|opt| match opt {
+                Some(ir) => ChunkSlotInput {
+                    entry_id: ir.entry_id,
+                    num_entries: ir.num_entries,
+                },
+                // Not-found sentinel — collapses to the same all-dummy
+                // path as a whale (`num_entries == 0`) inside the
+                // classifier.
+                None => ChunkSlotInput {
+                    entry_id: 0,
+                    num_entries: 0,
+                },
+            })
+            .collect();
+        let actions = classify_chunk_slots(&slots);
+
         let mut unique: Vec<u32> = Vec::new();
         let mut seen: HashSet<u32> = HashSet::new();
-        for ir in index_results.iter().flatten() {
-            if ir.num_entries == 0 {
-                continue;
-            }
-            for i in 0..ir.num_entries as u32 {
-                let eid = ir.entry_id + i;
-                if seen.insert(eid) {
-                    unique.push(eid);
+        let mut padding_rng = SimpleRng::new();
+        let total_packed = params.total_packed.max(1) as u64;
+        let mut dummies_added = 0usize;
+        for action in &actions {
+            match *action {
+                ChunkSlotAction::AppendReal { entry_id, num_entries } => {
+                    for i in 0..num_entries as u32 {
+                        let eid = entry_id + i;
+                        if seen.insert(eid) {
+                            unique.push(eid);
+                        }
+                    }
+                }
+                ChunkSlotAction::AppendDummy => {
+                    // Loop until we land on a fresh value so we don't
+                    // shrink `unique` via dedup — collision probability
+                    // is ~`unique.len() / total_packed` per attempt.
+                    for _ in 0..32 {
+                        let cand = (padding_rng.next_u64() % total_packed) as u32;
+                        if seen.insert(cand) {
+                            unique.push(cand);
+                            dummies_added += 1;
+                            break;
+                        }
+                    }
                 }
             }
+        }
+        if dummies_added > 0 {
+            log::info!(
+                "[PIR-AUDIT] OnionPIR CHUNK round-presence padding: added {} dummy entry_id(s) for not-found/whale queries",
+                dummies_added
+            );
         }
 
         let mut decrypted: HashMap<u32, Vec<u8>> = HashMap::new();
@@ -1301,6 +1436,9 @@ impl OnionClient {
         // Merkle verifier.
         let mut data_merkle: HashMap<u32, (Hash256, usize)> = HashMap::new();
         if unique.is_empty() {
+            // All 32 dedup attempts collided AND the batch had zero queries
+            // — the latter can only happen on an empty `script_hashes` call,
+            // which is a no-op anyway. Either way, nothing to emit.
             return Ok((decrypted, data_merkle));
         }
 
@@ -2293,6 +2431,147 @@ impl SimpleRng {
     fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(pir_core::hash::GOLDEN_RATIO);
         pir_core::hash::splitmix64(self.state)
+    }
+}
+
+// ─── Kani harnesses ─────────────────────────────────────────────────────────
+//
+// CHUNK Round-Presence Symmetry (CLAUDE.md): the OnionPIR client
+// must never skip the CHUNK PIR phase for not-found / whale queries
+// — every batch must produce exactly one entry_id per slot in the
+// unique-fetch list (real or dummy), so CHUNK round count is a
+// function only of batch size, not of which queries matched.
+//
+// The decision tree lives in `classify_chunk_slots`, which is
+// feature-flag-free (the full `IndexResult` is gated on
+// `feature = "onion"`, but the projection `ChunkSlotInput` is not),
+// so these harnesses run via the default `cargo kani -p pir-sdk-client`
+// invocation without pulling SEAL or onionpir into the build.
+
+#[cfg(kani)]
+mod kani_harnesses {
+    use super::*;
+
+    /// Pick a per-slot shape from a 2-bit symbolic. Mirrors the
+    /// pattern from `dpf::kani_harnesses::symbolic_matched_idx` —
+    /// keeps the symbolic state space small enough for CBMC.
+    fn symbolic_slot() -> ChunkSlotInput {
+        let raw: u8 = kani::any();
+        kani::assume(raw < 4);
+        match raw {
+            0 => ChunkSlotInput { entry_id: 0, num_entries: 0 }, // not-found sentinel
+            1 => ChunkSlotInput { entry_id: kani::any(), num_entries: 0 }, // whale
+            2 => ChunkSlotInput { entry_id: kani::any(), num_entries: 1 }, // small-found
+            _ => ChunkSlotInput { entry_id: kani::any(), num_entries: kani::any() }, // generic-found
+        }
+    }
+
+    /// **P1** — round-count uniformity. For any input list of slots,
+    /// the classifier returns exactly `slots.len()` actions. Combined
+    /// with the call-site loop in `query_chunk_level` that pushes
+    /// ≥1 entry_id per action, this establishes that the unique-fetch
+    /// list (and therefore the CHUNK PIR round count) is a function
+    /// only of batch size — not of which queries matched.
+    ///
+    /// Bound: `slots.len() ∈ {0, 1, 2, 3, 4}`. Each slot's
+    /// `num_entries` is drawn from a 4-way symbolic via
+    /// `symbolic_slot` to cover the not-found / whale / small-found /
+    /// generic-found shapes that the classifier dispatches on.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn classify_chunk_slots_emits_one_action_per_slot() {
+        let n: usize = kani::any();
+        kani::assume(n <= 4);
+        let mut slots: Vec<ChunkSlotInput> = Vec::with_capacity(n);
+        for _ in 0..n {
+            slots.push(symbolic_slot());
+        }
+
+        let actions = classify_chunk_slots(&slots);
+
+        assert_eq!(
+            actions.len(),
+            slots.len(),
+            "CHUNK Round-Presence Symmetry P1: classifier must emit \
+             one action per slot. The pre-fix bug skipped not-found \
+             / whale slots entirely — exactly the leak this property \
+             rules out.",
+        );
+    }
+
+    /// **P2** — every action is `AppendReal` iff `num_entries > 0`,
+    /// `AppendDummy` otherwise. There is no third "skip" branch.
+    /// Captures the structural decision the classifier makes: the
+    /// dispatch is purely on `num_entries` and the resulting action
+    /// covers every input.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn classify_chunk_slots_no_skip_branch() {
+        let slot = symbolic_slot();
+        let actions = classify_chunk_slots(&[slot]);
+
+        assert_eq!(actions.len(), 1);
+        match (slot.num_entries, &actions[0]) {
+            (0, ChunkSlotAction::AppendDummy) => {}
+            (n, ChunkSlotAction::AppendReal { num_entries, entry_id })
+                if n > 0 && *num_entries == n && *entry_id == slot.entry_id => {}
+            _ => panic!(
+                "CHUNK Round-Presence Symmetry P2: action must be \
+                 AppendReal iff num_entries > 0, AppendDummy iff == 0. \
+                 No skip branch."
+            ),
+        }
+    }
+
+    /// **P2 corollary** — the classifier's action carries the
+    /// correct `entry_id` and `num_entries` through to the wire:
+    /// `AppendReal { entry_id, num_entries }` matches the input
+    /// slot exactly. Catches a hypothetical regression that
+    /// truncates or reorders fields between the projection and the
+    /// classifier.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn classify_chunk_slots_preserves_real_fields() {
+        let entry_id: u32 = kani::any();
+        let num_entries: u8 = kani::any();
+        kani::assume(num_entries > 0);
+        let slot = ChunkSlotInput { entry_id, num_entries };
+
+        let actions = classify_chunk_slots(&[slot]);
+
+        assert_eq!(actions.len(), 1);
+        match actions[0] {
+            ChunkSlotAction::AppendReal { entry_id: e, num_entries: n } => {
+                assert_eq!(e, entry_id, "entry_id must round-trip through the classifier");
+                assert_eq!(n, num_entries, "num_entries must round-trip through the classifier");
+            }
+            ChunkSlotAction::AppendDummy => panic!(
+                "num_entries > 0 must produce AppendReal — Dummy on a \
+                 real slot would shrink the wire fetch list and break \
+                 the FOUND path"
+            ),
+        }
+    }
+
+    /// **P2 corollary** — `num_entries == 0` is the universal
+    /// dummy-trigger condition, regardless of `entry_id` value.
+    /// Covers both not-found (sentinel `entry_id == 0`) and whale
+    /// (arbitrary `entry_id`, but `num_entries == 0`) inputs in a
+    /// single proof.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn classify_chunk_slots_zero_entries_means_dummy() {
+        let entry_id: u32 = kani::any();
+        let slot = ChunkSlotInput { entry_id, num_entries: 0 };
+
+        let actions = classify_chunk_slots(&[slot]);
+
+        assert_eq!(actions.len(), 1);
+        assert!(
+            matches!(actions[0], ChunkSlotAction::AppendDummy),
+            "num_entries == 0 must trigger AppendDummy — the wire-level \
+             fix for CHUNK Round-Presence Symmetry"
+        );
     }
 }
 

@@ -291,6 +291,126 @@ export interface OnionPirClientConfig {
   onLog?: (message: string, level: 'info' | 'success' | 'error') => void;
 }
 
+// ─── CHUNK Round-Presence Symmetry: per-slot classifier ───────────────────
+//
+// Mirrors the Rust helper `classify_chunk_slots` in
+// `pir-sdk-client/src/onion.rs`. Pure (no side effects, no RNG, no DOM
+// access) so it can be exercised by unit tests in node without
+// instantiating the WASM module.
+//
+// CHUNK Round-Presence Symmetry (CLAUDE.md): every per-query slot
+// produces exactly one action — `AppendReal` if the INDEX scan
+// returned a non-whale match, `AppendDummy` otherwise (not-found or
+// whale). The pre-fix bug skipped not-found / whale slots entirely,
+// so CHUNK round count was a binary side channel for found vs
+// not-found. The classifier captures the structural fix: the
+// per-slot action list has length equal to the input list, with no
+// "skip" branch.
+
+/**
+ * Per-slot input shape — projection of the relevant fields of the
+ * IndexResult-like objects produced by the INDEX scan loop. Used by
+ * the classifier; the OnionPirWebClient also emits this shape when
+ * delegating to `classifyChunkSlots`.
+ */
+export interface ChunkSlotInput {
+  entryId: number;
+  numEntries: number;
+}
+
+/**
+ * Per-slot action emitted by the classifier. The `queryBatch` chunk
+ * loop dispatches on this discriminator: `append_real` adds
+ * `numEntries` real entry_ids to the unique-fetch list,
+ * `append_dummy` injects one uniformly random dummy entry_id (with
+ * up to 32 dedup retries).
+ */
+export type ChunkSlotAction =
+  | { kind: 'append_real'; entryId: number; numEntries: number }
+  | { kind: 'append_dummy' };
+
+/**
+ * Classify each per-query slot for the OnionPIR CHUNK round.
+ *
+ * Postconditions (verified by the unit tests in
+ * `web/src/__tests__/onion_chunk_slot_classifier.test.ts`):
+ *
+ * - **P1** (round-count uniformity) — `result.length === slots.length`.
+ *   Combined with the call-site loop in `queryBatch`, this gives
+ *   `uniqueEntryIds.length >= slots.length` (modulo dedup
+ *   collisions on the dummy path, probabilistically negligible).
+ * - **P2** (no-skip) — every slot maps to either `append_real` or
+ *   `append_dummy`. There is no third "skip" branch — the pre-fix
+ *   bug.
+ *
+ * Mirrors `classify_chunk_slots` in `pir-sdk-client/src/onion.rs`.
+ * Cross-language consistency is enforced by the cross-language diff
+ * test (`onion_leakage_diff.test.ts`) — same RoundProfile shape on
+ * the wire requires same per-slot decisions here.
+ */
+export function classifyChunkSlots(slots: readonly ChunkSlotInput[]): ChunkSlotAction[] {
+  return slots.map((s) => {
+    if (s.numEntries > 0) {
+      return { kind: 'append_real' as const, entryId: s.entryId, numEntries: s.numEntries };
+    }
+    return { kind: 'append_dummy' as const };
+  });
+}
+
+/**
+ * Pure version of the unique-fetch collection logic in `queryBatch`.
+ *
+ * Drives the same dedup loop the production code runs, but takes a
+ * deterministic dummy generator (an iterator over u32) instead of
+ * `crypto.getRandomValues`. The actual `queryBatch` path uses
+ * `crypto.getRandomValues`, but the iteration logic and dedup
+ * behaviour are otherwise identical — this helper is the
+ * test-friendly analog.
+ *
+ * **Returns** `{ unique, dummiesAdded }` where `unique` is the
+ * deduplicated entry_id list and `dummiesAdded` is the count of
+ * successful dummy appends.
+ *
+ * **Property** verified by tests: when the dummy generator yields
+ * fresh values (no dedup collisions), `unique.length === slots.length`
+ * for any input — every slot contributes one entry, real or dummy.
+ */
+export function selectChunkUniqueFetches(
+  slots: readonly ChunkSlotInput[],
+  dummyGen: () => number,
+): { unique: number[]; dummiesAdded: number } {
+  const actions = classifyChunkSlots(slots);
+  const unique: number[] = [];
+  const seen = new Set<number>();
+  let dummiesAdded = 0;
+
+  for (const action of actions) {
+    if (action.kind === 'append_real') {
+      for (let i = 0; i < action.numEntries; i++) {
+        const eid = action.entryId + i;
+        if (!seen.has(eid)) {
+          seen.add(eid);
+          unique.push(eid);
+        }
+      }
+    } else {
+      // Up to 32 retries to dodge dedup collisions — same bound as
+      // the production code.
+      for (let attempt = 0; attempt < 32; attempt++) {
+        const cand = dummyGen();
+        if (!seen.has(cand)) {
+          seen.add(cand);
+          unique.push(cand);
+          dummiesAdded++;
+          break;
+        }
+      }
+    }
+  }
+
+  return { unique, dummiesAdded };
+}
+
 // ─── Client class ─────────────────────────────────────────────────────────
 
 export class OnionPirWebClient {
@@ -793,30 +913,66 @@ export class OnionPirWebClient {
       // LEVEL 2: Chunk PIR
       // ════════════════════════════════════════════════════════════════
 
-      // Collect unique entry_ids and detect whales BEFORE registering chunk keys
-      const uniqueEntryIds: number[] = [];
-      const entryIdSet = new Map<number, number>();
+      // Collect unique entry_ids and detect whales BEFORE registering chunk keys.
+      //
+      // 🔒 CHUNK Round-Presence Symmetry (CLAUDE.md): every query in the
+      // batch contributes at least one entry_id to `uniqueEntryIds` —
+      // real ones for found-with-entries, a uniformly random dummy for
+      // not-found and whale (`numEntries === 0`). This keeps CHUNK round
+      // count proportional to batch size regardless of how many queries
+      // actually matched, so the server cannot infer found-vs-not-found
+      // from CHUNK round absence.
+      //
+      // The decision tree lives in the pure helper `classifyChunkSlots`,
+      // wrapped by `selectChunkUniqueFetches` which folds in the dedup
+      // loop. Same shape as the Rust client's `classify_chunk_slots` —
+      // verified by unit tests in `__tests__/onion_chunk_slot_classifier.test.ts`
+      // and by the cross-language diff test
+      // (`__tests__/onion_leakage_diff.test.ts`).
       const whaleQueries = new Set<number>();
-
+      const slots: ChunkSlotInput[] = [];
       for (let i = 0; i < N; i++) {
         const ir = indexResults[i];
-        if (!ir) continue;
-        if (ir.numEntries === 0) { whaleQueries.add(i); continue; }
-        for (let j = 0; j < ir.numEntries; j++) {
-          const eid = ir.entryId + j;
-          if (!entryIdSet.has(eid)) {
-            entryIdSet.set(eid, uniqueEntryIds.length);
-            uniqueEntryIds.push(eid);
-          }
+        if (ir && ir.numEntries === 0) {
+          whaleQueries.add(i);
         }
+        slots.push({
+          entryId: ir ? ir.entryId : 0,
+          numEntries: ir ? ir.numEntries : 0,
+        });
+      }
+
+      const pickDummyEntryId = (): number => {
+        const buf = new Uint32Array(1);
+        crypto.getRandomValues(buf);
+        return buf[0] % this.totalPacked;
+      };
+
+      const { unique: uniqueEntryIdsArr, dummiesAdded } = selectChunkUniqueFetches(
+        slots,
+        pickDummyEntryId,
+      );
+      const uniqueEntryIds: number[] = uniqueEntryIdsArr;
+      // Build the entry_id → unique-list-position map the chunk loop
+      // below uses for response assembly.
+      const entryIdSet = new Map<number, number>();
+      for (let i = 0; i < uniqueEntryIds.length; i++) {
+        entryIdSet.set(uniqueEntryIds[i], i);
       }
 
       if (whaleQueries.size > 0) {
         this.log(`${whaleQueries.size} whale address(es) excluded`);
       }
 
+      if (dummiesAdded > 0) {
+        this.log(`[PIR-AUDIT] CHUNK round-presence padding: added ${dummiesAdded} dummy entry_id(s) for not-found/whale queries`);
+      }
+
       if (uniqueEntryIds.length === 0) {
-        this.log('No entries to fetch — skipping chunk phase');
+        // Only reachable on empty-batch calls (no scripthashes queried),
+        // which is a no-op. Real batches always emit ≥1 entry per query
+        // due to the padding above.
+        this.log('Empty batch — skipping chunk phase');
       }
 
       const decryptedEntries = new Map<number, Uint8Array>();
