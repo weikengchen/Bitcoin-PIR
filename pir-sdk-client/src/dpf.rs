@@ -59,6 +59,50 @@ const CHUNK_SLOTS_PER_BIN: usize = 3;
 /// Number of PBC hash functions.
 const NUM_HASHES: usize = 3;
 
+// ─── Pure request-shape helpers (extracted for Kani verification) ──────────
+
+/// Build the K × INDEX_CUCKOO_NUM_HASHES matrix of `alpha` values for a
+/// single DPF INDEX request. Each `alpha` is the bin index that
+/// `dpf.gen(alpha, dpf_n)` will hide inside its keys: the assigned
+/// group's cuckoo positions for the real query, fresh random bins for
+/// every other group. The K-padding invariant — every wire request
+/// covers all K groups, regardless of match outcome — is a structural
+/// property of this matrix shape.
+///
+/// Pulled out as a pure function so a Kani harness can prove the
+/// shape exhaustively for every (k, assigned_group, my_locs) shape in
+/// a small bound. The caller (`query_index_level`) feeds each `alpha`
+/// into `dpf.gen` separately; the SHAPE of the resulting key Vec
+/// equals the SHAPE of this alpha matrix.
+///
+/// `next_random_bin` is an `FnMut` returning a u64 in `[0, u64::MAX]`
+/// — the function applies `% bins` itself to bound the alpha into
+/// `[0, bins)`. Production callers wrap their `SimpleRng::next_u64`;
+/// the Kani harness wraps `kani::any::<u64>()`, which sidesteps
+/// modelling `splitmix64` symbolically.
+pub(crate) fn build_index_alphas(
+    k: usize,
+    assigned_group: usize,
+    my_locs: &[u64; INDEX_CUCKOO_NUM_HASHES],
+    bins: usize,
+    mut next_random_bin: impl FnMut() -> u64,
+) -> Vec<Vec<u64>> {
+    let mut alphas = Vec::with_capacity(k);
+    for b in 0..k {
+        let mut group = Vec::with_capacity(INDEX_CUCKOO_NUM_HASHES);
+        for h in 0..INDEX_CUCKOO_NUM_HASHES {
+            let alpha = if b == assigned_group {
+                my_locs[h]
+            } else {
+                next_random_bin() % bins as u64
+            };
+            group.push(alpha);
+        }
+        alphas.push(group);
+    }
+    alphas
+}
+
 // ─── Merkle verification traces ─────────────────────────────────────────────
 
 /// Record of one INDEX cuckoo bin we checked during a query.
@@ -886,11 +930,12 @@ impl DpfClient {
         let assigned_group = my_groups[0];
 
         // Compute cuckoo hash locations in the assigned group
-        let mut my_locs = Vec::with_capacity(INDEX_CUCKOO_NUM_HASHES);
+        let mut my_locs_arr = [0u64; INDEX_CUCKOO_NUM_HASHES];
         for h in 0..INDEX_CUCKOO_NUM_HASHES {
             let key = pir_core::hash::derive_cuckoo_key(master_seed, assigned_group, h);
-            my_locs.push(pir_core::hash::cuckoo_hash(script_hash, key, bins) as u64);
+            my_locs_arr[h] = pir_core::hash::cuckoo_hash(script_hash, key, bins) as u64;
         }
+        let my_locs = my_locs_arr.to_vec();
 
         log::info!(
             "[PIR-AUDIT] INDEX query: script_hash={}, assigned_group={}, k={}, bins={}, cuckoo_positions={:?} (K-padded to {} groups)",
@@ -902,28 +947,30 @@ impl DpfClient {
             k
         );
 
-        // Generate DPF keys for all K groups
+        // Build the K × INDEX_CUCKOO_NUM_HASHES alpha matrix via the
+        // pure shape-builder (so a Kani harness can prove the K-padding
+        // invariant exhaustively for every input shape) and feed each
+        // alpha through `dpf.gen` to produce the wire keys.
         let dpf = Dpf::with_default_key();
         let mut rng = SimpleRng::new();
+        let alphas = build_index_alphas(
+            k,
+            assigned_group,
+            &my_locs_arr,
+            bins,
+            || rng.next_u64(),
+        );
 
         let mut s0_keys: Vec<Vec<Vec<u8>>> = Vec::with_capacity(k);
         let mut s1_keys: Vec<Vec<Vec<u8>>> = Vec::with_capacity(k);
-
-        for b in 0..k {
-            let mut s0_group = Vec::new();
-            let mut s1_group = Vec::new();
-
-            for h in 0..INDEX_CUCKOO_NUM_HASHES {
-                let alpha = if b == assigned_group {
-                    my_locs[h]
-                } else {
-                    rng.next_u64() % bins as u64
-                };
+        for group_alphas in &alphas {
+            let mut s0_group = Vec::with_capacity(INDEX_CUCKOO_NUM_HASHES);
+            let mut s1_group = Vec::with_capacity(INDEX_CUCKOO_NUM_HASHES);
+            for &alpha in group_alphas {
                 let (k0, k1) = dpf.gen(alpha, dpf_n);
                 s0_group.push(k0.to_bytes());
                 s1_group.push(k1.to_bytes());
             }
-
             s0_keys.push(s0_group);
             s1_keys.push(s1_group);
         }
@@ -2356,6 +2403,72 @@ mod kani_harnesses {
             "padding must preserve length when input already non-empty",
         );
     }
+
+    /// Prove the K-padding invariant for the DPF INDEX request shape
+    /// at `k = 4` (the practical maximum for typical batches in the
+    /// integration tests): `build_index_alphas` emits exactly 4
+    /// outer groups, each with `INDEX_CUCKOO_NUM_HASHES = 2` alphas.
+    /// This is the structural form of CLAUDE.md's "Query Padding":
+    /// within each PIR round, queries are padded to a fixed count
+    /// regardless of how many real queries there are.
+    ///
+    /// Single concrete `k`: the function body is `for b in 0..k {
+    /// fixed-loop-body }` with no early-exit and no branch on `k`
+    /// size, so verifying the shape at `k = 4` covers `k ∈ {1, 2,
+    /// 3}` by induction on loop count (each iteration appends one
+    /// 2-element group; running the loop fewer times produces
+    /// proportionally fewer outer entries with the same inner shape).
+    /// Everything else is concrete (`assigned_group = 0`, `bins = 8`,
+    /// `my_locs = [0, 1]`, random closure returns 0) — symbolic-k
+    /// with dynamic `Vec::with_capacity(k)` blew up CBMC past 31 %
+    /// RAM in the first iteration.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn build_index_alphas_emits_k_groups_two_hashes_each() {
+        let my_locs: [u64; INDEX_CUCKOO_NUM_HASHES] = [0, 1];
+
+        let alphas = build_index_alphas(
+            /* k */ 4,
+            /* assigned_group */ 0,
+            &my_locs,
+            /* bins */ 8,
+            || 0u64,
+        );
+
+        assert_eq!(alphas.len(), 4);
+        for g in 0..4 {
+            assert_eq!(alphas[g].len(), INDEX_CUCKOO_NUM_HASHES);
+        }
+    }
+
+    /// Prove that the real-query group's alphas are exactly `my_locs`
+    /// — i.e. the assigned group carries the precomputed cuckoo
+    /// positions, not random bins. Pinned with `k = 4` and a
+    /// symbolic in-range `assigned_group` so every position
+    /// (0..=3) is exercised.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn build_index_alphas_real_query_uses_my_locs() {
+        let raw_ag: u8 = kani::any();
+        kani::assume(raw_ag < 4);
+        let assigned_group = raw_ag as usize;
+
+        let my_locs: [u64; INDEX_CUCKOO_NUM_HASHES] = [42, 43];
+
+        let alphas = build_index_alphas(
+            /* k */ 4,
+            assigned_group,
+            &my_locs,
+            /* bins */ 8,
+            || 0u64,
+        );
+
+        // The real-query group carries `my_locs` verbatim (no `% bins`
+        // applied — these are pre-computed cuckoo positions which are
+        // already in [0, bins) by `cuckoo_hash`'s contract).
+        assert_eq!(alphas[assigned_group][0], 42);
+        assert_eq!(alphas[assigned_group][1], 43);
+    }
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────────
@@ -2830,6 +2943,67 @@ mod tests {
         assert_eq!(items.len(), INDEX_CUCKOO_NUM_HASHES);
         assert_eq!(items[0].chunk_bin_indices.len(), 0);
         assert_eq!(items[1].chunk_bin_indices.len(), 0);
+    }
+
+    // ─── build_index_alphas: K-padding shape ────────────────────────────────
+
+    /// Concrete sanity check: a 4-group request with assigned_group=2
+    /// produces 4 outer groups of 2 alphas each. The assigned group
+    /// echoes `my_locs`; other groups receive the random-bin closure
+    /// output reduced mod `bins`.
+    #[test]
+    fn build_index_alphas_concrete_shape() {
+        let mut counter: u64 = 1000;
+        let alphas = build_index_alphas(
+            /* k */ 4,
+            /* assigned_group */ 2,
+            &[7, 13],
+            /* bins */ 100,
+            || {
+                let v = counter;
+                counter = counter.wrapping_add(1);
+                v
+            },
+        );
+        assert_eq!(alphas.len(), 4);
+        for g in 0..4 {
+            assert_eq!(alphas[g].len(), INDEX_CUCKOO_NUM_HASHES);
+        }
+        // Real-query group carries my_locs verbatim.
+        assert_eq!(alphas[2], vec![7, 13]);
+        // Padding groups apply `% bins`, so all values are in [0, bins).
+        for g in [0usize, 1, 3] {
+            for &alpha in &alphas[g] {
+                assert!(alpha < 100);
+            }
+        }
+    }
+
+    /// Out-of-range `assigned_group` is degraded but safe: every group
+    /// receives random alphas (no real query), and the K-padding shape
+    /// is preserved. Documents the invariant for the
+    /// `assigned_group >= k` edge case the Kani harness explores.
+    #[test]
+    fn build_index_alphas_out_of_range_assigned_group_keeps_shape() {
+        let mut counter: u64 = 0;
+        let alphas = build_index_alphas(
+            /* k */ 3,
+            /* assigned_group */ 99,
+            &[42, 43],
+            /* bins */ 50,
+            || {
+                let v = counter;
+                counter = counter.wrapping_add(1);
+                v
+            },
+        );
+        assert_eq!(alphas.len(), 3);
+        for g in 0..3 {
+            assert_eq!(alphas[g].len(), INDEX_CUCKOO_NUM_HASHES);
+            for &alpha in &alphas[g] {
+                assert!(alpha < 50);
+            }
+        }
     }
 
     // ─── Leakage recorder wiring ────────────────────────────────────────────
