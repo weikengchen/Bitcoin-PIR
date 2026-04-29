@@ -60,3 +60,27 @@ module Sim : ProtocolRunner = {
     return sim_transcript b (L q);
   }
 }.
+
+(* ---------- Sim_batch : multi-query batch simulator ---------- *
+ * Mirrors `Real_batch` from Protocol.ec: the batch simulator is the
+ * concatenation of per-query simulator outputs, where each query's
+ * leakage is read once via `L q` and then the simulator composes the
+ * per-section fragments from `leak`-fields only.
+ *
+ * Equational view:
+ *
+ *   sim_batch_transcript b leaks = flatten (map (sim_transcript b) leaks)
+ *
+ * The `Sim_batch.query_batch` procedure binds `leaks = map L qs` and
+ * delegates to the op. The Real_batch ≡ Sim_batch theorem
+ * (`simulator_property_multi_query_constructive` in Theorem.ec)
+ * follows from the per-query `real_eq_sim_op` lifted over the list.
+ *)
+op sim_batch_transcript (b : backend) (leaks : leakage list) : transcript =
+  flatten (map (sim_transcript b) leaks).
+
+module Sim_batch : ProtocolBatchRunner = {
+  proc query_batch(b : backend, qs : query list) : transcript = {
+    return sim_batch_transcript b (map L qs);
+  }
+}.

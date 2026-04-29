@@ -52,32 +52,36 @@ fully randomised pRHL formulation.
 |---|---|---|
 | [Common.ec](Common.ec) | Shared abstract types (`query`, `db_id`, `transcript`, `round_kind`, `round_profile`, `backend`); protocol parameters (K=75, K_chunk=80, INDEX_CUCKOO_NUM_HASHES=2). | ~95 |
 | [Leakage.ec](Leakage.ec) | The leakage record `L : query → leakage` with four admitted axes (`index_max_items_per_group_per_level`, `chunk_max_items_per_group_per_level`, `session_query_index`, `query_db_id`); query-side accessors; the `L_factors` axiom relating accessors to `L`. Documents 4 explicit non-claims and 5 closed axes. | ~210 |
-| [Protocol.ec](Protocol.ec) | The `Real` model — abstract description of what the client emits on the wire. Per-section transcript fragments (info, key-register, hint-refresh, index, chunk, merkle-tops, index-merkle, chunk-merkle), each a deterministic function of backend + db_id + leakage axes. `Real.query` body composes the fragments in order. Pure-functional view `real_transcript` provided for proofs that prefer equational reasoning. | ~210 |
-| [Simulator.ec](Simulator.ec) | The `Sim` model — same per-section composition as `Real`, but reads exclusively from `L q`. Once the body executes `leak <- L q`, every subsequent computation is a function of `leak` and `b` alone — no further reads of `q`. Pure-functional view `sim_transcript`. | ~75 |
-| [Theorem.ec](Theorem.ec) | The simulator-property statement, decomposed into per-axis lemmas: (1) `L_eq` implies each accessor agrees, (2) `real_transcript` factors through `L`, (3) `real_transcript b q = sim_transcript b (L q)`, (4) bridge to `proc` view, (5) the headline `simulator_property_per_query` and `simulator_property_constructive`. Multi-query Lemma 3 placeholder. | ~240 |
+| [Protocol.ec](Protocol.ec) | The `Real` model — abstract description of what the client emits on the wire. Per-section transcript fragments (info, key-register, hint-refresh, index, chunk, merkle-tops, index-merkle, chunk-merkle), each a deterministic function of backend + db_id + leakage axes. `Real.query` body composes the fragments in order. Pure-functional view `real_transcript` provided for proofs that prefer equational reasoning. The `Real_batch.query_batch` module + `real_batch_transcript = flatten ∘ map (real_transcript b)` op extends the per-query model to multi-query batches. | ~290 |
+| [Simulator.ec](Simulator.ec) | The `Sim` model — same per-section composition as `Real`, but reads exclusively from `L q`. Once the body executes `leak <- L q`, every subsequent computation is a function of `leak` and `b` alone — no further reads of `q`. Pure-functional view `sim_transcript`. The `Sim_batch.query_batch` module + `sim_batch_transcript b leaks = flatten ∘ map (sim_transcript b)` op extends to multi-query batches; the procedure binds `leaks = map L qs` as the only `q`-touching step. | ~85 |
+| [Theorem.ec](Theorem.ec) | The simulator-property statement, decomposed into per-axis lemmas: (1) `L_eq` implies each accessor agrees, (2) `real_transcript` factors through `L`, (3) `real_transcript b q = sim_transcript b (L q)`, (4) bridge to `proc` view, (5) headline per-query simulator-property, (6) **multi-query closure** (this revision): `simulator_property_multi_query` op-form + `real_eq_sim_op_batch` + proc bridges + equiv-form analog + `Real_batch ≡ Sim_batch`. | ~340 |
 
 ## Status: proven vs. admitted
 
-The spec **typechecks cleanly with all 14 lemmas closed** (`make check` exits 0; zero `admit` tactics; zero warnings).
+The spec **typechecks cleanly with all 19 lemmas closed** (`make check` exits 0; zero `admit` tactics; zero warnings).
 
-**14 of 14 lemmas mechanically closed:**
+**19 of 19 lemmas mechanically closed:**
 
 In `Leakage.ec`:
 - `L_eq_refl`, `L_eq_sym`, `L_eq_trans` — equivalence-relation axioms.
 
 In `Theorem.ec`:
-- `L_eq_query_db_id`, `L_eq_query_index_max`, `L_eq_query_chunk_max`, `L_eq_query_session_query_index` — the four per-axis projection equalities. **These are the heart of the simulator argument** — they say `L`-equivalent queries agree on every accessor that `Real` reads. Proof: rewrite via `L_factors` and conclude.
+- **Per-axis projection (4 lemmas)** — `L_eq_query_db_id`, `L_eq_query_index_max`, `L_eq_query_chunk_max`, `L_eq_query_session_query_index`. **These are the heart of the simulator argument** — they say `L`-equivalent queries agree on every accessor that `Real` reads. Proof: rewrite via `L_factors` and conclude.
 - `real_transcript_factors_through_L` — wire transcript depends only on `L`. Proof: substitute the four per-axis equalities, conclude by reflexivity.
 - `real_eq_sim_op` — equational simulator construction `real_transcript b q = sim_transcript b (L q)`. Proof: rewrite via `L_factors` and simplify.
 - `Real_proc_eq_op`, `Sim_proc_eq_op` — bridge from `proc` view to `op` view. Proof: `proc; auto.` (the procs delegate to the deterministic ops).
 - `simulator_property_per_query` — headline `equiv [ Real ~ Real : L_eq q1 q2 ==> ={res} ]`. Proof: `proc; skip => />.` symbolically executes the trivial `return real_transcript b q` body, leaving `real_transcript b0 q1 = real_transcript b0 q2`, closed by `exact (real_transcript_factors_through_L b0 q1 q2 h)`.
 - `simulator_property_constructive` — headline `equiv [ Real ~ Sim : ... ==> ={res} ]`. Same pattern, closed by `exact (real_eq_sim_op b0 q0)`.
-- `simulator_property_multi_query` — placeholder (returns `true`); awaits a `query_batch` extension before having substance.
+- **Multi-query closure (5 lemmas)**:
+  - `simulator_property_multi_query` (op-form) — pairwise `L_eq` lifts to `real_batch_transcript b qs1 = real_batch_transcript b qs2`. Proof: list induction via `eq_from_nth` + `nth_map` from `List.ec`. Per-position equality reduces to `real_transcript_factors_through_L`.
+  - `real_eq_sim_op_batch` — batch real ≡ batch sim at the op level: `real_batch_transcript b qs = sim_batch_transcript b (map L qs)`. Same list-induction shape, per-position closes via `real_eq_sim_op`.
+  - `Real_batch_proc_eq_op`, `Sim_batch_proc_eq_op` — proc bridges. Proof: `proc; auto.`
+  - `simulator_property_multi_query_equiv` — equiv-form `equiv [ Real_batch ~ Real_batch : pairwise L_eq ==> ={res} ]`. Proof: `proc; skip => />` + exact of the op-form.
+  - `simulator_property_multi_query_constructive` — equiv-form `Real_batch ≡ Sim_batch`. Proof: `proc; skip => />` + exact of `real_eq_sim_op_batch`.
 
-**Subtle gotcha caught while closing the equiv lemmas.** The lemma signatures originally used parameter names `b` and `q`, which shadow the procedure parameters `b` and `q` of `Real.query` / `Sim.query`. EasyCrypt parses the unmarked `b` in the precondition `b{1} = b` as `b{1}` (defaulting to memory `&1`), making the precondition `b{1} = b{1}` — tautological. The fix is to rename the lemma parameters to `b0` and `q0`, matching the convention already established by `Real_proc_eq_op (b0 : backend)`. This is the kind of "obvious in retrospect" detail that makes pRHL work look harder than it is.
+**Subtle gotcha caught while closing the per-query equiv lemmas.** The lemma signatures originally used parameter names `b` and `q`, which shadow the procedure parameters `b` and `q` of `Real.query` / `Sim.query`. EasyCrypt parses the unmarked `b` in the precondition `b{1} = b` as `b{1}` (defaulting to memory `&1`), making the precondition `b{1} = b{1}` — tautological. The fix is to rename the lemma parameters to `b0` and `q0`, matching the convention already established by `Real_proc_eq_op (b0 : backend)`. The same `b0` / `qs0` naming convention applies to the new multi-query equiv lemmas.
 
 **Out of scope:**
-- `simulator_property_multi_query` (non-vacuous form) — needs a `query_batch` extension to `Real` and `Sim` before the lemma has substance.
 - Closing the cryptographic ideal-primitive reductions (DPF, FHE, PRP). Those live in the primitives' papers; we cite by hypothesis.
 
 ## How the simulator-property proof catches a missing axis

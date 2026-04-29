@@ -31,7 +31,7 @@
  *   real_transcript b q1 = real_transcript b q2   whenever L_eq q1 q2.
  *
  * The proof closure is the standard "destruct L_eq into per-axis
- * equalities, substitute into the body, conclude". All 14 lemmas
+ * equalities, substitute into the body, conclude". All 19 lemmas
  * are now mechanically closed (no `admit`); the equiv-form lemmas
  * `simulator_property_per_query` and `simulator_property_constructive`
  * close via `proc; skip => />` (symbolic-execute the trivial
@@ -42,6 +42,30 @@
  * `Real_proc_eq_op (b0 : backend)` convention) lifts the precondition
  * `b{1} = b0` to a real binding instead of a tautological
  * `b{1} = b{1}`. Same fix for `q -> q0` in the constructive lemma.
+ *
+ * # Multi-query closure (this revision)
+ *
+ * The previous spec stopped at single-query Real/Sim. Real privacy
+ * claims need the multi-query analog: an adversary issuing q1, q2,
+ * …, qN learns at most (L q1, …, L qN). This file now defines
+ * `Real_batch.query_batch` / `Sim_batch.query_batch` (in
+ * `Protocol.ec` / `Simulator.ec`) and proves five new lemmas closing
+ * the multi-query argument:
+ *
+ *   - `simulator_property_multi_query` (op-form): pairwise L_eq lifts
+ *     to `real_batch_transcript b qs1 = real_batch_transcript b qs2`.
+ *   - `real_eq_sim_op_batch`: batch real ≡ batch sim at the op level.
+ *   - `Real_batch_proc_eq_op`, `Sim_batch_proc_eq_op`: proc bridges.
+ *   - `simulator_property_multi_query_equiv`: equiv-form pairwise
+ *     L_eq lemma.
+ *   - `simulator_property_multi_query_constructive`: equiv-form
+ *     `Real_batch ≡ Sim_batch`.
+ *
+ * The proofs use list induction via `eq_from_nth` + `nth_map` from
+ * `List.ec`: per-position equality lifts to `map` equality, which
+ * `flatten` preserves. HarmonyPIR's hint-refresh side band is
+ * captured per-position via `query_session_query_index q` in `L`,
+ * so pairwise L_eq guarantees agreement of refresh decisions.
  *
  * # Run
  *
@@ -254,26 +278,136 @@ qed.
  * For DPF and OnionPIR this follows from per-query independence
  * (each query uses fresh DPF keys / FHE keys, no cross-query state).
  *
- * For HarmonyPIR the argument is more subtle: the hint state evolves
- * across queries, so Lemma 3 must be conditioned on the hint refresh
- * not having happened mid-batch (or the proof has to handle the
- * refresh as a state transition explicitly).
+ * For HarmonyPIR the argument depends on the hint-refresh side band
+ * being captured by the per-query `query_session_query_index q` axis:
+ * each per-query transcript fragment includes (or omits) the
+ * `RHarmonyHintRefresh` round as a function of `session_query_index`,
+ * which is in `L`. So if pairwise L_eq holds, the per-position
+ * hint-refresh decisions agree, and the batch transcripts agree.
  *
- * The current spec models a single-query Real/Sim only; a
- * `query_batch` extension is required before Lemma 3 has a non-vacuous
- * statement to prove. Captured as a separate work item rather than
- * admitted here, because the spec extension is structurally
- * non-trivial (per-query transcripts must be sequenced and the
- * HarmonyPIR session state threaded through).
+ * # Spec extension (this commit)
+ *
+ * `Protocol.ec` now defines `real_batch_transcript b qs = flatten
+ * (map (real_transcript b) qs)` plus a `Real_batch.query_batch`
+ * procedure that delegates to the op (mirrors the per-query
+ * `Real.query` / `real_transcript` split). `Simulator.ec` defines
+ * `sim_batch_transcript b leaks` and `Sim_batch.query_batch`
+ * symmetrically.
+ *
+ * # Closure path
+ *
+ * The op-form below reduces to a per-position equality on the
+ * mapped transcripts, then `flatten` preserves equality. The
+ * per-position step is exactly `real_transcript_factors_through_L`
+ * applied at each i.
+ *
+ *   1. Reduce `flatten (map ...) = flatten (map ...)` to
+ *      `map (real_transcript b) qs1 = map (real_transcript b) qs2`
+ *      via congruence.
+ *   2. Apply `eq_from_nth` (List.ec): map equality from per-position
+ *      equality, given equal lengths.
+ *   3. Per-position: `nth_map` rewrites `nth (map f s) i = f (nth s i)`,
+ *      then `real_transcript_factors_through_L` closes from `hl i`.
  * --------------------------------------------------------------------- *)
-lemma simulator_property_multi_query (qs1 qs2 : query list) :
+lemma simulator_property_multi_query (b : backend) (qs1 qs2 : query list) :
   size qs1 = size qs2 =>
   (forall (i : int), 0 <= i < size qs1 =>
      L_eq (nth witness qs1 i) (nth witness qs2 i)) =>
-  (* TODO: state the equiv on the multi-query procedure once `Real`
-   * has a `query_batch` extension. Placeholder `true` keeps the
-   * lemma typechecking while the spec extension is pending. *)
-  true.
+  real_batch_transcript b qs1 = real_batch_transcript b qs2.
 proof.
-  done.
+  move => hsz hl.
+  rewrite /real_batch_transcript.
+  have hmap : map (real_transcript b) qs1 = map (real_transcript b) qs2.
+  - apply (eq_from_nth witness).
+    + by rewrite !size_map hsz.
+    + move => i; rewrite size_map => hi.
+      rewrite (nth_map witness witness (real_transcript b) i qs1) //.
+      rewrite (nth_map witness witness (real_transcript b) i qs2);
+        first by rewrite -hsz.
+      apply real_transcript_factors_through_L.
+      by apply hl.
+  by rewrite hmap.
+qed.
+
+(* ---------------------------------------------------------------------- *
+ * Lemma 4 (constructive multi-query): Real_batch ≡ Sim_batch.
+ *
+ * The batch simulator (which only sees `map L qs`) produces the same
+ * transcript as the batch protocol (which sees `qs`). Lifts the
+ * per-query `real_eq_sim_op` over the list.
+ *
+ * Closure path: unfold both batch ops to `flatten (map ...)`, show
+ * the maps coincide via `eq_from_nth` + `real_eq_sim_op`, then
+ * `flatten` preserves equality.
+ * --------------------------------------------------------------------- *)
+lemma real_eq_sim_op_batch (b : backend) (qs : query list) :
+  real_batch_transcript b qs = sim_batch_transcript b (map L qs).
+proof.
+  rewrite /real_batch_transcript /sim_batch_transcript.
+  have hmap : map (real_transcript b) qs = map (sim_transcript b) (map L qs).
+  - apply (eq_from_nth witness).
+    + by rewrite !size_map.
+    + move => i; rewrite size_map => hi.
+      rewrite (nth_map witness witness (real_transcript b) i qs) //.
+      rewrite (nth_map witness witness (sim_transcript b) i (map L qs));
+        first by rewrite size_map.
+      rewrite (nth_map witness witness L i qs) //.
+      exact (real_eq_sim_op b (nth witness qs i)).
+  by rewrite hmap.
+qed.
+
+(* ---------------------------------------------------------------------- *
+ * Lemma 5 (proc-form bridges): `Real_batch.query_batch` and
+ * `Sim_batch.query_batch` factor through their op definitions.
+ * Mirror of `Real_proc_eq_op` / `Sim_proc_eq_op` for the batch case.
+ * --------------------------------------------------------------------- *)
+lemma Real_batch_proc_eq_op (b0 : backend) (qs0 : query list) :
+  hoare [ Real_batch.query_batch :
+            b = b0 /\ qs = qs0 ==> res = real_batch_transcript b0 qs0 ].
+proof.
+  by proc; auto.
+qed.
+
+lemma Sim_batch_proc_eq_op (b0 : backend) (qs0 : query list) :
+  hoare [ Sim_batch.query_batch :
+            b = b0 /\ qs = qs0 ==> res = sim_batch_transcript b0 (map L qs0) ].
+proof.
+  by proc; auto.
+qed.
+
+(* ---------------------------------------------------------------------- *
+ * Lemma 6 (equiv-form multi-query): pairwise L_eq lifts to batch
+ * transcript equivalence via `Real_batch.query_batch`.
+ * --------------------------------------------------------------------- *)
+lemma simulator_property_multi_query_equiv (b0 : backend) (qs1 qs2 : query list) :
+  size qs1 = size qs2 =>
+  (forall (i : int), 0 <= i < size qs1 =>
+     L_eq (nth witness qs1 i) (nth witness qs2 i)) =>
+  equiv [
+    Real_batch.query_batch ~ Real_batch.query_batch :
+    ={glob Real_batch} /\ b{1} = b0 /\ b{2} = b0 /\ qs{1} = qs1 /\ qs{2} = qs2
+    ==>
+    ={res}
+  ].
+proof.
+  move => hsz hl.
+  proc.
+  skip => />.
+  exact (simulator_property_multi_query b0 qs1 qs2 hsz hl).
+qed.
+
+(* ---------------------------------------------------------------------- *
+ * Lemma 7 (constructive equiv-form): `Real_batch ≡ Sim_batch`.
+ * --------------------------------------------------------------------- *)
+lemma simulator_property_multi_query_constructive (b0 : backend) (qs0 : query list) :
+  equiv [
+    Real_batch.query_batch ~ Sim_batch.query_batch :
+    ={glob Real_batch, glob Sim_batch} /\ b{1} = b0 /\ b{2} = b0 /\ qs{1} = qs0 /\ qs{2} = qs0
+    ==>
+    ={res}
+  ].
+proof.
+  proc.
+  skip => />.
+  exact (real_eq_sim_op_batch b0 qs0).
 qed.

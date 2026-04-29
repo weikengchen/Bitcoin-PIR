@@ -262,3 +262,43 @@ module Real : ProtocolRunner = {
     return real_transcript b q;
   }
 }.
+
+(* ---------- Real_batch : multi-query batch transcript ---------- *
+ * `Real_batch(b).query_batch(qs)` runs a sequence of PIR queries and
+ * concatenates their per-query transcripts. The op-form
+ * `real_batch_transcript` is the meaningful definition; the procedure
+ * delegates so the multi-query simulator-property reduces to a
+ * functional equality on lists, just like the per-query case did via
+ * `real_transcript`.
+ *
+ * # Modelling notes
+ *
+ * - The batch transcript is `flatten (map (real_transcript b) qs)`.
+ *   This composes with the per-query proof: equality at every position
+ *   lifts to equality of the maps, then `flatten` preserves equality.
+ *
+ * - HarmonyPIR's hint-state evolution across queries is captured
+ *   per-query via `query_session_query_index q` — that axis is admitted
+ *   in `Leakage.ec` and propagates through the per-query
+ *   `harmony_hint_refresh_segment`. As long as L_eq holds pairwise
+ *   between the two batches, the hint-refresh decisions agree
+ *   per-position, so the batch transcripts agree.
+ *
+ * - For DPF / OnionPIR the per-query independence assumption (fresh
+ *   DPF / FHE keys per query, no cross-query state) is what makes the
+ *   `flatten (map ...)` decomposition sound. That assumption is part
+ *   of the cryptographic black-box hypothesis the spec already relies
+ *   on for the per-query case.
+ *)
+op real_batch_transcript (b : backend) (qs : query list) : transcript =
+  flatten (map (real_transcript b) qs).
+
+module type ProtocolBatchRunner = {
+  proc query_batch(b : backend, qs : query list) : transcript
+}.
+
+module Real_batch : ProtocolBatchRunner = {
+  proc query_batch(b : backend, qs : query list) : transcript = {
+    return real_batch_transcript b qs;
+  }
+}.
