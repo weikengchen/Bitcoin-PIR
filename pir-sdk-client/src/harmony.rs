@@ -270,7 +270,14 @@ fn items_from_trace(trace: &QueryTraces) -> Vec<BucketMerkleItem> {
                 chunk_bin_indices: Vec::new(),
                 chunk_bin_contents: Vec::new(),
             };
-            if trace.matched_index_idx == Some(bi) {
+            // Post-`chunk_max` closure: chunk_bins attach to `bi == 0`
+            // unconditionally — matched_index_idx no longer gates the
+            // attachment because every query (found / not-found / whale)
+            // emits `CHUNK_MERKLE_ITEMS_PER_QUERY` chunk Merkle items
+            // via `pad_chunk_ids_to_m`. Mirrors `dpf::items_from_trace`
+            // post-closure shape; see `pir-core::params::CHUNK_MERKLE_ITEMS_PER_QUERY`
+            // and `dpf::pad_chunk_ids_to_m` for the M-padding helper.
+            if bi == 0 {
                 for cb in &trace.chunk_bins {
                     it.chunk_pbc_groups.push(cb.pbc_group);
                     it.chunk_bin_indices.push(cb.bin_index);
@@ -1496,10 +1503,19 @@ impl HarmonyClient {
             .query_index_phase_batched(script_hashes, db_info)
             .await?;
 
-        // Phase 2: per-scripthash CHUNK + result assembly. Mirrors the
-        // legacy `query_single` body for the post-INDEX path so CHUNK
-        // Round-Presence Symmetry (one K_CHUNK-padded round per query
-        // regardless of found/not-found/whale) is unchanged.
+        // Phase 2: per-scripthash CHUNK + result assembly with the
+        // `chunk_max_items_per_group_per_level` closure. Every query
+        // (found / not-found / whale) pads its real-chunk list to
+        // `CHUNK_MERKLE_ITEMS_PER_QUERY = M` chunks via
+        // `crate::dpf::pad_chunk_ids_to_m`. The wire-observable
+        // `max_items_per_group_per_level` collapses to
+        // `ceil(M / K_CHUNK) = 1` for the production parameters,
+        // independent of UTXO count or found/not-found classification.
+        // CHUNK Round-Presence Symmetry is now subsumed by the
+        // closure: every query runs the M-padded chunk fetch with the
+        // same wire shape.
+        let chunk_pad_m = pir_core::params::CHUNK_MERKLE_ITEMS_PER_QUERY;
+
         for (i, (found_info, index_bins, matched_idx)) in index_outcomes.into_iter().enumerate() {
             let mut q_traces = QueryTraces {
                 index_bins,
@@ -1507,51 +1523,64 @@ impl HarmonyClient {
                 chunk_bins: Vec::new(),
             };
 
-            let (start_chunk_id, num_chunks, is_whale) = match found_info {
-                Some((start, num, whale)) => (start, num, whale),
-                None => {
-                    let _ = self.query_chunk_level(&[], db_info).await?;
-                    log::info!(
-                        "[PIR-AUDIT] HarmonyPIR CHUNK round-presence padding: not-found query #{} issued 1 dummy CHUNK round",
-                        i,
-                    );
-                    results.push(None);
-                    traces.push(q_traces);
-                    continue;
-                }
+            // Resolve the real-chunk slice for this query. Whale and
+            // not-found contribute none; found contributes start..end.
+            let (real_chunk_ids, is_whale, has_real_match): (Vec<u32>, bool, bool) =
+                match found_info {
+                    Some((start, num, whale)) if num > 0 => (
+                        (start..start + num as u32).collect(),
+                        whale,
+                        true,
+                    ),
+                    Some((_start, _num, whale)) => (Vec::new(), whale, true),
+                    None => (Vec::new(), false, false),
+                };
+
+            let real_count = real_chunk_ids.len();
+            let padded_chunk_ids =
+                crate::dpf::pad_chunk_ids_to_m(&real_chunk_ids, chunk_pad_m);
+            log::info!(
+                "[PIR-AUDIT] HarmonyPIR CHUNK chunk_max closure: query #{} real_chunks={} padded_to={} (M={})",
+                i,
+                real_count,
+                padded_chunk_ids.len(),
+                chunk_pad_m,
+            );
+            let (chunk_data, chunk_bins) =
+                self.query_chunk_level(&padded_chunk_ids, db_info).await?;
+            q_traces.chunk_bins = chunk_bins;
+
+            // Decode only the first real_count chunks' payloads as
+            // genuine UTXO entries. Synthetic-slot payloads belong to
+            // other scripthashes and must not be surfaced.
+            let real_data_len = real_count * pir_core::params::CHUNK_SIZE;
+            let real_data: Vec<u8> = if real_data_len <= chunk_data.len() {
+                chunk_data[..real_data_len].to_vec()
+            } else {
+                chunk_data.clone()
             };
 
-            if num_chunks == 0 {
-                let _ = self.query_chunk_level(&[], db_info).await?;
-                log::info!(
-                    "[PIR-AUDIT] HarmonyPIR CHUNK round-presence padding: whale query #{} issued 1 dummy CHUNK round",
-                    i,
-                );
-                results.push(Some(QueryResult {
-                    entries: Vec::new(),
-                    is_whale,
-                    merkle_verified: true,
-                    raw_chunk_data: None,
-                    index_bins: Vec::new(),
-                    chunk_bins: Vec::new(),
-                    matched_index_idx: None,
-                }));
+            if !has_real_match {
+                results.push(None);
                 traces.push(q_traces);
                 continue;
             }
 
-            let chunk_ids: Vec<u32> =
-                (start_chunk_id..start_chunk_id + num_chunks as u32).collect();
-            let (chunk_data, chunk_bins) = self.query_chunk_level(&chunk_ids, db_info).await?;
-            q_traces.chunk_bins = chunk_bins;
-            let entries = decode_utxo_entries(&chunk_data);
+            if !is_whale && real_count == 0 {
+                log::warn!(
+                    "[PIR-AUDIT] HarmonyPIR CHUNK closure: query #{} matched a non-whale INDEX entry with num_chunks=0; treating as whale",
+                    i,
+                );
+            }
+
+            let entries = decode_utxo_entries(&real_data);
 
             results.push(Some(QueryResult {
                 entries,
                 is_whale,
                 merkle_verified: true,
-                raw_chunk_data: if db_info.kind.is_delta() {
-                    Some(chunk_data)
+                raw_chunk_data: if db_info.kind.is_delta() && real_count > 0 {
+                    Some(real_data)
                 } else {
                     None
                 },
@@ -4660,8 +4689,11 @@ mod tests {
         };
         let items = items_from_trace(&trace);
         assert_eq!(items.len(), INDEX_CUCKOO_NUM_HASHES);
-        assert_eq!(items[0].chunk_bin_indices.len(), 0);
-        assert_eq!(items[1].chunk_bin_indices.len(), 1);
+        // Post-`chunk_max` closure: chunks always live on items[0],
+        // regardless of which INDEX position matched. Mirrors the
+        // dpf::items_from_trace post-closure shape.
+        assert_eq!(items[0].chunk_bin_indices.len(), 1);
+        assert_eq!(items[1].chunk_bin_indices.len(), 0);
     }
 
     #[test]

@@ -760,6 +760,40 @@ async fn harmony_simulator_property_multi_query_collision() {
     );
 }
 
+/// Post-`chunk_max` closure (Harmony analog of
+/// `dpf_found_vs_not_found_have_byte_identical_profiles`): a FOUND
+/// query and a NOT-FOUND query must produce byte-identical leakage
+/// profiles. Pre-closure NOT-FOUND emitted 0 ChunkMerkleSiblings
+/// rounds vs ≥1 for FOUND (chunk-Merkle-presence leak); the M-padded
+/// closure pads every query to `CHUNK_MERKLE_ITEMS_PER_QUERY = 16`
+/// chunk Merkle items so the wire shape is identical across
+/// classifications.
+///
+/// Known flake: HarmonyPIR runs against the public Hetzner deployment
+/// can intermittently time out on the hint-stream WebSocket — same
+/// caveat as the rest of this file's harmony tests.
+#[tokio::test]
+#[ignore = "requires running PIR servers"]
+async fn harmony_found_vs_not_found_have_byte_identical_profiles() {
+    let (sh_found, _) = found_pair();
+    let (sh_nf, _) = not_found_pair();
+    let p_found = run_harmony_single_query(sh_found).await;
+    let p_nf = run_harmony_single_query(sh_nf).await;
+
+    println!(
+        "harmony found-vs-not-found byte-identity: total={} vs {}, ChunkMerkleSiblings={} vs {}",
+        p_found.rounds.len(),
+        p_nf.rounds.len(),
+        p_found.count_of_kind(&RoundKind::ChunkMerkleSiblings { level: 0 }),
+        p_nf.count_of_kind(&RoundKind::ChunkMerkleSiblings { level: 0 }),
+    );
+
+    // Strongest possible assertion: every wire-recorded field on
+    // every round must match between the two profiles. Mirror of
+    // `dpf_found_vs_not_found_have_byte_identical_profiles`.
+    assert_profiles_equivalent(&p_found, &p_nf);
+}
+
 // ─── OnionPIR tests (feature-gated) ─────────────────────────────────────────
 
 #[cfg(feature = "onion")]
