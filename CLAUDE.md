@@ -125,6 +125,58 @@ padding the shortfall with random distinct indices drawn from
 `process_response` / `process_response_xor_only`. No wire-format or
 server-side change is required.
 
+### INDEX Merkle Group-Symmetry (MANDATORY for Privacy)
+
+**INDEX Merkle items in a multi-query batch MUST be distributed
+across PBC groups via `pbc_plan_rounds(derive_groups_3, K, 3, 500)`,
+not hard-coupled to `derive_groups_3(scripthash, K)[0]`.**
+
+Two scripthashes whose `derive_groups_3[0]` collide would, under the
+old fixed-`[0]` placement, accumulate all four INDEX Merkle items in
+one PBC group → the per-Merkle-level pass count would jump from 2 to
+4. The wire-observable pass count is therefore a function of the
+batch's collision pattern at the assigned-group level — a side
+channel the server can fit to candidate scripthash sets.
+
+**Why:** The PBC plan distributes scripthashes across distinct PBC
+slots within a round. Each scripthash's INDEX query (and its two
+INDEX Merkle items) inherits the planner-assigned group, so
+`max_items_per_group_per_level = 2` independently of input collision
+pattern. Wire round count per level becomes `2 × n_servers × n_levels
+× n_pbc_rounds`; for typical batches with `N ≤ K`, `n_pbc_rounds = 1`.
+
+**How implementations preserve this:**
+
+1. **DPF** ([pir-sdk-client/src/dpf.rs](pir-sdk-client/src/dpf.rs)):
+   `query_index_phase_batched` runs one or more K-padded DPF INDEX
+   wire rounds per PBC round. Real placements use the planner-assigned
+   group's cuckoo positions; remaining groups send random dummies.
+2. **HarmonyPIR** ([pir-sdk-client/src/harmony.rs](pir-sdk-client/src/harmony.rs)):
+   `query_index_phase_batched` runs `INDEX_CUCKOO_NUM_HASHES = 2`
+   wire rounds per PBC round (one per cuckoo position). Each placed
+   group sends `build_request(target_bin)`; remaining groups send
+   `build_synthetic_dummy()`.
+3. **OnionPIR** ([pir-sdk-client/src/onion.rs](pir-sdk-client/src/onion.rs)):
+   already uses `pbc_plan_rounds` over INDEX queries, plus a separate
+   gid-level PBC plan at the Merkle layer with ARITY=120 — at batch=2
+   the axis is structurally trivial regardless of placement (`pbc_plan_rounds`
+   over ≤4 unique gids always packs into 1 round).
+
+**Server-side compatibility:** the build script replicates each
+scripthash's INDEX entry to all 3 candidate groups
+([build/src/build_cuckoo_generic.rs:87-90](build/src/build_cuckoo_generic.rs:87)
+and [build/src/gen_4_build_merkle.rs:236-239](build/src/gen_4_build_merkle.rs:236)),
+so any candidate group can serve the query. No server changes were
+required.
+
+**Empirical witnesses (against `wss://pir1.chenweikeng.com`):**
+- `dpf_simulator_property_multi_query_collision`: A=B=C=19 rounds,
+  IndexMerkleSiblings A=B=C=12. Pre-closure: A=33 / C=21.
+- `harmony_simulator_property_multi_query_collision`: A=B=C=20 rounds,
+  IndexMerkleSiblings A=B=C=6. Pre-closure: A=28 / C=22.
+- `onion_simulator_property_multi_query_collision`: A=B=C=7 rounds,
+  IndexMerkleSiblings A=B=C=1 (structurally trivial pre- and post-).
+
 ### What the Server Learns (Documented Trade-offs)
 
 The server **cannot** learn:
@@ -135,6 +187,8 @@ The server **cannot** learn:
 - Whether a query was found or not-found from CHUNK round presence
   (closed by the CHUNK Round-Presence Symmetry invariant above)
 - Which cuckoo position (h=0 vs h=1) a found query matched at
+- The collision pattern of `derive_groups_3[0]` across a multi-query
+  batch (closed by the INDEX Merkle Group-Symmetry invariant above)
 
 The server **can** observe (known trade-offs):
 - How many CHUNK Merkle items each query contributes (reveals

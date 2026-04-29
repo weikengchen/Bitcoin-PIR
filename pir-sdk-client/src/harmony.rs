@@ -44,7 +44,7 @@ use async_trait::async_trait;
 use harmonypir_wasm::HarmonyGroup;
 use pir_core::params::{
     CHUNK_CUCKOO_NUM_HASHES, CHUNK_PARAMS, CHUNK_SIZE, CHUNK_SLOT_SIZE, CHUNK_SLOTS_PER_BIN,
-    INDEX_CUCKOO_NUM_HASHES, INDEX_PARAMS, INDEX_SLOT_SIZE, INDEX_SLOTS_PER_BIN, TAG_SIZE,
+    INDEX_CUCKOO_NUM_HASHES, INDEX_PARAMS, INDEX_SLOT_SIZE, INDEX_SLOTS_PER_BIN, NUM_HASHES, TAG_SIZE,
 };
 use pir_sdk::{
     compute_sync_plan, merge_delta_batch, BucketRef, ConnectionState, DatabaseCatalog,
@@ -211,6 +211,40 @@ pub(crate) fn classify_chunk_groups(
         if (group as usize) < (k_chunk as usize) {
             // Last-wins matches HashMap::collect (pre-refactor behaviour).
             roles[group as usize] = ChunkGroupRole::Real(cid);
+        }
+    }
+    roles
+}
+
+/// INDEX-side analog of [`ChunkGroupRole`], used by the Option-B
+/// `index_max_items_per_group_per_level` closure. `Real(target_bin)`
+/// marks a group as carrying a real INDEX query for some scripthash
+/// in this round; `Dummy` marks a group as needing
+/// `build_synthetic_dummy()`. The structural witness for the closure
+/// is `result.len() == k_index` regardless of how many scripthashes
+/// the PBC plan placed in this round — every wire INDEX request
+/// covers all K groups, so the per-group payload count is a function
+/// of `k_index` alone, not of the batch's collision pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IndexGroupRole {
+    Real(u32),
+    Dummy,
+}
+
+/// Classify each of the `k_index` groups for one batched HarmonyPIR
+/// INDEX round (one cuckoo position `h` × one PBC round). Mirrors
+/// [`classify_chunk_groups`] in shape: pure, no I/O, no RNG. Last
+/// duplicate wins so the structural invariant is observably equivalent
+/// to the pre-Option-B single-real-group path when the placement list
+/// has exactly one entry.
+pub(crate) fn classify_index_groups(
+    placements: &[(u8, u32)],
+    k_index: u8,
+) -> Vec<IndexGroupRole> {
+    let mut roles = vec![IndexGroupRole::Dummy; k_index as usize];
+    for &(group, target_bin) in placements {
+        if (group as usize) < (k_index as usize) {
+            roles[group as usize] = IndexGroupRole::Real(target_bin);
         }
     }
     roles
@@ -1451,10 +1485,81 @@ impl HarmonyClient {
 
         let mut results: Vec<Option<QueryResult>> = Vec::with_capacity(script_hashes.len());
         let mut traces: Vec<QueryTraces> = Vec::with_capacity(script_hashes.len());
-        for script_hash in script_hashes {
-            let (result, trace) = self.query_single(script_hash, db_info).await?;
-            results.push(result);
-            traces.push(trace);
+
+        // Phase 1: batched INDEX via PBC plan. Drives one or more
+        // K-padded HarmonyPIR INDEX rounds (one per cuckoo position
+        // per PBC round) covering all scripthashes; each scripthash's
+        // two INDEX Merkle items inherit a unique-per-batch
+        // `pbc_group`, so `index_max_items_per_group_per_level = 2`
+        // independently of the batch's collision pattern.
+        let index_outcomes = self
+            .query_index_phase_batched(script_hashes, db_info)
+            .await?;
+
+        // Phase 2: per-scripthash CHUNK + result assembly. Mirrors the
+        // legacy `query_single` body for the post-INDEX path so CHUNK
+        // Round-Presence Symmetry (one K_CHUNK-padded round per query
+        // regardless of found/not-found/whale) is unchanged.
+        for (i, (found_info, index_bins, matched_idx)) in index_outcomes.into_iter().enumerate() {
+            let mut q_traces = QueryTraces {
+                index_bins,
+                matched_index_idx: matched_idx,
+                chunk_bins: Vec::new(),
+            };
+
+            let (start_chunk_id, num_chunks, is_whale) = match found_info {
+                Some((start, num, whale)) => (start, num, whale),
+                None => {
+                    let _ = self.query_chunk_level(&[], db_info).await?;
+                    log::info!(
+                        "[PIR-AUDIT] HarmonyPIR CHUNK round-presence padding: not-found query #{} issued 1 dummy CHUNK round",
+                        i,
+                    );
+                    results.push(None);
+                    traces.push(q_traces);
+                    continue;
+                }
+            };
+
+            if num_chunks == 0 {
+                let _ = self.query_chunk_level(&[], db_info).await?;
+                log::info!(
+                    "[PIR-AUDIT] HarmonyPIR CHUNK round-presence padding: whale query #{} issued 1 dummy CHUNK round",
+                    i,
+                );
+                results.push(Some(QueryResult {
+                    entries: Vec::new(),
+                    is_whale,
+                    merkle_verified: true,
+                    raw_chunk_data: None,
+                    index_bins: Vec::new(),
+                    chunk_bins: Vec::new(),
+                    matched_index_idx: None,
+                }));
+                traces.push(q_traces);
+                continue;
+            }
+
+            let chunk_ids: Vec<u32> =
+                (start_chunk_id..start_chunk_id + num_chunks as u32).collect();
+            let (chunk_data, chunk_bins) = self.query_chunk_level(&chunk_ids, db_info).await?;
+            q_traces.chunk_bins = chunk_bins;
+            let entries = decode_utxo_entries(&chunk_data);
+
+            results.push(Some(QueryResult {
+                entries,
+                is_whale,
+                merkle_verified: true,
+                raw_chunk_data: if db_info.kind.is_delta() {
+                    Some(chunk_data)
+                } else {
+                    None
+                },
+                index_bins: Vec::new(),
+                chunk_bins: Vec::new(),
+                matched_index_idx: None,
+            }));
+            traces.push(q_traces);
         }
 
         if db_info.has_bucket_merkle {
@@ -1468,6 +1573,162 @@ impl HarmonyClient {
         }
 
         Ok(results)
+    }
+
+    /// Batched INDEX phase for the Option-B
+    /// `index_max_items_per_group_per_level` closure (Harmony analog
+    /// of `DpfClient::query_index_phase_batched`).
+    ///
+    /// Plans PBC rounds over the batch's candidate groups, then for
+    /// each PBC round runs `INDEX_CUCKOO_NUM_HASHES = 2` wire INDEX
+    /// rounds (one per cuckoo position `h`) — each wire round packs
+    /// every placed scripthash's bin for that `h` into the same
+    /// K-padded HarmonyPIR INDEX request. Per-scripthash output is
+    /// the same `(found_info, index_bins, matched_idx)` triple
+    /// `query_single` produced pre-Option-B; the wire-observable
+    /// difference is the round count is now `2 × n_pbc_rounds`
+    /// (typically 2 for batches with `N ≤ k`) instead of
+    /// `2 × N` (one per scripthash × 2 cuckoo positions).
+    ///
+    /// HarmonyPIR's per-group hint state is consumed in lock-step
+    /// across placed groups: each wire round consumes one hint from
+    /// every placed group's `HarmonyGroup`. For a single-query batch
+    /// this matches pre-Option-B hint usage; for multi-query batches
+    /// hint consumption is more balanced (no concentration on
+    /// `derive_groups_3[0]`), which delays exhaustion-driven refresh
+    /// rounds.
+    #[tracing::instrument(level = "trace", skip_all, fields(backend = "harmony", db_id = db_info.db_id, num_queries = script_hashes.len()))]
+    async fn query_index_phase_batched(
+        &mut self,
+        script_hashes: &[ScriptHash],
+        db_info: &DatabaseInfo,
+    ) -> PirResult<Vec<(Option<(u32, u8, bool)>, Vec<IndexBinTrace>, Option<usize>)>> {
+        let k_index = db_info.index_k as usize;
+        let index_bins = db_info.index_bins as usize;
+        let tag_seed = db_info.tag_seed;
+        let n = script_hashes.len();
+
+        // PBC plan over each scripthash's three candidate groups.
+        let candidate_groups: Vec<[usize; NUM_HASHES]> = script_hashes
+            .iter()
+            .map(|sh| pir_core::hash::derive_groups_3(sh, k_index))
+            .collect();
+        let rounds = pir_core::pbc::pbc_plan_rounds(&candidate_groups, k_index, NUM_HASHES, 500);
+
+        // Build a placement view for downstream decode + Merkle traces.
+        // Each scripthash's INDEX query (and its INDEX Merkle items)
+        // inherits the planner-assigned group; this is the structural
+        // change the closure relies on.
+        let mut placement: Vec<(usize, usize)> = vec![(0, 0); n];
+        for (round_id, round) in rounds.iter().enumerate() {
+            for &(sh_idx, pbc_group) in round {
+                placement[sh_idx] = (round_id, pbc_group);
+            }
+        }
+
+        log::info!(
+            "[PIR-AUDIT] HarmonyPIR INDEX batched query: {} queries planned into {} PBC round(s) (K={})",
+            n, rounds.len(), k_index,
+        );
+
+        // Per-scripthash output buffers.
+        let mut found_info: Vec<Option<(u32, u8, bool)>> = vec![None; n];
+        let mut index_bins_per_sh: Vec<Vec<IndexBinTrace>> =
+            (0..n).map(|_| Vec::with_capacity(INDEX_CUCKOO_NUM_HASHES)).collect();
+        let mut matched_idx_per_sh: Vec<Option<usize>> = vec![None; n];
+
+        for (round_id, round) in rounds.iter().enumerate() {
+            for h in 0..INDEX_CUCKOO_NUM_HASHES {
+                // Build placements: per scripthash placed in this round,
+                // compute its target bin in its assigned group at cuckoo
+                // position `h` (the cuckoo key is keyed on the placed
+                // group, matching what the server stores at build time).
+                let mut placements: Vec<(u8, u32)> = Vec::with_capacity(round.len());
+                for &(sh_idx, pbc_group) in round {
+                    let key = pir_core::hash::derive_cuckoo_key(
+                        INDEX_PARAMS.master_seed,
+                        pbc_group,
+                        h,
+                    );
+                    let target_bin = pir_core::hash::cuckoo_hash(
+                        &script_hashes[sh_idx],
+                        key,
+                        index_bins,
+                    );
+                    placements.push((pbc_group as u8, target_bin as u32));
+                }
+
+                // round_tag encodes (round_id, h) so audit logs can tell
+                // which wire round corresponds to which (PBC round,
+                // cuckoo position) pair.
+                let round_tag = round_id * INDEX_CUCKOO_NUM_HASHES + h;
+                let answers = self
+                    .run_index_round(db_info.db_id, &placements, round_tag)
+                    .await?;
+
+                // Map each placement back to its scripthash; record bin
+                // trace + match.
+                for &(sh_idx, pbc_group) in round {
+                    let g = pbc_group as u8;
+                    let key = pir_core::hash::derive_cuckoo_key(
+                        INDEX_PARAMS.master_seed,
+                        pbc_group,
+                        h,
+                    );
+                    let target_bin = pir_core::hash::cuckoo_hash(
+                        &script_hashes[sh_idx],
+                        key,
+                        index_bins,
+                    ) as u32;
+                    let answer = answers.get(&g).ok_or_else(|| {
+                        PirError::Protocol(format!(
+                            "INDEX round group {} dropped for sh_idx {}",
+                            g, sh_idx
+                        ))
+                    })?;
+
+                    let pos = index_bins_per_sh[sh_idx].len();
+                    index_bins_per_sh[sh_idx].push(IndexBinTrace {
+                        pbc_group,
+                        bin_index: target_bin,
+                        bin_content: answer.clone(),
+                    });
+
+                    if found_info[sh_idx].is_some() {
+                        log::info!(
+                            "[PIR-AUDIT] HarmonyPIR INDEX[sh={}] extra probe at h={} (group={}, bin={}) — tracked for Merkle uniformity",
+                            sh_idx, h, pbc_group, target_bin,
+                        );
+                        continue;
+                    }
+
+                    let my_tag =
+                        pir_core::hash::compute_tag(tag_seed, &script_hashes[sh_idx]);
+                    if let Some(entry) = find_entry_in_index_result(answer, my_tag) {
+                        let is_whale = entry.1 == 0;
+                        log::info!(
+                            "[PIR-AUDIT] HarmonyPIR INDEX[sh={}] FOUND at h={} (group={}, bin={}): start_chunk={}, num_chunks={}, whale={}",
+                            sh_idx, h, pbc_group, target_bin, entry.0, entry.1, is_whale,
+                        );
+                        matched_idx_per_sh[sh_idx] = Some(pos);
+                        found_info[sh_idx] = Some((entry.0, entry.1, is_whale));
+                    } else {
+                        log::info!(
+                            "[PIR-AUDIT] HarmonyPIR INDEX[sh={}] miss at h={} (group={}, bin={})",
+                            sh_idx, h, pbc_group, target_bin,
+                        );
+                    }
+                }
+            }
+        }
+
+        // Suppress an unused-binding warning if no scripthashes were
+        // placed (degenerate empty-batch case the planner handles gracefully).
+        let _ = placement;
+
+        Ok((0..n)
+            .map(|i| (found_info[i], std::mem::take(&mut index_bins_per_sh[i]), matched_idx_per_sh[i]))
+            .collect())
     }
 
     /// Query a single script hash.
@@ -1530,9 +1791,16 @@ impl HarmonyClient {
                 pir_core::hash::derive_cuckoo_key(INDEX_PARAMS.master_seed, real_group, h);
             let target_bin = pir_core::hash::cuckoo_hash(script_hash, key, index_bins);
 
-            let answer = self
-                .run_index_round(db_info.db_id, real_group as u8, target_bin as u32, h)
+            let placements = [(real_group as u8, target_bin as u32)];
+            let mut round_results = self
+                .run_index_round(db_info.db_id, &placements, h)
                 .await?;
+            let answer = round_results.remove(&(real_group as u8)).ok_or_else(|| {
+                PirError::Protocol(format!(
+                    "INDEX round dropped real group {} response",
+                    real_group
+                ))
+            })?;
 
             let pos = traces.index_bins.len();
             traces.index_bins.push(IndexBinTrace {
@@ -1644,34 +1912,46 @@ impl HarmonyClient {
         ))
     }
 
-    /// Build and send one INDEX batch (K groups, 1 sub-query each, real
-    /// group + synthetic dummies). Returns the XOR-recovered bin for
-    /// `(real_group, target_bin)`.
+    /// Build and send one INDEX batch (K groups, 1 sub-query each).
+    /// `placements` lists the `(group_id, target_bin)` pairs that
+    /// carry real queries this round; remaining groups send
+    /// `build_synthetic_dummy()`. Returns a `HashMap<group_id,
+    /// XOR-recovered bin content>` covering every group flagged as
+    /// `Real`, leaving the caller to map placements back to scripthashes.
     ///
-    /// `round_tag` is passed to the server as the `round_id` field —
-    /// primarily useful for audit logging and load balancing.
+    /// Pre-Option-B this function only ever received a single placement
+    /// (the assigned-group `derive_groups_3[0]` of the active
+    /// scripthash). The Option-B closure for the
+    /// `index_max_items_per_group_per_level` axis fans real placements
+    /// across multiple groups within a single PBC round, halving the
+    /// wire INDEX round count for batches and forcing
+    /// `max_items_per_group_per_level = 2` regardless of input collision
+    /// pattern. Wire format unchanged — the server still processes K
+    /// BatchItems × (T-1) indices each indistinguishably.
     async fn run_index_round(
         &mut self,
         db_id: u8,
-        real_group: u8,
-        target_bin: u32,
+        placements: &[(u8, u32)],
         round_tag: usize,
-    ) -> PirResult<Vec<u8>> {
+    ) -> PirResult<HashMap<u8, Vec<u8>>> {
         let k_index = self.index_groups.len() as u8;
+        let roles = classify_index_groups(placements, k_index);
         let mut batch_items: Vec<BatchItem> = Vec::with_capacity(k_index as usize);
 
         for g in 0..k_index {
+            let role = roles[g as usize];
             let group = self
                 .index_groups
                 .get_mut(&g)
                 .ok_or_else(|| PirError::InvalidState(format!("missing INDEX group {}", g)))?;
-            let bytes = if g == real_group {
-                let req = group
-                    .build_request(target_bin)
-                    .map_err(|e| PirError::BackendState(format!("build_request: {:?}", e)))?;
-                req.request()
-            } else {
-                group.build_synthetic_dummy()
+            let bytes = match role {
+                IndexGroupRole::Real(target_bin) => {
+                    let req = group
+                        .build_request(target_bin)
+                        .map_err(|e| PirError::BackendState(format!("build_request: {:?}", e)))?;
+                    req.request()
+                }
+                IndexGroupRole::Dummy => group.build_synthetic_dummy(),
             };
             batch_items.push(BatchItem {
                 group_id: g,
@@ -1697,20 +1977,29 @@ impl HarmonyClient {
             response_bytes: (response.len() as u64).saturating_add(4),
             items: items_per_group,
         });
-        let results = decode_batch_response(&response)?;
+        let raw_results = decode_batch_response(&response)?;
 
-        let data = results
-            .get(&real_group)
-            .ok_or_else(|| PirError::Protocol(format!("no response for group {}", real_group)))?;
-
-        let group = self
-            .index_groups
-            .get_mut(&real_group)
-            .ok_or_else(|| PirError::InvalidState("missing INDEX real group".into()))?;
-        let answer = group
-            .process_response(data)
-            .map_err(|e| PirError::BackendState(format!("process_response: {:?}", e)))?;
-        Ok(answer)
+        // Decode only groups marked `Real` — unprocessed dummy responses
+        // mirror the chunk-side pattern, where decoding dummies would
+        // advance HarmonyGroup state for no caller-visible benefit.
+        let mut out = HashMap::new();
+        for g in 0..k_index {
+            if !matches!(roles[g as usize], IndexGroupRole::Real(_)) {
+                continue;
+            }
+            let data = raw_results.get(&g).ok_or_else(|| {
+                PirError::Protocol(format!("no INDEX response for group {}", g))
+            })?;
+            let group = self
+                .index_groups
+                .get_mut(&g)
+                .ok_or_else(|| PirError::InvalidState("missing INDEX real group".into()))?;
+            let answer = group
+                .process_response(data)
+                .map_err(|e| PirError::BackendState(format!("process_response: {:?}", e)))?;
+            out.insert(g, answer);
+        }
+        Ok(out)
     }
 
     /// Execute CHUNK rounds to recover each chunk in `chunk_ids`.

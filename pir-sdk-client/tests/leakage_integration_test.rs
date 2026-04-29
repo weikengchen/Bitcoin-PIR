@@ -506,46 +506,6 @@ async fn run_dpf_batch_query(scripthashes: &[ScriptHash]) -> LeakageProfile {
     recorder.take_profile("dpf")
 }
 
-/// Assert two profiles agree on every round whose `kind` is NOT
-/// `IndexMerkleSiblings`. The order of remaining rounds is preserved
-/// because IndexMerkleSiblings rounds are emitted contiguously at the
-/// tail of the transcript (after `run_merkle_verification`), so
-/// filtering them out leaves the per-query INDEX/CHUNK rounds in the
-/// same wire order.
-fn assert_non_index_merkle_rounds_equal(a: &LeakageProfile, c: &LeakageProfile) {
-    let a_rest: Vec<&RoundProfile> = a
-        .rounds
-        .iter()
-        .filter(|r| !matches!(r.kind, RoundKind::IndexMerkleSiblings { .. }))
-        .collect();
-    let c_rest: Vec<&RoundProfile> = c
-        .rounds
-        .iter()
-        .filter(|r| !matches!(r.kind, RoundKind::IndexMerkleSiblings { .. }))
-        .collect();
-    assert_eq!(
-        a_rest.len(), c_rest.len(),
-        "non-IndexMerkleSiblings round count mismatch: A={} C={}",
-        a_rest.len(), c_rest.len(),
-    );
-    for (i, (ra, rc)) in a_rest.iter().zip(c_rest.iter()).enumerate() {
-        assert_eq!(ra.kind, rc.kind, "non-merkle round[{}] kind mismatch", i);
-        assert_eq!(ra.server_id, rc.server_id, "non-merkle round[{}] server_id mismatch", i);
-        assert_eq!(ra.db_id, rc.db_id, "non-merkle round[{}] db_id mismatch", i);
-        assert_eq!(
-            ra.request_bytes, rc.request_bytes,
-            "non-merkle round[{}] {:?} request_bytes mismatch ({} vs {})",
-            i, ra.kind, ra.request_bytes, rc.request_bytes,
-        );
-        assert_eq!(
-            ra.response_bytes, rc.response_bytes,
-            "non-merkle round[{}] {:?} response_bytes mismatch",
-            i, ra.kind,
-        );
-        assert_eq!(ra.items, rc.items, "non-merkle round[{}] items mismatch", i);
-    }
-}
-
 /// Cheap, no-network sanity check that the pinned hex constants still
 /// witness the (4-collision, 2-distinct) pattern. Runs on every
 /// `cargo test` invocation (no `--ignored` flag needed) so a `K` change
@@ -745,12 +705,18 @@ async fn run_harmony_batch_query(scripthashes: &[ScriptHash]) -> LeakageProfile 
 /// Multi-query simulator-property witness for HarmonyPIR — same
 /// curated scripthash batches as the DPF analog, since HarmonyPIR's
 /// INDEX path also assigns each scripthash to
-/// `derive_groups_3(sh, K)[0]` (see
-/// `pir-sdk-client/src/harmony.rs::query_single`). For the colliding
-/// pair, both INDEX Merkle items per query land in the same PBC group,
-/// so `max_items_per_group_per_level = 4`; for the non-colliding pair
-/// it is 2. The DPF analog passed cleanly against Hetzner with
-/// `IndexMerkleSiblings A=24 B=24 C=12 (= 2 × A)`.
+/// `derive_groups_3(sh, K)[0]`. Pre-closure (commit `6eda18a`) the
+/// curated colliding pair drove HarmonyPIR's
+/// `max_items_per_group_per_level` from 2 to 4, with empirical
+/// `IndexMerkleSiblings A=12 B=12 C=6`. Post-closure (this commit)
+/// HarmonyPIR's INDEX phase routes each scripthash to its
+/// PBC-plan-assigned group instead of `[0]`, so the three batches
+/// produce byte-identical profiles. The DPF analog has the same
+/// post-closure assertions; see its docstring for the full rationale.
+///
+/// Empirical against Hetzner (post-closure):
+///   `total rounds A=B=C=20; IndexMerkleSiblings A=B=C=6`
+///   = 2 max_items_per_group × 1 server × 3 Merkle levels.
 ///
 /// Known flake: HarmonyPIR runs against the public Hetzner deployment
 /// can intermittently time out on the hint-stream WebSocket — the same
@@ -771,37 +737,26 @@ async fn harmony_simulator_property_multi_query_collision() {
     let b_merkle = profile_b.count_of_kind(&RoundKind::IndexMerkleSiblings { level: 0 });
     let c_merkle = profile_c.count_of_kind(&RoundKind::IndexMerkleSiblings { level: 0 });
     println!(
-        "harmony multi-query collision: total rounds A={} B={} C={}; \
+        "harmony multi-query collision (post-closure): total rounds A={} B={} C={}; \
          IndexMerkleSiblings A={} B={} C={}",
         profile_a.rounds.len(), profile_b.rounds.len(), profile_c.rounds.len(),
         a_merkle, b_merkle, c_merkle,
     );
 
-    // Same four assertions as the DPF analog — see that test for the
-    // axis-by-axis rationale.
+    // Post-closure: all three profiles must be byte-identical.
     assert_profiles_equivalent(&profile_a, &profile_b);
-    assert_ne!(
-        profile_a.rounds.len(), profile_c.rounds.len(),
-        "expected A and C to have different total round counts \
-         (max_items_per_group differs 4 vs 2); got equal = {} rounds",
-        profile_a.rounds.len(),
-    );
-    assert_non_index_merkle_rounds_equal(&profile_a, &profile_c);
+    assert_profiles_equivalent(&profile_a, &profile_c);
+
     assert!(
         c_merkle > 0,
         "expected ≥1 IndexMerkleSiblings round in batch_C profile (DB has Merkle?); got 0",
     );
     assert_eq!(
-        a_merkle, 2 * c_merkle,
-        "expected harmony batch_A IndexMerkleSiblings count ({}) = 2 × batch_C count ({}) \
-         — max_items_per_group should be 4 for A vs 2 for C",
         a_merkle, c_merkle,
-    );
-    assert_eq!(
-        a_merkle, b_merkle,
-        "expected harmony batch_A and batch_B IndexMerkleSiblings counts to match \
-         (got {} vs {})",
-        a_merkle, b_merkle,
+        "expected harmony batch_A and batch_C IndexMerkleSiblings counts to match \
+         post-closure (got A={}, C={}); if A == 2*C, the PBC plan regressed \
+         to derive_groups_3[0] coupling",
+        a_merkle, c_merkle,
     );
 }
 
