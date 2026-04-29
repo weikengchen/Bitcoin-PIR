@@ -916,6 +916,144 @@ async fn run_onion_single_query(sh: ScriptHash) -> LeakageProfile {
     recorder.take_profile("onion")
 }
 
+#[cfg(feature = "onion")]
+async fn run_onion_batch_query(scripthashes: &[ScriptHash]) -> LeakageProfile {
+    let recorder = Arc::new(BufferingLeakageRecorder::new());
+    let mut client = OnionClient::new(&onion_url());
+    client.set_leakage_recorder(Some(recorder.clone()));
+    client.connect().await.expect("onion connect");
+    let catalog = client.fetch_catalog().await.expect("onion fetch_catalog");
+    let _ = client
+        .query_batch(scripthashes, catalog.databases[0].db_id)
+        .await
+        .expect("onion query_batch");
+    client.disconnect().await.unwrap();
+    recorder.take_profile("onion")
+}
+
+/// Multi-query simulator-property witness for OnionPIR. Reuses the
+/// curated scripthash pairs from `curated_batches()` (the same six
+/// pinned values the DPF and Harmony analogs use).
+///
+/// **Why this asserts equivalence across ALL three batches** — including
+/// the non-colliding `batch_C`, where DPF and Harmony assert *non*-equivalence:
+///
+/// 1. OnionPIR's INDEX query layer
+///    ([pir-sdk-client/src/onion.rs:1228-1232](pir-sdk-client/src/onion.rs:1228))
+///    calls `pbc_plan_rounds` over the scripthashes' `derive_groups_3`
+///    triples. When two scripthashes share `derive_groups_3[0]`, the
+///    planner re-routes one to its [1] or [2] within the same INDEX
+///    round — they land in different `group` slots, so their INDEX
+///    Merkle leaves do *not* accumulate in one PBC group the way DPF's
+///    do.
+/// 2. OnionPIR's INDEX Merkle layer
+///    ([pir-sdk-client/src/onion_merkle.rs:777-790](pir-sdk-client/src/onion_merkle.rs:777))
+///    buckets items by `gid = node_idx / arity` (post-cuckoo, *not* by
+///    `pbc_group`), then PBC-routes unique gids again via
+///    `derive_int_groups_3(gid, level_info.k)`. Wire emits
+///    `pbc_rounds.len()` rounds per level.
+/// 3. Concretely: ARITY = 120 for OnionPIR Merkle (see
+///    `build/src/gen_4_build_merkle_onion.rs:35`), and
+///    `level_info.k = adaptive_k(num_groups)` returns 25 for typical
+///    production sizes (same file, line 40-43). For batch=2 the upper
+///    bound on INDEX Merkle items is 4 → at most 4 unique gids →
+///    `pbc_plan_rounds(≤4 items, k=25, 3 candidates, 500 max_kicks)`
+///    always packs into 1 round.
+///
+/// So the `index_max_items_per_group_per_level` axis is *structurally
+/// trivial on Onion at small batch*: `pbc_rounds.len() = 1` per level,
+/// regardless of any collision pattern in the inputs. The empirical
+/// witness here is the negation of what DPF shows — the curation that
+/// distinguishes DPF/Harmony profiles is a no-op on Onion.
+///
+/// If `level_info.k` ever drops to ≤ 4 (very small DB) or batch size
+/// grows past ~12, the per-level count assertion below fires and forces
+/// a re-think. The condition is pinned explicitly so a future server
+/// reconfiguration cannot silently invalidate the structural argument.
+#[cfg(feature = "onion")]
+#[tokio::test]
+#[ignore = "requires running PIR servers"]
+async fn onion_simulator_property_multi_query_collision() {
+    let (batch_a, batch_b, batch_c) = curated_batches();
+
+    let profile_a = run_onion_batch_query(&batch_a).await;
+    let profile_b = run_onion_batch_query(&batch_b).await;
+    let profile_c = run_onion_batch_query(&batch_c).await;
+
+    // Build per-level histograms of IndexMerkleSiblings rounds. Note
+    // `count_of_kind` ignores the `level` field (matches by enum
+    // discriminant), so we cannot rely on it for per-level counts and
+    // walk the rounds list manually instead.
+    let index_merkle_per_level = |p: &LeakageProfile| -> std::collections::BTreeMap<u8, usize> {
+        let mut h = std::collections::BTreeMap::new();
+        for r in &p.rounds {
+            if let RoundKind::IndexMerkleSiblings { level } = r.kind {
+                *h.entry(level).or_insert(0) += 1;
+            }
+        }
+        h
+    };
+    let hist_a = index_merkle_per_level(&profile_a);
+    let hist_b = index_merkle_per_level(&profile_b);
+    let hist_c = index_merkle_per_level(&profile_c);
+
+    println!(
+        "onion multi-query collision: total rounds A={} B={} C={}",
+        profile_a.rounds.len(), profile_b.rounds.len(), profile_c.rounds.len(),
+    );
+    println!("  IndexMerkleSiblings per level:");
+    for (level, &a_lvl) in &hist_a {
+        let b_lvl = hist_b.get(level).copied().unwrap_or(0);
+        let c_lvl = hist_c.get(level).copied().unwrap_or(0);
+        println!("    L{}: A={} B={} C={}", level, a_lvl, b_lvl, c_lvl);
+    }
+
+    // Cross-batch L-equivalence — the load-bearing assertion. Holds
+    // across ALL three because the axis is structurally trivial on
+    // Onion at batch=2 (see header comment).
+    assert_profiles_equivalent(&profile_a, &profile_b);
+    assert_profiles_equivalent(&profile_a, &profile_c);
+
+    // Pin the structural-triviality assumption per level. Each
+    // observed Merkle level must have emitted exactly 1 PBC round.
+    // If a future server reconfiguration shrinks `level_info.k` below
+    // ~5 (or batch size grows past ~12), this fires and the
+    // structural argument needs a re-think.
+    assert!(
+        !hist_a.is_empty(),
+        "expected ≥1 IndexMerkleSiblings level in OnionPIR profile (DB has Merkle?); got 0",
+    );
+    for (level, &count) in &hist_a {
+        assert_eq!(
+            count, 1,
+            "batch=2 expected pbc_rounds.len()=1 at IndexMerkleSiblings L{}; got {} \
+             — server's level_info.k may have shrunk below the structural-triviality \
+             threshold; see the test header comment for context",
+            level, count,
+        );
+    }
+
+    // Per-message K-padding still holds for the multi-query path. K
+    // values come from the catalog, not constants, so a server K-rebuild
+    // doesn't silently break this assertion.
+    {
+        let recorder_for_catalog = Arc::new(BufferingLeakageRecorder::new());
+        let mut client = OnionClient::new(&onion_url());
+        client.set_leakage_recorder(Some(recorder_for_catalog.clone()));
+        client.connect().await.expect("onion connect (catalog probe)");
+        let catalog = client
+            .fetch_catalog()
+            .await
+            .expect("onion fetch_catalog (catalog probe)");
+        let main = &catalog.databases[0];
+        let k_index = main.index_k as usize;
+        let k_chunk = main.chunk_k as usize;
+        client.disconnect().await.unwrap();
+        assert_pir_k_padding(&profile_a, k_index, k_chunk);
+        assert_merkle_per_level_uniform(&profile_a);
+    }
+}
+
 // ─── Phase 2.2 hardening: FOUND path + admitted-leak validation ─────────────
 
 /// FOUND path coverage for DPF: a known-found scripthash MUST emit

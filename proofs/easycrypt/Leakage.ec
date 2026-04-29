@@ -34,6 +34,26 @@
  *      and distribute into PBC groups uniformly (analogous to the
  *      pending fix for chunk Merkle below).
  *
+ *      OnionPIR realises the same axis as `pbc_rounds.len()` per
+ *      Merkle level, computed over unique gids
+ *      `(group * bins + bin) / arity` re-routed via
+ *      `derive_int_groups_3(gid, level_info.k)`. The wire-observable
+ *      axis (count of `IndexMerkleSiblings` rounds per level) is
+ *      identical across backends; the per-backend computation
+ *      differs because XOR-PIR (DPF, Harmony) uses sequential
+ *      sibling passes within a single PBC group, while batched-FHE
+ *      (OnionPIR) uses one round per PBC slot of unique gids and a
+ *      different ARITY (120 vs. 8). At batch=2 with typical
+ *      `level_info.k = 25`, the OnionPIR axis is structurally
+ *      trivial: at most 4 unique gids, so `pbc_plan_rounds` always
+ *      packs into 1 round. The empirical witness is the negation
+ *      of the DPF/Harmony witness — the curation that distinguishes
+ *      DPF/Harmony profiles is a no-op on Onion. See
+ *      `pir-sdk-client/tests/leakage_integration_test.rs` —
+ *      `dpf_simulator_property_multi_query_collision`,
+ *      `harmony_simulator_property_multi_query_collision`,
+ *      `onion_simulator_property_multi_query_collision`.
+ *
  *   2. chunk_max_items_per_group_per_level : int
  *      Number of CHUNK Merkle items concentrated in any single
  *      chunk-PBC group. For a found query producing M total chunk
