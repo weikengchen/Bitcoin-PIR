@@ -30,16 +30,18 @@
  *
  *   real_transcript b q1 = real_transcript b q2   whenever L_eq q1 q2.
  *
- * The proof closure is then a standard "destruct L_eq into per-axis
- * equalities, substitute into the body, conclude". The closure is
- * not yet mechanised here — proof bodies below are `admit`-stubbed
- * because the exact tactic syntax (`proc; auto`, record-projection
- * destructuring, `congr` variants) depends on the EasyCrypt version's
- * elaboration. The structural sketch in each proof is precise enough
- * that an EasyCrypt user can fill in the tactics in days, not months.
- * (The earlier scaffolding estimated months because it was framed as
- * full pRHL; the deterministic-shape framing introduced 2026-04-29
- * reduces this dramatically.)
+ * The proof closure is the standard "destruct L_eq into per-axis
+ * equalities, substitute into the body, conclude". All 14 lemmas
+ * are now mechanically closed (no `admit`); the equiv-form lemmas
+ * `simulator_property_per_query` and `simulator_property_constructive`
+ * close via `proc; skip => />` (symbolic-execute the trivial
+ * `return op(...)` body) followed by `exact` of the corresponding
+ * functional-equality lemma. The single non-obvious detail was that
+ * the lemma's ambient `b : backend` parameter shadowed the procedure
+ * argument also named `b`; renaming to `b0` (matching the existing
+ * `Real_proc_eq_op (b0 : backend)` convention) lifts the precondition
+ * `b{1} = b0` to a real binding instead of a tautological
+ * `b{1} = b{1}`. Same fix for `q -> q0` in the constructive lemma.
  *
  * # Run
  *
@@ -58,10 +60,11 @@
  * Or via the Makefile:
  *   make -C proofs/easycrypt check
  *
- * Successful typecheck of the spec (with admit-stubbed proofs) is
- * already a meaningful contribution: it pins down (a) the leakage
- * record, (b) the protocol's per-section structure, and (c) the
- * exact proof obligations that close the simulator argument.
+ * Successful typecheck of the spec, with all 14 lemmas closed
+ * (zero `admit`), pins down (a) the leakage record, (b) the
+ * protocol's per-section structure, (c) the exact proof obligations
+ * that close the simulator argument, and (d) a mechanically verified
+ * proof of those obligations.
  * --------------------------------------------------------------------- *)
 
 require import Common Leakage Protocol Simulator.
@@ -201,22 +204,19 @@ qed.
  * applications via `Real_proc_eq_op`, then `real_transcript_factors_through_L`
  * concludes.
  * --------------------------------------------------------------------- *)
-lemma simulator_property_per_query (b : backend) (q1 q2 : query) :
+lemma simulator_property_per_query (b0 : backend) (q1 q2 : query) :
   L_eq q1 q2 =>
   equiv [
     Real.query ~ Real.query :
-    ={glob Real} /\ b{1} = b /\ b{2} = b /\ q{1} = q1 /\ q{2} = q2
+    ={glob Real} /\ b{1} = b0 /\ b{2} = b0 /\ q{1} = q1 /\ q{2} = q2
     ==>
     ={res}
   ].
 proof.
-  (* Closure path: combine `Real_proc_eq_op` (closed above) with
-   * `real_transcript_factors_through_L b q1 q2 h` (also closed
-   * above). The remaining gap is just the EasyCrypt incantation
-   * to translate from `equiv` over `proc` to functional equality
-   * on the deterministic `op`. We have closed the meaningful
-   * mathematical content; only the tactic-level glue is missing. *)
-  admit.
+  move => h.
+  proc.
+  skip => />.
+  exact (real_transcript_factors_through_L b0 q1 q2 h).
 qed.
 
 (* ---------------------------------------------------------------------- *
@@ -231,19 +231,17 @@ qed.
  *
  * Closure path: `Real_proc_eq_op` + `Sim_proc_eq_op` + `real_eq_sim_op`.
  * --------------------------------------------------------------------- *)
-lemma simulator_property_constructive (b : backend) (q : query) :
+lemma simulator_property_constructive (b0 : backend) (q0 : query) :
   equiv [
     Real.query ~ Sim.query :
-    ={glob Real, glob Sim} /\ b{1} = b /\ b{2} = b /\ q{1} = q /\ q{2} = q
+    ={glob Real, glob Sim} /\ b{1} = b0 /\ b{2} = b0 /\ q{1} = q0 /\ q{2} = q0
     ==>
     ={res}
   ].
 proof.
-  (* Closure path: combine `Real_proc_eq_op`, `Sim_proc_eq_op`,
-   * and `real_eq_sim_op b q` (all closed above). The remaining
-   * gap is the EasyCrypt incantation translating from `equiv`
-   * over the two `proc`s to the functional equality. *)
-  admit.
+  proc.
+  skip => />.
+  exact (real_eq_sim_op b0 q0).
 qed.
 
 (* ---------------------------------------------------------------------- *

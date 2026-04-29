@@ -58,10 +58,9 @@ fully randomised pRHL formulation.
 
 ## Status: proven vs. admitted
 
-The spec **typechecks cleanly** (`make check` exits 0; only cosmetic
-warnings about unused memory annotations in equiv pre-conditions).
+The spec **typechecks cleanly with all 14 lemmas closed** (`make check` exits 0; zero `admit` tactics; zero warnings).
 
-**12 of 14 lemmas are mechanically closed (no `admit`):**
+**14 of 14 lemmas mechanically closed:**
 
 In `Leakage.ec`:
 - `L_eq_refl`, `L_eq_sym`, `L_eq_trans` — equivalence-relation axioms.
@@ -71,19 +70,11 @@ In `Theorem.ec`:
 - `real_transcript_factors_through_L` — wire transcript depends only on `L`. Proof: substitute the four per-axis equalities, conclude by reflexivity.
 - `real_eq_sim_op` — equational simulator construction `real_transcript b q = sim_transcript b (L q)`. Proof: rewrite via `L_factors` and simplify.
 - `Real_proc_eq_op`, `Sim_proc_eq_op` — bridge from `proc` view to `op` view. Proof: `proc; auto.` (the procs delegate to the deterministic ops).
+- `simulator_property_per_query` — headline `equiv [ Real ~ Real : L_eq q1 q2 ==> ={res} ]`. Proof: `proc; skip => />.` symbolically executes the trivial `return real_transcript b q` body, leaving `real_transcript b0 q1 = real_transcript b0 q2`, closed by `exact (real_transcript_factors_through_L b0 q1 q2 h)`.
+- `simulator_property_constructive` — headline `equiv [ Real ~ Sim : ... ==> ={res} ]`. Same pattern, closed by `exact (real_eq_sim_op b0 q0)`.
 - `simulator_property_multi_query` — placeholder (returns `true`); awaits a `query_batch` extension before having substance.
 
-**2 of 14 admit-stubbed (Theorem.ec):**
-
-- `simulator_property_per_query` — the headline `equiv [ Real ~ Real ]` form.
-- `simulator_property_constructive` — the headline `equiv [ Real ~ Sim ]` form.
-
-These two are admit-stubbed **not for lack of mathematical content** but because the EasyCrypt tactic incantation to translate `equiv [proc1 ~ proc2 : pre ==> ={res}]` into a functional equality on the underlying `op` requires version-specific glue (`byequiv`, `inline`, `wp; skip`, or hint-driven `smt`). The underlying mathematical equivalents are already closed:
-
-- `simulator_property_per_query` follows from `Real_proc_eq_op` (closed) + `real_transcript_factors_through_L` (closed).
-- `simulator_property_constructive` follows from `Real_proc_eq_op` (closed) + `Sim_proc_eq_op` (closed) + `real_eq_sim_op` (closed).
-
-A user fluent in EasyCrypt's pRHL tactic dialect should close both in minutes by composing the existing closed lemmas. The author of this spec is not (yet) that fluent.
+**Subtle gotcha caught while closing the equiv lemmas.** The lemma signatures originally used parameter names `b` and `q`, which shadow the procedure parameters `b` and `q` of `Real.query` / `Sim.query`. EasyCrypt parses the unmarked `b` in the precondition `b{1} = b` as `b{1}` (defaulting to memory `&1`), making the precondition `b{1} = b{1}` — tautological. The fix is to rename the lemma parameters to `b0` and `q0`, matching the convention already established by `Real_proc_eq_op (b0 : backend)`. This is the kind of "obvious in retrospect" detail that makes pRHL work look harder than it is.
 
 **Out of scope:**
 - `simulator_property_multi_query` (non-vacuous form) — needs a `query_batch` extension to `Real` and `Sim` before the lemma has substance.
@@ -144,10 +135,9 @@ eval $(opam env --switch=easycrypt)
 easycrypt -I . Theorem.ec
 ```
 
-A successful typecheck prints no errors. `admit`-stubbed lemmas emit
-warnings of the form `Warning: lemma <name> uses admit`; that is
-expected. The presence of any `Error:` line (typically a syntactic
-mismatch with the EasyCrypt version) needs fixing.
+A successful typecheck prints no errors and no warnings. The spec
+contains zero `admit` tactics; any `Error:` line (typically a
+syntactic mismatch with the EasyCrypt version) needs fixing.
 
 ### CI
 
