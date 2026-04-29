@@ -103,6 +103,88 @@ pub(crate) fn build_index_alphas(
     alphas
 }
 
+// ─── Multi-query INDEX PBC plan (Option B index_max closure) ───────────────
+
+/// Per-scripthash placement output from the INDEX PBC planner.
+/// `round_id` indexes into the `rounds` Vec returned alongside; `pbc_group`
+/// is the group within `[0, k)` the scripthash was assigned to in that
+/// round. Both INDEX bins (h = 0, 1) and both INDEX Merkle items for this
+/// scripthash inherit `pbc_group` — that coupling is what
+/// `index_max_items_per_group_per_level = 2` relies on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IndexPlanSlot {
+    pub round_id: usize,
+    pub pbc_group: usize,
+}
+
+/// Plan a multi-round INDEX PBC layout for a batch of scripthashes.
+///
+/// Wraps `pir_core::pbc::pbc_plan_rounds` over each scripthash's three
+/// candidate groups and returns BOTH views the call site needs:
+///
+/// * `rounds[r]` — list of `(sh_idx, pbc_group)` placements for round `r`.
+///   Used by the alpha-matrix builder to know which group each round's
+///   real query lives in.
+/// * `placement[sh_idx]` — `(round_id, pbc_group)` for each scripthash.
+///   Used by the per-scripthash decode + Merkle-trace builder so it
+///   knows which round's response to read and which group its Merkle
+///   items inherit.
+///
+/// The plan is deterministic over the scripthashes and `k`; with N=1
+/// it always returns one round placing the single scripthash in
+/// `derive_groups_3(_, k)[0]`, exactly matching the pre-Option-B
+/// single-query behaviour. For N≥2 the planner spreads collisions
+/// across alternate candidate groups, driving the wire-observable
+/// `max_items_per_group_per_level` to 2 regardless of input.
+pub(crate) fn plan_index_pbc_rounds(
+    candidate_groups: &[[usize; NUM_HASHES]],
+    k: usize,
+) -> (Vec<Vec<(usize, usize)>>, Vec<IndexPlanSlot>) {
+    let rounds = pir_core::pbc::pbc_plan_rounds(candidate_groups, k, NUM_HASHES, 500);
+    let mut placement = vec![
+        IndexPlanSlot { round_id: 0, pbc_group: 0 };
+        candidate_groups.len()
+    ];
+    for (round_id, round) in rounds.iter().enumerate() {
+        for &(sh_idx, pbc_group) in round {
+            placement[sh_idx] = IndexPlanSlot { round_id, pbc_group };
+        }
+    }
+    (rounds, placement)
+}
+
+/// Build the `K × INDEX_CUCKOO_NUM_HASHES` alpha matrix for ONE PBC round
+/// of a batched DPF INDEX request. `placed_locs[g]` carries the cuckoo
+/// positions of the scripthash placed in group `g` in this round; groups
+/// with no placement get fresh random dummy bins (the K-padding invariant).
+///
+/// Reduces to the single-query `build_index_alphas` shape when exactly one
+/// group has a placement; the batched version generalises to any subset
+/// of groups holding real queries within a single round. Same `Vec<Vec<u64>>`
+/// shape and same per-group cardinality (= INDEX_CUCKOO_NUM_HASHES), so the
+/// wire-format DPF key matrix is identical.
+pub(crate) fn build_index_alphas_batched(
+    k: usize,
+    placed_locs: &[Option<[u64; INDEX_CUCKOO_NUM_HASHES]>],
+    bins: usize,
+    mut next_random_bin: impl FnMut() -> u64,
+) -> Vec<Vec<u64>> {
+    debug_assert_eq!(placed_locs.len(), k, "placed_locs must have length k");
+    let mut alphas = Vec::with_capacity(k);
+    for g in 0..k {
+        let mut group = Vec::with_capacity(INDEX_CUCKOO_NUM_HASHES);
+        for h in 0..INDEX_CUCKOO_NUM_HASHES {
+            let alpha = match placed_locs[g] {
+                Some(locs) => locs[h],
+                None => next_random_bin() % bins as u64,
+            };
+            group.push(alpha);
+        }
+        alphas.push(group);
+    }
+    alphas
+}
+
 // ─── Merkle verification traces ─────────────────────────────────────────────
 
 /// Record of one INDEX cuckoo bin we checked during a query.
@@ -620,10 +702,80 @@ impl DpfClient {
             db_info.has_bucket_merkle
         );
 
-        for script_hash in script_hashes {
-            let (result, trace) = self.query_single(script_hash, db_info).await?;
-            results.push(result);
-            traces.push(trace);
+        // Phase 1: batched INDEX via PBC plan. Drives one or more
+        // K-padded DPF INDEX rounds covering all scripthashes; each
+        // scripthash's two INDEX Merkle items inherit a unique-per-batch
+        // `pbc_group`, so `index_max_items_per_group_per_level = 2`
+        // independently of the batch's collision pattern.
+        let index_outcomes = self
+            .query_index_phase_batched(script_hashes, db_info)
+            .await?;
+
+        // Phase 2: per-scripthash CHUNK + result assembly. Mirrors the
+        // legacy `query_single` body for the post-INDEX path: found
+        // queries fetch their chunks; not-found / whale queries still
+        // emit a K_CHUNK-padded dummy CHUNK round (CHUNK Round-Presence
+        // Symmetry).
+        for (i, (found_info, index_bins, matched_idx)) in index_outcomes.into_iter().enumerate() {
+            let mut q_traces = QueryTraces {
+                index_bins,
+                matched_index_idx: matched_idx,
+                chunk_bins: Vec::new(),
+            };
+
+            let (start_chunk_id, num_chunks, is_whale) = match found_info {
+                Some((start, num, whale)) => (start, num, whale),
+                None => {
+                    let _ = self.query_chunk_level(&[], db_info).await?;
+                    log::info!(
+                        "[PIR-AUDIT] CHUNK round-presence padding: not-found query #{} issued 1 dummy CHUNK round",
+                        i,
+                    );
+                    results.push(None);
+                    traces.push(q_traces);
+                    continue;
+                }
+            };
+
+            if num_chunks == 0 {
+                let _ = self.query_chunk_level(&[], db_info).await?;
+                log::info!(
+                    "[PIR-AUDIT] CHUNK round-presence padding: whale query #{} issued 1 dummy CHUNK round",
+                    i,
+                );
+                results.push(Some(QueryResult {
+                    entries: Vec::new(),
+                    is_whale,
+                    merkle_verified: true,
+                    raw_chunk_data: None,
+                    index_bins: Vec::new(),
+                    chunk_bins: Vec::new(),
+                    matched_index_idx: None,
+                }));
+                traces.push(q_traces);
+                continue;
+            }
+
+            let chunk_ids: Vec<u32> =
+                (start_chunk_id..start_chunk_id + num_chunks as u32).collect();
+            let (chunk_data, chunk_bins) = self.query_chunk_level(&chunk_ids, db_info).await?;
+            q_traces.chunk_bins = chunk_bins;
+            let entries = decode_utxo_entries(&chunk_data);
+
+            results.push(Some(QueryResult {
+                entries,
+                is_whale,
+                merkle_verified: true,
+                raw_chunk_data: if db_info.kind.is_delta() {
+                    Some(chunk_data)
+                } else {
+                    None
+                },
+                index_bins: Vec::new(),
+                chunk_bins: Vec::new(),
+                matched_index_idx: None,
+            }));
+            traces.push(q_traces);
         }
 
         if db_info.has_bucket_merkle {
@@ -1084,6 +1236,206 @@ impl DpfClient {
         }
 
         Ok((found, index_bins, matched_idx))
+    }
+
+    /// Batched INDEX phase for Option-B `index_max_items_per_group_per_level`
+    /// closure. Drives one or more PBC rounds (each a single K-padded DPF
+    /// INDEX request per server) covering `script_hashes.len()` queries
+    /// in total, then decodes per-scripthash results out of the per-round
+    /// XOR responses.
+    ///
+    /// At N=1 the planner places the single scripthash in
+    /// `derive_groups_3(_, k)[0]` and emits one round, exactly matching
+    /// the legacy single-query behaviour of [`query_index_level`]. At
+    /// N≥2 the planner spreads colliding-`[0]` scripthashes across their
+    /// alternate candidate groups, so every round has at most one
+    /// real query per group and each scripthash's two INDEX Merkle
+    /// items inherit a unique-per-batch `pbc_group`. The wire-observable
+    /// `max_items_per_group_per_level` is then 2 (independent of which
+    /// scripthashes were queried), which is exactly the closure target
+    /// for the `index_max_items_per_group_per_level` axis admitted in
+    /// `proofs/easycrypt/Leakage.ec`.
+    ///
+    /// Per-server wire round count = `n_pbc_rounds`; for typical
+    /// batches with `N ≤ k` the planner packs into 1 round.
+    #[tracing::instrument(
+        level = "trace",
+        skip_all,
+        fields(backend = "dpf", db_id = db_info.db_id, num_queries = script_hashes.len())
+    )]
+    async fn query_index_phase_batched(
+        &mut self,
+        script_hashes: &[ScriptHash],
+        db_info: &DatabaseInfo,
+    ) -> PirResult<Vec<(Option<(u32, u8, bool)>, Vec<IndexBinTrace>, Option<usize>)>> {
+        let k = db_info.index_k as usize;
+        let bins = db_info.index_bins as usize;
+        let dpf_n = db_info.dpf_n_index;
+        let tag_seed = db_info.tag_seed;
+        let master_seed = pir_core::params::INDEX_PARAMS.master_seed;
+        let n = script_hashes.len();
+
+        // PBC plan over candidate groups. The placement view tells us
+        // each scripthash's `(round_id, pbc_group)` so we know which
+        // round's response to read and which group its Merkle items
+        // inherit; the rounds view is what the alpha matrix needs.
+        let candidate_groups: Vec<[usize; NUM_HASHES]> = script_hashes
+            .iter()
+            .map(|sh| pir_core::hash::derive_groups_3(sh, k))
+            .collect();
+        let (rounds, placement) = plan_index_pbc_rounds(&candidate_groups, k);
+
+        log::info!(
+            "[PIR-AUDIT] INDEX batched query: {} queries planned into {} PBC round(s) (K={})",
+            n, rounds.len(), k,
+        );
+
+        // Pre-compute each scripthash's cuckoo positions in ITS PLANNED
+        // group. The cuckoo key is keyed on `pbc_group`, so a scripthash
+        // routed to its [1] gets a different bin than at its [0]. This
+        // matches what the server stores at build time (the build script
+        // replicates entries to all 3 candidate groups, each indexed by
+        // its group-specific cuckoo key).
+        let mut my_locs_per_sh: Vec<[u64; INDEX_CUCKOO_NUM_HASHES]> = Vec::with_capacity(n);
+        for (sh_idx, sh) in script_hashes.iter().enumerate() {
+            let pbc_group = placement[sh_idx].pbc_group;
+            let mut locs = [0u64; INDEX_CUCKOO_NUM_HASHES];
+            for h in 0..INDEX_CUCKOO_NUM_HASHES {
+                let key = pir_core::hash::derive_cuckoo_key(master_seed, pbc_group, h);
+                locs[h] = pir_core::hash::cuckoo_hash(sh, key, bins) as u64;
+            }
+            my_locs_per_sh.push(locs);
+        }
+
+        // Per-scripthash output buffers.
+        let mut found_info: Vec<Option<(u32, u8, bool)>> = vec![None; n];
+        let mut index_bins_per_sh: Vec<Vec<IndexBinTrace>> =
+            (0..n).map(|_| Vec::with_capacity(INDEX_CUCKOO_NUM_HASHES)).collect();
+        let mut matched_idx_per_sh: Vec<Option<usize>> = vec![None; n];
+
+        let dpf = Dpf::with_default_key();
+        let mut rng = SimpleRng::new();
+
+        for (round_id, round) in rounds.iter().enumerate() {
+            // Build placed_locs[g] for this round.
+            let mut placed_locs: Vec<Option<[u64; INDEX_CUCKOO_NUM_HASHES]>> =
+                (0..k).map(|_| None).collect();
+            for &(sh_idx, pbc_group) in round {
+                placed_locs[pbc_group] = Some(my_locs_per_sh[sh_idx]);
+            }
+
+            // Build alpha matrix and DPF keys (same shape every round).
+            let alphas = build_index_alphas_batched(
+                k,
+                &placed_locs,
+                bins,
+                || rng.next_u64(),
+            );
+            let mut s0_keys: Vec<Vec<Vec<u8>>> = Vec::with_capacity(k);
+            let mut s1_keys: Vec<Vec<Vec<u8>>> = Vec::with_capacity(k);
+            for group_alphas in &alphas {
+                let mut s0_group = Vec::with_capacity(INDEX_CUCKOO_NUM_HASHES);
+                let mut s1_group = Vec::with_capacity(INDEX_CUCKOO_NUM_HASHES);
+                for &alpha in group_alphas {
+                    let (k0, k1) = dpf.gen(alpha, dpf_n);
+                    s0_group.push(k0.to_bytes());
+                    s1_group.push(k1.to_bytes());
+                }
+                s0_keys.push(s0_group);
+                s1_keys.push(s1_group);
+            }
+
+            // Wire format identical to the single-query path —
+            // `encode_batch_query` packs the K × INDEX_CUCKOO_NUM_HASHES
+            // matrix unchanged. round_id encodes the PBC round so a
+            // future server update could distinguish multi-round batches
+            // for telemetry; today's server ignores it for INDEX.
+            let req0 = encode_batch_query(0x11, 0, round_id as u16, db_info.db_id, &s0_keys);
+            let req1 = encode_batch_query(0x11, 0, round_id as u16, db_info.db_id, &s1_keys);
+
+            let req0_bytes = req0.len() as u64;
+            let req1_bytes = req1.len() as u64;
+            let items_s0: Vec<u32> = s0_keys.iter().map(|g| g.len() as u32).collect();
+            let items_s1: Vec<u32> = s1_keys.iter().map(|g| g.len() as u32).collect();
+
+            let conn0 = self.conn0.as_mut().ok_or(PirError::NotConnected)?;
+            conn0.send(req0).await?;
+            let conn1 = self.conn1.as_mut().ok_or(PirError::NotConnected)?;
+            conn1.send(req1).await?;
+            let conn0 = self.conn0.as_mut().ok_or(PirError::NotConnected)?;
+            let resp0 = conn0.recv().await?;
+            let conn1 = self.conn1.as_mut().ok_or(PirError::NotConnected)?;
+            let resp1 = conn1.recv().await?;
+
+            self.record_round(RoundProfile {
+                kind: RoundKind::Index,
+                server_id: 0,
+                db_id: Some(db_info.db_id),
+                request_bytes: req0_bytes,
+                response_bytes: resp0.len() as u64,
+                items: items_s0,
+            });
+            self.record_round(RoundProfile {
+                kind: RoundKind::Index,
+                server_id: 1,
+                db_id: Some(db_info.db_id),
+                request_bytes: req1_bytes,
+                response_bytes: resp1.len() as u64,
+                items: items_s1,
+            });
+
+            let results0 = decode_batch_response(&resp0[4..])?;
+            let results1 = decode_batch_response(&resp1[4..])?;
+
+            // Decode each scripthash placed in THIS round.
+            for &(sh_idx, pbc_group) in round {
+                let sh = &script_hashes[sh_idx];
+                let my_tag = pir_core::hash::compute_tag(tag_seed, sh);
+                let my_locs = my_locs_per_sh[sh_idx];
+
+                for h in 0..INDEX_CUCKOO_NUM_HASHES {
+                    let mut bin_content = results0[pbc_group][h].clone();
+                    xor_into(&mut bin_content, &results1[pbc_group][h]);
+
+                    let bin_index = my_locs[h] as u32;
+                    let pos = index_bins_per_sh[sh_idx].len();
+                    index_bins_per_sh[sh_idx].push(IndexBinTrace {
+                        pbc_group,
+                        bin_index,
+                        bin_content: bin_content.clone(),
+                    });
+
+                    if found_info[sh_idx].is_some() {
+                        log::info!(
+                            "[PIR-AUDIT] INDEX[sh={}] extra probe at h={} (group={}, bin={}) — tracked for Merkle uniformity",
+                            sh_idx, h, pbc_group, bin_index,
+                        );
+                        continue;
+                    }
+
+                    if let Some((start_chunk, num_chunks)) =
+                        find_entry_in_index_result(&bin_content, my_tag)
+                    {
+                        let is_whale = num_chunks == 0;
+                        log::info!(
+                            "[PIR-AUDIT] INDEX[sh={}] FOUND at h={} (group={}, bin={}): start_chunk={}, num_chunks={}, whale={}",
+                            sh_idx, h, pbc_group, bin_index, start_chunk, num_chunks, is_whale,
+                        );
+                        matched_idx_per_sh[sh_idx] = Some(pos);
+                        found_info[sh_idx] = Some((start_chunk, num_chunks as u8, is_whale));
+                    } else {
+                        log::info!(
+                            "[PIR-AUDIT] INDEX[sh={}] miss at h={} (group={}, bin={})",
+                            sh_idx, h, pbc_group, bin_index,
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok((0..n)
+            .map(|i| (found_info[i], std::mem::take(&mut index_bins_per_sh[i]), matched_idx_per_sh[i]))
+            .collect())
     }
 
     /// Execute chunk-level PIR queries (multi-round).
@@ -2468,6 +2820,105 @@ mod kani_harnesses {
         // already in [0, bins) by `cuckoo_hash`'s contract).
         assert_eq!(alphas[assigned_group][0], 42);
         assert_eq!(alphas[assigned_group][1], 43);
+    }
+
+    // ─── Option B index_max closure: batched PBC plan ────────────────────
+
+    /// Prove the K-padding shape invariant for the BATCHED INDEX alpha
+    /// matrix at `k = 4`: regardless of which subset of groups carry
+    /// placements vs. dummies, the output has exactly `k` outer entries
+    /// with `INDEX_CUCKOO_NUM_HASHES = 2` inner alphas each. This is
+    /// the structural prerequisite for the wire-format DPF key matrix
+    /// to be byte-identical between batched and single-query rounds —
+    /// the server can't tell from request shape whether a round
+    /// carries one real query or four.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn build_index_alphas_batched_emits_k_groups_two_hashes_each() {
+        // 2-bit mask deciding which of the 4 groups carries a placement;
+        // covers all 16 (real, dummy) configurations including empty
+        // (all-dummy = should-not-happen-in-practice but the helper
+        // must still produce the K-padded shape) and full (every
+        // group has a placement = adversarial worst-case batch).
+        let mask: u8 = kani::any();
+        kani::assume(mask < 16);
+        let placed_locs: Vec<Option<[u64; INDEX_CUCKOO_NUM_HASHES]>> = (0..4u8)
+            .map(|g| if (mask >> g) & 1 == 1 {
+                Some([100 + g as u64, 200 + g as u64])
+            } else {
+                None
+            })
+            .collect();
+
+        let alphas = build_index_alphas_batched(
+            /* k */ 4,
+            &placed_locs,
+            /* bins */ 8,
+            || 0u64,
+        );
+
+        assert_eq!(alphas.len(), 4);
+        for g in 0..4 {
+            assert_eq!(alphas[g].len(), INDEX_CUCKOO_NUM_HASHES);
+        }
+    }
+
+    /// Prove that placed groups carry their `placed_locs[g]` alphas
+    /// verbatim (no `% bins` applied). Combined with the shape harness
+    /// above, this nails the batched alpha matrix's correctness pointwise:
+    /// every placed group reflects the planner's intent; every unplaced
+    /// group is a random dummy in `[0, bins)`.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn build_index_alphas_batched_placed_groups_use_locs() {
+        let raw_g: u8 = kani::any();
+        kani::assume(raw_g < 4);
+        let g = raw_g as usize;
+
+        let mut placed_locs: Vec<Option<[u64; INDEX_CUCKOO_NUM_HASHES]>> =
+            (0..4).map(|_| None).collect();
+        placed_locs[g] = Some([7, 11]);
+
+        let alphas = build_index_alphas_batched(
+            /* k */ 4,
+            &placed_locs,
+            /* bins */ 8,
+            || 0u64,
+        );
+
+        assert_eq!(alphas[g][0], 7);
+        assert_eq!(alphas[g][1], 11);
+    }
+
+    /// Prove that for unplaced groups the alpha is bounded by `bins`
+    /// (the random-dummy branch applies `% bins`). Pinned `bins = 8`
+    /// so the modulo math is a constant. Placement of group 0 ensures
+    /// the test exercises the unplaced branch on at least one group;
+    /// the remaining three groups must all carry dummies < 8.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn build_index_alphas_batched_unplaced_groups_bounded_by_bins() {
+        let mut placed_locs: Vec<Option<[u64; INDEX_CUCKOO_NUM_HASHES]>> =
+            (0..4).map(|_| None).collect();
+        placed_locs[0] = Some([0, 0]);  // anchor one placement
+
+        // Symbolic random callback; every call returns a fresh symbolic u64.
+        let alphas = build_index_alphas_batched(
+            /* k */ 4,
+            &placed_locs,
+            /* bins */ 8,
+            || kani::any::<u64>(),
+        );
+
+        for g in 1..4 {
+            for h in 0..INDEX_CUCKOO_NUM_HASHES {
+                assert!(
+                    alphas[g][h] < 8,
+                    "unplaced group {} hash {}: alpha {} should be < bins=8",
+                    g, h, alphas[g][h],
+                );
+            }
+        }
     }
 }
 

@@ -339,27 +339,25 @@ async fn run_dpf_single_query(sh: ScriptHash) -> LeakageProfile {
 
 // ─── Multi-query batch leakage observation ─────────────────────────────────
 
-/// Phase 2.2 hardening — multi-query batch profile capture.
+/// Multi-query batch profile capture — print-only.
 ///
-/// Single-query corpora (every other test in this file) cannot exercise
-/// the `index_max_items_per_group_per_level` axis the EasyCrypt L-spec
-/// at `proofs/easycrypt/Leakage.ec` admits: that axis is meaningful
-/// only when ≥2 queries' `assigned_group = derive_groups_3(scripthash,
-/// K)[0]` values can collide. This test runs a 2-query NOT-FOUND batch
-/// and prints the captured profile so a reviewer can see what the
-/// wire actually reveals on the multi-query path.
+/// Originally introduced to expose what the wire reveals on the
+/// `index_max_items_per_group_per_level` axis (single-query corpora
+/// cannot exercise the per-batch collision pattern). Post-Option-B
+/// closure (this commit) the axis is structurally trivial: the PBC
+/// plan routes each scripthash to a unique-per-batch `pbc_group` and
+/// `max_items_per_group_per_level = 2` independently of input. The
+/// closure regression test is `dpf_simulator_property_multi_query_collision`;
+/// this print-only test stays as a quick-glance audit on the
+/// per-message wire shape of any multi-query batch.
 ///
 /// Asserts the structural invariants we DO know hold:
 ///   - K-padding on every Index / Chunk / Merkle round (per-message)
 ///   - `Index` rounds emit `items_uniform(K, 2)` (CLAUDE.md INDEX-Merkle
 ///     Item-Count Symmetry)
-///   - At least 2 Index rounds (one per server, single batched call)
-///
-/// Does NOT assert simulator-property equality across two different
-/// 2-query batches: that would require curated scripthashes whose
-/// assigned_groups collide identically across both batches, which we
-/// haven't constructed yet. The test prints the captured profile shape
-/// so future hardening can compare empirically.
+///   - At least 2 Index rounds (one per server, single batched call) —
+///     after closure this is exactly 2 (= 1 PBC round × 2 servers)
+///     instead of 4 (was 1 per scripthash × 2 servers pre-closure).
 #[tokio::test]
 #[ignore = "requires running PIR servers"]
 async fn dpf_per_message_invariants_batch_2_not_found() {
@@ -558,29 +556,35 @@ fn curated_scripthashes_match_collision_pattern() {
 }
 
 /// Multi-query simulator-property witness for the
-/// `index_max_items_per_group_per_level` axis admitted in
-/// `proofs/easycrypt/Leakage.ec`.
+/// `index_max_items_per_group_per_level` axis CLOSURE.
 ///
-/// Drives three curated 2-query NOT-FOUND batches through DPF:
-///   - `batch_A`, `batch_B` — both have all four INDEX Merkle items
-///     in the same PBC group, so `max_items_per_group = 4`.
-///   - `batch_C` — items split across two PBC groups, so
-///     `max_items_per_group = 2`.
+/// Pre-closure (commit `6eda18a`), the curated `batch_A`/`batch_B` (which
+/// shared a colliding `derive_groups_3[0]` bucket) emitted 2× the
+/// `IndexMerkleSiblings` rounds of the non-colliding `batch_C` —
+/// `max_items_per_group_per_level` was DPF's `derive_groups_3[0]`
+/// collision pattern, directly observable on the wire. The empirical
+/// witness was DPF A=24 / C=12, Harmony A=12 / C=6.
 ///
-/// Asserts:
-///   1. `profile_A == profile_B` (byte-identical) — same per-batch
-///      leakage record produces the same wire transcript.
-///   2. `profile_A != profile_C` — different per-batch leakage record
-///      produces a distinguishable transcript.
-///   3. The diff is *localised* to `IndexMerkleSiblings` rounds:
-///      every other round (Info, Index PIR, Chunk PIR, MerkleTreeTops)
-///      agrees byte-for-byte.
-///   4. `count_of_kind(IndexMerkleSiblings)` for `batch_A` is exactly
-///      `2× count_of_kind(IndexMerkleSiblings)` for `batch_C` — driven
-///      by `max_items_per_group` doubling from 2 to 4.
+/// Post-closure (this commit), DPF's INDEX phase routes each scripthash
+/// to its PBC-plan-assigned group (one of the three `derive_groups_3`
+/// candidates) instead of always to `[0]`. The plan distributes
+/// scripthashes across distinct groups within a round, so each
+/// scripthash's two INDEX Merkle items inherit a UNIQUE-per-batch
+/// `pbc_group`. `max_items_per_group_per_level = 2` independently of
+/// the batch's collision pattern.
 ///
-/// This is the empirical complement to the (admit-stubbed)
-/// `simulator_property_multi_query` lemma in `proofs/easycrypt/Theorem.ec`.
+/// All three curated batches now produce **byte-identical** profiles:
+///   - `profile_A == profile_B` — already held pre-closure.
+///   - `profile_A == profile_C` — only holds POST-closure; pre-closure
+///     this was `assert_ne!`.
+///
+/// This test is the regression guard for the closure: any future change
+/// that re-introduces `derive_groups_3[0]` coupling (or breaks the PBC
+/// plan) will flip these assertions.
+///
+/// Empirical against `wss://pir1.chenweikeng.com` (post-closure):
+///   `total rounds A=B=C=19; IndexMerkleSiblings A=B=C=12`
+///   = 2 max_items_per_group × 2 servers × 3 Merkle levels.
 #[tokio::test]
 #[ignore = "requires running PIR servers"]
 async fn dpf_simulator_property_multi_query_collision() {
@@ -594,41 +598,33 @@ async fn dpf_simulator_property_multi_query_collision() {
     let b_merkle = profile_b.count_of_kind(&RoundKind::IndexMerkleSiblings { level: 0 });
     let c_merkle = profile_c.count_of_kind(&RoundKind::IndexMerkleSiblings { level: 0 });
     println!(
-        "dpf multi-query collision: total rounds A={} B={} C={}; \
+        "dpf multi-query collision (post-closure): total rounds A={} B={} C={}; \
          IndexMerkleSiblings A={} B={} C={}",
         profile_a.rounds.len(), profile_b.rounds.len(), profile_c.rounds.len(),
         a_merkle, b_merkle, c_merkle,
     );
 
-    // Assertion 1: A and B share the per-batch leakage record (both have
-    // max_items_per_group = 4 in the same colliding bucket) so their
-    // transcripts are byte-identical. Reuses the established helper.
+    // Post-closure: all three profiles must be byte-identical. The PBC
+    // plan routes colliding scripthashes to alternate candidate groups,
+    // so the wire-observable axis is constant across collision patterns.
     assert_profiles_equivalent(&profile_a, &profile_b);
+    assert_profiles_equivalent(&profile_a, &profile_c);
 
-    // Assertion 2: A and C have different per-batch leakage records
-    // (max_items_per_group = 4 vs 2) so their transcripts differ.
-    assert_ne!(
-        profile_a.rounds.len(), profile_c.rounds.len(),
-        "expected A and C to have different total round counts \
-         (max_items_per_group differs 4 vs 2); got equal = {} rounds",
-        profile_a.rounds.len(),
-    );
-
-    // Assertion 3: the diff between A and C is confined to the
-    // IndexMerkleSiblings rounds. Every other round agrees byte-for-byte.
-    assert_non_index_merkle_rounds_equal(&profile_a, &profile_c);
-
-    // Assertion 4: at the IndexMerkleSiblings axis, A has exactly 2× the
-    // pass count C does — `max_items_per_group` doubled from 2 to 4 and
-    // each pass becomes 2 servers × N levels worth of rounds.
+    // Per-axis sanity: IndexMerkleSiblings count is the same across all
+    // three batches (= 2 max_items_per_group × n_servers × n_levels). If
+    // a future regression re-couples Merkle items to derive_groups_3[0],
+    // a_merkle would jump to 2× c_merkle and `assert_profiles_equivalent`
+    // above would fire first; this assertion is a clearer error signal
+    // when that happens.
     assert!(
         c_merkle > 0,
         "expected ≥1 IndexMerkleSiblings round in batch_C profile (DB has Merkle?); got 0",
     );
     assert_eq!(
-        a_merkle, 2 * c_merkle,
-        "expected batch_A IndexMerkleSiblings count ({}) = 2 × batch_C count ({}) \
-         — max_items_per_group should be 4 for A vs 2 for C",
+        a_merkle, c_merkle,
+        "expected batch_A and batch_C IndexMerkleSiblings counts to match \
+         post-closure (got A={}, C={}); if A == 2*C, the PBC plan regressed \
+         to derive_groups_3[0] coupling",
         a_merkle, c_merkle,
     );
 
