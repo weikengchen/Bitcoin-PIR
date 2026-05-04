@@ -73,10 +73,12 @@ export interface ServerAttestPin {
  * Pinned 2026-05-04 from the v4 deploy (UKI sha `e835a516…f8396da0`).
  */
 export const PIR2_TIER3_PIN: ServerAttestPin = {
+  // FIXME: measurement needs re-capture after UKI rebuild (--pool-size added to cmdline).
+  // Run: bpir-admin attest wss://pir2.chenweikeng.com to get the new measurement.
   measurementHex:
     'f6aa29156c63cae96dce8c33427489016dee86b5716b2aa3c9d9a67e47768fa010d5ad5468ada3f858931f53c6ae8bd9',
   binarySha256Hex:
-    'dc1b97b51360afa83cca47eb30870dcf4a5217c85ba1c26219aff1bb1dc16000',
+    'eb625c68afc81d8d81e3d2a8bea9363282c32477c26c34093b41b918b9c678b6',
   description: 'pir2.chenweikeng.com (VPSBG, SEV-SNP, Tier 3 UKI v4)',
 };
 
@@ -90,6 +92,6 @@ export const PIR2_TIER3_PIN: ServerAttestPin = {
 export const PIR1_PIN: ServerAttestPin = {
   // No measurementHex — Hetzner has no SEV.
   binarySha256Hex:
-    '8fec274b9089a5defaec5825920e662af771a3cbd542968c6fdba93ab3f7d0f6',
+    '11f0860bee3c00da478ecddb43a9431393b27c78952a0bd69f0561d7d509452d',
   description: 'pir1.chenweikeng.com (Hetzner i7-8700, no SEV)',
 };
