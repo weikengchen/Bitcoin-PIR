@@ -426,7 +426,7 @@ async fn main() {
                                 q.level, n, q.sub_queries_per_group, wall);
                             result
                         }
-                        Request::HarmonyHints(_) => {
+                        Request::HarmonyHints(_) | Request::HarmonyHintsV2(_) => {
                             // Hint generation is handled by the dedicated Hint Server,
                             // not the Query Server.
                             Response::Error("hint requests not supported on query server".into())

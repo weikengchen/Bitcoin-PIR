@@ -22,6 +22,7 @@ use tokio_tungstenite::tungstenite::Message;
 use harmonypir::params::Params;
 use harmonypir::prp::hoang::HoangPrp;
 use harmonypir_wasm; // for find_best_t, pad_n_for_t, compute_rounds
+use rand::RngCore;
 
 // ─── Server data ────────────────────────────────────────────────────────────
 
@@ -295,6 +296,80 @@ async fn main() {
 
                         println!("[{}] Hints streamed: level={} {}/{} groups in {:.2?}",
                             peer, level, sent, num, t_start.elapsed());
+                    }
+                    Request::HarmonyHintsV2(_v2_req) => {
+                        // V2: server generates PRP key, sends ALL groups for both
+                        // INDEX and CHUNK levels. This is the on-demand equivalent
+                        // of the unified_server's pre-computed hint pool path.
+                        let t_start = Instant::now();
+                        let prp_backend = harmonypir_wasm::PRP_ALF;
+
+                        // Generate random PRP key.
+                        let mut prp_key = [0u8; 16];
+                        rand::thread_rng().fill_bytes(&mut prp_key);
+
+                        // Build and send key preamble.
+                        // Wire layout: [RESP_HARMONY_HINTS_KEY][1B prp_backend][1B 0xFF][1B total_groups][16B prp_key]
+                        let total_groups = (K + K_CHUNK) as u8;
+                        let preamble_payload_len: u32 = 1 + 1 + 1 + 1 + 16;
+                        let mut preamble = Vec::with_capacity(4 + preamble_payload_len as usize);
+                        preamble.extend_from_slice(&preamble_payload_len.to_le_bytes());
+                        preamble.push(RESP_HARMONY_HINTS_KEY); // 0x44
+                        preamble.push(prp_backend);
+                        preamble.push(0xFF); // HINT_LEVEL_ALL sentinel
+                        preamble.push(total_groups);
+                        preamble.extend_from_slice(&prp_key);
+
+                        if let Err(e) = sink.send(Message::Binary(preamble.into())).await {
+                            eprintln!("[{}] V2 preamble send error: {}", peer, e);
+                            break;
+                        }
+
+                        println!("[{}] V2 hint request: prp_backend={} total_groups={}",
+                            peer, prp_backend, total_groups);
+
+                        // Compute and stream all INDEX + CHUNK groups in parallel.
+                        let data_ref = Arc::clone(&data);
+                        let key = prp_key;
+                        let (tx, mut rx) = tokio::sync::mpsc::channel::<(u8, u32, u32, u32, Vec<u8>)>(8);
+
+                        tokio::task::spawn_blocking(move || {
+                            // Collect all (level, group_id) pairs into a Vec for rayon.
+                            let mut all_groups: Vec<(u8, u8)> = Vec::with_capacity(K + K_CHUNK);
+                            for g in 0..K as u8 {
+                                all_groups.push((0, g));
+                            }
+                            for g in 0..K_CHUNK as u8 {
+                                all_groups.push((1, g));
+                            }
+                            all_groups.into_par_iter().for_each_with(tx, |tx, (level, gid)| {
+                                let result = data_ref.compute_hints_for_group(&key, prp_backend, level, gid);
+                                let _ = tx.blocking_send(result);
+                            });
+                        });
+
+                        // Stream frames as they arrive.
+                        let mut sent = 0usize;
+                        while let Some((group_id, n, t, m, flat_hints)) = rx.recv().await {
+                            let hint_payload_len: u32 = 1 + 1 + 4 + 4 + 4 + flat_hints.len() as u32;
+                            let mut resp = Vec::with_capacity(4 + hint_payload_len as usize);
+                            resp.extend_from_slice(&hint_payload_len.to_le_bytes());
+                            resp.push(RESP_HARMONY_HINTS);
+                            resp.push(group_id);
+                            resp.extend_from_slice(&n.to_le_bytes());
+                            resp.extend_from_slice(&t.to_le_bytes());
+                            resp.extend_from_slice(&m.to_le_bytes());
+                            resp.extend_from_slice(&flat_hints);
+
+                            if let Err(e) = sink.send(Message::Binary(resp.into())).await {
+                                eprintln!("[{}] V2 hint send error: {}", peer, e);
+                                break;
+                            }
+                            sent += 1;
+                        }
+
+                        println!("[{}] V2 hints streamed: {}/{} groups in {:.2?}",
+                            peer, sent, total_groups, t_start.elapsed());
                     }
                     _ => {
                         let resp = Response::Error("unsupported request on hint server".into());

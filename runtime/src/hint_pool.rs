@@ -98,7 +98,6 @@ pub struct PoolEntry {
 /// A background thread keeps the pool filled to `config.pool_size`. When a
 /// client connects, `take()` pops an entry — zero computation on the hot path.
 pub struct HintPool {
-    config: HintPoolConfig,
     entries: Arc<Mutex<VecDeque<PoolEntry>>>,
     condvar: Arc<Condvar>,
     shutdown: Arc<AtomicBool>,
@@ -141,7 +140,6 @@ impl HintPool {
             chunk_bins: db.chunk.bins_per_table,
             index_entry_size: db.index.params.bin_size(),
             chunk_entry_size: db.chunk.params.bin_size(),
-            tag_seed: db.index.tag_seed,
         };
         let index_mmap_ptr = db.index.mmap.as_ptr() as usize;
         let index_mmap_len = db.index.mmap.len();
@@ -167,7 +165,6 @@ impl HintPool {
         });
 
         HintPool {
-            config,
             entries,
             condvar,
             shutdown,
@@ -219,7 +216,6 @@ struct DbParams {
     chunk_bins: usize,
     index_entry_size: usize,
     chunk_entry_size: usize,
-    tag_seed: u64,
 }
 
 fn generation_loop(

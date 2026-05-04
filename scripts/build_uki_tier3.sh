@@ -41,7 +41,7 @@ if [ "$EUID" != "0" ]; then
 fi
 
 # ─── Defaults (override via env) ───────────────────────────────────────────
-KERNEL=${KERNEL:-/boot/vmlinuz-7.0.0-15-generic}
+KERNEL=${KERNEL:-}
 OUT=${OUT:-/tmp/bpir-tier3.efi}
 CUSTOM_INITRD=/tmp/bpir-tier3-initrd.img
 
@@ -50,7 +50,6 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 DRACUT_MODULE_DIR="$SCRIPT_DIR/dracut"
 
 # ─── Sanity checks ─────────────────────────────────────────────────────────
-[ -r "$KERNEL" ] || { echo "error: $KERNEL not readable" >&2; exit 1; }
 
 for tool in ukify dracut sha256sum; do
     command -v "$tool" >/dev/null 2>&1 || {
@@ -90,12 +89,47 @@ BINARY=${BINARY:-/home/pir/BitcoinPIR/target/release/unified_server}
     exit 1
 }
 
+# ─── Kernel auto-detection ──────────────────────────────────────────────────
+# Prefer explicit KERNEL=/boot/vmlinuz-<ver> in the environment.
+# Otherwise, auto-detect the latest installed kernel (highest sort order under
+# /boot/vmlinuz-*). This adapts to unattended-upgrades replacing the kernel
+# and apt autoremove cleaning stale modules without manual pin maintenance.
+if [ -z "$KERNEL" ]; then
+    KERNEL=$(ls -1 /boot/vmlinuz-*-generic 2>/dev/null | sort -V | tail -1)
+    if [ -z "$KERNEL" ]; then
+        echo "error: no kernel found under /boot/vmlinuz-*-generic — set KERNEL= explicitly" >&2
+        exit 1
+    fi
+    echo "auto-detected kernel: $KERNEL"
+fi
+[ -r "$KERNEL" ] || { echo "error: $KERNEL not readable" >&2; exit 1; }
+
 # Derive kernel version from KERNEL filename.
 KVER=$(basename "$KERNEL" | sed 's/^vmlinuz-//')
 [ -d "/usr/lib/modules/$KVER" ] || {
     echo "error: /usr/lib/modules/$KVER missing — kernel modules not installed?" >&2
+    echo "  apt autoremove may have cleaned modules for the pinned kernel." >&2
+    echo "  Reinstall: apt install --reinstall linux-modules-$KVER" >&2
     exit 1
 }
+
+# Validate SEV-SNP kernel modules exist BEFORE building the initramfs.
+# Dracut silently skips modules it cannot find, producing a UKI that boots
+# but whose /dev/sev-guest is never created → noSevHost in the web frontend.
+# Fail early with an actionable message.
+SEV_MODULES_DIR="/usr/lib/modules/$KVER/kernel/drivers"
+for mod in ccp sev-guest tsm_report; do
+    found=$(find "$SEV_MODULES_DIR" -name "${mod}.ko*" -print -quit 2>/dev/null)
+    if [ -z "$found" ]; then
+        echo "error: kernel module '${mod}.ko' not found under $SEV_MODULES_DIR" >&2
+        echo "  This module is REQUIRED for SEV-SNP attestation (/dev/sev-guest)." >&2
+        echo "  The dracut --add-drivers flag will silently skip it, producing a UKI" >&2
+        echo "  that boots but returns noSevHost on the /attest endpoint." >&2
+        echo "  Fix: apt install --reinstall linux-modules-$KVER" >&2
+        exit 1
+    fi
+done
+echo "SEV modules: ccp, sev-guest, tsm_report — all found in $SEV_MODULES_DIR"
 
 # ─── Install dracut modules ────────────────────────────────────────────────
 # Same pattern as build_uki.sh: copy module dirs into dracut's search
@@ -174,6 +208,32 @@ SOURCE_DATE_EPOCH=0 dracut --force --no-hostonly --reproducible --nostrip \
     --kver "$KVER" \
     "$CUSTOM_INITRD"
 echo "initrd:                   $CUSTOM_INITRD ($(du -h "$CUSTOM_INITRD" | cut -f1))"
+
+# Post-build validation: verify SEV-SNP kernel modules actually landed in the
+# initramfs. Dracut silently skips modules it cannot find; the pre-build check
+# guards against missing source .ko files, but this second gate catches
+# dependency-resolution failures, dracut bugs, or accidental filter changes.
+echo "verifying SEV modules in initramfs…"
+if command -v lsinitrd >/dev/null 2>&1; then
+    INITRD_LISTING=$(lsinitrd "$CUSTOM_INITRD" 2>/dev/null || true)
+else
+    # lsinitrd not available (some Ubuntu versions); fall back to zcat.
+    INITRD_LISTING=$(zcat "$CUSTOM_INITRD" 2>/dev/null | cpio -t 2>/dev/null || true)
+fi
+MISSING_MODS=""
+for mod in ccp sev-guest tsm_report; do
+    if ! echo "$INITRD_LISTING" | grep -q "${mod}\.ko"; then
+        MISSING_MODS="$MISSING_MODS $mod"
+    fi
+done
+if [ -n "$MISSING_MODS" ]; then
+    echo "ERROR: SEV kernel module(s) MISSING from initramfs:$MISSING_MODS" >&2
+    echo "  /dev/sev-guest will NOT be created at boot → noSevHost." >&2
+    echo "  Check: dracut warnings above, kernel module dir /usr/lib/modules/$KVER" >&2
+    echo "  Hint:  find /usr/lib/modules/$KVER -name 'ccp.ko*' -o -name 'sev-guest.ko*'" >&2
+    exit 1
+fi
+echo "SEV modules confirmed in initramfs: ccp, sev-guest, tsm_report"
 
 # ─── Build the cmdline ─────────────────────────────────────────────────────
 # rdinit=/sbin/bpir-tier3-init  : kernel exec's OUR script as PID 1

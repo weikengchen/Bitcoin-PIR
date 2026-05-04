@@ -167,12 +167,19 @@ fi
 # In Tier 3 we run unified_server as root, so the default
 # root:root 0600 perms on /dev/sev-guest are sufficient — no chgrp/
 # chmod equivalent of the Slice 2 systemd ExecStartPre is needed.
-modprobe ccp        2>/dev/null || true
-modprobe sev-guest  2>/dev/null || true
-modprobe tsm_report 2>/dev/null || true   # explicit; sev-guest pulls it as dep too
-echo "--- sev modules + device ---"
-lsmod 2>/dev/null | grep -E "sev|ccp|tsm" || echo "[bpir-tier3-init] WARN: no sev/ccp modules loaded"
-ls -la /dev/sev-guest 2>&1 || echo "[bpir-tier3-init] WARN: /dev/sev-guest missing — SEV-SNP attest will return NoSevHost"
+    echo "--- loading SEV-SNP kernel modules ---"
+    modprobe ccp        || echo "[bpir-tier3-init] WARN: modprobe ccp failed"
+    modprobe sev-guest  || echo "[bpir-tier3-init] WARN: modprobe sev-guest failed"
+    modprobe tsm_report || echo "[bpir-tier3-init] WARN: modprobe tsm_report failed"
+    echo "--- sev modules + device ---"
+    lsmod 2>/dev/null | grep -E "sev|ccp|tsm" || echo "[bpir-tier3-init] WARN: no sev/ccp modules loaded"
+    if [ -c /dev/sev-guest ]; then
+        ls -la /dev/sev-guest
+        echo "[bpir-tier3-init] /dev/sev-guest ready — SEV-SNP attestation enabled"
+    else
+        echo "[bpir-tier3-init] WARN: /dev/sev-guest missing — SEV-SNP attest will return NoSevHost"
+        echo "[bpir-tier3-init] modules may not have been baked into initramfs — check UKI build log"
+    fi
 
 # ── 5. Service tree ────────────────────────────────────────────────
 mkdir -p /etc/service
