@@ -117,19 +117,35 @@ KVER=$(basename "$KERNEL" | sed 's/^vmlinuz-//')
 # Dracut silently skips modules it cannot find, producing a UKI that boots
 # but whose /dev/sev-guest is never created → noSevHost in the web frontend.
 # Fail early with an actionable message.
+#
+# ccp + sev-guest are always required. tsm_report exists only on kernel ≥6.10
+# (it's the unified TEE Security Manager interface that sev-guest depends on
+# in newer kernels). On 6.8.x, sev-guest handles the ioctl directly.
 SEV_MODULES_DIR="/usr/lib/modules/$KVER/kernel/drivers"
-for mod in ccp sev-guest tsm_report; do
-    found=$(find "$SEV_MODULES_DIR" -name "${mod}.ko*" -print -quit 2>/dev/null)
-    if [ -z "$found" ]; then
-        echo "error: kernel module '${mod}.ko' not found under $SEV_MODULES_DIR" >&2
-        echo "  This module is REQUIRED for SEV-SNP attestation (/dev/sev-guest)." >&2
-        echo "  The dracut --add-drivers flag will silently skip it, producing a UKI" >&2
-        echo "  that boots but returns noSevHost on the /attest endpoint." >&2
-        echo "  Fix: apt install --reinstall linux-modules-$KVER" >&2
-        exit 1
+REQUIRED_SEV_MODS="ccp sev-guest"
+OPTIONAL_SEV_MODS="tsm_report"
+# Build the driver list and the validation set.
+SEV_DRIVER_LIST="ccp sev-guest"
+for mod in $OPTIONAL_SEV_MODS; do
+    if find "$SEV_MODULES_DIR" -name "${mod}.ko*" -print -quit 2>/dev/null | grep -q .; then
+        REQUIRED_SEV_MODS="$REQUIRED_SEV_MODS $mod"
+        SEV_DRIVER_LIST="$SEV_DRIVER_LIST $mod"
     fi
 done
-echo "SEV modules: ccp, sev-guest, tsm_report — all found in $SEV_MODULES_DIR"
+MISSING_REQUIRED=""
+for mod in $REQUIRED_SEV_MODS; do
+    found=$(find "$SEV_MODULES_DIR" -name "${mod}.ko*" -print -quit 2>/dev/null)
+    if [ -z "$found" ]; then
+        MISSING_REQUIRED="$MISSING_REQUIRED $mod"
+    fi
+done
+if [ -n "$MISSING_REQUIRED" ]; then
+    echo "error: SEV kernel module(s) not found under $SEV_MODULES_DIR:$MISSING_REQUIRED" >&2
+    echo "  These are REQUIRED for SEV-SNP attestation (/dev/sev-guest)." >&2
+    echo "  Fix: apt install --reinstall linux-modules-$KVER" >&2
+    exit 1
+fi
+echo "SEV modules: $REQUIRED_SEV_MODS — all found in $SEV_MODULES_DIR"
 
 # ─── Install dracut modules ────────────────────────────────────────────────
 # Same pattern as build_uki.sh: copy module dirs into dracut's search
@@ -200,11 +216,12 @@ echo "generating tier3 initrd…"
 # --add-drivers ccp,sev-guest,tsm_report: SEV-SNP attestation stack.
 # udev auto-loads these on Slice 2 via PCI matching; in Tier 3 we
 # have no udev so we both bake them in here AND explicitly modprobe
-# in bpir-tier3-init.sh. tsm_report is a dep of sev-guest (modprobe
-# pulls it transitively, but listing it makes the intent explicit).
+# in bpir-tier3-init.sh. tsm_report is a dep of sev-guest on kernel ≥6.10
+# (modprobe pulls it transitively, but listing it makes intent explicit).
+DRIVER_LIST="virtio_net virtio_pci virtio_blk $SEV_DRIVER_LIST"
 SOURCE_DATE_EPOCH=0 dracut --force --no-hostonly --reproducible --nostrip \
     --add "network bpir-cloudflared bpir-unified-server bpir-tier3-init" \
-    --add-drivers " virtio_net virtio_pci virtio_blk ccp sev-guest tsm_report " \
+    --add-drivers " $DRIVER_LIST " \
     --kver "$KVER" \
     "$CUSTOM_INITRD"
 echo "initrd:                   $CUSTOM_INITRD ($(du -h "$CUSTOM_INITRD" | cut -f1))"
@@ -222,7 +239,7 @@ if [ -z "$INITRD_LISTING" ]; then
     exit 1
 fi
 MISSING_MODS=""
-for mod in ccp sev-guest tsm_report; do
+for mod in $REQUIRED_SEV_MODS; do
     # Use here-string instead of pipe to avoid SIGPIPE under set -o pipefail:
     # grep -q exits on first match, closing the pipe, echo gets SIGPIPE (141),
     # pipefail propagates that as the pipeline's exit status.
