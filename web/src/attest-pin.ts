@@ -73,10 +73,9 @@ export interface ServerAttestPin {
  * Pinned 2026-05-04 from the v4 deploy (UKI sha `e835a516…f8396da0`).
  */
 export const PIR2_TIER3_PIN: ServerAttestPin = {
-  // FIXME: measurement needs re-capture after UKI v5 deploy.
-  // Run: bpir-admin attest wss://pir2.chenweikeng.com to get the new measurement.
+  // Tier 3 UKI v5 — 2026-05-04. Includes V2 hint pool, hardened SEV module validation.
   measurementHex:
-    'f6aa29156c63cae96dce8c33427489016dee86b5716b2aa3c9d9a67e47768fa010d5ad5468ada3f858931f53c6ae8bd9',
+    'ac03dde40f5496051a580d062934d879e132e8ba7db7b18670ccc457f6655dad8d7111565b25ccfaa154167faf626304',
   binarySha256Hex:
     '5877e304ee1447fa3747073f5f8f2783abe24c1d459c123d39e30860829ed256',
   description: 'pir2.chenweikeng.com (VPSBG, SEV-SNP, Tier 3 UKI v5)',
