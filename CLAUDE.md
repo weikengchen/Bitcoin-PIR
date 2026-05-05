@@ -369,3 +369,35 @@ cargo test -p pir-sdk-client --lib
 cargo test -p pir-sdk-client --features onion --lib
 cargo test -p pir-sdk-wasm --lib
 ```
+
+## Operations
+
+### VPSBG (pir2)
+- **SSH**: `ssh vpsbg-pir` (root@87.120.8.198, key `~/.ssh/id_ed25519_vpsbg`). Only works in Slice 2.
+- **Boot modes**: Slice 2 (rootfs, sshd, udev) ↔ Tier 3 (UKI, no sshd). Toggle in VPSBG portal → Measured Boot → UKI.
+- **Restart service (Slice 2)**: `ssh vpsbg-pir 'sudo systemctl restart pir-vpsbg'`
+- **Capture pins**: `./target/release/bpir-admin attest wss://pir2.chenweikeng.com`
+- **Update web pins**: `web/src/attest-pin.ts` → `PIR2_TIER3_PIN.measurementHex` / `binarySha256Hex`
+- **Recovery**: Portal → UKI → "None" → Save & Reboot → boots rootfs with sshd
+
+### Hetzner (pir-hetzner) — UKI build host
+- **SSH**: `ssh pir-hetzner` (root@65.21.91.217, key `~/.ssh/id_ed25519`)
+- **Build binary**: `ssh pir-hetzner 'export PATH="/home/pir/.cargo/bin:$PATH" && cd /home/pir/BitcoinPIR && ./scripts/build_unified_server.sh'`
+- **Build UKI** (with VPSBG kernel): `ssh pir-hetzner '... && sudo KERNEL=/boot/vmlinuz-7.0.0-15-generic ./scripts/build_uki_tier3.sh'`
+- **Deploy UKI**: `scp pir-hetzner:/tmp/bpir-tier3.efi deploy/uki/bpir-tier3-vN.efi`, then portal → Upload → Save & Reboot
+- **Cross-build stack**: kernel 7.0.0-15, kmod 34.2, libkmod 2.5.1, dracut 110 (all backported from Ubuntu 25.04 plucky)
+- **Critical**: dracut 060 (Ubuntu 24.04) cannot build a working initramfs for kernel 7.0 — modprobe silently fails. dracut 110 required.
+
+### Shell gotcha — `set -o pipefail` + SIGPIPE
+Never use `echo "$var" | grep -q` under `set -o pipefail`. `grep -q` exits on first match → pipe closes → echo gets SIGPIPE (141) → pipefail propagates → false failure. Use `grep -q ... <<< "$var"` (here-string) instead. See `memory/pattern_shell_sigpipe.md`.
+
+### UKI/initramfs internals
+- dracut-110 on Ubuntu 24.04 produces **zstd-compressed** initramfs (raw `.img` is Zstandard data)
+- Uses **real kmod** (`/usr/bin/kmod` +ZSTD), NOT busybox modprobe — `.ko.zst` support works
+- Kernel modules stored as `.ko.zst` in initramfs: `usr/lib/modules/$KVER/kernel/drivers/...`
+- Inspect with `lsinitrd` (handles all compression); `cpio -t <` does NOT work on zstd
+- SEV modules: ccp, sev-guest, tsm_report — validated pre/post-build in `build_uki_tier3.sh`
+
+### Attestation pins (current as of 2026-05-05)
+- **pir1 (Hetzner)**: binary `11f0860b...` — no SEV, no measurement
+- **pir2 (VPSBG) Tier 3 v11**: binary `f9daecb1...`, measurement `0662adca...`
