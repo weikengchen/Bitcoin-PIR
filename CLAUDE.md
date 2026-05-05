@@ -399,5 +399,5 @@ Never use `echo "$var" | grep -q` under `set -o pipefail`. `grep -q` exits on fi
 - SEV modules: ccp, sev-guest, tsm_report — validated pre/post-build in `build_uki_tier3.sh`
 
 ### Attestation pins (current as of 2026-05-05)
-- **pir1 (Hetzner)**: binary `11f0860b...` — no SEV, no measurement
+- **pir1 (Hetzner)**: binary `f9daecb1...` (same as pir2) — no SEV, no measurement
 - **pir2 (VPSBG) Tier 3 v11**: binary `f9daecb1...`, measurement `0662adca...`
