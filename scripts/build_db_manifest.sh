@@ -66,8 +66,19 @@ generated_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
     printf '\n'
     printf '[files]\n'
     while IFS= read -r f; do
-        h=$(hash_one "$f")
-        printf '"%s" = "%s"\n' "$f" "$h"
+        # Cuckoo table files are several GB — skip hashing them.
+        # The server (pir-runtime-core::manifest::verify_dir_contents)
+        # checks their existence but skips content-hash verification;
+        # the table bytes are covered by SEV-SNP MEASUREMENT instead.
+        case "$f" in
+            *_cuckoo.bin)
+                printf '"%s" = "%s"\n' "$f" "0000000000000000000000000000000000000000000000000000000000000000"
+                ;;
+            *)
+                h=$(hash_one "$f")
+                printf '"%s" = "%s"\n' "$f" "$h"
+                ;;
+        esac
     done < "$files_list"
 } > "$out_tmp"
 

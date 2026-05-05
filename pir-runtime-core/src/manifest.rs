@@ -152,9 +152,24 @@ impl DbManifest {
 
     /// Verify every listed file matches its expected SHA-256, and that no
     /// unlisted regular file is present in the directory tree.
+    ///
+    /// Files ending in `_cuckoo.bin` are the large cuckoo table mmap files
+    /// (several GB each). Reading them into memory just to SHA-256 them at
+    /// startup adds ~50s of delay. They are still checked for existence
+    /// (and must appear in the manifest to pass the stray-file gate), but
+    /// the content hash is skipped — the table bytes are already covered by
+    /// the SEV-SNP MEASUREMENT (which signs the binary + cmdline + rootfs
+    /// that loaded them).
     pub fn verify_dir_contents(&self, base_dir: &Path) -> Result<(), ManifestError> {
-        // Phase 1 — every listed file must exist and hash-match.
+        // Phase 1 — every listed file must exist. Non-cuckoo files also hash-match.
         for (rel, expected_hex) in &self.files {
+            let full = base_dir.join(rel);
+            if !full.exists() {
+                return Err(ManifestError::MissingFile { path: rel.clone() });
+            }
+            if is_cuckoo_table(rel) {
+                continue;
+            }
             if expected_hex.len() != HASH_SIZE * 2
                 || !expected_hex.chars().all(|c| c.is_ascii_hexdigit())
             {
@@ -162,10 +177,6 @@ impl DbManifest {
                     path: rel.clone(),
                     value: expected_hex.clone(),
                 });
-            }
-            let full = base_dir.join(rel);
-            if !full.exists() {
-                return Err(ManifestError::MissingFile { path: rel.clone() });
             }
             let bytes = fs::read(&full).map_err(|err| ManifestError::Io {
                 path: full.display().to_string(),
@@ -220,6 +231,11 @@ fn walk(root: &Path, dir: &Path, out: &mut HashSet<String>) -> std::io::Result<(
         // require resolving them deterministically (a separate decision).
     }
     Ok(())
+}
+
+/// Files ending in `_cuckoo.bin` are the large cuckoo table mmap files.
+fn is_cuckoo_table(rel: &str) -> bool {
+    rel.ends_with("_cuckoo.bin")
 }
 
 /// Lowercase hex of a byte slice (no extra deps).
@@ -390,6 +406,38 @@ mod tests {
         write_files(dir.path(), files);
         write_manifest_for(dir.path(), files);
         DbManifest::load_and_verify(dir.path()).unwrap().unwrap();
+    }
+
+    #[test]
+    fn cuckoo_table_files_skip_hash_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        write_files(dir.path(), &[
+            ("batch_pir_cuckoo.bin", b"actual data"),
+            ("index.bin", b"small index"),
+        ]);
+        // Write manifest with a WRONG hash for the cuckoo table.
+        let index_line = format!("\"index.bin\" = \"{}\"", hex_encode(&sha256(b"small index")));
+        let lines = vec![
+            "[manifest]",
+            "version = 1",
+            "",
+            "[files]",
+            "\"batch_pir_cuckoo.bin\" = \"0000000000000000000000000000000000000000000000000000000000000000\"",
+            &index_line,
+        ];
+        fs::write(dir.path().join(MANIFEST_FILENAME), lines.join("\n")).unwrap();
+        // Should succeed — cuckoo table hash is skipped (wrong hash ignored).
+        DbManifest::load_and_verify(dir.path()).unwrap().unwrap();
+    }
+
+    #[test]
+    fn cuckoo_table_still_must_be_listed_in_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        write_files(dir.path(), &[("batch_pir_cuckoo.bin", b"data"), ("index.bin", b"small")]);
+        // Only list index.bin — stray cuckoo file should be caught.
+        write_manifest_for(dir.path(), &[("index.bin", b"small")]);
+        let err = DbManifest::load_and_verify(dir.path()).unwrap_err();
+        assert!(matches!(err, ManifestError::UnexpectedFile { .. }), "got {:?}", err);
     }
 
     #[test]
