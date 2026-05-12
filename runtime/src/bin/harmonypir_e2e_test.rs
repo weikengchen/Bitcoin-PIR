@@ -13,7 +13,7 @@ use harmonypir::prp::Prp;
 use harmonypir::relocation::{RelocationDS, EMPTY};
 use harmonypir_wasm::state::{self, GroupEntry, StateFileHeader};
 use harmonypir_wasm::{
-    HarmonyGroup, PRP_HMR12, PRP_FASTPRP, PRP_ALF,
+    HarmonyGroup, PRP_HMR12, PRP_FASTPRP,
     compute_rounds, derive_group_key, find_best_t, pad_n_for_t,
     verify_protocol_impl,
 };
@@ -362,14 +362,7 @@ fn main() {
         assert!(ok, "FastPRP test failed!");
     }
 
-    // ALF (requires domain >= 65536, so N >= 32768)
-    {
-        let alf_n: u32 = 33000;
-        let t0 = Instant::now();
-        let ok = verify_protocol_impl(alf_n, 42, PRP_ALF);
-        println!("[ALF]      N={}, w=42 → {} ({:.2?})", alf_n, if ok { "PASS ✓" } else { "FAIL ✗" }, t0.elapsed());
-        assert!(ok, "ALF test failed!");
-    }
+    // ALF block removed 2026-05-12 — see harmonypir-wasm/src/lib.rs:36.
 
     // Also verify HMR12 at larger N to be thorough.
     {

@@ -49,6 +49,11 @@ pub use merkle_verify::{
     BUCKET_MERKLE_ARITY, BUCKET_MERKLE_SIB_ROW_SIZE,
 };
 
+/// ARC (Anonymous Rate-limited Credentials) presentation state.
+/// Exposes `WasmArcPresentationState` for the browser to produce
+/// unlinkable rate-limited credential presentations.
+pub mod arc;
+
 /// Async PIR clients (`WasmDpfClient` / `WasmHarmonyClient`) wrapping the
 /// native `pir-sdk-client` structs. On wasm32 they use
 /// `WasmWebSocketTransport` under the hood; on native (for unit tests)

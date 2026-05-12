@@ -1,8 +1,8 @@
-//! Two-level Batch PIR WebSocket server.
+//! Multi-backend PIR WebSocket server.
 //!
-//! Loads both cuckoo tables (index + chunk) and serves DPF queries.
-//! Each client sends batches of DPF keys; the server evaluates them
-//! in parallel and returns XOR-accumulated results.
+//! Loads cuckoo tables (index + chunk) and serves DPF, HarmonyPIR, and
+//! OnionPIR queries. Each client sends protocol-specific requests; the
+//! server routes to the appropriate backend and returns results.
 //!
 //! Usage:
 //!   cargo run --release -p runtime --bin server -- --port 8091

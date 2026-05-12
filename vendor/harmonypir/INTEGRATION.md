@@ -142,6 +142,78 @@ let diff = server.modify_entry(42, new_entry);
 client.apply_modification(42, &diff).unwrap();
 ```
 
+## Pipelined Pair Queries (one network round-trip per two queries)
+
+`Client::query` does one server roundtrip per query. When you have two
+queries to issue against the same client, the pair API lets you bundle
+both requests into a single roundtrip — same answers, same final state,
+half the latency.
+
+### Why this is sound
+
+`RelocateSegment(s)` (the DS' update half of post-query bookkeeping) is
+purely local — it does not depend on the server's response. Splitting it
+from the hint-parity update unlocks pipelining: build Q_1, locally
+relocate s_1, build Q_2 from the post-relocation DS', send both, then
+update H twice using the two responses. The result is mathematically
+identical to two sequential `query()` calls. See the rustdoc on
+`Client::build_pair_requests` for the eight-step argument and the
+`test_query_pair_equiv_sequential_*` test family for the empirical
+equivalence checks (Hoang, FastPRP, ALF — all green).
+
+### All-in-one (local Server)
+
+```rust
+let mut rng = ChaCha20Rng::from_entropy();
+let (entry_1, entry_2) = client.query_pair(42, 100, &server, &mut rng).unwrap();
+```
+
+### Split API (caller manages network roundtrip)
+
+For remote servers — issue both requests in parallel, then process both
+responses together:
+
+```rust
+use harmonypir::prelude::*;
+
+// Build phase: produces two requests + opaque PendingPair state.
+// DS' is advanced past q_1's relocation; H is NOT yet updated.
+let (req_1, req_2, pending): (Vec<usize>, Vec<usize>, PendingPair) =
+    client.build_pair_requests(42, 100, &mut rng)?;
+
+// Caller-side: send both requests in parallel over the network.
+let (resp_1, resp_2): (Vec<Vec<u8>>, Vec<Vec<u8>>) = tokio::join!(
+    network.fetch(req_1),
+    network.fetch(req_2),
+);
+
+// Finish phase: feeds both responses, returns both answers, advances H.
+let (entry_1, entry_2) = client.finish_pair(pending, &resp_1, &resp_2)?;
+```
+
+Each request is a `Vec<usize>` of exactly T entries (database indices in
+`[0, N)` or [`relocation::EMPTY`] for empty cells). Each response must be
+a `&[Vec<u8>]` of exactly T entries of w bytes.
+
+### In-flight invariant
+
+Between `build_pair_requests` and `finish_pair`, the client is in an
+**in-flight** state — DS' is one segment ahead of H. Do not call other
+query methods (`query`, `query_pair`, `apply_modification`) on the same
+client until `finish_pair` returns. The borrow checker won't catch this;
+it's a logical invariant. The returned `PendingPair` is `#[must_use]` to
+nudge callers in the right direction.
+
+### Edge cases (all covered by tests)
+
+- `q_1` and `q_2` in the same original segment: works without special
+  handling. After `RelocateSegment(s_1)`, q_2 is chain-walked to its new
+  cell and Q_2 targets the new segment normally.
+- `q_1 == q_2`: both answers equal `db[q_1]`. q is relocated twice, H is
+  updated correspondingly.
+- Wrong-length response in `finish_pair`: returns
+  `HarmonyPirError::InvalidParams` instead of corrupting state.
+
 ## Bitcoin UTXO Parameters (Bucket-Size-4)
 
 ```

@@ -24,9 +24,10 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::time::Instant;
 
-const INPUT_FILE: &str = "/Volumes/Bitcoin/data/intermediate/utxo_set.bin";
-const PACKED_FILE: &str = "/Volumes/Bitcoin/data/intermediate/onion_packed_entries.bin";
-const INDEX_FILE: &str = "/Volumes/Bitcoin/data/intermediate/onion_index.bin";
+/// Default data dir; reads `<dir>/utxo_set.bin` and writes
+/// `<dir>/onion_packed_entries.bin` + `<dir>/onion_index.bin`.
+/// Override with `--data-dir <D>`.
+const DEFAULT_DATA_DIR: &str = "/Volumes/Bitcoin/data/intermediate";
 
 const ENTRY_SIZE_RAW: usize = 68; // raw UTXO entry from utxo_set.bin
 const SCRIPT_HASH_SIZE: usize = 20;
@@ -92,19 +93,38 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn parse_partitions() -> usize {
+fn parse_cli() -> (usize, String) {
     let args: Vec<String> = env::args().collect();
+    let mut partitions = DEFAULT_PARTITIONS;
+    let mut data_dir = DEFAULT_DATA_DIR.to_string();
     let mut i = 1;
     while i < args.len() {
-        if args[i] == "--partitions" {
-            i += 1;
-            if i < args.len() {
-                return args[i].parse().unwrap_or(DEFAULT_PARTITIONS).max(1);
+        match args[i].as_str() {
+            "--partitions" => {
+                i += 1;
+                if i < args.len() {
+                    partitions = args[i].parse().unwrap_or(DEFAULT_PARTITIONS).max(1);
+                }
             }
+            "--data-dir" => {
+                i += 1;
+                if i < args.len() {
+                    data_dir = args[i].clone();
+                }
+            }
+            "-h" | "--help" => {
+                println!("Usage: {} [--partitions N] [--data-dir <dir>]", args[0]);
+                println!();
+                println!("Reads <dir>/utxo_set.bin, writes");
+                println!("<dir>/{{onion_packed_entries.bin, onion_index.bin}}.");
+                println!("Default dir: {}", DEFAULT_DATA_DIR);
+                std::process::exit(0);
+            }
+            _ => {}
         }
         i += 1;
     }
-    DEFAULT_PARTITIONS
+    (partitions, data_dir)
 }
 
 // ─── Packing engine ─────────────────────────────────────────────────────────
@@ -245,7 +265,11 @@ fn main() {
     println!("=== gen_1_onion: Pack UTXOs into 3840B OnionPIR Entries ===");
     println!();
 
-    let num_partitions = parse_partitions();
+    let (num_partitions, data_dir) = parse_cli();
+    std::fs::create_dir_all(&data_dir).expect("create data dir");
+    let input_path = format!("{}/utxo_set.bin", data_dir);
+    let packed_path = format!("{}/onion_packed_entries.bin", data_dir);
+    let onion_index_path = format!("{}/onion_index.bin", data_dir);
 
     println!("Configuration:");
     println!("  OnionPIR entry size: {} bytes", PACKED_ENTRY_SIZE);
@@ -253,16 +277,16 @@ fn main() {
     println!("  Partitions:          {}", num_partitions);
     println!("  Dust threshold:      {} sats", DUST_THRESHOLD);
     println!("  Max UTXOs/SPK:       {} (skip larger)", MAX_UTXOS_PER_SPK);
-    println!("  Input:               {}", INPUT_FILE);
-    println!("  Output packed:       {}", PACKED_FILE);
-    println!("  Output index:        {}", INDEX_FILE);
+    println!("  Input:               {}", input_path);
+    println!("  Output packed:       {}", packed_path);
+    println!("  Output index:        {}", onion_index_path);
     println!();
 
     let total_start = Instant::now();
 
     // ── 1. mmap input ──────────────────────────────────────────────────
     println!("[1] Memory-mapping input...");
-    let input_file = File::open(INPUT_FILE).expect("open input");
+    let input_file = File::open(&input_path).expect("open input");
     let mmap = unsafe { Mmap::map(&input_file) }.expect("mmap");
     let entry_count = mmap.len() / ENTRY_SIZE_RAW;
     assert_eq!(mmap.len() % ENTRY_SIZE_RAW, 0);
@@ -271,9 +295,9 @@ fn main() {
 
     // ── 2. Open output files ───────────────────────────────────────────
     println!("[2] Opening output files...");
-    let packed_file = File::create(PACKED_FILE).expect("create packed entries file");
+    let packed_file = File::create(&packed_path).expect("create packed entries file");
     let mut packer = Packer::new(packed_file);
-    let index_file = File::create(INDEX_FILE).expect("create index file");
+    let index_file = File::create(&onion_index_path).expect("create index file");
     let mut index_writer = BufWriter::with_capacity(1024 * 1024, index_file);
     println!("  Done");
     println!();

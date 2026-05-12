@@ -1,6 +1,4 @@
 //! DPF evaluation for both index-level and chunk-level PIR.
-//!
-//! Ported from build test_batch_pir.rs and test_chunk_pir_batched.rs.
 
 use libdpf::{Block, Dpf, DpfKey};
 use pir_core::params::{

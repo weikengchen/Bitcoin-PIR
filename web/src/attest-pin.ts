@@ -73,13 +73,18 @@ export interface ServerAttestPin {
  * Pinned 2026-05-04 from the v4 deploy (UKI sha `e835a516…f8396da0`).
  */
 export const PIR2_TIER3_PIN: ServerAttestPin = {
-  // Tier 3 UKI v11 — 2026-05-05. Built on Hetzner with VPSBG-matched
+  // Tier 3 UKI v13 — 2026-05-12. Built on Hetzner with VPSBG-matched
   // kernel (7.0.0-15), kmod 34.2, dracut 110. Console-hardened.
+  // Drops PRP_ALF (panicked on sibling-table small domains, crashed
+  // pir-vpsbg in a tight loop). Default backend is now PRP_FASTPRP.
+  // Includes harmonypir 60635d8e (pipelined pair-query API) and
+  // cashu_verifier / arc_verifier work in pir-runtime-core. Hint pool
+  // generation dropped from 187s/entry (ALF) to ~14s/entry (FastPRP).
   measurementHex:
-    '0662adca3ef25ead88ae763684b6a7261e6d71e75e0a197f26c2439a3b6511c86019968bbd4a44c049ea8e6eb636c346',
+    '7d412f0422b48f1d0b8805224355acb1c917489629f76c4c711498030d8cd19da1485ea25c0dceccefdd2d0a0e1de62c',
   binarySha256Hex:
-    'f9daecb103104c58c40440738557785febdfe2c9724de5b3506bca22a5265c9c',
-  description: 'pir2.chenweikeng.com (VPSBG, SEV-SNP, Tier 3 UKI v11)',
+    'd65b72050ae11ea9fdbe0da604d155caa40badb7af19e8e9f80e93bc854889a3',
+  description: 'pir2.chenweikeng.com (VPSBG, SEV-SNP, Tier 3 UKI v13)',
 };
 
 /**
@@ -91,7 +96,9 @@ export const PIR2_TIER3_PIN: ServerAttestPin = {
  */
 export const PIR1_PIN: ServerAttestPin = {
   // No measurementHex — Hetzner has no SEV.
+  // Bumped 2026-05-12 to v13 alongside pir2 — same binary on both
+  // servers. v13 drops PRP_ALF (sibling-table panic fix).
   binarySha256Hex:
-    'f9daecb103104c58c40440738557785febdfe2c9724de5b3506bca22a5265c9c',
+    'd65b72050ae11ea9fdbe0da604d155caa40badb7af19e8e9f80e93bc854889a3',
   description: 'pir1.chenweikeng.com (Hetzner i7-8700, no SEV)',
 };

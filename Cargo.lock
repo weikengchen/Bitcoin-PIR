@@ -33,11 +33,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "alf-nt"
-version = "0.1.0"
-source = "git+https://github.com/Bitcoin-PIR/ALF.git?rev=e2e0b3d6a231f2a3491d07a4facbf69d4e5ae607#e2e0b3d6a231f2a3491d07a4facbf69d4e5ae607"
-
-[[package]]
 name = "anes"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -91,6 +86,20 @@ dependencies = [
  "anstyle",
  "once_cell_polyfill",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "arc"
+version = "0.1.0"
+dependencies = [
+ "crypto-bigint",
+ "elliptic-curve",
+ "p256",
+ "rand_core 0.6.4",
+ "sha2",
+ "sha3",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -1177,10 +1186,9 @@ dependencies = [
 [[package]]
 name = "harmonypir"
 version = "0.1.0"
-source = "git+https://github.com/Bitcoin-PIR/harmonypir.git?rev=a849dedfe0b0ab283c7c9ad9e20f8775b01b4543#a849dedfe0b0ab283c7c9ad9e20f8775b01b4543"
+source = "git+https://github.com/Bitcoin-PIR/harmonypir.git?rev=60635d8e526629b2ba99ec5020a55d078a299660#60635d8e526629b2ba99ec5020a55d078a299660"
 dependencies = [
  "aes",
- "alf-nt",
  "bincode",
  "cipher",
  "fastprp",
@@ -1189,7 +1197,6 @@ dependencies = [
  "num-bigint",
  "rand 0.8.5",
  "rand_chacha 0.3.1",
- "rayon",
  "serde",
 ]
 
@@ -1370,6 +1377,29 @@ checksum = "b49715b7073f385ba4bc528e5747d02e66cb39c6146efb66b781f131f0fb399c"
 dependencies = [
  "once_cell",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "k256"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6e3919bbaa2945715f0bb6d3934a173d1e9a59ac23767fbaaef277265a7411b"
+dependencies = [
+ "cfg-if",
+ "ecdsa",
+ "elliptic-curve",
+ "once_cell",
+ "sha2",
+ "signature",
+]
+
+[[package]]
+name = "keccak"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb26cec98cce3a3d96cbb7bced3c4b16e3d13f27ec56dbd62cbc8f39cfb9d653"
+dependencies = [
+ "cpufeatures",
 ]
 
 [[package]]
@@ -1563,6 +1593,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d211803b9b6b570f68772237e415a029d5a50c65d382910b879fb19d3271f94d"
 
 [[package]]
+name = "p256"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9863ad85fa8f4460f9c48cb909d38a0d689dba1f6f6988a5e3e0d31071bcd4b"
+dependencies = [
+ "ecdsa",
+ "elliptic-curve",
+ "primeorder",
+ "sha2",
+]
+
+[[package]]
 name = "p384"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1653,8 +1695,11 @@ version = "0.1.0"
 name = "pir-runtime-core"
 version = "0.1.0"
 dependencies = [
+ "arc",
  "ed25519-dalek",
  "getrandom 0.2.17",
+ "hex",
+ "k256",
  "libc",
  "libdpf",
  "memmap2",
@@ -1663,6 +1708,8 @@ dependencies = [
  "rand_core 0.6.4",
  "rayon",
  "serde",
+ "serde_json",
+ "sha2",
  "tempfile",
  "toml",
  "x25519-dalek",
@@ -1738,6 +1785,7 @@ dependencies = [
 name = "pir-sdk-wasm"
 version = "0.1.0"
 dependencies = [
+ "arc",
  "console_error_panic_hook",
  "getrandom 0.2.17",
  "js-sys",
@@ -1745,6 +1793,7 @@ dependencies = [
  "pir-core",
  "pir-sdk",
  "pir-sdk-client",
+ "rand_core 0.6.4",
  "send_wrapper",
  "serde",
  "serde-wasm-bindgen",
@@ -2408,6 +2457,16 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "digest",
+]
+
+[[package]]
+name = "sha3"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77fd7028345d415a4034cf8777cd4f8ab1851274233b45f84e3d955502d93874"
+dependencies = [
+ "digest",
+ "keccak",
 ]
 
 [[package]]

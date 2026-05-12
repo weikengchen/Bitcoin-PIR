@@ -34,7 +34,7 @@
 use js_sys::{Array, Uint8Array};
 use pir_sdk::{PirClient, QueryResult, ScriptHash, SyncResult};
 use pir_sdk_client::attest::{AttestVerification, SevStatus};
-use pir_sdk_client::{DpfClient, HarmonyClient, PRP_ALF, PRP_FASTPRP, PRP_HMR12};
+use pir_sdk_client::{DpfClient, HarmonyClient, PRP_FASTPRP, PRP_HMR12};
 #[cfg(target_arch = "wasm32")]
 use pir_sdk_client::HintProgress;
 use wasm_bindgen::prelude::*;
@@ -87,10 +87,11 @@ fn unpack_script_hashes(packed: &[u8]) -> Result<Vec<ScriptHash>, String> {
 /// use, factored out so unit tests can exercise it without constructing
 /// a `JsError` (which panics on native).
 fn validate_prp_backend(backend: u8) -> Result<(), String> {
-    if backend != PRP_HMR12 && backend != PRP_FASTPRP && backend != PRP_ALF {
+    if backend != PRP_HMR12 && backend != PRP_FASTPRP {
         return Err(format!(
-            "unknown PRP backend: {} (use PRP_HMR12={}, PRP_FASTPRP={}, PRP_ALF={})",
-            backend, PRP_HMR12, PRP_FASTPRP, PRP_ALF
+            "unknown PRP backend: {} (use PRP_HMR12={} or PRP_FASTPRP={}; \
+             PRP_ALF=2 was removed 2026-05-12)",
+            backend, PRP_HMR12, PRP_FASTPRP
         ));
     }
     Ok(())
@@ -1061,8 +1062,8 @@ impl WasmHarmonyClient {
 
     /// Select the PRP backend.
     ///
-    /// Accepts any of the [`PRP_HMR12`], [`PRP_FASTPRP`], [`PRP_ALF`]
-    /// constants. [`PRP_HMR12`] is the reference backend (always
+    /// Accepts [`PRP_HMR12`] or [`PRP_FASTPRP`].
+    /// [`PRP_HMR12`] is the reference backend (always
     /// available); the faster backends require the corresponding cargo
     /// features on the enclosing build.
     #[wasm_bindgen(js_name = setPrpBackend)]
@@ -1525,12 +1526,9 @@ pub fn prp_fastprp() -> u8 {
     PRP_FASTPRP
 }
 
-/// PRP backend constant for `ALF`. Requires the `alf` cargo feature on
-/// the enclosing build.
-#[wasm_bindgen(js_name = PRP_ALF)]
-pub fn prp_alf() -> u8 {
-    PRP_ALF
-}
+// PRP_ALF (= 2) was removed 2026-05-12 — see pir-sdk-client/src/harmony.rs:81.
+// The JS-side `PRP_ALF` accessor is intentionally removed. JS callers that
+// pass `2` will hit `validate_prp_backend` and get a clean error.
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
@@ -1639,7 +1637,8 @@ mod tests {
     fn validate_prp_backend_matches_constants() {
         assert!(validate_prp_backend(PRP_HMR12).is_ok());
         assert!(validate_prp_backend(PRP_FASTPRP).is_ok());
-        assert!(validate_prp_backend(PRP_ALF).is_ok());
+        // PRP_ALF (= 2) was removed 2026-05-12 and now errors.
+        assert!(validate_prp_backend(2).is_err());
         assert!(validate_prp_backend(99).is_err());
         assert!(validate_prp_backend(255).is_err());
     }
@@ -1648,12 +1647,9 @@ mod tests {
     fn prp_constants_reachable() {
         assert_eq!(prp_hmr12(), PRP_HMR12);
         assert_eq!(prp_fastprp(), PRP_FASTPRP);
-        assert_eq!(prp_alf(), PRP_ALF);
         // Exercise the uniqueness invariant — the set_prp_backend guard
-        // above relies on these three being distinct.
+        // above relies on these two being distinct.
         assert_ne!(PRP_HMR12, PRP_FASTPRP);
-        assert_ne!(PRP_FASTPRP, PRP_ALF);
-        assert_ne!(PRP_HMR12, PRP_ALF);
     }
 
     #[test]

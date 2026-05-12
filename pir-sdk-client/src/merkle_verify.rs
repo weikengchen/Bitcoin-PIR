@@ -943,6 +943,7 @@ async fn verify_sibling_levels(
 // ─── Utilities ──────────────────────────────────────────────────────────────
 
 pub(crate) fn xor_into(dst: &mut [u8], src: &[u8]) {
+    debug_assert_eq!(dst.len(), src.len(), "xor_into: length mismatch");
     for (d, s) in dst.iter_mut().zip(src.iter()) {
         *d ^= *s;
     }

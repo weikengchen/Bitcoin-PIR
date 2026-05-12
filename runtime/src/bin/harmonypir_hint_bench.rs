@@ -11,11 +11,9 @@ use harmonypir::params::Params;
 use harmonypir::prp::hoang::HoangPrp;
 #[cfg(feature = "fastprp")]
 use harmonypir::prp::fast::FastPrpWrapper;
-#[cfg(feature = "alf")]
-use harmonypir::prp::alf::AlfPrp;
 use harmonypir::prp::Prp;
 use harmonypir_wasm::{
-    PRP_HMR12, PRP_FASTPRP, PRP_ALF,
+    PRP_HMR12, PRP_FASTPRP,
     compute_rounds, derive_group_key, find_best_t, pad_n_for_t,
 };
 
@@ -53,10 +51,7 @@ fn generate_hints_single_group(
         PRP_FASTPRP => {
             Box::new(FastPrpWrapper::new(&derived_key, domain))
         }
-        #[cfg(feature = "alf")]
-        PRP_ALF => {
-            Box::new(AlfPrp::new(&derived_key, domain, &derived_key, 0x4250_4952))
-        }
+        // ALF arm removed 2026-05-12 — see harmonypir-wasm/src/lib.rs:36.
         _ => {
             Box::new(HoangPrp::new(domain, rounds, &derived_key))
         }
@@ -142,13 +137,10 @@ fn generate_hints_inner_rayon(
     let table_offset = header_size + actual_group * n * w;
 
     // Build PRP — same as before.
+    // ALF arm removed 2026-05-12 — see harmonypir-wasm/src/lib.rs:36.
     let prp: Box<dyn BatchPrp> = match backend {
         PRP_HMR12 => {
             Box::new(HoangPrp::new(domain, rounds, &derived_key))
-        }
-        #[cfg(feature = "alf")]
-        PRP_ALF => {
-            Box::new(AlfPrp::new(&derived_key, domain, &derived_key, 0x4250_4952))
         }
         _ => {
             Box::new(HoangPrp::new(domain, rounds, &derived_key))
@@ -214,8 +206,6 @@ fn main() {
         (PRP_HMR12, "HMR12 (4-way AES, single-threaded per group)"),
         #[cfg(feature = "fastprp")]
         (PRP_FASTPRP, "FastPRP (batch_permute, single-threaded per group)"),
-        #[cfg(feature = "alf")]
-        (PRP_ALF, "ALF (sequential forward, single-threaded per group)"),
     ];
 
     for &(backend, backend_name) in &backends {
@@ -270,8 +260,6 @@ fn main() {
 
     let inner_backends: Vec<(u8, &str)> = vec![
         (PRP_HMR12, "HMR12 (inner rayon par_chunks_mut(4))"),
-        #[cfg(feature = "alf")]
-        (PRP_ALF, "ALF (inner rayon par_iter)"),
     ];
 
     for &(backend, backend_name) in &inner_backends {

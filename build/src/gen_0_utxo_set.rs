@@ -51,8 +51,9 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Output file path for the flat UTXO set
-const OUTPUT_FILE: &str = "/Volumes/Bitcoin/data/intermediate/utxo_set.bin";
+/// Default data directory; the flat UTXO set is written to `<data_dir>/utxo_set.bin`.
+/// Override with `--data-dir <D>`.
+const DEFAULT_DATA_DIR: &str = "/Volumes/Bitcoin/data/intermediate";
 
 /// Size of each output entry in bytes
 const ENTRY_SIZE: u64 = 68;
@@ -76,7 +77,7 @@ fn write_utxo_entry(
 }
 
 /// Process the UTXO snapshot and write flat UTXO entries
-fn process_utxo_snapshot(snapshot_path: &Path) -> Result<(), String> {
+fn process_utxo_snapshot(snapshot_path: &Path, output_file: &Path) -> Result<(), String> {
     println!();
     println!("[1] Opening UTXO snapshot...");
     println!("    Snapshot path: {}", snapshot_path.display());
@@ -100,10 +101,14 @@ fn process_utxo_snapshot(snapshot_path: &Path) -> Result<(), String> {
 
     // Open output file
     println!();
-    println!("[2] Opening output file: {}", OUTPUT_FILE);
-    let output_file =
-        File::create(OUTPUT_FILE).map_err(|e| format!("Failed to create output file: {}", e))?;
-    let mut writer = BufWriter::with_capacity(1024 * 1024, output_file); // 1MB buffer
+    println!("[2] Opening output file: {}", output_file.display());
+    if let Some(parent) = output_file.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create output directory {}: {}", parent.display(), e))?;
+    }
+    let out_handle =
+        File::create(output_file).map_err(|e| format!("Failed to create output file: {}", e))?;
+    let mut writer = BufWriter::with_capacity(1024 * 1024, out_handle); // 1MB buffer
 
     println!();
     println!("[3] Processing UTXOs...");
@@ -191,7 +196,7 @@ fn process_utxo_snapshot(snapshot_path: &Path) -> Result<(), String> {
         "Total amount: {:.8} BTC",
         total_amount as f64 / 100_000_000.0
     );
-    println!("Output file: {}", OUTPUT_FILE);
+    println!("Output file: {}", output_file.display());
     println!("Time elapsed: {}", format_duration(elapsed.as_secs_f64()));
     println!(
         "Entries per second: {:.0}",
@@ -199,7 +204,7 @@ fn process_utxo_snapshot(snapshot_path: &Path) -> Result<(), String> {
     );
 
     // Get output file size
-    if let Ok(metadata) = std::fs::metadata(OUTPUT_FILE) {
+    if let Ok(metadata) = std::fs::metadata(output_file) {
         let size = metadata.len();
         println!("Output file size: {} ({})", format_bytes(size), size);
         println!(
@@ -216,21 +221,52 @@ fn process_utxo_snapshot(snapshot_path: &Path) -> Result<(), String> {
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    if args.len() < 2 {
-        eprintln!("Usage: {} <utxo_snapshot_file>", args[0]);
-        eprintln!();
-        eprintln!("Create a UTXO snapshot with: bitcoin-cli dumptxoutset <path>");
-        std::process::exit(1);
+    let mut snapshot: Option<&str> = None;
+    let mut data_dir: &str = DEFAULT_DATA_DIR;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--data-dir" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --data-dir requires an argument");
+                    std::process::exit(2);
+                }
+                data_dir = &args[i];
+            }
+            "-h" | "--help" => {
+                println!("Usage: {} <utxo_snapshot_file> [--data-dir <dir>]", args[0]);
+                println!();
+                println!("Writes <dir>/utxo_set.bin (default dir: {}).", DEFAULT_DATA_DIR);
+                println!("Create a UTXO snapshot with: bitcoin-cli dumptxoutset <path>");
+                std::process::exit(0);
+            }
+            other if !other.starts_with("--") && snapshot.is_none() => {
+                snapshot = Some(other);
+            }
+            other => {
+                eprintln!("error: unexpected argument: {}", other);
+                std::process::exit(2);
+            }
+        }
+        i += 1;
     }
 
-    let snapshot_path = Path::new(&args[1]);
+    let Some(snapshot) = snapshot else {
+        eprintln!("Usage: {} <utxo_snapshot_file> [--data-dir <dir>]", args[0]);
+        std::process::exit(1);
+    };
+
+    let snapshot_path = Path::new(snapshot);
+    let output_file = Path::new(data_dir).join("utxo_set.bin");
 
     println!("=== Generate UTXO Set (64-byte entries with HASH160 + full TXID) ===");
     println!("Snapshot: {}", snapshot_path.display());
-    println!("Output:   {}", OUTPUT_FILE);
+    println!("Output:   {}", output_file.display());
     println!();
 
-    if let Err(e) = process_utxo_snapshot(snapshot_path) {
+    if let Err(e) = process_utxo_snapshot(snapshot_path, &output_file) {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }

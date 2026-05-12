@@ -104,6 +104,6 @@ pub mod prelude {
     #[cfg(feature = "alf")]
     pub use crate::prp::alf::{AlfPrp, AlfEngine};
     pub use crate::prp::{Prp, BatchPrp};
-    pub use crate::protocol::Client;
+    pub use crate::protocol::{Client, PendingPair};
     pub use crate::server::Server;
 }

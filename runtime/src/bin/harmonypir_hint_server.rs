@@ -93,14 +93,10 @@ impl HintServerData {
         // than sequential locate().
         use harmonypir::prp::BatchPrp;
         use harmonypir::prp::fast::FastPrpWrapper;
-        use harmonypir::prp::alf::AlfPrp;
+        // PRP_ALF removed 2026-05-12 — see harmonypir-wasm/src/lib.rs:36.
         let cell_of: Vec<usize> = match prp_backend {
             harmonypir_wasm::PRP_FASTPRP => {
                 let prp = FastPrpWrapper::new(&derived_key, domain);
-                prp.batch_forward()
-            }
-            harmonypir_wasm::PRP_ALF => {
-                let prp = AlfPrp::new(&derived_key, domain, &derived_key, 0x4250_4952);
                 prp.batch_forward()
             }
             _ => {
@@ -302,7 +298,8 @@ async fn main() {
                         // INDEX and CHUNK levels. This is the on-demand equivalent
                         // of the unified_server's pre-computed hint pool path.
                         let t_start = Instant::now();
-                        let prp_backend = harmonypir_wasm::PRP_ALF;
+                        // ALF removed 2026-05-12 — was crashing on small sibling-table domains.
+                        let prp_backend = harmonypir_wasm::PRP_FASTPRP;
 
                         // Generate random PRP key.
                         let mut prp_key = [0u8; 16];

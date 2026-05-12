@@ -113,6 +113,10 @@ struct CliArgs {
     pool_size: usize,
     /// Directory for pool file persistence.
     pool_dir: Option<PathBuf>,
+    /// Require ARC credential presentation before serving PIR queries.
+    require_arc: bool,
+    require_cashu: bool,
+    cashu_keysets: Vec<(String, String)>,
 }
 
 fn parse_args() -> CliArgs {
@@ -129,6 +133,9 @@ fn parse_args() -> CliArgs {
     let mut vcek_dir: Option<PathBuf> = None;
     let mut pool_size: usize = 0; // 0 = pool disabled
     let mut pool_dir: Option<PathBuf> = None;
+    let mut require_arc = false;
+    let mut require_cashu = false;
+    let mut cashu_keysets: Vec<(String, String)> = Vec::new();
 
     let mut i = 1;
     while i < args.len() {
@@ -207,12 +214,28 @@ fn parse_args() -> CliArgs {
                 }
                 i += 1;
             }
+            "--require-arc" => {
+                require_arc = true;
+            }
+            "--require-cashu" => {
+                require_cashu = true;
+            }
+            "--cashu-keyset" => {
+                // Format: --cashu-keyset <id>:<hex_secret_key>
+                // Can be repeated for multiple keysets.
+                if let Some(kv) = args.get(i + 1) {
+                    if let Some((id, sk_hex)) = kv.split_once(':') {
+                        cashu_keysets.push((id.to_string(), sk_hex.to_string()));
+                    }
+                }
+                i += 1;
+            }
             _ => {}
         }
         i += 1;
     }
 
-    CliArgs { port, data_dir, role, warmup, config_path, checkpoints, deltas, admin_pubkey_hex, disable_onion, vcek_dir, pool_size, pool_dir }
+    CliArgs { port, data_dir, role, warmup, config_path, checkpoints, deltas, admin_pubkey_hex, disable_onion, vcek_dir, pool_size, pool_dir, require_arc, require_cashu, cashu_keysets }
 }
 
 // ─── OnionPIR worker thread ─────────────────────────────────────────────────
@@ -360,14 +383,12 @@ fn compute_hints_for_group(
 
     use harmonypir::prp::BatchPrp;
     use harmonypir::prp::fast::FastPrpWrapper;
-    use harmonypir::prp::alf::AlfPrp;
+    // PRP_ALF (= 2) was removed 2026-05-12 — see harmonypir-wasm/src/lib.rs:36
+    // and pir-sdk-client/src/harmony.rs:81 for the rationale (panic on
+    // domain<65536 crashed pir-vpsbg in a tight loop).
     let cell_of: Vec<usize> = match prp_backend {
         harmonypir_wasm::PRP_FASTPRP => {
             let prp = FastPrpWrapper::new(&derived_key, domain);
-            prp.batch_forward()
-        }
-        harmonypir_wasm::PRP_ALF => {
-            let prp = AlfPrp::new(&derived_key, domain, &derived_key, 0x4250_4952);
             prp.batch_forward()
         }
         _ => {
@@ -427,6 +448,16 @@ struct UnifiedServerData {
     channel_keypair: pir_runtime_core::channel::ChannelKeypair,
     /// Pre-computed HarmonyPIR V2 hint pool (None if pool_size=0).
     hint_pool: Option<hint_pool::HintPool>,
+    /// ARC presentation verifier + seen-tag set. Wrapped in a Mutex because
+    /// `verify()` mutates the per-context tag set. `None` if ARC is disabled
+    /// (server started without --require-arc).
+    arc_verifier: Option<std::sync::Mutex<pir_runtime_core::arc_verifier::ArcVerifier>>,
+    /// Whether ARC credential presentation is required for PIR queries.
+    require_arc: bool,
+    /// Cashu blind auth verifier.
+    cashu_verifier: Option<std::sync::Mutex<pir_runtime_core::cashu_verifier::CashuVerifier>>,
+    /// Whether Cashu BAT presentation is required for PIR queries.
+    require_cashu: bool,
 }
 
 impl UnifiedServerData {
@@ -1867,10 +1898,35 @@ async fn main() {
     println!("  Data root: {}", data_root.display());
 
     // ── Initialize HarmonyPIR V2 hint pool (if enabled) ──────────────────
+    let (arc_verifier, require_arc) = if args.require_arc {
+        let verifier = pir_runtime_core::arc_verifier::ArcVerifier::generate();
+        println!("  ARC: enabled — credential verification required");
+        (Some(std::sync::Mutex::new(verifier)), true)
+    } else {
+        println!("  ARC: disabled (use --require-arc to enable)");
+        (None, false)
+    };
+
+    let (cashu_verifier, require_cashu) = if args.require_cashu {
+        if args.cashu_keysets.is_empty() {
+            panic!("--require-cashu requires at least one --cashu-keyset <id>:<hex_sk>");
+        }
+        let verifier = pir_runtime_core::cashu_verifier::CashuVerifier::from_keys(&args.cashu_keysets)
+            .expect("valid Cashu keysets");
+        println!("  Cashu: enabled — {} keyset(s) loaded", verifier.keyset_count());
+        (Some(std::sync::Mutex::new(verifier)), true)
+    } else {
+        println!("  Cashu: disabled (use --require-cashu to enable)");
+        (None, false)
+    };
+
     let hint_pool = if args.pool_size > 0 {
         let pool_config = hint_pool::HintPoolConfig {
             pool_size: args.pool_size,
-            prp_backend: harmonypir_wasm::PRP_ALF,
+            // Default to PRP_FASTPRP (large-domain SAFE; main hints have
+            // domain >= 2^20 easily). Was PRP_ALF before 2026-05-12 but
+            // ALF panicked on small (sibling) domains, crashing the server.
+            prp_backend: harmonypir_wasm::PRP_FASTPRP,
             pool_dir: args.pool_dir.clone(),
         };
         let main_db = state.get_db(0).expect("main database must be loaded");
@@ -1899,6 +1955,10 @@ async fn main() {
         data_root,
         channel_keypair,
         hint_pool,
+        arc_verifier,
+        require_arc,
+        cashu_verifier,
+        require_cashu,
     });
 
     // ── Accept WebSocket connections ────────────────────────────────────
@@ -1972,6 +2032,14 @@ async fn main() {
             // application frame; legacy clients keep working.
             let mut channel_session: Option<pir_runtime_core::channel::Session> = None;
 
+            // Per-connection ARC state: set to true after the first valid
+            // REQ_CREDENTIAL_PRESENT. The presentation_context for this
+            // connection is the client-supplied bytes (typically a random
+            // session nonce). Tags are scoped to this context.
+            let mut arc_ok: bool = false;
+            let mut arc_pres_ctx: Option<Vec<u8>> = None;
+            let mut cashu_ok: bool = false;
+
             while let Some(msg) = ws_stream.next().await {
                 let msg = match msg {
                     Ok(m) => m,
@@ -2025,6 +2093,37 @@ async fn main() {
                 let variant = payload[0];
                 let body = &payload[1..];
 
+                // ARC gate: if --require-arc is set and no valid credential
+                // presented yet, reject PIR-bearing request variants. Whitelisted
+                // variants (info, ping, auth, attest, handshake, hints, and the
+                // credential presentation itself) pass through.
+                if (server.require_arc || server.require_cashu) && !arc_ok && !cashu_ok {
+                    match variant {
+                        REQ_INDEX_BATCH
+                        | REQ_CHUNK_BATCH
+                        | REQ_MERKLE_SIBLING_BATCH
+                        | REQ_MERKLE_TREE_TOP
+                        | REQ_BUCKET_MERKLE_SIB_BATCH
+                        | REQ_BUCKET_MERKLE_TREE_TOPS
+                        | REQ_HARMONY_QUERY
+                        | REQ_HARMONY_BATCH_QUERY
+                        | REQ_REGISTER_KEYS
+                        | REQ_ONIONPIR_INDEX_QUERY
+                        | REQ_ONIONPIR_CHUNK_QUERY
+                        | REQ_ONIONPIR_MERKLE_INDEX_SIBLING
+                        | REQ_ONIONPIR_MERKLE_INDEX_TREE_TOP
+                        | REQ_ONIONPIR_MERKLE_DATA_SIBLING
+                        | REQ_ONIONPIR_MERKLE_DATA_TREE_TOP => {
+                            let resp = Response::Error(
+                                "ARC credential required — send REQ_CREDENTIAL_PRESENT first".into(),
+                            );
+                            let _ = send_resp(&mut sink, channel_session.as_mut(), resp.encode()).await;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+
                 // Route by variant byte
                 match variant {
                     // ── Shared: info / ping ──────────────────────────────
@@ -2041,6 +2140,92 @@ async fn main() {
                     // All clients should use 0x03 (JSON) instead.
                     REQ_GET_DB_CATALOG => {
                         let _ = send_resp(&mut sink, channel_session.as_mut(), Response::DbCatalog(server.build_catalog()).encode()).await;
+                    }
+                    REQ_CREDENTIAL_PRESENT => {
+                        // Wire format:
+                        //   [1B variant=0x08]
+                        //   [1B request_context_len][request_context]
+                        //   [1B presentation_context_len][presentation_context]
+                        //   [8B presentation_limit LE]
+                        //   [presentation_bytes...]
+                        if body.len() < 11 {
+                            let resp = Response::Error("malformed REQ_CREDENTIAL_PRESENT: too short".into());
+                            let _ = send_resp(&mut sink, channel_session.as_mut(), resp.encode()).await;
+                            continue;
+                        }
+                        let req_ctx_len = body[0] as usize;
+                        if body.len() < 1 + req_ctx_len + 1 {
+                            let resp = Response::Error("malformed REQ_CREDENTIAL_PRESENT: truncated".into());
+                            let _ = send_resp(&mut sink, channel_session.as_mut(), resp.encode()).await;
+                            continue;
+                        }
+                        let req_ctx = &body[1..1 + req_ctx_len];
+                        let off = 1 + req_ctx_len;
+                        let pres_ctx_len = body[off] as usize;
+                        if body.len() < off + 1 + pres_ctx_len + 8 {
+                            let resp = Response::Error("malformed REQ_CREDENTIAL_PRESENT: truncated".into());
+                            let _ = send_resp(&mut sink, channel_session.as_mut(), resp.encode()).await;
+                            continue;
+                        }
+                        let pres_ctx = &body[off + 1..off + 1 + pres_ctx_len];
+                        let limit_off = off + 1 + pres_ctx_len;
+                        let limit = u64::from_le_bytes(
+                            body[limit_off..limit_off + 8].try_into().unwrap()
+                        );
+                        let pres_bytes = &body[limit_off + 8..];
+
+                        let result = match &server.arc_verifier {
+                            None => Err(pir_runtime_core::arc_verifier::ArcVerifyError::InvalidProof(
+                                "ARC disabled on this server".into()
+                            )),
+                            Some(verifier) => {
+                                let mut v = verifier.lock().unwrap();
+                                v.verify(req_ctx, pres_ctx, pres_bytes, limit)
+                            }
+                        };
+
+                        match result {
+                            Ok(()) => {
+                                arc_ok = true;
+                                arc_pres_ctx = Some(pres_ctx.to_vec());
+                                let resp = Response::ArcCredentialOk;
+                                let _ = send_resp(&mut sink, channel_session.as_mut(), resp.encode()).await;
+                            }
+                            Err(e) => {
+                                arc_ok = false;
+                                let resp = Response::Error(format!("ARC: {}", e));
+                                let _ = send_resp(&mut sink, channel_session.as_mut(), resp.encode()).await;
+                            }
+                        }
+                    }
+                    REQ_CASHU_BAT_PRESENT => {
+                        // Wire format: [1B variant=0x09][bat_base64url bytes...]
+                        let bat_str = match std::str::from_utf8(body) {
+                            Ok(s) => s,
+                            Err(_) => {
+                                let resp = Response::Error("invalid UTF-8 in Cashu BAT".into());
+                                let _ = send_resp(&mut sink, channel_session.as_mut(), resp.encode()).await;
+                                continue;
+                            }
+                        };
+                        let result = match &server.cashu_verifier {
+                            None => Err(pir_runtime_core::cashu_verifier::CashuVerifyError::InvalidFormat(
+                                "Cashu disabled on this server".into(),
+                            )),
+                            Some(v) => v.lock().unwrap().verify(bat_str),
+                        };
+                        match result {
+                            Ok(()) => {
+                                cashu_ok = true;
+                                let resp = Response::CashuBatOk;
+                                let _ = send_resp(&mut sink, channel_session.as_mut(), resp.encode()).await;
+                            }
+                            Err(e) => {
+                                cashu_ok = false;
+                                let resp = Response::Error(format!("Cashu: {}", e));
+                                let _ = send_resp(&mut sink, channel_session.as_mut(), resp.encode()).await;
+                            }
+                        }
                     }
                     REQ_ADMIN_AUTH_CHALLENGE => {
                         match server.admin_config {
@@ -2722,6 +2907,12 @@ async fn main() {
                         let _ = send_resp(&mut sink, channel_session.as_mut(), resp.encode()).await;
                     }
                 }
+            }
+
+            // ARC cleanup: remove the seen-tag set for this connection's
+            // presentation context so memory doesn't grow unboundedly.
+            if let (Some(ctx), Some(verifier)) = (arc_pres_ctx, &server.arc_verifier) {
+                verifier.lock().unwrap().remove_context(&ctx);
             }
 
             println!("[{}] Disconnected (id={})", peer, client_id);

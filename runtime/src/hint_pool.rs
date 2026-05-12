@@ -39,7 +39,9 @@ impl Default for HintPoolConfig {
     fn default() -> Self {
         Self {
             pool_size: 8,
-            prp_backend: harmonypir_wasm::PRP_ALF,
+            // Default to PRP_FASTPRP. Was PRP_ALF before 2026-05-12; ALF
+            // panicked on small (sibling) domains, crashing pir-vpsbg.
+            prp_backend: harmonypir_wasm::PRP_FASTPRP,
             pool_dir: None,
         }
     }
@@ -414,17 +416,13 @@ fn compute_and_serialize_hint_frame(
     let r = harmonypir_wasm::compute_rounds(padded_n);
 
     // Batch PRP evaluation.
+    // PRP_ALF (= 2) was removed 2026-05-12 — see harmonypir-wasm/src/lib.rs:36
+    // for the rationale (panic on domain<65536 crashed pir-vpsbg).
     let cell_of: Vec<usize> = match prp_backend {
         #[cfg(feature = "fastprp")]
         harmonypir_wasm::PRP_FASTPRP => {
             use harmonypir::prp::fast::FastPrpWrapper;
             let prp = FastPrpWrapper::new(&derived_key, domain);
-            prp.batch_forward()
-        }
-        #[cfg(feature = "alf")]
-        harmonypir_wasm::PRP_ALF => {
-            use harmonypir::prp::alf::AlfPrp;
-            let prp = AlfPrp::new(&derived_key, domain, &derived_key, 0x4250_4952);
             prp.batch_forward()
         }
         _ => {

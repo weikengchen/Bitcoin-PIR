@@ -46,6 +46,20 @@ pub const REQ_RESIDENCY: u8 = 0x04;
 
 pub const REQ_ATTEST: u8 = 0x05;
 
+// ─── Anonymous credential (ARC) ────────────────────────────────────────────
+
+/// Client presents an ARC credential before a PIR query batch.
+/// Server verifies it and responds 0x00 (valid) or an error code.
+pub const REQ_CREDENTIAL_PRESENT: u8 = 0x08;
+/// Response: ARC credential presentation accepted.
+pub const RESP_CREDENTIAL_OK: u8 = 0x08;
+
+/// Client presents a Cashu Blind Auth Token (BAT) before a PIR query batch.
+/// Server verifies the BDHKE signature and checks the spent-set.
+pub const REQ_CASHU_BAT_PRESENT: u8 = 0x09;
+/// Response: Cashu BAT accepted.
+pub const RESP_CASHU_BAT_OK: u8 = 0x09;
+
 // ─── Encrypted channel handshake (Slice B) ─────────────────────────────────
 //
 // One-round X25519 handshake before any traffic-bearing requests on a
@@ -508,6 +522,10 @@ pub enum Response {
     HarmonyInfo(ServerInfo),
     HarmonyQueryResult(HarmonyQueryResult),
     HarmonyBatchResult(HarmonyBatchResult),
+    /// ARC credential presentation verified (status=0x00).
+    ArcCredentialOk,
+    /// Cashu BAT presentation verified.
+    CashuBatOk,
 }
 
 // ─── Encoding ───────────────────────────────────────────────────────────────
@@ -853,6 +871,14 @@ impl Response {
             Response::HarmonyBatchResult(r) => {
                 payload.push(RESP_HARMONY_BATCH_QUERY);
                 encode_harmony_batch_result(&mut payload, r);
+            }
+            Response::ArcCredentialOk => {
+                payload.push(RESP_CREDENTIAL_OK);
+                payload.push(0x00u8); // status = valid
+            }
+            Response::CashuBatOk => {
+                payload.push(RESP_CASHU_BAT_OK);
+                payload.push(0x00u8);
             }
         }
         let mut msg = Vec::with_capacity(4 + payload.len());

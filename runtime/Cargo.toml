@@ -64,9 +64,11 @@ name = "harmonypir_batch_trace"
 path = "src/bin/harmonypir_batch_trace.rs"
 
 [features]
-default = ["fastprp", "alf"]
+default = ["fastprp"]
 fastprp = ["harmonypir/fastprp-prp", "harmonypir-wasm/fastprp"]
-alf = ["harmonypir/alf", "harmonypir-wasm/alf"]
+# `alf` feature dropped 2026-05-12: ALF panics on domain<65536 (sibling
+# Merkle tables hit this), causing pir-vpsbg crash loops. Use fastprp
+# (large domains) or HoangPrp (default, all domains) instead.
 
 [dependencies]
 pir-core = { path = "../pir-core" }
@@ -74,7 +76,7 @@ pir-runtime-core = { path = "../pir-runtime-core" }
 build = { path = "../build" }
 libdpf = { git = "https://github.com/weikengchen/libdpf.git" }
 onionpir = { git = "https://github.com/Bitcoin-PIR/OnionPIRv2-fork.git", rev = "350ccc43e41338264aefabf80f639f23ea34f3ee" }
-harmonypir = { git = "https://github.com/Bitcoin-PIR/harmonypir.git", rev = "a849dedfe0b0ab283c7c9ad9e20f8775b01b4543", default-features = false }
+harmonypir = { git = "https://github.com/Bitcoin-PIR/harmonypir.git", rev = "60635d8e526629b2ba99ec5020a55d078a299660", default-features = false }
 harmonypir-wasm = { path = "../harmonypir-wasm" }
 libc = "0.2"
 memmap2 = "0.9"

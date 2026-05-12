@@ -254,7 +254,7 @@ if [ -n "$MISSING_MODS" ]; then
     echo "  Hint:  find /usr/lib/modules/$KVER -name 'ccp.ko*' -o -name 'sev-guest.ko*'" >&2
     exit 1
 fi
-echo "SEV modules confirmed in initramfs: ccp, sev-guest, tsm_report"
+echo "SEV modules confirmed in initramfs: $REQUIRED_SEV_MODS"
 
 # ─── Build the cmdline ─────────────────────────────────────────────────────
 # rdinit=/sbin/bpir-tier3-init  : kernel exec's OUR script as PID 1

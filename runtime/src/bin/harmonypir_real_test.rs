@@ -15,12 +15,10 @@ use harmonypir::params::Params;
 use harmonypir::prp::hoang::HoangPrp;
 #[cfg(feature = "fastprp")]
 use harmonypir::prp::fast::FastPrpWrapper;
-#[cfg(feature = "alf")]
-use harmonypir::prp::alf::AlfPrp;
 use harmonypir::prp::Prp;
 use harmonypir::relocation::RelocationDS;
 use harmonypir_wasm::{
-    HarmonyGroup, PRP_HMR12, PRP_FASTPRP, PRP_ALF,
+    HarmonyGroup, PRP_HMR12, PRP_FASTPRP,
     compute_rounds, derive_group_key, find_best_t, pad_n_for_t,
 };
 
@@ -60,8 +58,6 @@ fn build_prp_box(backend: u8, key: &[u8; 16], domain: usize, rounds: usize) -> B
         PRP_HMR12 => Box::new(HoangPrp::new(domain, rounds, key)),
         #[cfg(feature = "fastprp")]
         PRP_FASTPRP => Box::new(FastPrpWrapper::new(key, domain)),
-        #[cfg(feature = "alf")]
-        PRP_ALF => Box::new(AlfPrp::new(key, domain, key, 0x4250_4952)),
         _ => Box::new(HoangPrp::new(domain, rounds, key)),
     }
 }
@@ -104,8 +100,6 @@ fn main() {
         (PRP_HMR12, "HMR12 PRP"),
         #[cfg(feature = "fastprp")]
         (PRP_FASTPRP, "FastPRP"),
-        #[cfg(feature = "alf")]
-        (PRP_ALF, "ALF PRP"),
     ];
 
     for &(backend, backend_name) in &backends {
@@ -207,13 +201,7 @@ fn run_narrative(
                 let full = unsafe { &*(fp as *const FastPrpWrapper) }.batch_forward();
                 full[..pn].to_vec()
             }
-            #[cfg(feature = "alf")]
-            PRP_ALF => {
-                println!("    Using ALF batch_forward() (SIMD-parallel)...");
-                let ap = prp.as_ref() as *const dyn Prp;
-                let full = unsafe { &*(ap as *const AlfPrp) }.batch_forward();
-                full[..pn].to_vec()
-            }
+            // ALF arm removed 2026-05-12 — see harmonypir-wasm/src/lib.rs:36.
             _ => {
                 println!("    Using HMR12 batch_forward() (4-way AES + rayon)...");
                 let hp = prp.as_ref() as *const dyn Prp;

@@ -13,12 +13,10 @@
 
 use build::common::*;
 use harmonypir::params::Params;
-#[cfg(feature = "alf")]
-use harmonypir::prp::alf::AlfPrp;
 use harmonypir::prp::hoang::HoangPrp;
 use harmonypir::prp::Prp;
 use harmonypir_wasm::{
-    HarmonyGroup, PRP_ALF, PRP_HMR12,
+    HarmonyGroup, PRP_HMR12,
     compute_rounds, derive_group_key, find_best_t, pad_n_for_t,
 };
 
@@ -56,16 +54,11 @@ fn decode_chunk_slot(slot: &[u8]) -> (u32, &[u8]) {
 
 /// Pick the PRP backend: ALF if available, else HMR12.
 fn choose_backend() -> (u8, &'static str) {
-    #[cfg(feature = "alf")]
-    { (PRP_ALF, "ALF") }
-    #[cfg(not(feature = "alf"))]
     { (PRP_HMR12, "HMR12") }
 }
 
 fn build_prp_box(backend: u8, key: &[u8; 16], domain: usize, rounds: usize) -> Box<dyn Prp> {
     match backend {
-        #[cfg(feature = "alf")]
-        PRP_ALF => Box::new(AlfPrp::new(key, domain, key, 0x4250_4952)),
         _ => Box::new(HoangPrp::new(domain, rounds, key)),
     }
 }
@@ -108,13 +101,8 @@ fn generate_hints_for_bucket(
     let prp = build_prp_box(backend, &derived_key, domain, r);
     let cell_of: Vec<usize> = {
         use harmonypir::prp::BatchPrp;
+        // ALF arm removed 2026-05-12 — see harmonypir-wasm/src/lib.rs:36.
         match backend {
-            #[cfg(feature = "alf")]
-            PRP_ALF => {
-                let ap = prp.as_ref() as *const dyn Prp;
-                let full = unsafe { &*(ap as *const AlfPrp) }.batch_forward();
-                full[..pn].to_vec()
-            }
             _ => {
                 let hp = prp.as_ref() as *const dyn Prp;
                 let full = unsafe { &*(hp as *const HoangPrp) }.batch_forward();

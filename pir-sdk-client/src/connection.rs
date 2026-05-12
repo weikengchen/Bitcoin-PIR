@@ -57,10 +57,13 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default deadline for a single `send` / `recv` / `roundtrip` once a
 /// connection is established. PIR responses can take several seconds to
 /// compute server-side, and a fresh-sync chunk batch can be ~32 MiB —
-/// a 90s budget is generous for both. `tungstenite` reads a whole binary
-/// frame in one call, so this covers the full response, not just one
-/// TCP segment.
-pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
+/// a 240s budget covers both. Bumped from 90s to 240s on 2026-05-12 to
+/// accommodate HarmonyPIR V1 sibling-hint on-demand generation on the
+/// VPSBG (slower CPU): one cold sib pass takes ~120s on pir2. The V2
+/// main-hint pool is fast (1-2s) but sib hints are still on V1.
+/// `tungstenite` reads a whole binary frame in one call, so this covers
+/// the full response, not just one TCP segment.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(240);
 
 /// Default starting delay between reconnect attempts. Doubles each try
 /// (up to `DEFAULT_MAX_BACKOFF_DELAY`).

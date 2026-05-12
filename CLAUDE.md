@@ -92,11 +92,16 @@ This invariant is enforced in:
   round is dispatched via `run_chunk_round(db_id, &[], …)` which already
   takes the `build_synthetic_dummy` branch for every group when
   `real_queries` is empty.
-- `pir-sdk-client/src/onion.rs::query_chunk_level` — adds one uniformly
-  random dummy `entry_id` to the unique-fetch list for each not-found /
-  whale query, keeping CHUNK round count proportional to batch size.
-- `web/src/onionpir_client.ts::queryBatch` — same per-query dummy
-  injection as the Rust OnionPIR client (uses `crypto.getRandomValues`).
+- `pir-sdk-client/src/onion.rs::query_chunk_level` — pads every query's
+  entry-id list to `CHUNK_MERKLE_ITEMS_PER_QUERY = M` via
+  `pad_chunk_ids_to_m` (the same Kani-verified helper DPF and Harmony
+  reuse), with deterministic synthetic ids `0..` filling the suffix. The
+  previous per-query random-dummy injection is subsumed by the M-padding
+  mechanism (see comment at `onion.rs:1418-1422`).
+- `web/src/onionpir_client.ts::queryBatch` — same
+  `padChunkIdsToM`-based M-padding as the Rust client; synthetic entry
+  ids are deterministic (`0..`, skipping reals). No
+  `crypto.getRandomValues` call in the production chunk path.
 
 **Invariants implementations must preserve:**
 1. The padded round is byte-identical in shape to a real round on the
@@ -301,8 +306,9 @@ expensive privacy/efficiency trade-off.
   `WasmBucketMerkleTreeTops` verifier, `WasmAtomicMetrics`,
   `initTracingSubscriber()`). No `WasmOnionClient` — SEAL doesn't compile
   to wasm32.
-- `pir-runtime-core` — shared server primitives (protocol, table, eval,
-  handler). Extracted from `runtime/` as a publishable lib crate.
+- `pir-runtime-core` — shared server primitives (admin, attest, channel,
+  eval, handler, manifest, protocol, table). Extracted from `runtime/` as a
+  publishable lib crate.
 - `runtime/`, `build/`, `block_reader/`, `harmonypir-wasm/` — internal
   binary crates (`publish = false`).
 
@@ -344,9 +350,10 @@ YPIR_*_PLAN.md were deleted 2026-04-19 — all superseded or rejected.
 
 - `pir-sdk/src/lib.rs`, `pir-sdk/src/error.rs`, `pir-sdk/src/metrics.rs`,
   `pir-sdk/src/sync.rs`.
-- `pir-sdk-client/src/`: `dpf.rs`, `harmony.rs`, `onion.rs`,
-  `transport.rs`, `connection.rs`, `wasm_transport.rs`,
-  `merkle_verify.rs`, `onion_merkle.rs`, `hint_cache.rs`, `protocol.rs`.
+- `pir-sdk-client/src/`: `admin.rs`, `attest.rs`, `channel.rs`,
+  `dpf.rs`, `harmony.rs`, `onion.rs`, `transport.rs`, `connection.rs`,
+  `wasm_transport.rs`, `merkle_verify.rs`, `onion_merkle.rs`,
+  `hint_cache.rs`, `protocol.rs`.
 - `pir-sdk-wasm/src/`: `lib.rs`, `client.rs`, `merkle_verify.rs`,
   `metrics.rs`, `tracing_bridge.rs`.
 - `pir-sdk-server/src/`: `server.rs`, `loader.rs`, `config.rs`.

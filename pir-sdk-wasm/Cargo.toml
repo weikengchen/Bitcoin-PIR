@@ -28,6 +28,8 @@ pir-core = { version = "0.1.0", path = "../pir-core" }
 # the native path in `cargo test -p pir-sdk-wasm`, so the tokio pull-in is
 # acceptable.
 pir-sdk-client = { version = "0.1.0", path = "../pir-sdk-client" }
+arc = { path = "../../bitcoin-pir/arc" }
+rand_core = { version = "0.6", features = ["getrandom"] }
 # Browser-side AMD VCEK chain verifier (Slice D). Pure-Rust crypto
 # so the browser can chain-validate the SEV-SNP report's signature
 # back to AMD's known root without talking to kdsintf.amd.com

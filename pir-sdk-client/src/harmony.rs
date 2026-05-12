@@ -78,7 +78,8 @@ const RESP_HARMONY_BATCH_QUERY: u8 = 0x43;
 /// PRP backends (mirrors `harmonypir_wasm::PRP_*`).
 pub const PRP_HMR12: u8 = 0;
 pub const PRP_FASTPRP: u8 = 1;
-pub const PRP_ALF: u8 = 2;
+// PRP_ALF (= 2) was removed 2026-05-12: ALF panicked on domain<65536
+// (sibling Merkle tables hit this), causing pir-vpsbg crash loops.
 
 /// Which group-map `fetch_and_load_hints_into` should write into.
 ///
@@ -401,9 +402,9 @@ fn chunk_trace_to_bucket_ref(t: &ChunkBinTrace) -> BucketRef {
 /// HarmonyPIR is parameterised by a pseudo-random permutation. The
 /// default is HMR12 (portable, no extra deps); the `fastprp` cargo
 /// feature enables FastPRP (2-3× faster per-group encode with a
-/// precomputed cache) and the `alf` feature enables ALF. Select at
-/// runtime via [`set_prp_backend`] with one of [`PRP_HMR12`],
-/// [`PRP_FASTPRP`], or [`PRP_ALF`].
+/// precomputed cache). Select at runtime via [`set_prp_backend`] with
+/// one of [`PRP_HMR12`] or [`PRP_FASTPRP`]. (PRP_ALF was removed
+/// 2026-05-12 — see harmony.rs:81 note.)
 ///
 /// # Examples
 ///
@@ -852,7 +853,7 @@ impl HarmonyClient {
         self.invalidate_groups();
     }
 
-    /// Set the PRP backend (`PRP_HMR12`, `PRP_FASTPRP`, or `PRP_ALF`).
+    /// Set the PRP backend (`PRP_HMR12` or `PRP_FASTPRP`).
     pub fn set_prp_backend(&mut self, backend: u8) {
         if backend != self.prp_backend {
             self.prp_backend = backend;
@@ -1961,13 +1962,19 @@ impl HarmonyClient {
             (0..n).map(|_| Vec::with_capacity(INDEX_CUCKOO_NUM_HASHES)).collect();
         let mut matched_idx_per_sh: Vec<Option<usize>> = vec![None; n];
 
+        // Pair-mode batching requires exactly 2 cuckoo positions per
+        // scripthash (the wrapper's `build_request_pair` takes two query
+        // indices). If `INDEX_CUCKOO_NUM_HASHES` ever changes, the
+        // pair-mode path needs a redesign.
+        const _: () = assert!(INDEX_CUCKOO_NUM_HASHES == 2);
+
         for (round_id, round) in rounds.iter().enumerate() {
+            // Compute (group, target_bin) placements for both cuckoo
+            // positions. The cuckoo key is keyed on the placed group,
+            // matching what the server stores at build time.
+            let mut placements_per_h: [Vec<(u8, u32)>; INDEX_CUCKOO_NUM_HASHES] =
+                std::array::from_fn(|_| Vec::with_capacity(round.len()));
             for h in 0..INDEX_CUCKOO_NUM_HASHES {
-                // Build placements: per scripthash placed in this round,
-                // compute its target bin in its assigned group at cuckoo
-                // position `h` (the cuckoo key is keyed on the placed
-                // group, matching what the server stores at build time).
-                let mut placements: Vec<(u8, u32)> = Vec::with_capacity(round.len());
                 for &(sh_idx, pbc_group) in round {
                     let key = pir_core::hash::derive_cuckoo_key(
                         INDEX_PARAMS.master_seed,
@@ -1979,19 +1986,37 @@ impl HarmonyClient {
                         key,
                         index_bins,
                     );
-                    placements.push((pbc_group as u8, target_bin as u32));
+                    placements_per_h[h].push((pbc_group as u8, target_bin as u32));
                 }
+            }
 
-                // round_tag encodes (round_id, h) so audit logs can tell
-                // which wire round corresponds to which (PBC round,
-                // cuckoo position) pair.
-                let round_tag = round_id * INDEX_CUCKOO_NUM_HASHES + h;
-                let answers = self
-                    .run_index_round(db_info.db_id, &placements, round_tag)
-                    .await?;
+            // Pipelined pair INDEX round: 1 RTT instead of 2. Wire format
+            // and hint accounting are identical to two sequential
+            // `run_index_round` calls — see `run_index_round_pair` docs.
+            // round_tag encodes (round_id, h) so audit logs can tell
+            // which wire round corresponds to which (PBC round, cuckoo
+            // position) pair.
+            let round_tag_h0 = round_id * INDEX_CUCKOO_NUM_HASHES;
+            let round_tag_h1 = round_tag_h0 + 1;
+            let (answers_h0, answers_h1) = self
+                .run_index_round_pair(
+                    db_info.db_id,
+                    &placements_per_h[0],
+                    &placements_per_h[1],
+                    round_tag_h0,
+                    round_tag_h1,
+                )
+                .await?;
+            let answers_per_h: [&HashMap<u8, Vec<u8>>; INDEX_CUCKOO_NUM_HASHES] =
+                [&answers_h0, &answers_h1];
 
-                // Map each placement back to its scripthash; record bin
-                // trace + match.
+            // Map each placement back to its scripthash; record bin
+            // trace + match. Iteration order (h=0 first, then h=1) is
+            // unchanged from the sequential path, so per-scripthash
+            // bookkeeping (matched_idx_per_sh, found_info, audit logs)
+            // is bit-for-bit equivalent.
+            for h in 0..INDEX_CUCKOO_NUM_HASHES {
+                let answers = answers_per_h[h];
                 for &(sh_idx, pbc_group) in round {
                     let g = pbc_group as u8;
                     let key = pir_core::hash::derive_cuckoo_key(
@@ -2324,6 +2349,207 @@ impl HarmonyClient {
             out.insert(g, answer);
         }
         Ok(out)
+    }
+
+    /// Pair-mode INDEX round: runs both cuckoo positions (h=0 and h=1) of
+    /// one PBC round in a single pipelined network round-trip via the
+    /// wrapper's `build_request_pair` / `process_response_pair` API.
+    ///
+    /// Wire format is identical to two back-to-back [`Self::run_index_round`]
+    /// calls — each of the two emitted requests is K-padded with K
+    /// `BatchItem`s of `T-1` indices, exactly as the sequential path. The
+    /// only observable difference is the network ordering: both requests
+    /// are sent before either response is awaited, so the two RTTs collapse
+    /// into one (the second send overlaps the first response's flight
+    /// time, and once both requests are in flight the responses arrive
+    /// pipelined).
+    ///
+    /// Hint accounting is unchanged: each real group consumes 2 hints
+    /// (one per cuckoo position), exactly as the sequential path. The
+    /// upstream pair API guarantees bit-for-bit equivalence with two
+    /// sequential `build_request` + `process_response` cycles given the
+    /// same RNG seed (see `harmonypir-wasm::test_pair_equiv_sequential_*`).
+    ///
+    /// Dummy groups are *not* covered by the wrapper's `PendingPair`
+    /// state — they call `build_synthetic_dummy()` twice (once per wire
+    /// round). This is safe per the wrapper docs ("`build_synthetic_dummy`
+    /// is safe to call" during the in-flight period — it only advances
+    /// the RNG and never touches DS') and matches the sequential path's
+    /// dummy emission shape.
+    ///
+    /// Both `placements_h0` and `placements_h1` MUST cover the same set
+    /// of PBC groups (the same scripthashes are placed in the same groups
+    /// across both cuckoo positions; only the `target_bin` differs). The
+    /// function asserts this in debug builds.
+    async fn run_index_round_pair(
+        &mut self,
+        db_id: u8,
+        placements_h0: &[(u8, u32)],
+        placements_h1: &[(u8, u32)],
+        round_tag_h0: usize,
+        round_tag_h1: usize,
+    ) -> PirResult<(HashMap<u8, Vec<u8>>, HashMap<u8, Vec<u8>>)> {
+        let k_index = self.index_groups.len() as u8;
+
+        // Both cuckoo positions reuse the same group placement (a real
+        // group at h=0 is also real at h=1; only the target_bin differs).
+        // We classify from h=0 and assert the Real/Dummy split matches
+        // h=1 — the actual bin index per Real group legitimately differs
+        // between cuckoo positions, so we strip the Real(bin) payload
+        // before comparing.
+        let roles = classify_index_groups(placements_h0, k_index);
+        debug_assert!(
+            {
+                let roles_h1 = classify_index_groups(placements_h1, k_index);
+                roles.iter().zip(roles_h1.iter()).all(|(a, b)| {
+                    matches!(
+                        (a, b),
+                        (IndexGroupRole::Real(_), IndexGroupRole::Real(_))
+                            | (IndexGroupRole::Dummy, IndexGroupRole::Dummy),
+                    )
+                })
+            },
+            "pair-mode INDEX requires identical Real/Dummy split for h=0 and h=1",
+        );
+
+        // Per-group target-bin lookup. `placements_*` is a slice of
+        // (group_id, target_bin); turn into a HashMap so we can pluck the
+        // bin for each group during the pair build below.
+        let h0_bins: HashMap<u8, u32> = placements_h0.iter().copied().collect();
+        let h1_bins: HashMap<u8, u32> = placements_h1.iter().copied().collect();
+
+        let mut batch_items_h0: Vec<BatchItem> = Vec::with_capacity(k_index as usize);
+        let mut batch_items_h1: Vec<BatchItem> = Vec::with_capacity(k_index as usize);
+
+        for g in 0..k_index {
+            let role = roles[g as usize];
+            let group = self
+                .index_groups
+                .get_mut(&g)
+                .ok_or_else(|| PirError::InvalidState(format!("missing INDEX group {}", g)))?;
+            let (bytes_h0, bytes_h1) = match role {
+                IndexGroupRole::Real(_) => {
+                    let bin_h0 = *h0_bins.get(&g).ok_or_else(|| {
+                        PirError::InvalidState(format!("missing h=0 bin for real group {}", g))
+                    })?;
+                    let bin_h1 = *h1_bins.get(&g).ok_or_else(|| {
+                        PirError::InvalidState(format!("missing h=1 bin for real group {}", g))
+                    })?;
+                    let pair = group.build_request_pair(bin_h0, bin_h1).map_err(|e| {
+                        PirError::BackendState(format!("build_request_pair: {:?}", e))
+                    })?;
+                    let (req_1, req_2) = pair.into_parts();
+                    (req_1.request(), req_2.request())
+                }
+                IndexGroupRole::Dummy => {
+                    // Two independent K-padded synthetic dummies — one per
+                    // wire round. RNG advances naturally so the two dummies
+                    // differ on the wire. Per wrapper docs,
+                    // `build_synthetic_dummy` is safe during the pair's
+                    // in-flight period (it never touches DS').
+                    let d_h0 = group.build_synthetic_dummy();
+                    let d_h1 = group.build_synthetic_dummy();
+                    (d_h0, d_h1)
+                }
+            };
+            batch_items_h0.push(BatchItem {
+                group_id: g,
+                indices: bytes_to_u32_vec(&bytes_h0)?,
+            });
+            batch_items_h1.push(BatchItem {
+                group_id: g,
+                indices: bytes_to_u32_vec(&bytes_h1)?,
+            });
+        }
+
+        let request_h0 = encode_batch_query(0, round_tag_h0 as u16, db_id, &batch_items_h0);
+        let request_h1 = encode_batch_query(0, round_tag_h1 as u16, db_id, &batch_items_h1);
+        let request_h0_bytes = request_h0.len() as u64;
+        let request_h1_bytes = request_h1.len() as u64;
+        let items_per_group_h0: Vec<u32> = batch_items_h0
+            .iter()
+            .map(|it| it.indices.len() as u32)
+            .collect();
+        let items_per_group_h1: Vec<u32> = batch_items_h1
+            .iter()
+            .map(|it| it.indices.len() as u32)
+            .collect();
+
+        // ── Pipelined network round-trip ──
+        // Send both requests before awaiting either response. The
+        // WebSocket sink delivers them in order; the server processes
+        // requests sequentially per connection and responses arrive in
+        // the same order. The two RTTs collapse into one (one send-first,
+        // both flights overlap, both recvs in order).
+        //
+        // Note: `conn.recv()` returns the raw frame INCLUDING the 4-byte
+        // length prefix (unlike `conn.roundtrip()`, which strips it).
+        // We strip with `[4..]` here, mirroring `dpf.rs:1442-1443`. The
+        // saturating-prefix-len check guards against a too-short frame —
+        // a missing prefix is a server protocol violation, not a normal
+        // case.
+        let conn = self.query_conn.as_mut().ok_or(PirError::NotConnected)?;
+        conn.send(request_h0).await?;
+        conn.send(request_h1).await?;
+        let response_h0 = conn.recv().await?;
+        let response_h1 = conn.recv().await?;
+        if response_h0.len() < 4 || response_h1.len() < 4 {
+            return Err(PirError::Protocol(
+                "INDEX pair response too short to carry length prefix".into(),
+            ));
+        }
+
+        // Record both wire rounds in the leakage profile separately —
+        // wire-observable shape is unchanged from the sequential path.
+        // `response_bytes` is the raw frame length (length-prefix
+        // included), matching the `dpf.rs` raw-recv path.
+        self.record_round(RoundProfile {
+            kind: RoundKind::Index,
+            server_id: 0,
+            db_id: Some(db_id),
+            request_bytes: request_h0_bytes,
+            response_bytes: response_h0.len() as u64,
+            items: items_per_group_h0,
+        });
+        self.record_round(RoundProfile {
+            kind: RoundKind::Index,
+            server_id: 0,
+            db_id: Some(db_id),
+            request_bytes: request_h1_bytes,
+            response_bytes: response_h1.len() as u64,
+            items: items_per_group_h1,
+        });
+
+        let raw_results_h0 = decode_batch_response(&response_h0[4..])?;
+        let raw_results_h1 = decode_batch_response(&response_h1[4..])?;
+
+        // Decode real groups via the pair API. Dummies are not surfaced.
+        let mut out_h0 = HashMap::new();
+        let mut out_h1 = HashMap::new();
+        for g in 0..k_index {
+            if !matches!(roles[g as usize], IndexGroupRole::Real(_)) {
+                continue;
+            }
+            let data_h0 = raw_results_h0.get(&g).ok_or_else(|| {
+                PirError::Protocol(format!("no INDEX response (h=0) for group {}", g))
+            })?;
+            let data_h1 = raw_results_h1.get(&g).ok_or_else(|| {
+                PirError::Protocol(format!("no INDEX response (h=1) for group {}", g))
+            })?;
+            let group = self
+                .index_groups
+                .get_mut(&g)
+                .ok_or_else(|| PirError::InvalidState("missing INDEX real group".into()))?;
+            let answer_pair = group
+                .process_response_pair(data_h0, data_h1)
+                .map_err(|e| {
+                    PirError::BackendState(format!("process_response_pair: {:?}", e))
+                })?;
+            let (answer_h0, answer_h1) = answer_pair.into_parts();
+            out_h0.insert(g, answer_h0);
+            out_h1.insert(g, answer_h1);
+        }
+        Ok((out_h0, out_h1))
     }
 
     /// Execute CHUNK rounds to recover each chunk in `chunk_ids`.

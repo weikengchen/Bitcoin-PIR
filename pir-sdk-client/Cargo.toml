@@ -23,8 +23,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 default = []
 # Enable fast PRP backend (FastPRP) for HarmonyPIR — faster per-element but slower build.
 fastprp = ["harmonypir-wasm/fastprp"]
-# Enable ALF PRP backend for HarmonyPIR — fastest per-element with native per-group tweaks.
-alf = ["harmonypir-wasm/alf"]
+# `alf` feature dropped 2026-05-12 — ALF panicked on small (sibling-table)
+# domains, crashed pir-vpsbg in a tight loop. See runtime/Cargo.toml note.
 # Enable the real OnionPIR client. Off by default because the upstream
 # `onionpir` crate requires a C++ toolchain + cmake + Homebrew GCC on macOS
 # and pulls in the SEAL submodule. Without this feature, `OnionClient` keeps

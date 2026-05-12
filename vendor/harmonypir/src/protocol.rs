@@ -63,6 +63,28 @@ pub struct Client {
     query_count: usize,
 }
 
+/// Per-call state bridging [`Client::build_pair_requests`] and [`Client::finish_pair`].
+///
+/// Holds the segment/position metadata and the destination segments for q_1's
+/// relocation (already applied to DS' by `build_pair_requests`). Opaque to the
+/// caller — just thread the value from build to finish.
+///
+/// **State invariant**: while a `PendingPair` is outstanding, the client's DS'
+/// has been advanced past q_1's relocation, but the hint parities have NOT
+/// been updated. Calling another query method on the same client before
+/// `finish_pair` would corrupt state. Treat the pair as in-flight until
+/// finish_pair returns.
+#[must_use = "the PendingPair must be passed to Client::finish_pair to complete the pair query"]
+pub struct PendingPair {
+    s_1: usize,
+    r_1: usize,
+    /// d_1[i] = segment containing the destination cell of q_1's i-th
+    /// per-cell relocation (computed post-RelocateSegment(s_1)).
+    d_1: Vec<usize>,
+    s_2: usize,
+    r_2: usize,
+}
+
 impl Client {
     /// Run the offline phase: initialize DS' and compute hint parities by
     /// streaming the database from the server.
@@ -150,6 +172,227 @@ impl Client {
 
         self.query_count += 1;
         Ok(answer)
+    }
+
+    /// Build both server requests for a pipelined pair query.
+    ///
+    /// This is the **build half** of the pair-pipelined online phase. It
+    /// constructs requests for both `q_1` and `q_2` and advances DS' past
+    /// q_1's relocation, but does NOT touch the hint parities. The caller
+    /// then sends both requests over the network (in parallel, ideally)
+    /// and feeds both responses to [`Client::finish_pair`] together with
+    /// the returned [`PendingPair`].
+    ///
+    /// # Output
+    ///
+    /// - `request_1`, `request_2`: each a `Vec<usize>` of length T, with
+    ///   entries in `[0, N)` for real database indices or [`EMPTY`] for
+    ///   empty cells. The caller passes these through whatever wire format
+    ///   the server expects, and feeds back two `&[Vec<u8>]` responses of
+    ///   exactly T entries each.
+    /// - [`PendingPair`]: opaque state to thread to `finish_pair`.
+    ///
+    /// # In-flight state
+    ///
+    /// Between `build_pair_requests` and `finish_pair`, the client is in
+    /// an **in-flight** state — DS' is advanced but H is stale. Do not
+    /// call `query`, `query_pair`, `apply_modification`, etc. on the same
+    /// client until `finish_pair` returns. The borrow checker won't catch
+    /// this — it's a logical invariant.
+    ///
+    /// # Equivalence
+    ///
+    /// `build_pair_requests(q_1, q_2, rng)` followed by `finish_pair(...)`
+    /// produces the same final client state and same answers as two
+    /// sequential `query(q_1)` then `query(q_2)` calls with the same RNG
+    /// (proof: see test suite, `test_query_pair_equiv_sequential_*`).
+    ///
+    /// # Why this is sound
+    ///
+    /// `RelocateSegment(s)` is purely local — it appends to the relocation
+    /// history and does not touch H. Only the *hint update* (H[d_i] ⊕= R[i]
+    /// and H[d_r] ⊕= A) depends on the server's response. So we can:
+    ///
+    /// 1. Build Q_1 from DS'_0.
+    /// 2. Apply `RelocateSegment(s_1)` locally → DS'_1. (No server data needed.)
+    /// 3. Build Q_2 from DS'_1. `Locate(q_2)`, `Access` calls, and the fake
+    ///    position l_2 all use the post-step-2 DS' — same as what sequential
+    ///    would see between query 1 and query 2.
+    /// 4. (caller) Send both requests; receive both responses.
+    /// 5. (`finish_pair`) Compute A_1 from pre-update H[s_1] and R_1.
+    /// 6. Apply Part B for q_1: H ⊕= R_1, A_1.
+    /// 7. Compute A_2 from post-Part-B H[s_2] and R_2.    ← H[s_2] may have
+    ///    been just updated by step 6 if q_1 relocated a value into segment
+    ///    s_2; this is exactly what sequential would do too.
+    /// 8. RelocateSegment(s_2) + Part B for q_2.
+    pub fn build_pair_requests(
+        &mut self,
+        q_1: usize,
+        q_2: usize,
+        rng: &mut impl Rng,
+    ) -> Result<(Vec<usize>, Vec<usize>, PendingPair)> {
+        if q_1 >= self.params.n {
+            return Err(HarmonyPirError::InvalidIndex {
+                index: q_1,
+                max: self.params.n - 1,
+            });
+        }
+        if q_2 >= self.params.n {
+            return Err(HarmonyPirError::InvalidIndex {
+                index: q_2,
+                max: self.params.n - 1,
+            });
+        }
+        if self.query_count + 2 > self.params.max_queries {
+            return Err(HarmonyPirError::NoMoreQueries);
+        }
+
+        let t = self.params.t;
+        let n = self.params.n;
+
+        // ── Step 1: Build Q_1 from current DS' ──
+        let c_1 = self.ds.locate(q_1)?;
+        let s_1 = c_1 / t;
+        let r_1 = c_1 % t;
+
+        let mut request_1 = vec![EMPTY; t];
+        for i in 0..t {
+            if i != r_1 {
+                request_1[i] = self.ds.access(s_1 * t + i)?;
+            }
+        }
+        let l_1 = self.sample_random_cell(s_1, rng)?;
+        request_1[r_1] = self.ds.access(l_1)?;
+
+        // ── Step 2: RelocateSegment(s_1); cache q_1's destination segments ──
+        let m_1 = self.ds.relocated_segment_count();
+        self.ds.relocate_segment(s_1)?;
+
+        let mut d_1 = vec![0usize; t];
+        for i in 0..t {
+            let empty_value = n + m_1 * t + i;
+            let dest_cell = self.ds.locate_extended(empty_value)?;
+            d_1[i] = dest_cell / t;
+        }
+
+        // ── Step 3: Build Q_2 from updated DS' ──
+        let c_2 = self.ds.locate(q_2)?;
+        let s_2 = c_2 / t;
+        let r_2 = c_2 % t;
+
+        let mut request_2 = vec![EMPTY; t];
+        for i in 0..t {
+            if i != r_2 {
+                request_2[i] = self.ds.access(s_2 * t + i)?;
+            }
+        }
+        let l_2 = self.sample_random_cell(s_2, rng)?;
+        request_2[r_2] = self.ds.access(l_2)?;
+
+        Ok((
+            request_1,
+            request_2,
+            PendingPair {
+                s_1,
+                r_1,
+                d_1,
+                s_2,
+                r_2,
+            },
+        ))
+    }
+
+    /// Finish a pipelined pair query: compute both answers and complete state updates.
+    ///
+    /// Consumes the [`PendingPair`] returned by `build_pair_requests` and the
+    /// two server responses. Each response must be exactly T entries of w
+    /// bytes (matching the request length).
+    ///
+    /// On success, the client's H and DS' are advanced as if two sequential
+    /// `query` calls had completed.
+    pub fn finish_pair(
+        &mut self,
+        pending: PendingPair,
+        response_1: &[Vec<u8>],
+        response_2: &[Vec<u8>],
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let t = self.params.t;
+        let n = self.params.n;
+        if response_1.len() != t || response_2.len() != t {
+            return Err(HarmonyPirError::InvalidParams(
+                "response length must equal T (segment size)",
+            ));
+        }
+
+        let PendingPair { s_1, r_1, d_1, s_2, r_2 } = pending;
+
+        // ── Step 5: A_1 (uses pre-update H[s_1]) ──
+        let mut answer_1 = self.hints[s_1].clone();
+        for i in 0..t {
+            if i != r_1 {
+                xor_bytes_into(&mut answer_1, &response_1[i]);
+            }
+        }
+
+        // ── Step 6: Part B for q_1 — advance H using R_1, A_1 ──
+        for i in 0..t {
+            if i != r_1 {
+                xor_bytes_into(&mut self.hints[d_1[i]], &response_1[i]);
+            } else {
+                xor_bytes_into(&mut self.hints[d_1[i]], &answer_1);
+            }
+        }
+
+        // ── Step 7: A_2 (uses post-step-6 H[s_2]) ──
+        let mut answer_2 = self.hints[s_2].clone();
+        for i in 0..t {
+            if i != r_2 {
+                xor_bytes_into(&mut answer_2, &response_2[i]);
+            }
+        }
+
+        // ── Step 8: RelocateSegment(s_2) + Part B for q_2 ──
+        let m_2 = self.ds.relocated_segment_count();
+        self.ds.relocate_segment(s_2)?;
+        for i in 0..t {
+            let empty_value = n + m_2 * t + i;
+            let dest_cell = self.ds.locate_extended(empty_value)?;
+            let e_i = dest_cell / t;
+            if i != r_2 {
+                xor_bytes_into(&mut self.hints[e_i], &response_2[i]);
+            } else {
+                xor_bytes_into(&mut self.hints[e_i], &answer_2);
+            }
+        }
+
+        self.query_count += 2;
+        Ok((answer_1, answer_2))
+    }
+
+    /// Execute two online queries with pipelined server roundtrips.
+    ///
+    /// All-in-one convenience wrapper around [`Client::build_pair_requests`]
+    /// and [`Client::finish_pair`] for users that have a local [`Server`].
+    /// Real deployments with a remote server should call the two halves
+    /// directly so the network roundtrip can be parallelized.
+    ///
+    /// The observable result is identical to two sequential `query()` calls
+    /// for `q_1` then `q_2` (same answers, same final H, same final DS').
+    pub fn query_pair(
+        &mut self,
+        q_1: usize,
+        q_2: usize,
+        server: &Server,
+        rng: &mut impl Rng,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let (request_1, request_2, pending) =
+            self.build_pair_requests(q_1, q_2, rng)?;
+        // In a real deployment these two `answer` calls would be issued in
+        // parallel over the network. Here they're sequential because the
+        // server is in-process.
+        let response_1 = server.answer(&request_1);
+        let response_2 = server.answer(&request_2);
+        self.finish_pair(pending, &response_1, &response_2)
     }
 
     /// Algorithm 7: Optimized hint relocation.
@@ -519,6 +762,276 @@ mod tests {
         let r = 44;
         let prp = Box::new(HoangPrp::new(2 * n, r, &[0xCDu8; 16]));
         run_protocol_test(prp, n, w, t);
+    }
+
+    // ================================================================
+    // Pipelined `query_pair` — equivalence to sequential `query`
+    // ================================================================
+
+    /// Compare `query_pair(q_1, q_2)` against `query(q_1); query(q_2)` on two
+    /// independently-built clients seeded identically. Equivalence means
+    /// (a) same answers and (b) same internal state (H, query_count, and
+    /// `relocated_segment_count` of DS').
+    fn assert_query_pair_equiv_sequential(
+        n: usize,
+        w: usize,
+        t: usize,
+        prp_factory: impl Fn() -> Box<dyn crate::prp::Prp>,
+        rng_seed: u64,
+        pairs: &[(usize, usize)],
+    ) {
+        let db = make_test_db(n, w);
+        let server = Server::new(db.clone());
+
+        // -- Sequential mode: run query(q_1) then query(q_2) for each pair --
+        let mut client_seq = {
+            let params = Params::new(n, w, t).unwrap();
+            Client::offline(params, prp_factory(), &server).unwrap()
+        };
+        let mut rng_seq = ChaCha20Rng::seed_from_u64(rng_seed);
+        let mut answers_seq: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for &(q_1, q_2) in pairs {
+            let a1 = client_seq.query(q_1, &server, &mut rng_seq).unwrap();
+            let a2 = client_seq.query(q_2, &server, &mut rng_seq).unwrap();
+            answers_seq.push((a1, a2));
+        }
+
+        // -- Pipelined mode: run query_pair(q_1, q_2) for each pair --
+        let mut client_pipe = {
+            let params = Params::new(n, w, t).unwrap();
+            Client::offline(params, prp_factory(), &server).unwrap()
+        };
+        let mut rng_pipe = ChaCha20Rng::seed_from_u64(rng_seed);
+        let mut answers_pipe: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for &(q_1, q_2) in pairs {
+            let pair = client_pipe
+                .query_pair(q_1, q_2, &server, &mut rng_pipe)
+                .unwrap();
+            answers_pipe.push(pair);
+        }
+
+        // (1) answers per-pair must match between modes,
+        //     and each answer must equal db[q].
+        for (i, &(q_1, q_2)) in pairs.iter().enumerate() {
+            let (a1_seq, a2_seq) = &answers_seq[i];
+            let (a1_pipe, a2_pipe) = &answers_pipe[i];
+
+            assert_eq!(a1_seq, &db[q_1], "seq pair {i}: A_1 wrong");
+            assert_eq!(a2_seq, &db[q_2], "seq pair {i}: A_2 wrong");
+            assert_eq!(a1_pipe, &db[q_1], "pipe pair {i}: A_1 wrong");
+            assert_eq!(a2_pipe, &db[q_2], "pipe pair {i}: A_2 wrong");
+
+            assert_eq!(a1_seq, a1_pipe, "pair {i}: A_1 differs seq vs pipe");
+            assert_eq!(a2_seq, a2_pipe, "pair {i}: A_2 differs seq vs pipe");
+        }
+
+        // (2) internal client state must match.
+        assert_eq!(client_seq.hints, client_pipe.hints, "hints diverge");
+        assert_eq!(
+            client_seq.query_count, client_pipe.query_count,
+            "query_count diverges"
+        );
+        assert_eq!(
+            client_seq.ds.relocated_segment_count(),
+            client_pipe.ds.relocated_segment_count(),
+            "DS' relocated_segment_count diverges"
+        );
+    }
+
+    #[test]
+    fn test_split_pair_api_matches_query_pair() {
+        // Exercise the split (build_pair_requests + finish_pair) API directly
+        // and verify it produces the same result as query_pair.
+        let n = 64;
+        let w = 32;
+        let t = 8;
+        let key = [0x99u8; 16];
+        let r = 44;
+
+        let db = make_test_db(n, w);
+        let server = Server::new(db.clone());
+
+        let q_1 = 5;
+        let q_2 = 17;
+
+        // Path A: Client::query_pair (all-in-one).
+        let mut client_a = {
+            let params = Params::new(n, w, t).unwrap();
+            let prp = Box::new(HoangPrp::new(2 * n, r, &key));
+            Client::offline(params, prp, &server).unwrap()
+        };
+        let mut rng_a = ChaCha20Rng::seed_from_u64(11);
+        let (a1_a, a2_a) = client_a.query_pair(q_1, q_2, &server, &mut rng_a).unwrap();
+
+        // Path B: build_pair_requests, manual server.answer calls, finish_pair.
+        let mut client_b = {
+            let params = Params::new(n, w, t).unwrap();
+            let prp = Box::new(HoangPrp::new(2 * n, r, &key));
+            Client::offline(params, prp, &server).unwrap()
+        };
+        let mut rng_b = ChaCha20Rng::seed_from_u64(11);
+        let (req_1, req_2, pending) = client_b
+            .build_pair_requests(q_1, q_2, &mut rng_b)
+            .unwrap();
+        // Caller-side network roundtrip — could be parallel in a real deployment.
+        let resp_1 = server.answer(&req_1);
+        let resp_2 = server.answer(&req_2);
+        let (a1_b, a2_b) = client_b.finish_pair(pending, &resp_1, &resp_2).unwrap();
+
+        assert_eq!(a1_a, db[q_1]);
+        assert_eq!(a2_a, db[q_2]);
+        assert_eq!(a1_a, a1_b, "split A_1 differs from all-in-one");
+        assert_eq!(a2_a, a2_b, "split A_2 differs from all-in-one");
+        assert_eq!(client_a.hints, client_b.hints, "hints diverge");
+        assert_eq!(client_a.query_count, client_b.query_count);
+    }
+
+    #[test]
+    fn test_split_pair_api_request_length() {
+        // Each returned request is exactly T entries.
+        let n = 64;
+        let w = 32;
+        let t = 8;
+        let db = make_test_db(n, w);
+        let server = Server::new(db);
+        let params = Params::new(n, w, t).unwrap();
+        let prp = Box::new(HoangPrp::new(2 * n, 44, &[0x12u8; 16]));
+        let mut client = Client::offline(params, prp, &server).unwrap();
+        let mut rng = ChaCha20Rng::seed_from_u64(99);
+
+        let (req_1, req_2, _pending) = client.build_pair_requests(3, 30, &mut rng).unwrap();
+        assert_eq!(req_1.len(), t);
+        assert_eq!(req_2.len(), t);
+    }
+
+    #[test]
+    fn test_split_pair_api_rejects_wrong_response_length() {
+        let n = 64;
+        let w = 32;
+        let t = 8;
+        let db = make_test_db(n, w);
+        let server = Server::new(db);
+        let params = Params::new(n, w, t).unwrap();
+        let prp = Box::new(HoangPrp::new(2 * n, 44, &[0x34u8; 16]));
+        let mut client = Client::offline(params, prp, &server).unwrap();
+        let mut rng = ChaCha20Rng::seed_from_u64(7);
+
+        let (_, _, pending) = client.build_pair_requests(0, 1, &mut rng).unwrap();
+        // Wrong-length responses must error out, not silently corrupt state.
+        let bad_resp: Vec<Vec<u8>> = vec![vec![0u8; w]; t - 1]; // T-1 instead of T
+        let good_resp: Vec<Vec<u8>> = vec![vec![0u8; w]; t];
+        let result = client.finish_pair(pending, &bad_resp, &good_resp);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_query_pair_equiv_sequential_basic() {
+        // 8 distinct pairs with various combinations.
+        let pairs = vec![(0, 1), (5, 17), (3, 30), (60, 7)];
+        assert_query_pair_equiv_sequential(
+            64,
+            32,
+            8,
+            || Box::new(HoangPrp::new(2 * 64, 44, &[0xAB; 16])),
+            0xDEADBEEF,
+            &pairs,
+        );
+    }
+
+    #[test]
+    fn test_query_pair_equiv_sequential_chained() {
+        // Many pairs in sequence — exercises state evolution across pairs.
+        let n = 128;
+        let t = 16;
+        // max_queries = 2n/t / 2 = n/t = 8. So 4 pairs max.
+        let pairs: Vec<(usize, usize)> = (0..4).map(|i| (i, n - 1 - i)).collect();
+        assert_query_pair_equiv_sequential(
+            n,
+            32,
+            t,
+            || Box::new(HoangPrp::new(2 * n, 44, &[0x33; 16])),
+            0x1234_5678,
+            &pairs,
+        );
+    }
+
+    #[test]
+    fn test_query_pair_same_index() {
+        // q_1 == q_2: edge case — query_pair must still return DB[q] twice.
+        let pairs = vec![(7, 7), (42, 42)];
+        assert_query_pair_equiv_sequential(
+            64,
+            32,
+            8,
+            || Box::new(HoangPrp::new(2 * 64, 44, &[0xCD; 16])),
+            0xCAFE_BABE,
+            &pairs,
+        );
+    }
+
+    #[test]
+    fn test_query_pair_finds_same_segment_pair() {
+        // Build a DS' with the test PRP, find a (q_1, q_2) pair that lands in
+        // the same original segment, then verify query_pair handles it.
+        let n = 64;
+        let w = 32;
+        let t = 8;
+        let key = [0x77u8; 16];
+        let r = 44;
+
+        // Probe to find a same-segment pair.
+        let probe_prp: Box<dyn crate::prp::Prp> = Box::new(HoangPrp::new(2 * n, r, &key));
+        let probe_ds = RelocationDS::new(n, t, probe_prp).unwrap();
+        let mut same_seg_pair: Option<(usize, usize)> = None;
+        'outer: for q_1 in 0..n {
+            let s_1 = probe_ds.locate(q_1).unwrap() / t;
+            for q_2 in (q_1 + 1)..n {
+                let s_2 = probe_ds.locate(q_2).unwrap() / t;
+                if s_1 == s_2 {
+                    same_seg_pair = Some((q_1, q_2));
+                    break 'outer;
+                }
+            }
+        }
+        let pair = same_seg_pair.expect("expected at least one same-segment pair");
+
+        assert_query_pair_equiv_sequential(
+            n,
+            w,
+            t,
+            || Box::new(HoangPrp::new(2 * n, r, &key)),
+            0xABCD_EF00,
+            &[pair],
+        );
+    }
+
+    #[cfg(feature = "fastprp-prp")]
+    #[test]
+    fn test_query_pair_equiv_sequential_fastprp() {
+        let pairs = vec![(0, 50), (200, 800), (1, 1023)];
+        assert_query_pair_equiv_sequential(
+            1024,
+            32,
+            32,
+            || Box::new(FastPrpWrapper::new(&[0x55u8; 16], 2 * 1024)),
+            0x4242_4242,
+            &pairs,
+        );
+    }
+
+    #[cfg(feature = "alf")]
+    #[test]
+    fn test_query_pair_equiv_sequential_alf() {
+        let n = 32768;
+        let pairs = vec![(0, 12345), (n - 1, 7), (1024, 5000)];
+        assert_query_pair_equiv_sequential(
+            n,
+            32,
+            128,
+            || Box::new(AlfPrp::new(&[0xAA; 16], 2 * n, &[0u8; 16], 0)),
+            0xF00D_F00D,
+            &pairs,
+        );
     }
 
     // --- Cross-PRP consistency test ---

@@ -37,6 +37,7 @@ exec /usr/local/bin/unified_server \
     --port 8091 \
     --role secondary \
     --pool-size 8 \
+    --pool-dir /home/pir/data/hint_pool \
     --config /home/pir/data/databases.toml \
     --admin-pubkey-hex 87d454db85266e10e55ed8b68417de9d79ceb1d5d944bae831a7877627efdad3 \
     --vcek-dir /home/pir/data/vcek \

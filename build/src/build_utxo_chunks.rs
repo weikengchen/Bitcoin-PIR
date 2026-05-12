@@ -20,10 +20,9 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::time::Instant;
 
-const INPUT_FILE: &str = "/Volumes/Bitcoin/data/intermediate/utxo_set.bin";
-const CHUNKS_FILE: &str = "/Volumes/Bitcoin/data/intermediate/utxo_chunks_nodust.bin";
-const INDEX_FILE: &str = "/Volumes/Bitcoin/data/intermediate/utxo_chunks_index_nodust.bin";
-const TOP_FILE: &str = "/Volumes/Bitcoin/data/intermediate/top100_addresses.bin";
+/// Default data dir; all five files (utxo_set.bin input, chunks/index/top100/whale outputs)
+/// live under this dir unless overridden by `--data-dir <D>`.
+const DEFAULT_DATA_DIR: &str = "/Volumes/Bitcoin/data/intermediate";
 
 const ENTRY_SIZE: usize = 68;
 const SCRIPT_HASH_SIZE: usize = 20;
@@ -34,7 +33,6 @@ const DUST_THRESHOLD: u64 = 576; // sats
 const MAX_UTXOS_PER_SPK: usize = 100; // skip script pubkeys with more than this many UTXOs
 const TOP_N: usize = 100;
 const INDEX_RECORD_SIZE: usize = 20 + 4 + 1; // script_hash + start_chunk_id(u32) + num_chunks(u8)
-const WHALES_FILE: &str = "/Volumes/Bitcoin/data/intermediate/whale_addresses.txt";
 
 /// Zero buffer for padding (max padding = BLOCK_SIZE - 1 = 79 bytes)
 const ZERO_PAD: [u8; BLOCK_SIZE] = [0u8; BLOCK_SIZE];
@@ -91,43 +89,68 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn parse_partitions() -> usize {
+fn parse_cli() -> (usize, String) {
     let args: Vec<String> = env::args().collect();
+    let mut partitions = DEFAULT_PARTITIONS;
+    let mut data_dir = DEFAULT_DATA_DIR.to_string();
     let mut i = 1;
     while i < args.len() {
-        if args[i] == "--partitions" {
-            i += 1;
-            if i < args.len() {
-                return args[i].parse().unwrap_or(DEFAULT_PARTITIONS).max(1);
+        match args[i].as_str() {
+            "--partitions" => {
+                i += 1;
+                if i < args.len() {
+                    partitions = args[i].parse().unwrap_or(DEFAULT_PARTITIONS).max(1);
+                }
             }
+            "--data-dir" => {
+                i += 1;
+                if i < args.len() {
+                    data_dir = args[i].clone();
+                }
+            }
+            "-h" | "--help" => {
+                println!("Usage: {} [--partitions N] [--data-dir <dir>]", args[0]);
+                println!();
+                println!("Reads <dir>/utxo_set.bin and writes <dir>/{{utxo_chunks_nodust.bin,");
+                println!("utxo_chunks_index_nodust.bin, top100_addresses.bin, whale_addresses.txt}}.");
+                println!("Default dir: {}", DEFAULT_DATA_DIR);
+                std::process::exit(0);
+            }
+            _ => {}
         }
         i += 1;
     }
-    DEFAULT_PARTITIONS
+    (partitions, data_dir)
 }
 
 fn main() {
     println!("=== Build UTXO Chunks (No Dust, 80-byte blocks) ===");
     println!();
 
-    let num_partitions = parse_partitions();
+    let (num_partitions, data_dir) = parse_cli();
+    std::fs::create_dir_all(&data_dir).expect("create data dir");
+    let input_path = format!("{}/utxo_set.bin", data_dir);
+    let chunks_path = format!("{}/utxo_chunks_nodust.bin", data_dir);
+    let index_path = format!("{}/utxo_chunks_index_nodust.bin", data_dir);
+    let top_path = format!("{}/top100_addresses.bin", data_dir);
+    let whales_path = format!("{}/whale_addresses.txt", data_dir);
 
     println!("Configuration:");
     println!("  Block size:     {} bytes", BLOCK_SIZE);
     println!("  Partitions:     {}", num_partitions);
     println!("  Dust threshold: {} sats", DUST_THRESHOLD);
     println!("  Max UTXOs/SPK:  {} (skip larger)", MAX_UTXOS_PER_SPK);
-    println!("  Input:          {}", INPUT_FILE);
-    println!("  Output chunks:  {}", CHUNKS_FILE);
-    println!("  Output index:   {}", INDEX_FILE);
-    println!("  Top-100 file:   {}", TOP_FILE);
+    println!("  Input:          {}", input_path);
+    println!("  Output chunks:  {}", chunks_path);
+    println!("  Output index:   {}", index_path);
+    println!("  Top-100 file:   {}", top_path);
     println!();
 
     let total_start = Instant::now();
 
     // ── 1. mmap input ──────────────────────────────────────────────────
     println!("[1] Memory-mapping input...");
-    let input_file = File::open(INPUT_FILE).expect("open input");
+    let input_file = File::open(&input_path).expect("open input");
     let mmap = unsafe { Mmap::map(&input_file) }.expect("mmap");
     let entry_count = mmap.len() / ENTRY_SIZE;
     assert_eq!(mmap.len() % ENTRY_SIZE, 0);
@@ -136,9 +159,9 @@ fn main() {
 
     // ── 2. Open output files ───────────────────────────────────────────
     println!("[2] Opening output files...");
-    let chunks_file = File::create(CHUNKS_FILE).expect("create chunks file");
+    let chunks_file = File::create(&chunks_path).expect("create chunks file");
     let mut chunks_writer = BufWriter::with_capacity(1024 * 1024, chunks_file);
-    let index_file = File::create(INDEX_FILE).expect("create index file");
+    let index_file = File::create(&index_path).expect("create index file");
     let mut index_writer = BufWriter::with_capacity(1024 * 1024, index_file);
     println!("  Done");
     println!();
@@ -333,7 +356,7 @@ fn main() {
     println!();
 
     // ── 5. Write top-100 file ──────────────────────────────────────────
-    println!("[5] Writing top-100 largest groups to {}...", TOP_FILE);
+    println!("[5] Writing top-100 largest groups to {}...", top_path);
 
     // Drain heap into a vec, sorted by data_len descending
     let mut top_entries: Vec<TopEntry> = top_heap.into_sorted_vec()
@@ -343,7 +366,7 @@ fn main() {
     top_entries.reverse(); // largest first
 
     {
-        let top_file = File::create(TOP_FILE).expect("create top-100 file");
+        let top_file = File::create(&top_path).expect("create top-100 file");
         let mut top_writer = BufWriter::new(top_file);
 
         for (data_len, script_hash, first_txid, first_vout) in &top_entries {
@@ -370,13 +393,13 @@ fn main() {
     }
     // ── 6. Write whale addresses file ─────────────────────────────────
     println!();
-    println!("[6] Writing excluded whale addresses to {}...", WHALES_FILE);
+    println!("[6] Writing excluded whale addresses to {}...", whales_path);
 
     // Sort whales by UTXO count descending
     whale_entries.sort_by(|a, b| b.1.cmp(&a.1));
 
     {
-        let whale_file = File::create(WHALES_FILE).expect("create whale addresses file");
+        let whale_file = File::create(&whales_path).expect("create whale addresses file");
         let mut whale_writer = BufWriter::new(whale_file);
         writeln!(whale_writer, "# Excluded whale addresses (>{} UTXOs per scriptPubKey)", MAX_UTXOS_PER_SPK).unwrap();
         writeln!(whale_writer, "# Format: script_hash_hex  utxo_count").unwrap();

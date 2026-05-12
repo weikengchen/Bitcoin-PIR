@@ -9,12 +9,10 @@
 
 use build::common::*;
 use harmonypir::params::Params;
-#[cfg(feature = "alf")]
-use harmonypir::prp::alf::AlfPrp;
 use harmonypir::prp::hoang::HoangPrp;
 use harmonypir::prp::Prp;
 use harmonypir_wasm::{
-    HarmonyGroup, PRP_ALF, PRP_HMR12,
+    HarmonyGroup, PRP_HMR12,
     compute_rounds, derive_group_key, find_best_t, pad_n_for_t,
 };
 
@@ -51,9 +49,6 @@ fn decode_chunk_slot(slot: &[u8]) -> (u32, &[u8]) {
 }
 
 fn choose_backend() -> (u8, &'static str) {
-    #[cfg(feature = "alf")]
-    { (PRP_ALF, "ALF") }
-    #[cfg(not(feature = "alf"))]
     { (PRP_HMR12, "HMR12") }
 }
 
@@ -76,12 +71,8 @@ fn generate_hints_for_bucket(
     let table_offset = header_size + actual_group * n * w;
 
     // Build PRP and compute cell assignments (single-threaded).
+    // ALF arm removed 2026-05-12 — see harmonypir-wasm/src/lib.rs:36.
     let cell_of: Vec<usize> = match backend {
-        #[cfg(feature = "alf")]
-        PRP_ALF => {
-            let prp = AlfPrp::new(&derived_key, domain, &derived_key, 0x4250_4952);
-            (0..padded_n).map(|k| prp.forward(k)).collect()
-        }
         _ => {
             let prp = HoangPrp::new(domain, rounds, &derived_key);
             let mut result = vec![0usize; padded_n];
