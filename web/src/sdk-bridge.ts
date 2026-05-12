@@ -49,6 +49,22 @@ interface PirSdkWasm {
   WasmAtomicMetrics: {
     new(): WasmAtomicMetrics;
   };
+  // ARC (Anonymous Rate-limited Credentials) presentation state. Opaque
+  // wrapper over the Rust `arc::PresentationState`; mirrored in TS by
+  // `web/src/credential-manager.ts::ArcCredentialManager`. The constructor
+  // takes the 131-byte credential blob from the payment service plus a
+  // per-session presentation_context and a query limit; `present()` returns
+  // wire-format bytes for `REQ_CREDENTIAL_PRESENT` (server opcode 0x08) and
+  // bumps the internal nonce. `serialize()` / `deserialize()` enable
+  // localStorage persistence across page reloads.
+  WasmArcPresentationState: {
+    new(
+      credentialBytes: Uint8Array,
+      presentationContext: Uint8Array,
+      limit: bigint,
+    ): WasmArcPresentationState;
+    deserialize(bytes: Uint8Array): WasmArcPresentationState;
+  };
   PRP_HMR12: () => number;
   PRP_FASTPRP: () => number;
   PRP_ALF: () => number;
@@ -427,6 +443,27 @@ interface AtomicMetricsSnapshot {
  * counters (via an `Arc` clone on the native side), so this single
  * handle aggregates events from an entire PIR deployment.
  */
+/**
+ * Opaque WASM handle wrapping the Rust `arc::PresentationState`. Held by
+ * `ArcCredentialManager` and mutated by `present()`; serialise / deserialise
+ * round-trip the full state through localStorage so a page reload restores
+ * the remaining-presentation count without re-fetching the credential from
+ * the payment service.
+ */
+interface WasmArcPresentationState {
+  free(): void;
+  /** Produce the next presentation; throws once `remaining() === 0n`. */
+  present(): Uint8Array;
+  /** Remaining presentations before the credential is exhausted. */
+  remaining(): bigint;
+  /** Total presentation limit baked into the credential at issue time. */
+  limit(): bigint;
+  /** Current nonce — i.e. how many presentations were already produced. */
+  nonce(): bigint;
+  /** Serialise full state (credential + presCtx + nonce + limit) for persistence. */
+  serialize(): Uint8Array;
+}
+
 interface WasmAtomicMetrics {
   free(): void;
   /**
