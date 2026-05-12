@@ -94,6 +94,13 @@ tracing = { version = "0.1", features = ["log"] }
 # Error handling
 thiserror = "1.0"
 
+# Scripthash-derived synthetic CHUNK padding (dpf::derive_synthetic_chunk_ids).
+# Pulls a SHA-256 KDF instead of the legacy deterministic `0..M` synthetic
+# IDs so the PBC planner can pack batched CHUNK rounds densely across
+# not-found-heavy wallet syncs. Pure-Rust, no C deps; already a
+# transitive dep via pir-channel.
+sha2 = { version = "0.10", default-features = false }
+
 # ─── Native (tokio + tungstenite) target deps ───────────────────────────────
 # The tokio reactor does not run on `wasm32-unknown-unknown`. Everything that
 # needs `net` / `time` / multi-threaded I/O lives here so the crate can still

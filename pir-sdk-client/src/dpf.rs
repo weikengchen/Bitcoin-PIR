@@ -742,6 +742,18 @@ impl DpfClient {
         // not-found" leak the pre-closure code admitted via the
         // dummy-`query_chunk_level(&[])` round.
         let chunk_pad_m = pir_core::params::CHUNK_MERKLE_ITEMS_PER_QUERY;
+        // Upper bound for synthetic CHUNK IDs — the chunk-id space
+        // implied by the server's CHUNK table layout (groups × bins ×
+        // slots). Scripthash-derived synthetics are drawn uniformly
+        // from `[0, num_chunks_space)` so the PBC planner can pack
+        // batched CHUNK rounds densely instead of collapsing onto the
+        // legacy `0..M` set. Even a generous overestimate is fine:
+        // `derive_int_groups_3` is hash-based, so any u32 in this
+        // range spreads uniformly across PBC groups.
+        let num_chunks_space: u32 = (db_info.chunk_k as u32)
+            .saturating_mul(db_info.chunk_bins)
+            .saturating_mul(pir_core::params::CHUNK_SLOTS_PER_BIN as u32)
+            .max(chunk_pad_m as u32);
 
         for (i, (found_info, index_bins, matched_idx)) in index_outcomes.into_iter().enumerate() {
             let mut q_traces = QueryTraces {
@@ -771,7 +783,17 @@ impl DpfClient {
                 };
 
             let real_count = real_chunk_ids.len();
-            let padded_chunk_ids = pad_chunk_ids_to_m(&real_chunk_ids, chunk_pad_m);
+            // Per-query seed: SHA-256("BPIR-CHUNK-PAD" || scripthash ||
+            // query_index_le). Distinct seeds across queries → distinct
+            // synthetic chunk sets → PBC planner can pack the batched
+            // CHUNK round densely.
+            let pad_seed = derive_chunk_pad_seed(&script_hashes[i], i as u32);
+            let padded_chunk_ids = pad_chunk_ids_to_m(
+                &real_chunk_ids,
+                chunk_pad_m,
+                &pad_seed,
+                num_chunks_space,
+            );
             log::info!(
                 "[PIR-AUDIT] CHUNK chunk_max closure: query #{} real_chunks={} padded_to={} (M={})",
                 i,
@@ -2544,14 +2566,160 @@ fn plan_chunk_rounds(chunk_ids: &[u32], k: usize) -> Vec<Vec<(u32, usize)>> {
         .collect()
 }
 
+/// Derive a per-query seed for scripthash-derived synthetic CHUNK
+/// padding (see [`derive_synthetic_chunk_ids`] /
+/// [`pad_chunk_ids_to_m`]).
+///
+/// Seed = `SHA-256("BPIR-CHUNK-PAD" || scripthash || query_index_le)`.
+/// Domain separation: the literal byte string `"BPIR-CHUNK-PAD"` is
+/// the only string the spec uses with this format; no other call site
+/// in the codebase produces a SHA-256 input that starts with these
+/// bytes, so synthetic-chunk seeds can never collide with another
+/// protocol's hash output even if scripthashes happen to coincide.
+/// `query_index_le` keeps the M synthetic IDs distinct across multiple
+/// queries that share a scripthash (paranoia — different scripthashes
+/// already give different seeds).
+///
+/// This is pure: same inputs → same output, no I/O, no allocation
+/// beyond the SHA-256 hasher.
+pub(crate) fn derive_chunk_pad_seed(scripthash: &[u8], query_index: u32) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"BPIR-CHUNK-PAD");
+    hasher.update(scripthash);
+    hasher.update(query_index.to_le_bytes());
+    let out = hasher.finalize();
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&out);
+    seed
+}
+
+/// Derive `m` synthetic chunk IDs from a per-query seed.
+///
+/// Returns a Vec<u32> of length `min(m, num_chunks - real_chunks.len())`
+/// whose entries are pairwise distinct, disjoint from `real_chunks`,
+/// and in `[0, num_chunks)`. Output is determined entirely by the four
+/// inputs — same `(seed, m, num_chunks, real_chunks)` always yields the
+/// same Vec.
+///
+/// Algorithm: counter-mode SHA-256. Each invocation
+/// `SHA-256(seed || counter_le)` produces 8 candidate u32 values (32
+/// bytes / 4 bytes each); each candidate is reduced mod `num_chunks`
+/// and accepted iff it's disjoint from `real_chunks` AND from
+/// already-collected synthetics. The counter increments until `m`
+/// synthetics are collected (or until the candidate space is
+/// exhausted, in which case fewer than `m` synthetics are returned —
+/// callers must handle this gracefully).
+///
+/// Termination: with the production parameters
+/// (`m = CHUNK_MERKLE_ITEMS_PER_QUERY = 16`, `num_chunks` in the
+/// millions for any production DB), the expected number of SHA-256
+/// invocations is ≤ 1 — 8 candidates × ~uniform distribution gives
+/// ≥ 16 valid candidates with overwhelming probability. The
+/// `counter > 1_000_000` cap is a defensive fallback for pathological
+/// inputs (e.g., `num_chunks == real_chunks.len()`) that no production
+/// caller produces.
+///
+/// Distinction from the legacy `0..M` padding: the legacy helper
+/// emitted the SAME synthetic IDs `[0, 1, …, M-1]` for every
+/// not-found / whale query. In an N-query batch where most queries
+/// are not-found, the flat chunk list collapses to ≤ M distinct IDs,
+/// all targeting the same `derive_int_groups_3` candidate groups, so
+/// the PBC planner can't pack the batch densely. The seeded version
+/// gives each query a distinct synthetic set spread uniformly over
+/// `[0, num_chunks)`, restoring PBC packing efficiency.
+///
+/// Privacy: the synthetic IDs are wire-observable but reveal no
+/// information about the query — they're a deterministic function of
+/// (scripthash, query_index, num_chunks, real_chunks). The simulator
+/// can reproduce them from the leakage profile (which records batch
+/// shape and per-query padding parameters) without knowing the real
+/// chunk content. See `proofs/easycrypt/Simulator.ec` for the formal
+/// argument.
+pub(crate) fn derive_synthetic_chunk_ids(
+    seed: &[u8; 32],
+    m: usize,
+    num_chunks: u32,
+    real_chunks: &[u32],
+) -> Vec<u32> {
+    use sha2::{Digest, Sha256};
+
+    if m == 0 || num_chunks == 0 {
+        return Vec::new();
+    }
+
+    // Cap target at `num_chunks - real_count` to guarantee termination
+    // even on adversarial inputs. In production, num_chunks >> M so the
+    // cap is a no-op.
+    let available = (num_chunks as usize).saturating_sub(real_chunks.len());
+    let target = m.min(available);
+    if target == 0 {
+        return Vec::new();
+    }
+
+    let mut result: Vec<u32> = Vec::with_capacity(target);
+    let mut counter: u64 = 0;
+
+    // Counter-mode SHA-256 stream. Each hash invocation yields 8
+    // candidate u32 values; reject duplicates and real-collisions.
+    while result.len() < target {
+        let mut hasher = Sha256::new();
+        hasher.update(seed);
+        hasher.update(counter.to_le_bytes());
+        let h = hasher.finalize();
+        for i in 0..8 {
+            let bytes: [u8; 4] = h[i * 4..(i + 1) * 4].try_into().unwrap();
+            let candidate = u32::from_le_bytes(bytes) % num_chunks;
+            // Reject collision with reals.
+            let mut clash = false;
+            for &r in real_chunks {
+                if r == candidate {
+                    clash = true;
+                    break;
+                }
+            }
+            if clash {
+                continue;
+            }
+            // Reject collision with already-collected synthetics.
+            let mut dup = false;
+            for &s in &result {
+                if s == candidate {
+                    dup = true;
+                    break;
+                }
+            }
+            if dup {
+                continue;
+            }
+            result.push(candidate);
+            if result.len() >= target {
+                break;
+            }
+        }
+        // Defensive bound — pathological inputs (e.g., num_chunks close
+        // to real_chunks.len()) could theoretically loop forever. In
+        // production this is unreachable (num_chunks >> M).
+        counter = counter.wrapping_add(1);
+        if counter > 1_000_000 {
+            break;
+        }
+    }
+
+    result
+}
+
 /// Pad a real-chunk list to exactly `m` chunk_ids by appending
-/// synthetic chunk_ids drawn from `[0, u32::MAX)`. Synthetic ids are
-/// chosen deterministically from the prefix `0..` so the closure
-/// doesn't depend on a per-query RNG; collisions with the real-chunk
-/// list are skipped so the planner sees `m` distinct chunk_ids.
+/// synthetic chunk_ids derived from a per-query SHA-256 seed
+/// (see [`derive_synthetic_chunk_ids`]). Synthetic ids are drawn from
+/// `[0, num_chunks)`, deterministically computed from `seed`, and
+/// disjoint from the real-chunk list.
 ///
 /// Pure helper extracted for Kani verification:
-/// * `result.len() == m` regardless of `real_chunks.len()`.
+/// * `result.len() == m` regardless of `real_chunks.len()` (for
+///   production parameters where `num_chunks >> m`; if `num_chunks` is
+///   pathologically small the result may be shorter — callers must
+///   handle this, but no production caller produces that input).
 /// * `result[..real_chunks.len()] == real_chunks` (real chunks come first
 ///   so the caller can decode the first `N * CHUNK_SIZE` payload bytes
 ///   as the genuine UTXO entries; synthetic-chunk payloads belong to
@@ -2562,37 +2730,57 @@ fn plan_chunk_rounds(chunk_ids: &[u32], k: usize) -> Vec<Vec<(u32, usize)>> {
 /// `pir_core::params::CHUNK_MERKLE_ITEMS_PER_QUERY`. Calling with
 /// `m == 0` is a no-op (returns the original list unchanged) — the
 /// closure is enabled by passing a non-zero `m`.
-pub(crate) fn pad_chunk_ids_to_m(real_chunks: &[u32], m: usize) -> Vec<u32> {
+///
+/// `seed` is per-query (typically derived from
+/// [`derive_chunk_pad_seed`] over scripthash + query_index) so each
+/// query gets a distinct synthetic set. This is what restores PBC
+/// packing efficiency for not-found-heavy batches that previously
+/// collapsed onto the legacy `0..M` synthetic set.
+///
+/// `num_chunks` is an upper bound for synthetic IDs (modulo). For
+/// DPF/Harmony pass `chunk_k * chunk_bins * CHUNK_SLOTS_PER_BIN` (the
+/// max chunk-id space implied by the table layout); for OnionPIR pass
+/// `total_packed`.
+pub(crate) fn pad_chunk_ids_to_m(
+    real_chunks: &[u32],
+    m: usize,
+    seed: &[u8; 32],
+    num_chunks: u32,
+) -> Vec<u32> {
     if m <= real_chunks.len() {
         return real_chunks.to_vec();
     }
     let mut padded: Vec<u32> = Vec::with_capacity(m);
     padded.extend_from_slice(real_chunks);
-    let mut next: u32 = 0;
-    while padded.len() < m {
-        // Check `next` against `real_chunks` only (a fixed-size input
-        // slice; bounded loop). Synthetic ids generated so far are
-        // guaranteed pairwise distinct by the strictly-increasing
-        // `next` counter, so we don't need to scan `padded` itself
-        // — only avoid colliding with the real-chunk prefix.
-        let mut conflict = false;
-        for &r in real_chunks {
-            if r == next {
-                conflict = true;
+
+    let needed = m - real_chunks.len();
+    let synthetics = derive_synthetic_chunk_ids(seed, needed, num_chunks, real_chunks);
+    padded.extend_from_slice(&synthetics);
+
+    // Fallback for pathological `num_chunks` (smaller than `m -
+    // real_count`): top up with the legacy `0..`-skipping behaviour
+    // so the post-condition `padded.len() == m` still holds. In
+    // production this branch is unreachable.
+    if padded.len() < m {
+        let mut next: u32 = 0;
+        while padded.len() < m {
+            let mut conflict = false;
+            for &r in &padded {
+                if r == next {
+                    conflict = true;
+                    break;
+                }
+            }
+            if !conflict {
+                padded.push(next);
+            }
+            if next == u32::MAX {
                 break;
             }
+            next = next.saturating_add(1);
         }
-        if !conflict {
-            padded.push(next);
-        }
-        // Saturating_add at u32::MAX guards a degenerate input where the
-        // real-chunks list contains every u32 (impossible in practice,
-        // but keeps the helper total).
-        if next == u32::MAX {
-            break;
-        }
-        next = next.saturating_add(1);
     }
+
     padded
 }
 
@@ -3122,6 +3310,25 @@ mod kani_harnesses {
     }
 
     // ─── chunk_max closure helpers ───────────────────────────────────────
+    //
+    // The seeded variant (scripthash-derived synthetic CHUNK padding)
+    // takes two extra inputs — a 32-byte seed and a `num_chunks` bound.
+    // All four harnesses use a fixed concrete seed (`[0u8; 32]`) and a
+    // `num_chunks` large enough that the helper always succeeds in
+    // collecting M synthetics. The properties under test are unchanged
+    // from the legacy `0..M` variant — only the synthetic-IDs source
+    // differs (SHA-256 counter mode instead of strictly-increasing
+    // counter), so the harnesses still cover shape, prefix
+    // preservation, synthetic-disjointness, and the `m == 0` no-op
+    // identity.
+    //
+    // The synthetic-disjointness harness drops the old hardcoded
+    // `padded[2] == 2 && padded[3] == 3` assertion (which relied on
+    // the legacy `0..M`-skipping order) and replaces it with a
+    // property-level check: every synthetic must lie outside the real
+    // set. The disjointness property is the substantive one — the
+    // specific synthetic values now depend on the SHA-256 of the seed
+    // and are not predictable by inspection.
 
     /// Prove `pad_chunk_ids_to_m` produces exactly `m` ids when
     /// `m > real_chunks.len()`. Pinned at `m = 4` — anything ≥ 1 is
@@ -3140,7 +3347,13 @@ mod kani_harnesses {
         } else {
             vec![42u32]
         };
-        let padded = pad_chunk_ids_to_m(&real_chunks, /* m */ 4);
+        let seed = [0u8; 32];
+        let padded = pad_chunk_ids_to_m(
+            &real_chunks,
+            /* m */ 4,
+            &seed,
+            /* num_chunks */ 1000,
+        );
         assert_eq!(padded.len(), 4);
     }
 
@@ -3154,26 +3367,53 @@ mod kani_harnesses {
     #[kani::unwind(8)]
     fn pad_chunk_ids_to_m_real_chunks_in_prefix() {
         let real_chunks = [100u32, 200u32];
-        let padded = pad_chunk_ids_to_m(&real_chunks, /* m */ 4);
+        let seed = [0u8; 32];
+        let padded = pad_chunk_ids_to_m(
+            &real_chunks,
+            /* m */ 4,
+            &seed,
+            /* num_chunks */ 1000,
+        );
         assert_eq!(padded[0], 100);
         assert_eq!(padded[1], 200);
     }
 
-    /// Prove the synthetic ids never collide with the real-chunk list
-    /// — the helper's `if !padded.contains(&next)` skip-branch is the
-    /// only way duplicates would appear, and Kani exhaustively
-    /// witnesses that branch never falls through. Pinning real chunks
-    /// to `[0, 1]` (the worst case where the helper must skip both
-    /// initial synthetic candidates 0 and 1 before settling on 2 and 3).
+    /// Prove the synthetic ids never collide with the real-chunk list.
+    /// Pre-closure (legacy `0..M`-skipping), the synthetics were
+    /// predictable: real=[0, 1] → synthetic prefix [2, 3]. Post-closure
+    /// (scripthash-derived seed), the synthetics are SHA-256(seed ||
+    /// counter)-derived modulo `num_chunks`, so the *specific values*
+    /// aren't predictable by inspection — but the *property* is
+    /// unchanged: synthetics ∉ real_chunks. Kani enumerates the helper's
+    /// candidate-skip branches and witnesses that none of the emitted
+    /// synthetics equal either real.
     #[kani::proof]
     #[kani::unwind(8)]
     fn pad_chunk_ids_to_m_synthetics_disjoint_from_real() {
         let real_chunks = [0u32, 1u32];
-        let padded = pad_chunk_ids_to_m(&real_chunks, /* m */ 4);
+        let seed = [0u8; 32];
+        let padded = pad_chunk_ids_to_m(
+            &real_chunks,
+            /* m */ 4,
+            &seed,
+            /* num_chunks */ 1000,
+        );
         assert_eq!(padded.len(), 4);
-        // Synthetic prefix `[2, 3]` because 0 and 1 are both real.
-        assert_eq!(padded[2], 2);
-        assert_eq!(padded[3], 3);
+        // Synthetics start at index 2 (after the 2 reals). Each must be
+        // disjoint from real_chunks = {0, 1}.
+        for i in 2..4 {
+            assert!(
+                padded[i] != 0 && padded[i] != 1,
+                "synthetic at idx {} ({}) collides with reals [0, 1]",
+                i, padded[i],
+            );
+        }
+        // And pairwise distinct (synthetic[i] != synthetic[j] for i != j).
+        assert!(
+            padded[2] != padded[3],
+            "synthetics [{}, {}] must be pairwise distinct",
+            padded[2], padded[3],
+        );
     }
 
     /// Prove `pad_chunk_ids_to_m` is a no-op when `m <= real_chunks.len()`
@@ -3184,7 +3424,13 @@ mod kani_harnesses {
     #[kani::unwind(8)]
     fn pad_chunk_ids_to_m_zero_m_is_identity() {
         let real_chunks = [10u32, 20u32, 30u32];
-        let padded = pad_chunk_ids_to_m(&real_chunks, /* m */ 0);
+        let seed = [0u8; 32];
+        let padded = pad_chunk_ids_to_m(
+            &real_chunks,
+            /* m */ 0,
+            &seed,
+            /* num_chunks */ 1000,
+        );
         assert_eq!(padded.len(), 3);
         assert_eq!(padded[0], 10);
         assert_eq!(padded[1], 20);

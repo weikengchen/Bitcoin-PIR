@@ -1753,6 +1753,7 @@ dependencies = [
  "rand_core 0.6.4",
  "rustls",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "tokio",
  "tokio-tungstenite 0.24.0",

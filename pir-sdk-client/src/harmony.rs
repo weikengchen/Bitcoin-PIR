@@ -1825,6 +1825,18 @@ impl HarmonyClient {
         // closure: every query runs the M-padded chunk fetch with the
         // same wire shape.
         let chunk_pad_m = pir_core::params::CHUNK_MERKLE_ITEMS_PER_QUERY;
+        // Upper bound for synthetic CHUNK IDs — the chunk-id space
+        // implied by the server's CHUNK table layout (groups × bins ×
+        // slots). Scripthash-derived synthetics are drawn uniformly
+        // from `[0, num_chunks_space)` so the PBC planner can pack
+        // batched CHUNK rounds densely across not-found-heavy batches
+        // (previously the legacy `0..M` synthetics collapsed onto the
+        // same `derive_int_groups_3` candidate set, forcing the
+        // planner to emit 4 PBC rounds where 2 sufficed).
+        let num_chunks_space: u32 = (db_info.chunk_k as u32)
+            .saturating_mul(db_info.chunk_bins)
+            .saturating_mul(pir_core::params::CHUNK_SLOTS_PER_BIN as u32)
+            .max(chunk_pad_m as u32);
 
         let t_chunk_start = std::time::Instant::now();
 
@@ -1839,7 +1851,7 @@ impl HarmonyClient {
         let mut per_q_is_whale: Vec<bool> = Vec::with_capacity(outcomes.len());
         let mut per_q_has_match: Vec<bool> = Vec::with_capacity(outcomes.len());
         let mut per_q_padded_chunks: Vec<Vec<u32>> = Vec::with_capacity(outcomes.len());
-        for (found_info, _ibins, _matched) in &outcomes {
+        for (i, (found_info, _ibins, _matched)) in outcomes.iter().enumerate() {
             let (real_chunk_ids, is_whale, has_real_match): (Vec<u32>, bool, bool) =
                 match found_info {
                     Some((start, num, whale)) if *num > 0 => (
@@ -1851,8 +1863,18 @@ impl HarmonyClient {
                     None => (Vec::new(), false, false),
                 };
             let real_count = real_chunk_ids.len();
-            let padded_chunk_ids =
-                crate::dpf::pad_chunk_ids_to_m(&real_chunk_ids, chunk_pad_m);
+            // Per-query seed: SHA-256("BPIR-CHUNK-PAD" || scripthash ||
+            // query_index_le). Distinct seeds across queries → distinct
+            // synthetic chunk sets → PBC planner can pack the batched
+            // CHUNK round densely.
+            let pad_seed =
+                crate::dpf::derive_chunk_pad_seed(&script_hashes[i], i as u32);
+            let padded_chunk_ids = crate::dpf::pad_chunk_ids_to_m(
+                &real_chunk_ids,
+                chunk_pad_m,
+                &pad_seed,
+                num_chunks_space,
+            );
             per_q_real_count.push(real_count);
             per_q_is_whale.push(is_whale);
             per_q_has_match.push(has_real_match);

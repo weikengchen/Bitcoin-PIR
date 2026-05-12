@@ -1390,7 +1390,7 @@ impl OnionClient {
     #[tracing::instrument(level = "trace", skip_all, fields(backend = "onion", db_id = db_info.db_id))]
     async fn query_chunk_level(
         &mut self,
-        _script_hashes: &[ScriptHash],
+        script_hashes: &[ScriptHash],
         index_results: &[Option<IndexResult>],
         db_info: &DatabaseInfo,
         params: &OnionDbParams,
@@ -1407,8 +1407,8 @@ impl OnionClient {
         //   - Found with N real entries: N reals + (M - N) synthetic.
         //   - Not-found / whale: M synthetic.
         //
-        // Synthetic entry_ids are drawn deterministically from `0..`
-        // skipping any reals already in this query's owned list, via
+        // Synthetic entry_ids are derived from a per-query SHA-256
+        // seed (scripthash || query_index), via
         // `crate::dpf::pad_chunk_ids_to_m` (the same Kani-verified
         // helper DPF and Harmony reuse — see `pir-core::params::CHUNK_MERKLE_ITEMS_PER_QUERY`).
         // Reals & synthetics are valid `entry_id`s in
@@ -1419,7 +1419,11 @@ impl OnionClient {
         // dummy per not-found / whale) is subsumed: M-padding both
         // closes the chunk_max axis AND the FOUND-vs-NOT-FOUND
         // wire-shape asymmetry where DATA Merkle traffic was emitted
-        // only for found queries.
+        // only for found queries. The scripthash-derived seed
+        // (vs the legacy deterministic `0..M`) prevents not-found
+        // queries from collapsing their synthetic IDs onto the same
+        // PBC candidate groups — restoring batched PBC packing
+        // efficiency for wallet syncs.
         let m = pir_core::params::CHUNK_MERKLE_ITEMS_PER_QUERY;
         let total_packed = params.total_packed.max(1) as u32;
 
@@ -1427,17 +1431,27 @@ impl OnionClient {
         let mut seen: HashSet<u32> = HashSet::new();
         let mut owned_per_query: Vec<Vec<u32>> = Vec::with_capacity(index_results.len());
 
-        for ir_opt in index_results {
+        for (qi, ir_opt) in index_results.iter().enumerate() {
             let real_chunks: Vec<u32> = match ir_opt {
                 Some(ir) if ir.num_entries > 0 => {
                     (0..ir.num_entries as u32).map(|i| ir.entry_id + i).collect()
                 }
                 _ => Vec::new(),
             };
-            // Pad to M with deterministic synthetic ids; bound at
-            // `total_packed` so we never reference an out-of-range
-            // entry. For typical Bitcoin UTXO DBs, total_packed >> M.
-            let owned = crate::dpf::pad_chunk_ids_to_m(&real_chunks, m);
+            // Per-query seed: SHA-256("BPIR-CHUNK-PAD" || scripthash ||
+            // query_index_le). Distinct seeds across queries → distinct
+            // synthetic chunk sets → PBC planner can pack the batched
+            // CHUNK round densely (matching the DPF / Harmony fix).
+            let scripthash = &script_hashes[qi];
+            let pad_seed = crate::dpf::derive_chunk_pad_seed(scripthash, qi as u32);
+            // Pad to M; bound at `total_packed` so synthetic ids land
+            // in `[0, total_packed)` for any production OnionPIR DB.
+            let owned = crate::dpf::pad_chunk_ids_to_m(
+                &real_chunks,
+                m,
+                &pad_seed,
+                total_packed,
+            );
             for &eid in &owned {
                 if eid < total_packed && seen.insert(eid) {
                     unique.push(eid);
