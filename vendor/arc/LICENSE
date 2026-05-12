@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2025 ALF-nt Rust Implementation Contributors
+Copyright (c) 2026 Weikeng Chen
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,16 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-This Rust implementation is based on the ALF cipher family described in:
-
-  "Introducing the ALF family: AES-NI-based length- and format-preserving encryption"
-  Dachao Wang, Alexander Maximov, Thomas Johansson
-  https://eprint.iacr.org/2025/2148
-
-The original C++ reference implementation is licensed under:
-
-  MIT License
-  Copyright (c) 2025 0NG

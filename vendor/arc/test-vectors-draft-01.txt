@@ -1,0 +1,236 @@
+========================================================================
+ARC Test Vectors — draft-ietf-privacypass-arc-crypto-01 (March 2026)
+========================================================================
+
+Sources
+-------
+  Draft (txt):   https://www.ietf.org/archive/id/draft-ietf-privacypass-arc-crypto-01.txt
+                 Section 10.2, pages 40-43 (lines 2212-2380 of the plaintext).
+  WG JSON:       https://raw.githubusercontent.com/ietf-wg-privacypass/draft-arc/main/poc/vectors/allVectors.json
+  WG TXT:        https://raw.githubusercontent.com/ietf-wg-privacypass/draft-arc/main/poc/vectors/allVectors.txt
+  WG generator:  https://raw.githubusercontent.com/ietf-wg-privacypass/draft-arc/main/poc/test_arc.sage
+  Apple mirror:  https://raw.githubusercontent.com/apple/swift-crypto/main/Tests/CryptoExtrasTests/ARC/ARCTestVectors.swift
+                 (inlined JSON as a Swift string literal; DIFFERENT VALUES — see note at bottom)
+
+The draft txt, WG JSON, and WG TXT all agree byte-for-byte. Apple's
+swift-crypto file uses a different, older seed / PRNG state and therefore
+produces completely different scalars and points — do NOT mix them.
+
+Global PRNG seed (from test_arc.sage line 30):
+    seed = b"test vector seed" + b"\x00" * 16   (32 bytes, for TestDRNG)
+
+Global presentationLimit (from test_arc.sage line 52): 2
+    => k = ceil(log2(2)) = 1, so there is exactly one bit D_0 in the
+       range-proof decomposition.
+
+========================================================================
+Test Vector: ARCV1-P256
+========================================================================
+
+Inputs
+------
+request_context       (hex, 20 bytes "test request context"):
+    74657374207265717565737420636f6e74657874
+presentation_context  (hex, 25 bytes "test presentation context"):
+    746573742070726573656e746174696f6e20636f6e74657874
+presentationLimit:
+    2
+
+Server setup
+------------
+x0  (scalar, 32 B): 1008f2c706ae2157c75e41b2d75695c7bf480d0632a1ef447036cafe4cabb021
+x1  (scalar, 32 B): 526e009578f6f25fdec992343f09f5e6c58489c31fcf8a934bbaf85797121bdd
+x2  (scalar, 32 B): 549075ccd3d1c36b3546725c43e71943414409a23b980b2c47a3fc2b9c37679b
+xb  (scalar, 32 B): 7276533ce3c89f04a007c2e8aa7d2e3b36829d0eaab5631347d8336c2da09a8e
+    (xb = x0Blinding)
+
+X0  (point, 33 B):  03bad54cc48293ef3472ac1ada55c9c9fdb3eb99ee47369bbe1d3ce46b300cd7b3
+X1  (point, 33 B):  02a0323862a05707d76862bfa8477eed468441ceae14c8fb1659e0b3020b8a24e1
+X2  (point, 33 B):  031d16ef08ede5a347e94a8eca071bec7bedb9d8ba943d24bde912a4e1578e529b
+
+CreateCredentialRequest
+-----------------------
+m1      (scalar): 141c4ca5e614af8e5e323eb47a7e7673ebb67caf49dfa8e109f45f231227f7a0
+m2      (scalar): 911fb315257d9ae29d47ecb48c6fa27074dee6860a0489f8db6ac9a486be6a3e
+r1      (scalar): 5c183d2dea942eb2780afb90cfd94983ae6575d60e350021c8c93008ac503973
+r2      (scalar): 044d4a5b5daf00dd1fb4444ca2f8c3facc95d537d5ad0e0a2815c912e98a431d
+m1_enc  (point):  033fe5d950712f711e5d292d68f804fad4c35fb7f3f1866516448647d4aab12590
+m2_enc  (point):  026502a833ed1d972ee27175e750b1719adee12726c653125887c0d32b1f3747ab
+request proof (hex, 5*Ns = 160 bytes; layout: challenge || responses[0..3]):
+    2a088673e302502a3dc80d6100a1bb709083ac7b31da34f9a7c52e7cfeaa2ea3   # challenge
+    0b7341133086e64b79dfc6cdac9f348ddbed0b087746f0167ea238d3ddf17e61   # response_0
+    3880b73e85f499c7eddc6555355ea71487b49862400091b5b32cb219d7104f57   # response_1
+    1306bc6f2487bab299bb2e9a1078dee94d83b6536ed570f8114ee9c97b8b602b   # response_2
+    facbeb3764f6a22915a19c24895a6bf7048c663337f7690f0182a1f866586d9e   # response_3
+
+CreateCredentialResponse
+------------------------
+b             (scalar): 9ac9d836ef405f4c6c1de4de18d210c929a8dc786c95e3eac3a828cc19e1636e
+U             (point):  021cf52318c97c33472cc8fb42a5b5a774f83c3b36e6c782209d53e5945d99a493
+enc_U_prime   (point):  02ae23020d5427c7f785a72d77c24997f955e66ab7c378c334b7c259dabdf572d7
+X0_aux        (point):  031523abe64e436e65e592abdae322dc556fcbea707757e18d4160ba57d574cd87
+X1_aux        (point):  023cc3b53807f6e0082b675794ae9f6b370483ca5a3e6d688c3b81f2fdb6d4ec00
+X2_aux        (point):  0329dc7c93f8a231a1f16ec69f0fba446e022ce69945b20f37386a7fda3e573b79
+H_aux         (point):  0389746891b6dbf062511619eae7d72ae87630bea1e277a925708fdfef8363a1d4
+
+Note: the draft does NOT publish t1/t2. They are the intermediate scalar
+products b*x1 and b*x2 used inside server.respond(); not part of the
+wire format, so no test vector for them.
+
+response proof (hex, 8*Ns = 256 bytes; layout: challenge || responses[0..6]):
+    ec342aee0d481435379ea6bbe919edd5d2eb9c12198a083e0e899da1f14dbc46   # challenge
+    a8048f5a12c5cae21e5f5949fe08d1c15c266c63544615400def4ce9a6cf8aee   # response_0
+    32052ced26e7a9d854f2c45ea23ffea0f6bf977f6155d412991abc0e2d1ad835   # response_1
+    04129c1ac8319b2a45940c52c4b41bde80969313641b9cb727445e20b44d0ea8   # response_2
+    84e9b180cd152442883038b97d72772201f281d76a18d22e374bd989accd7654   # response_3
+    8067399162428c4d25daf1b7f68f3580a38cc4564a88f28494649064500f06c5   # response_4
+    b946dde032a389f8fe337605627ce91a92c20db911100a2c7c42ae15fde5a5cb   # response_5
+    d9d078b819a80423593192c40d70ce77f1a6d377770fe5c05781782bd1eaa43f   # response_6
+
+FinalizeCredential
+------------------
+U       (point):  021cf52318c97c33472cc8fb42a5b5a774f83c3b36e6c782209d53e5945d99a493
+U_prime (point):  02646199272c28911165b4d1c5f4ffbd8a83f686948fd4c7250e28c81dbfecd354
+X1      (point):  02a0323862a05707d76862bfa8477eed468441ceae14c8fb1659e0b3020b8a24e1
+m1      (scalar): 141c4ca5e614af8e5e323eb47a7e7673ebb67caf49dfa8e109f45f231227f7a0
+    (the Credential is (m1, U, U_prime, X1); m2 is carried separately by the client)
+
+Presentation 1 (nonce = 0)
+--------------------------
+a               (scalar): a3c469d2d55062b463b17f45acd2fb17c038b18df4c8d6c9c745866ba961de9a
+r               (scalar): 54925f70e9ec2128114c6ae8bfc6e1a2914a8fdd383e5ff03d8c2992edd081a9
+z               (scalar): 9ed3c3ddb1b5ff64e55b1d0a4f58eee67351fea7de16baf644e80f4d0949cf5f
+nonce_blinding  (scalar): ed8b643e3c8ba74cc417b5bbfc4f42bee6dcd2d6c5ea48fb2273afec7b6505a4
+nonce           (int):    0x0
+U               (point):  0216af8901c1ad38a703bf9003fabea440b411b4f072fd23b5254cb17d1b5bf33d
+U_prime_commit  (point):  03140f8e6f6c5eab3d03a7fba5d542362a9bc00a89d80caa5051b4e4446b0b01f3
+m1_commit       (point):  0214d0297c21120d621cc6fed75852569de3cbf0bd9f5a8a812cf6b024bf51e627
+tag             (point):  0281428e61688f4e7989dbe8dab170705c81b294c4a73b785a0754712fc968eb40
+nonce_commit    (point):  032326abcd4eb2fd1a47053ec9ce1aab3ee91e98373d610e9752a7d16a5c1e38d8
+D_0             (point):  032326abcd4eb2fd1a47053ec9ce1aab3ee91e98373d610e9752a7d16a5c1e38d8
+    (for presentationLimit = 2, k = 1, so only D_0 is published; it equals
+     nonce_commit because bases[0] = 1 and D[0] is the only term.)
+
+presentation proof (hex, 321 bytes = Ne + 9*Ns = 33 + 288;
+                    layout: nonce_commit_enc(33) || challenge(32) || responses[0..7](8*32)):
+    032326abcd4eb2fd1a47053ec9ce1aab3ee91e98373d610e9752a7d16a5c1e38d8   # nonce_commit (Ne bytes)
+    946f5f0b44e34f826b41ec59a4e2dcfaa826b8a39cc278e10b1b02b5dbaafdb6     # challenge
+    e789639885a8d2d69269a9fea55830f1d7e1fd0a771183b7b4eebe5e03e0c025     # response_0
+    5d1ba614de7e31d4f46eb93a24e0ffe9864b002527109a516a10dc1ad718b8d9     # response_1
+    84efd16ab245d7a5dfabe2d0027e23796981422b19c2821a831cb46a8e9b8b56     # response_2
+    6bbdb55b649021bf2f777b9130c2e375f560eee4691d04bd38e9571d94512578     # response_3
+    58d9128002a2f8908d7e4521510a2185244fa533e2502b61e502fd157d974f91     # response_4
+    acc4f2ba0d724f2bfd182d5df4d038e74b5c35cc7c4aa7622c2682e040877eeb     # response_5
+    cc18fe822cc6abab5d3adc9db836991d3d1ecf699658245b8b0756946ba0d775     # response_6
+    6b433aae3b476ccbc2186b2fe2ecc2fe0da30df264802829254df8196a8307f0     # response_7
+
+Presentation 2 (nonce = 1)
+--------------------------
+a               (scalar): ae14ddaf96907f2fee72069664e1883fee4582cefcfbb2f3fae380c317018ab2
+r               (scalar): f994bf66d0c7943ce97331da186e231281b691eb271c7c524ff9f8bc7804b41d
+z               (scalar): fa27efc5066bca91121642d629477eb1c7812fa9c473b30dea3eaba8a1731568
+nonce_blinding  (scalar): 90b8387fe4145c2d47a0f042c26119939bcbcc8c2c32f81d1034db3958b9af39
+nonce           (int):    0x1
+U               (point):  0357e53851143e7cc34311bdba0d44d4d3c9192180434ce247b8766232b5de1e08
+U_prime_commit  (point):  02bad8dc9b0179dff7a1d63d03d92810520085cbc41b65b667d3cbe2203eb7c544
+m1_commit       (point):  02455589d2b92a24e49ff8c2e8287f6eeb05cbfddc16aba66dfe9ab97702bc3c35
+tag             (point):  02ad6c293325d0c2c388c8b2240b6d8ab9e52395297ef5921fb78ace6a1274b03b
+nonce_commit    (point):  0363d6bd2969b64a42354ba896be33a4abce479261d7dec0001fa1af7fbdeecb41
+D_0             (point):  0363d6bd2969b64a42354ba896be33a4abce479261d7dec0001fa1af7fbdeecb41
+
+presentation proof (hex, 321 bytes = Ne + 9*Ns = 33 + 288;
+                    layout: nonce_commit_enc(33) || challenge(32) || responses[0..7](8*32)):
+    0363d6bd2969b64a42354ba896be33a4abce479261d7dec0001fa1af7fbdeecb41   # nonce_commit (Ne bytes)
+    7c59300e0aafb0d58e3f85423030401dabe5dd39566924f07e99cae5b3be62f4     # challenge
+    5e736890857cfe0950c22c93c52d56e6ade5f5a1c1d486e9261e7788b7454387     # response_0
+    0115370c46e62e376b17844a287bbb6722dc5e5848fdbd8d19d259ec1cec8385     # response_1
+    1a1ef4a21dadefeef3f5222eb19361facbb2ec3ba640aef22cd5700a17ea17fc     # response_2
+    3ece772f5b5cca1e119bf32cfa7f3459c2184d6d8c777d281c91b416187ee949     # response_3
+    c9557fece8afb0ac785c7b8c4854e622f8b005daf5c0682cfdc2d900150087ba     # response_4
+    e0090d44b7bac130c7f4067bb8b3374b159106d0c03e30f9577063de0b52d15d     # response_5
+    1f5f41328b335ee23d10ca7dc4e0717bd9e919e3f6f580e594b3c48b358baa7a     # response_6
+    320ec9e1019260efe2cbf6e9cba6871ffee3b5566d5e865c729c5e1d48529559     # response_7
+
+
+========================================================================
+Field-name mapping (spec <-> WG JSON <-> Apple JSON)
+========================================================================
+  Draft prose            WG/Apple key         Notes
+  ---------              ---------            ---------
+  x0, x1, x2             x0, x1, x2           server private keys
+  x0Blinding             xb                   blinding scalar for X0
+  X0, X1, X2             X0, X1, X2           server public key points
+  m1, m2                 m1, m2               client secret scalars
+  r1, r2                 r1, r2               El-Gamal blinding scalars
+  m1Enc, m2Enc           m1_enc, m2_enc       ElGamal-encrypted m1, m2
+  requestProof           CredentialRequest.proof
+  b                      b                    response blind scalar
+  U                      U
+  encUPrime              enc_U_prime
+  X0Aux..HAux            X0_aux..H_aux
+  responseProof          CredentialResponse.proof
+  UPrime                 U_prime              (carried inside Credential after decryption)
+  a, r, z                a, r, z              presentation blind scalars
+  nonceBlinding          nonce_blinding
+  U                      U                    presentation's randomized U
+  UPrimeCommit           U_prime_commit
+  m1Commit               m1_commit
+  tag                    tag
+  nonceCommit            nonce_commit
+  D[0..k-1]              D_0, D_1, ...        only D_0 here (k = 1)
+  presentationProof      Presentation*.proof
+
+
+========================================================================
+Divergences: WG vectors vs Apple swift-crypto
+========================================================================
+Apple's swift-crypto Tests/CryptoExtrasTests/ARC/ARCTestVectors.swift
+(fetched 2026-04-16 from branch main) inlines a DIFFERENT set of vectors.
+Every scalar and point in ARCV1-P256 differs — the Apple file appears to
+have been generated with a different seed or an earlier ARC spec version.
+Examples:
+
+  Field            Draft-01 / WG JSON                                    Apple swift-crypto
+  -------          -------------------                                   ----------------
+  x0               1008f2c706ae2157c75e41b2d75695c7bf480...              3338fa65ec36e0290022b48eb562889d89dbfa...
+  x1               526e009578f6f25fdec992343f09f5e6c584...               f9db001266677f62c095021db018cd8cbb55...
+  X1               02a0323862a05707d76862bfa8477eed4684...               03c413230a9bd956718aa46138a33f774f4c...
+  request_context  74657374207265717565737420636f6e74657874 (match)
+  m2               911fb315...486be6a3e (match!)                         911fb315...486be6a3e (match)
+
+m2 and request_context happen to match, but x0, x1, x2, xb, X0..X2,
+m1, r1, r2, b, U, U', X0_aux..H_aux, enc_U_prime, all proofs, and both
+Presentations' randomness/outputs DIFFER between the two sources.
+
+Conclusion: use the WG JSON (or the text in Section 10.2 of
+draft-01) as the authoritative source. Apple's file is useful only as a
+sanity-check of the CODE PATH (its struct shape is identical), but NOT as
+cross-implementation bit-level confirmation of draft-01. Apple also
+includes ARCV1-P384 vectors, which the draft-01 WG JSON does not (the
+draft only publishes ARCV1-P256).
+
+Apple additionally OMITS these fields that the WG JSON publishes:
+  - Presentation1/2.D_0
+  - Presentation1/2.nonce_blinding
+  - Presentation1/2.nonce_commit
+(All three are recomputable from the proof bytes and seed, but the WG
+JSON spells them out explicitly.)
+
+
+========================================================================
+Implementation notes / wire-format reminders (from draft-01 Section 6)
+========================================================================
+  Ne (point, compressed)       = 33 bytes for P-256
+  Ns (scalar)                   = 32 bytes for P-256
+  CredentialRequest on wire     = m1_enc || m2_enc || request_proof = 226 bytes
+                                  = 33 + 33 + 160
+  CredentialResponse on wire    = U || enc_U_prime || X0_aux || X1_aux || X2_aux || H_aux || response_proof
+                                  = 6*33 + 256 = 454 bytes
+  Presentation on wire          = U || U_prime_commit || m1_commit || tag || presentation_proof
+                                  = 4*33 + 321 = 453 bytes
+  presentation_proof layout     = nonce_commit_enc(Ne) || challenge(Ns) || responses(8*Ns)
+                                  = 33 + 32 + 256 = 321 bytes (for presentationLimit = 2, k = 1)
+  Range-proof D array           = D[0..k-1] with k = ceil(log2(presentationLimit))
+                                  For presentationLimit=2, k=1, so only D_0 exists.
+                                  For larger limits, additional D_i points appear
+                                  inside the proof (scalar count grows accordingly).

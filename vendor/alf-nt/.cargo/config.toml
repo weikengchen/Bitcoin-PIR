@@ -1,8 +1,0 @@
-[target.aarch64-apple-darwin]
-rustflags = ["-C", "target-feature=+aes,+neon,+sha2,+sha3"]
-
-[target.x86_64-apple-darwin]
-rustflags = ["-C", "target-feature=+aes,+ssse3,+sse4.1,+pclmulqdq"]
-
-[target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "target-feature=+aes,+ssse3,+sse4.1,+pclmulqdq"]

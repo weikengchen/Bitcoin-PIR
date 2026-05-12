@@ -91,6 +91,7 @@ dependencies = [
 [[package]]
 name = "arc"
 version = "0.1.0"
+source = "git+https://github.com/Bitcoin-PIR/arc.git?rev=de6c1709eee0faa32985d5a452be11904ee95de4#de6c1709eee0faa32985d5a452be11904ee95de4"
 dependencies = [
  "crypto-bigint",
  "elliptic-curve",

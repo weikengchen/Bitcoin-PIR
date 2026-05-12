@@ -51,6 +51,11 @@ replace-with = "vendored-sources"
 git = "https://github.com/weikengchen/libdpf.git"
 replace-with = "vendored-sources"
 
+[source."git+https://github.com/Bitcoin-PIR/arc.git?rev=de6c1709eee0faa32985d5a452be11904ee95de4"]
+git = "https://github.com/Bitcoin-PIR/arc.git"
+rev = "de6c1709eee0faa32985d5a452be11904ee95de4"
+replace-with = "vendored-sources"
+
 [source.vendored-sources]
 directory = "vendor"
 
