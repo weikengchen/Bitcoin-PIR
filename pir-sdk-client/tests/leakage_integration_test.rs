@@ -235,6 +235,62 @@ fn assert_profiles_equivalent(a: &LeakageProfile, b: &LeakageProfile) {
 
 // ─── DPF tests ──────────────────────────────────────────────────────────────
 
+/// Empirical amortization benchmark for DPF — same shape as
+/// `harmony_amortization_bench` so the two can be compared
+/// side-by-side. DPF has no hint phase (stateless servers), so the
+/// "cold session" cost is just connection + catalog. Per-query cost
+/// should be roughly constant (no amortization curve like Harmony).
+#[tokio::test]
+#[ignore = "requires running PIR servers"]
+async fn dpf_amortization_bench() {
+    let mut client = DpfClient::new(&dpf_server0_url(), &dpf_server1_url());
+    client.connect().await.expect("connect");
+    let catalog = client.fetch_catalog().await.expect("catalog");
+    let db_id = catalog.databases[0].db_id;
+
+    // Same 10 distinct not-found scripthashes as the Harmony bench.
+    let scripthashes: Vec<ScriptHash> = (0..10u8)
+        .map(|i| {
+            let mut sh = [0u8; 20];
+            sh[0] = i;
+            sh[1] = 0x42;
+            sh
+        })
+        .collect();
+
+    let t0 = std::time::Instant::now();
+    let _ = client
+        .query_batch(&scripthashes[..1], db_id)
+        .await
+        .expect("1st query");
+    let cold = t0.elapsed();
+    println!("[BENCH] DPF 1st query (cold session): {:.2?}", cold);
+
+    let t1 = std::time::Instant::now();
+    let _ = client
+        .query_batch(&scripthashes[1..2], db_id)
+        .await
+        .expect("2nd query");
+    let warm_single = t1.elapsed();
+    println!("[BENCH] DPF 2nd query: {:.2?}", warm_single);
+
+    let t2 = std::time::Instant::now();
+    let _ = client
+        .query_batch(&scripthashes[2..], db_id)
+        .await
+        .expect("8-batch query");
+    let batch_of_8 = t2.elapsed();
+    println!("[BENCH] DPF 8-batch query: {:.2?}", batch_of_8);
+    println!(
+        "[BENCH] DPF per-scripthash: cold={:.2?}, warm-single={:.2?}, batch-of-8={:.2?}/sh",
+        cold,
+        warm_single,
+        batch_of_8 / 8,
+    );
+
+    client.disconnect().await.unwrap();
+}
+
 /// Drive a single not-found DPF query and assert per-message invariants.
 #[tokio::test]
 #[ignore = "requires running PIR servers"]
