@@ -1775,7 +1775,16 @@ impl HarmonyClient {
         _step: &SyncStep,
         db_info: &DatabaseInfo,
     ) -> PirResult<Vec<Option<QueryResult>>> {
+        // Phase-level timing for diagnostics. Guarded by env var so it
+        // only fires when the operator explicitly opts in.
+        let _bench = std::env::var("HARMONY_BENCH").is_ok();
+        let t_step_start = std::time::Instant::now();
+        let t_hint_start = std::time::Instant::now();
         self.ensure_groups_ready(db_info, None).await?;
+        let t_hint = t_hint_start.elapsed();
+        if _bench {
+            eprintln!("[HARMONY_BENCH] db={} queries={} ensure_groups_ready: {:?}", db_info.db_id, script_hashes.len(), t_hint);
+        }
 
         log::info!(
             "[PIR-AUDIT] HarmonyPIR execute_step: db_id={}, name={}, height={}, queries={}, has_bucket_merkle={}",
@@ -1795,9 +1804,14 @@ impl HarmonyClient {
         // two INDEX Merkle items inherit a unique-per-batch
         // `pbc_group`, so `index_max_items_per_group_per_level = 2`
         // independently of the batch's collision pattern.
+        let t_index_start = std::time::Instant::now();
         let index_outcomes = self
             .query_index_phase_batched(script_hashes, db_info)
             .await?;
+        let t_index = t_index_start.elapsed();
+        if _bench {
+            eprintln!("[HARMONY_BENCH] db={} INDEX phase: {:?}", db_info.db_id, t_index);
+        }
 
         // Phase 2: per-scripthash CHUNK + result assembly with the
         // `chunk_max_items_per_group_per_level` closure. Every query
@@ -1812,39 +1826,66 @@ impl HarmonyClient {
         // same wire shape.
         let chunk_pad_m = pir_core::params::CHUNK_MERKLE_ITEMS_PER_QUERY;
 
-        for (i, (found_info, index_bins, matched_idx)) in index_outcomes.into_iter().enumerate() {
-            let mut q_traces = QueryTraces {
-                index_bins,
-                matched_index_idx: matched_idx,
-                chunk_bins: Vec::new(),
-            };
+        let t_chunk_start = std::time::Instant::now();
 
-            // Resolve the real-chunk slice for this query. Whale and
-            // not-found contribute none; found contributes start..end.
+        // Phase 2 PREPROCESS: project each scripthash's INDEX outcome into
+        // (real_count, is_whale, has_real_match, padded_chunk_ids) up
+        // front, in scripthash order. We need both lists indexable by
+        // scripthash idx so the batched CHUNK fetch can run once and we
+        // still emit per-scripthash QueryResults in original order.
+        let outcomes: Vec<(Option<(u32, u8, bool)>, Vec<IndexBinTrace>, Option<usize>)> =
+            index_outcomes.into_iter().collect();
+        let mut per_q_real_count: Vec<usize> = Vec::with_capacity(outcomes.len());
+        let mut per_q_is_whale: Vec<bool> = Vec::with_capacity(outcomes.len());
+        let mut per_q_has_match: Vec<bool> = Vec::with_capacity(outcomes.len());
+        let mut per_q_padded_chunks: Vec<Vec<u32>> = Vec::with_capacity(outcomes.len());
+        for (found_info, _ibins, _matched) in &outcomes {
             let (real_chunk_ids, is_whale, has_real_match): (Vec<u32>, bool, bool) =
                 match found_info {
-                    Some((start, num, whale)) if num > 0 => (
-                        (start..start + num as u32).collect(),
-                        whale,
+                    Some((start, num, whale)) if *num > 0 => (
+                        (*start..*start + *num as u32).collect(),
+                        *whale,
                         true,
                     ),
-                    Some((_start, _num, whale)) => (Vec::new(), whale, true),
+                    Some((_start, _num, whale)) => (Vec::new(), *whale, true),
                     None => (Vec::new(), false, false),
                 };
-
             let real_count = real_chunk_ids.len();
             let padded_chunk_ids =
                 crate::dpf::pad_chunk_ids_to_m(&real_chunk_ids, chunk_pad_m);
+            per_q_real_count.push(real_count);
+            per_q_is_whale.push(is_whale);
+            per_q_has_match.push(has_real_match);
+            per_q_padded_chunks.push(padded_chunk_ids);
+        }
+
+        // Phase 2: BATCHED CHUNK fetch — one PBC plan over all queries'
+        // M-padded chunk lists; ceil(N*M / K_CHUNK) PBC rounds × 2
+        // cuckoo positions of wire round-trips instead of N × 2. For
+        // typical wallet syncs (N ≫ 1) this is a 3-5× wall-time
+        // reduction on the CHUNK phase.
+        let chunk_results = self
+            .query_chunk_phase_batched(&per_q_padded_chunks, db_info)
+            .await?;
+
+        for (i, ((_found_info, index_bins, matched_idx), (chunk_data, chunk_bins))) in
+            outcomes.into_iter().zip(chunk_results.into_iter()).enumerate()
+        {
+            let mut q_traces = QueryTraces {
+                index_bins,
+                matched_index_idx: matched_idx,
+                chunk_bins,
+            };
+            let real_count = per_q_real_count[i];
+            let is_whale = per_q_is_whale[i];
+            let has_real_match = per_q_has_match[i];
             log::info!(
                 "[PIR-AUDIT] HarmonyPIR CHUNK chunk_max closure: query #{} real_chunks={} padded_to={} (M={})",
                 i,
                 real_count,
-                padded_chunk_ids.len(),
+                per_q_padded_chunks[i].len(),
                 chunk_pad_m,
             );
-            let (chunk_data, chunk_bins) =
-                self.query_chunk_level(&padded_chunk_ids, db_info).await?;
-            q_traces.chunk_bins = chunk_bins;
 
             // Decode only the first real_count chunks' payloads as
             // genuine UTXO entries. Synthetic-slot payloads belong to
@@ -1887,6 +1928,12 @@ impl HarmonyClient {
             traces.push(q_traces);
         }
 
+        let t_chunk = t_chunk_start.elapsed();
+        if _bench {
+            eprintln!("[HARMONY_BENCH] db={} CHUNK phase ({} queries): {:?}", db_info.db_id, script_hashes.len(), t_chunk);
+        }
+
+        let t_merkle_start = std::time::Instant::now();
         if db_info.has_bucket_merkle {
             self.run_merkle_verification(&mut results, &traces, db_info)
                 .await?;
@@ -1895,6 +1942,12 @@ impl HarmonyClient {
                 "[PIR-AUDIT] HarmonyPIR Merkle verification SKIPPED (db_id={} has no bucket Merkle)",
                 db_info.db_id
             );
+        }
+        let t_merkle = t_merkle_start.elapsed();
+        if _bench {
+            eprintln!("[HARMONY_BENCH] db={} Merkle verification: {:?}", db_info.db_id, t_merkle);
+            eprintln!("[HARMONY_BENCH] db={} TOTAL execute_step: {:?}  (hint {:?} / index {:?} / chunk {:?} / merkle {:?})",
+                db_info.db_id, t_step_start.elapsed(), t_hint, t_index, t_chunk, t_merkle);
         }
 
         Ok(results)
@@ -2697,6 +2750,185 @@ impl HarmonyClient {
         }
 
         Ok((out, traces))
+    }
+
+    /// Batched CHUNK phase across multiple scripthashes — single
+    /// network round-trip pair (CHUNK_CUCKOO_NUM_HASHES=2 wire rounds)
+    /// per PBC round, instead of one full K_CHUNK-padded round per
+    /// scripthash. Mirrors the [`query_index_phase_batched`] PBC
+    /// pattern but for CHUNK queries.
+    ///
+    /// `per_query_chunks[i]` is the M-padded chunk_id list for
+    /// scripthash i (length == `CHUNK_MERKLE_ITEMS_PER_QUERY` for all
+    /// queries — found / not-found / whale all carry the same shape).
+    ///
+    /// Returns one `(chunk_data, chunk_bins)` pair per scripthash, in
+    /// the same order — `chunk_data` is concatenated payload bytes
+    /// for that scripthash's slots, `chunk_bins` is the per-slot
+    /// Merkle trace ready for `run_merkle_verification`.
+    ///
+    /// Wire-format and HarmonyGroup-state invariants are identical to
+    /// the per-scripthash path's `run_chunk_round` calls: every wire
+    /// round is K_CHUNK-padded, every group sends `T - 1` indices,
+    /// every group consumes one hint per wire round. The only thing
+    /// that changes is *how chunks are scheduled* into rounds —
+    /// before, one scripthash filled one round (mostly padding);
+    /// now, up to K_CHUNK chunks from any mix of scripthashes share
+    /// a round.
+    ///
+    /// CHUNK Round-Presence Symmetry: when every per-scripthash list
+    /// is empty (all not-found / whale in a "this DB has no found
+    /// queries" batch), this function still issues exactly one dummy
+    /// K_CHUNK-padded round, identical to the existing
+    /// `query_chunk_level(&[], ...)` fallback.
+    async fn query_chunk_phase_batched(
+        &mut self,
+        per_query_chunks: &[Vec<u32>],
+        db_info: &DatabaseInfo,
+    ) -> PirResult<Vec<(Vec<u8>, Vec<ChunkBinTrace>)>> {
+        let k_chunk = db_info.chunk_k as usize;
+        let chunk_bins = db_info.chunk_bins as usize;
+        let n = per_query_chunks.len();
+
+        // Empty: still emit 1 dummy round for symmetry.
+        if per_query_chunks.iter().all(|cids| cids.is_empty()) {
+            log::info!(
+                "[PIR-AUDIT] HarmonyPIR CHUNK batched: emitting 1 dummy K_CHUNK-padded round (no real chunks across {} queries)",
+                n,
+            );
+            let _ = self.run_chunk_round(db_info.db_id, &[], chunk_bins, 0, 0).await?;
+            return Ok((0..n).map(|_| (Vec::new(), Vec::new())).collect());
+        }
+
+        // Flatten to a single global list: (sh_idx, slot_in_sh, chunk_id).
+        // The slot is the chunk's position within its owning scripthash's
+        // padded list — needed to put recovered bytes back in the right
+        // order for `decode_utxo_entries`.
+        let mut flat: Vec<(usize, usize, u32)> = Vec::new();
+        for (sh_idx, cids) in per_query_chunks.iter().enumerate() {
+            for (slot, &cid) in cids.iter().enumerate() {
+                flat.push((sh_idx, slot, cid));
+            }
+        }
+
+        // PBC plan: each chunk's NUM_HASHES = 3 candidate groups are
+        // derived the same way the server's build path does it
+        // (`derive_int_groups_3`), so the planner-assigned group is
+        // valid for serving on the server side too.
+        let candidate_groups: Vec<[usize; NUM_HASHES]> = flat
+            .iter()
+            .map(|&(_, _, cid)| pir_core::hash::derive_int_groups_3(cid, k_chunk))
+            .collect();
+        let rounds = pir_core::pbc::pbc_plan_rounds(
+            &candidate_groups,
+            k_chunk,
+            NUM_HASHES,
+            500,
+        );
+        log::info!(
+            "[PIR-AUDIT] HarmonyPIR CHUNK batched: {} total chunks across {} queries → {} PBC round(s) × {} cuckoo positions = {} wire round(s) (K_CHUNK={})",
+            flat.len(),
+            n,
+            rounds.len(),
+            CHUNK_CUCKOO_NUM_HASHES,
+            rounds.len() * CHUNK_CUCKOO_NUM_HASHES,
+            k_chunk,
+        );
+        if std::env::var("HARMONY_BENCH").is_ok() {
+            eprintln!(
+                "[HARMONY_BENCH]   CHUNK plan: {} chunks × {} queries → {} PBC × {} h = {} wire rounds",
+                flat.len(), n, rounds.len(), CHUNK_CUCKOO_NUM_HASHES, rounds.len() * CHUNK_CUCKOO_NUM_HASHES,
+            );
+        }
+
+        // Per-(sh, slot) outputs. We use HashMap<(sh, slot), _> rather
+        // than HashMap<cid, _> because two scripthashes could pad to
+        // the same synthetic chunk_id; (sh, slot) is the unambiguous
+        // key.
+        let mut chunk_data: HashMap<(usize, usize), Vec<u8>> = HashMap::new();
+        let mut chunk_traces: HashMap<(usize, usize), ChunkBinTrace> = HashMap::new();
+        let mut recovered: std::collections::HashSet<usize> = std::collections::HashSet::new(); // flat_idx
+
+        for (round_id, round) in rounds.iter().enumerate() {
+            for h in 0..CHUNK_CUCKOO_NUM_HASHES {
+                // Filter out chunks already recovered at h=0 (or earlier
+                // PBC rounds) so subsequent cuckoo positions only retry
+                // the ones that missed.
+                let still_pending: Vec<(usize, u8)> = round
+                    .iter()
+                    .filter(|&&(flat_idx, _)| !recovered.contains(&flat_idx))
+                    .map(|&(flat_idx, pbc_group)| (flat_idx, pbc_group as u8))
+                    .collect();
+                if still_pending.is_empty() {
+                    break;
+                }
+
+                let placements: Vec<(u32, u8)> = still_pending
+                    .iter()
+                    .map(|&(flat_idx, pbc_group)| {
+                        let (_, _, cid) = flat[flat_idx];
+                        (cid, pbc_group)
+                    })
+                    .collect();
+
+                let round_tag = (round_id * CHUNK_CUCKOO_NUM_HASHES + h) as u16;
+                let round_answers = self
+                    .run_chunk_round(
+                        db_info.db_id,
+                        &placements,
+                        chunk_bins,
+                        h,
+                        round_tag,
+                    )
+                    .await?;
+
+                // Decode + reattribute to (sh_idx, slot).
+                for &(flat_idx, pbc_group) in &still_pending {
+                    let (sh_idx, slot, cid) = flat[flat_idx];
+                    if let Some(answer) = round_answers.get(&pbc_group) {
+                        if let Some(data) = find_chunk_in_result(answer, cid) {
+                            let key = pir_core::hash::derive_cuckoo_key(
+                                CHUNK_PARAMS.master_seed,
+                                pbc_group as usize,
+                                h,
+                            );
+                            let bin_index =
+                                pir_core::hash::cuckoo_hash_int(cid, key, chunk_bins) as u32;
+                            chunk_data.insert((sh_idx, slot), data.to_vec());
+                            chunk_traces.insert(
+                                (sh_idx, slot),
+                                ChunkBinTrace {
+                                    pbc_group: pbc_group as usize,
+                                    bin_index,
+                                    bin_content: answer.clone(),
+                                },
+                            );
+                            recovered.insert(flat_idx);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Reassemble per-scripthash output, preserving slot order so
+        // `decode_utxo_entries` reads bytes in the correct sequence.
+        let mut output = Vec::with_capacity(n);
+        for sh_idx in 0..n {
+            let cids = &per_query_chunks[sh_idx];
+            let mut data = Vec::with_capacity(cids.len() * pir_core::params::CHUNK_SIZE);
+            let mut bins = Vec::with_capacity(cids.len());
+            for slot in 0..cids.len() {
+                if let Some(d) = chunk_data.get(&(sh_idx, slot)) {
+                    data.extend_from_slice(d);
+                }
+                if let Some(t) = chunk_traces.get(&(sh_idx, slot)) {
+                    bins.push(t.clone());
+                }
+            }
+            output.push((data, bins));
+        }
+
+        Ok(output)
     }
 
     /// Lazily create (and hint-load) sibling groups for per-bucket Merkle.
