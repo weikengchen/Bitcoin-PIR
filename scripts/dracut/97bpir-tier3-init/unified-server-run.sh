@@ -6,7 +6,13 @@
 #
 # Flags mirror deploy/systemd/pir-vpsbg.service:
 #   --port 8091
-#   --role secondary   (DPF queries + HarmonyPIR hint, no OnionPIR)
+#   --role secondary   (DPF queries + HarmonyPIR query phase, no OnionPIR)
+#   --serve-queries    (pir2 is queries-only per the production topology
+#                       — see memory: project_pir1_hint_pir2_query_split.md.
+#                       No --serve-hints, no --pool-size: hints come from
+#                       pir1/Hetzner instead. Required by the startup
+#                       validation in unified_server::main since 2026-05-13;
+#                       without it the binary exits code 2 → runit crash-loop.)
 #   --config /home/pir/data/databases.toml   (loaded from rootfs via
 #                                             bpir-tier3-init's bind mount)
 #   --admin-pubkey-hex <op key>   (auth for REQ_ADMIN_DB_UPLOAD etc.)
@@ -36,8 +42,7 @@ fi
 exec /usr/local/bin/unified_server \
     --port 8091 \
     --role secondary \
-    --pool-size 8 \
-    --pool-dir /home/pir/data/hint_pool \
+    --serve-queries \
     --config /home/pir/data/databases.toml \
     --admin-pubkey-hex 87d454db85266e10e55ed8b68417de9d79ceb1d5d944bae831a7877627efdad3 \
     --vcek-dir /home/pir/data/vcek \
