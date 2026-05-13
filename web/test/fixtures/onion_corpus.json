@@ -9,7 +9,7 @@
             "items": [],
             "kind": "info",
             "request_bytes": 5,
-            "response_bytes": 35317,
+            "response_bytes": 35355,
             "server_id": 0
           },
           {
@@ -206,7 +206,7 @@
             "items": [],
             "kind": "merkle_tree_tops",
             "request_bytes": 5,
-            "response_bytes": 178361,
+            "response_bytes": 178969,
             "server_id": 0
           },
           {
@@ -249,7 +249,7 @@
             "items": [],
             "kind": "merkle_tree_tops",
             "request_bytes": 5,
-            "response_bytes": 700605,
+            "response_bytes": 702525,
             "server_id": 0
           },
           {
@@ -300,7 +300,7 @@
             "items": [],
             "kind": "info",
             "request_bytes": 5,
-            "response_bytes": 35317,
+            "response_bytes": 35355,
             "server_id": 0
           },
           {
@@ -497,7 +497,7 @@
             "items": [],
             "kind": "merkle_tree_tops",
             "request_bytes": 5,
-            "response_bytes": 178361,
+            "response_bytes": 178969,
             "server_id": 0
           },
           {
@@ -540,7 +540,7 @@
             "items": [],
             "kind": "merkle_tree_tops",
             "request_bytes": 5,
-            "response_bytes": 700605,
+            "response_bytes": 702525,
             "server_id": 0
           },
           {

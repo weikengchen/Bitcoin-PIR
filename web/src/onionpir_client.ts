@@ -431,50 +431,173 @@ export function selectChunkUniqueFetches(
 export const CHUNK_MERKLE_ITEMS_PER_QUERY = 16;
 
 /**
- * Pad a real-chunk list to length `m` by appending deterministic
- * synthetic chunk_ids drawn from `0..` (skipping any in
- * `realChunks`). Mirrors the Rust helper
+ * Derive a per-query 32-byte seed for scripthash-derived synthetic
+ * CHUNK padding. Mirrors the Rust helper
+ * `crate::dpf::derive_chunk_pad_seed`:
+ *
+ *   seed = SHA-256("BPIR-CHUNK-PAD" || scripthash || query_index_le)
+ *
+ * The literal `"BPIR-CHUNK-PAD"` domain-separates this from every
+ * other SHA-256 site in the protocol. `query_index_le` (little-endian
+ * u32) keeps the synthetic IDs distinct across queries that share a
+ * scripthash within a batch.
+ *
+ * Pure: same inputs → same output, no I/O.
+ */
+export function deriveChunkPadSeed(scripthash: Uint8Array, queryIndex: number): Uint8Array {
+  const labelStr = 'BPIR-CHUNK-PAD';
+  const label = new Uint8Array(labelStr.length);
+  for (let i = 0; i < labelStr.length; i++) label[i] = labelStr.charCodeAt(i);
+  const idxLe = new Uint8Array(4);
+  idxLe[0] = queryIndex & 0xff;
+  idxLe[1] = (queryIndex >>> 8) & 0xff;
+  idxLe[2] = (queryIndex >>> 16) & 0xff;
+  idxLe[3] = (queryIndex >>> 24) & 0xff;
+  const input = new Uint8Array(label.length + scripthash.length + 4);
+  input.set(label, 0);
+  input.set(scripthash, label.length);
+  input.set(idxLe, label.length + scripthash.length);
+  return sha256(input);
+}
+
+/**
+ * Derive up to `m` synthetic chunk IDs from a per-query seed.
+ * Mirrors the Rust helper `crate::dpf::derive_synthetic_chunk_ids`.
+ *
+ * Returns a number[] of length `min(m, num_chunks - real_chunks.length)`
+ * whose entries are pairwise distinct, disjoint from `realChunks`, and
+ * in `[0, numChunks)`. Output is determined entirely by the four
+ * inputs.
+ *
+ * Algorithm: counter-mode SHA-256. Each invocation
+ * `SHA-256(seed || counter_le)` yields 8 candidate u32 values (32B /
+ * 4B each); each candidate is taken modulo `numChunks` and accepted
+ * iff disjoint from `realChunks` AND from already-collected
+ * synthetics. The counter increments until `m` synthetics are
+ * collected (or the candidate space is exhausted — pathological
+ * inputs only; defensive `counter > 1_000_000` cap).
+ *
+ * Production parameters (`m = CHUNK_MERKLE_ITEMS_PER_QUERY = 16`,
+ * `numChunks` in the millions): expected SHA-256 invocations ≤ 1.
+ */
+export function deriveSyntheticChunkIds(
+  seed: Uint8Array,
+  m: number,
+  numChunks: number,
+  realChunks: readonly number[],
+): number[] {
+  if (m === 0 || numChunks === 0) return [];
+
+  const available = Math.max(0, numChunks - realChunks.length);
+  const target = Math.min(m, available);
+  if (target === 0) return [];
+
+  const result: number[] = [];
+  let counter = 0;
+  // counter is a u64 in Rust; in production it never exceeds a tiny
+  // value, so a JS number (safe to ~2^53) is more than enough.
+
+  while (result.length < target) {
+    const counterLe = new Uint8Array(8);
+    let c = counter;
+    for (let i = 0; i < 8; i++) {
+      counterLe[i] = c & 0xff;
+      c = Math.floor(c / 256);
+    }
+    const input = new Uint8Array(seed.length + 8);
+    input.set(seed, 0);
+    input.set(counterLe, seed.length);
+    const h = sha256(input);
+
+    for (let i = 0; i < 8; i++) {
+      // Read 4 bytes little-endian as a u32, then reduce mod numChunks.
+      // Use BigInt-free arithmetic: build the 32-bit value, then JS `%`
+      // is exact for unsigned 32-bit values.
+      const u32 =
+        (h[i * 4] |
+          (h[i * 4 + 1] << 8) |
+          (h[i * 4 + 2] << 16) |
+          (h[i * 4 + 3] << 24)) >>> 0;
+      const candidate = u32 % numChunks;
+
+      let clash = false;
+      for (const r of realChunks) {
+        if (r === candidate) { clash = true; break; }
+      }
+      if (clash) continue;
+
+      let dup = false;
+      for (const s of result) {
+        if (s === candidate) { dup = true; break; }
+      }
+      if (dup) continue;
+
+      result.push(candidate);
+      if (result.length >= target) break;
+    }
+
+    counter += 1;
+    if (counter > 1_000_000) break;
+  }
+
+  return result;
+}
+
+/**
+ * Pad a real-chunk list to length `m` by appending scripthash-derived
+ * synthetic chunk_ids. Mirrors the Rust helper
  * `crate::dpf::pad_chunk_ids_to_m` (Kani-verified, 4 harnesses):
  *
- *   - `result.length === m` when `m > realChunks.length`.
- *   - `result.slice(0, realChunks.length)` deep-equals `realChunks`
- *     (real chunks come first so the caller can decode the first
- *     `N * CHUNK_SIZE` payload bytes as genuine UTXO entries;
- *     synthetic-chunk payloads belong to other scripthashes and
- *     must be discarded).
- *   - Synthetic ids are pairwise distinct and disjoint from
- *     `realChunks`.
+ *   - `result.length === m` when `m > realChunks.length` (for
+ *     production parameters where `numChunks >> m`).
+ *   - `result.slice(0, realChunks.length)` deep-equals `realChunks`.
+ *   - Synthetic ids are pairwise distinct, disjoint from `realChunks`,
+ *     and in `[0, numChunks)`.
  *   - Identity when `m <= realChunks.length` (`m == 0` no-op or
  *     defensive shrink).
  *
- * Called by `queryBatch` to pad each query's owned-entry-id list
- * to `CHUNK_MERKLE_ITEMS_PER_QUERY` regardless of UTXO count.
+ * `seed` is per-query (typically `deriveChunkPadSeed(scripthash,
+ * queryIndex)`). Distinct seeds across queries → distinct synthetic
+ * chunk sets → PBC planner can pack the batched CHUNK round densely
+ * (matching the Rust closure that restores PBC efficiency for
+ * not-found-heavy batches).
+ *
+ * `numChunks` is an upper bound for synthetic IDs (modulo). For
+ * OnionPIR pass `totalPacked`.
  */
-export function padChunkIdsToM(realChunks: readonly number[], m: number): number[] {
+export function padChunkIdsToM(
+  realChunks: readonly number[],
+  m: number,
+  seed: Uint8Array,
+  numChunks: number,
+): number[] {
   if (m <= realChunks.length) {
     return [...realChunks];
   }
   const padded: number[] = [...realChunks];
-  let next = 0;
-  while (padded.length < m) {
-    let conflict = false;
-    for (const r of realChunks) {
-      if (r === next) {
-        conflict = true;
-        break;
+
+  const needed = m - realChunks.length;
+  const synthetics = deriveSyntheticChunkIds(seed, needed, numChunks, realChunks);
+  for (const s of synthetics) padded.push(s);
+
+  // Fallback for pathological `numChunks` (smaller than `m - N`):
+  // top up with the legacy `0..`-skipping behaviour so the length
+  // post-condition still holds. Production never hits this branch.
+  if (padded.length < m) {
+    let next = 0;
+    while (padded.length < m) {
+      let conflict = false;
+      for (const r of padded) {
+        if (r === next) { conflict = true; break; }
       }
+      if (!conflict) {
+        padded.push(next);
+      }
+      if (next === 0xffffffff) break;
+      next++;
     }
-    if (!conflict) {
-      padded.push(next);
-    }
-    if (next === 0xffffffff) {
-      // u32 saturation guard — would loop forever if `realChunks`
-      // somehow contained every u32 (impossible in practice for
-      // any real Bitcoin DB; bound here keeps the helper total).
-      break;
-    }
-    next++;
   }
+
   return padded;
 }
 
@@ -988,12 +1111,14 @@ export class OnionPirWebClient {
       //   - Found with N real entries: N reals + (M - N) synthetic.
       //   - Not-found / whale: M synthetic.
       //
-      // Synthetic entry_ids are drawn deterministically from `0..`
-      // skipping any reals already in this query's owned list, via
-      // `padChunkIdsToM` (same Kani-verified pattern the Rust
-      // `pad_chunk_ids_to_m` helper uses). Reals & synthetics are
-      // valid `entry_id`s in `[0, totalPacked)` for any production
-      // OnionPIR DB.
+      // Synthetic entry_ids are derived from a per-query SHA-256 seed
+      // (`scripthash || query_index`), via `padChunkIdsToM` — the same
+      // Kani-verified pattern the Rust `pad_chunk_ids_to_m` helper
+      // uses (commit `08d4725a` switched both Rust and TS away from
+      // the legacy `0..M`-skipping pad to scripthash-derived seeds so
+      // the PBC planner can pack not-found-heavy batches densely).
+      // Reals & synthetics are valid `entry_id`s in `[0, totalPacked)`
+      // for any production OnionPIR DB.
       //
       // The closure subsumes the previous CHUNK Round-Presence
       // Symmetry random-dummy injection (1 dummy per not-found /
@@ -1016,7 +1141,17 @@ export class OnionPirWebClient {
             realChunks.push(ir.entryId + j);
           }
         }
-        const owned = padChunkIdsToM(realChunks, CHUNK_MERKLE_ITEMS_PER_QUERY);
+        // Per-query seed: SHA-256("BPIR-CHUNK-PAD" || scripthash ||
+        // query_index_le). Distinct seeds across queries → distinct
+        // synthetic chunk sets → PBC planner can pack the batched
+        // CHUNK round densely (matching the Rust fix).
+        const padSeed = deriveChunkPadSeed(scriptHashes[i], i);
+        const owned = padChunkIdsToM(
+          realChunks,
+          CHUNK_MERKLE_ITEMS_PER_QUERY,
+          padSeed,
+          this.totalPacked,
+        );
         for (const eid of owned) {
           if (eid < this.totalPacked && !seen.has(eid)) {
             seen.add(eid);
