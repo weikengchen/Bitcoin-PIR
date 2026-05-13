@@ -56,8 +56,12 @@ use pir_sdk_client::OnionClient;
 
 const DEFAULT_DPF_SERVER0: &str = "wss://pir1.chenweikeng.com";
 const DEFAULT_DPF_SERVER1: &str = "wss://pir2.chenweikeng.com";
-const DEFAULT_HARMONY_HINT: &str = "wss://pir2.chenweikeng.com";
-const DEFAULT_HARMONY_QUERY: &str = "wss://pir1.chenweikeng.com";
+// Production topology (memory: project_pir1_hint_pir2_query_split.md):
+//   pir1 = Hetzner, no-SEV   → HINT server  (--serve-hints + --pool-size)
+//   pir2 = VPSBG,   SEV-SNP  → QUERY server (--serve-queries)
+// Defaults were reversed pre-2026-05-13.
+const DEFAULT_HARMONY_HINT: &str = "wss://pir1.chenweikeng.com";
+const DEFAULT_HARMONY_QUERY: &str = "wss://pir2.chenweikeng.com";
 #[cfg(feature = "onion")]
 const DEFAULT_ONION_URL: &str = "wss://pir1.chenweikeng.com";
 

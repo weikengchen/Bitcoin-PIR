@@ -31,12 +31,16 @@ use pir_sdk_client::{DpfClient, HarmonyClient, PirClient, ScriptHash};
 /// https://chenweikeng.com/bitcoin-pir uses.
 const DEFAULT_DPF_SERVER0: &str = "wss://pir1.chenweikeng.com";
 const DEFAULT_DPF_SERVER1: &str = "wss://pir2.chenweikeng.com";
-// Harmony hint/query role split matches the web client defaults in
-// `web/index.html` (the hint server runs on pir2, the query server on pir1).
-// The primary-role server rejects 0x41 REQ_HARMONY_HINTS with
-// "unsupported request 0x41 for primary role" — don't swap these.
-const DEFAULT_HARMONY_HINT: &str = "wss://pir2.chenweikeng.com";
-const DEFAULT_HARMONY_QUERY: &str = "wss://pir1.chenweikeng.com";
+// Production topology (memory: project_pir1_hint_pir2_query_split.md):
+//   pir1 = Hetzner, no-SEV   → HINT server  (--serve-hints + --pool-size)
+//   pir2 = VPSBG,   SEV-SNP  → QUERY server (--serve-queries)
+// Defaults were reversed pre-2026-05-13 and silently worked because
+// pir2 also had --pool-size enabled. After the mode-flag landing
+// (commit fb8b8a64) pir2 rejects hint requests with a clear
+// wire-level error ("server not configured to serve hints — start
+// with --serve-hints"), which surfaced the reversal in CI.
+const DEFAULT_HARMONY_HINT: &str = "wss://pir1.chenweikeng.com";
+const DEFAULT_HARMONY_QUERY: &str = "wss://pir2.chenweikeng.com";
 #[cfg(feature = "onion")]
 const DEFAULT_ONION_URL: &str = "wss://pir1.chenweikeng.com";
 
