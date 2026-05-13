@@ -94,7 +94,8 @@ export interface HarmonyPirClientConfig {
   hintServerUrl: string;
   queryServerUrl: string;
   onProgress?: (msg: string) => void;
-  /** PRP backend: 0=HMR12 (default), 1=FastPRP, 2=ALF. */
+  /** PRP backend: 0=HMR12 (default), 1=FastPRP. (PRP_ALF=2 was
+   * retired 2026-05-12 — see attest-pin.ts v13 notes.) */
   prpBackend?: number;
   /**
    * If `true` (default), the adapter automatically attests both servers
@@ -356,7 +357,7 @@ export class HarmonyPirClientAdapter {
     crypto.getRandomValues(masterKey);
     this.wasmClient.setMasterKey(masterKey);
     this._masterKey = masterKey;
-    const backendName = ['HMR12', 'FastPRP', 'ALF'][backend] ?? 'HMR12';
+    const backendName = ['HMR12', 'FastPRP'][backend] ?? 'HMR12';
     this.log(`WASM loaded: ${backendName}`);
   }
 

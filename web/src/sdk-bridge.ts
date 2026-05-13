@@ -67,7 +67,6 @@ interface PirSdkWasm {
   };
   PRP_HMR12: () => number;
   PRP_FASTPRP: () => number;
-  PRP_ALF: () => number;
   /**
    * Opaque wrapper around a parsed tree-tops blob. Obtain via
    * `WasmBucketMerkleTreeTops.fromBytes(...)` and reuse across all items that

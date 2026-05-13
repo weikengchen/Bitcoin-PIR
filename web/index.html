@@ -1367,7 +1367,6 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                                 <select id="hp-prpSelect" class="select" style="width: auto;">
                                     <option value="0" selected>HMR12 (default)</option>
                                     <option value="1">FastPRP</option>
-                                    <option value="2">ALF</option>
                                 </select>
                                 <span id="hp-prpNote" style="font-size: 11px; font-family: var(--mono); color: var(--ink-mute);"></span>
                             </div>
@@ -4177,8 +4176,8 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
             if (newPrp === hpCurrentPrp) return;
             const oldPrp = hpCurrentPrp;
             hpCurrentPrp = newPrp;
-            const names = ['HMR12', 'FastPRP', 'ALF'];
-            log(`HarmonyPIR: PRP changed to ${names[newPrp]}.`, 'info');
+            const names = ['HMR12', 'FastPRP'];
+            log(`HarmonyPIR: PRP changed to ${names[newPrp] ?? 'HMR12'}.`, 'info');
 
             if (!hpClient) return;
             if (hpSwitchingPrp) return; // already switching
