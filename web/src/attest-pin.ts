@@ -73,18 +73,28 @@ export interface ServerAttestPin {
  * Pinned 2026-05-04 from the v4 deploy (UKI sha `e835a516…f8396da0`).
  */
 export const PIR2_TIER3_PIN: ServerAttestPin = {
-  // Tier 3 UKI v13 — 2026-05-12. Built on Hetzner with VPSBG-matched
-  // kernel (7.0.0-15), kmod 34.2, dracut 110. Console-hardened.
-  // Drops PRP_ALF (panicked on sibling-table small domains, crashed
-  // pir-vpsbg in a tight loop). Default backend is now PRP_FASTPRP.
-  // Includes harmonypir 60635d8e (pipelined pair-query API) and
-  // cashu_verifier / arc_verifier work in pir-runtime-core. Hint pool
-  // generation dropped from 187s/entry (ALF) to ~14s/entry (FastPRP).
+  // Tier 3 UKI v15 — 2026-05-13. Built on Hetzner with VPSBG kernel
+  // 7.0.0-15, kmod 34.2, dracut 110. Bumped from v13 to ship the
+  // explicit `--serve-hints` / `--serve-queries` mode flags (commit
+  // fb8b8a64): pir2 runs `--serve-queries` only — no hint pool, no
+  // `--pool-size`. Hints come from pir1 (Hetzner, non-SEV) per the
+  // production topology (memory:
+  // `project_pir1_hint_pir2_query_split.md`).
+  //
+  // v14 (sha256 `81acfd6c…`) was the first attempt but the Tier 3
+  // runit init script still invoked unified_server with no mode
+  // flags → exit(2) crash loop. v15 (sha256 `9cd506ea…`) ships the
+  // corrected `scripts/dracut/97bpir-tier3-init/unified-server-run.sh`
+  // (commit 714eb832).
+  //
+  // The embedded binary (`94a9dc8c…`) is byte-identical to the one
+  // running on Hetzner pir-primary / pir-secondary so PIR1_PIN and
+  // PIR2_TIER3_PIN share the same `binarySha256Hex`.
   measurementHex:
-    '7d412f0422b48f1d0b8805224355acb1c917489629f76c4c711498030d8cd19da1485ea25c0dceccefdd2d0a0e1de62c',
+    '895dbc799144f24bddf266408c3221dda1b5e1b64dcdd2236cb1e84ba1fba4cb3b75c0054a0e0ee238780e78da10466d',
   binarySha256Hex:
-    'd65b72050ae11ea9fdbe0da604d155caa40badb7af19e8e9f80e93bc854889a3',
-  description: 'pir2.chenweikeng.com (VPSBG, SEV-SNP, Tier 3 UKI v13)',
+    '94a9dc8ca6bc7ea22cacfede50c0d4a5f44fead5e49af8e90df5aa40c4d40ea4',
+  description: 'pir2.chenweikeng.com (VPSBG, SEV-SNP, Tier 3 UKI v15)',
 };
 
 /**
