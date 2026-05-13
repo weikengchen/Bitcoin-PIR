@@ -1,5 +1,5 @@
 [Unit]
-Description=BitcoinPIR unified server on VPSBG (DPF + HarmonyPIR hint, attest-enabled, no OnionPIR)
+Description=BitcoinPIR unified server on VPSBG (queries only — DPF-1 + HarmonyPIR query, SEV-SNP attested, no OnionPIR, no hints)
 Documentation=https://github.com/Bitcoin-PIR/Bitcoin-PIR
 After=network-online.target
 Wants=network-online.target
@@ -9,7 +9,16 @@ Type=simple
 User=pir
 Group=pir
 WorkingDirectory=/home/pir/BitcoinPIR
-# Role=secondary serves DPF query + HarmonyPIR hint (offline preprocessing).
+# pir2 (VPSBG, Tier 3 SEV-SNP) is the QUERY server in the production
+# topology: it never serves HarmonyPIR hints — those come from pir1
+# (Hetzner, no-SEV) so the SEV-attested code path here stays focused
+# on the privacy-critical actual query handling. Role-pinning landed
+# 2026-05-13: `--serve-queries` whitelists DPF / Harmony query phase
+# and the absence of `--serve-hints` makes hint requests fail at the
+# dispatch boundary with a clear error rather than silently
+# fall-through. The `--pool-size` flag is intentionally absent —
+# no hint pool to maintain on this host.
+#
 # Secondary role NEVER loads OnionPIR — that's a primary-only protocol
 # and the data isn't useful here. The OnionPIR files were intentionally
 # excluded from the Hetzner→VPSBG rsync to keep this server focused.
@@ -27,7 +36,7 @@ ExecStartPre=+/bin/chmod 0660 /dev/sev-guest
 ExecStart=/home/pir/BitcoinPIR/target/release/unified_server \
     --port 8091 \
     --role secondary \
-    --pool-size 8 \
+    --serve-queries \
     --config /home/pir/data/databases.toml \
     --admin-pubkey-hex 87d454db85266e10e55ed8b68417de9d79ceb1d5d944bae831a7877627efdad3 \
     --vcek-dir /home/pir/data/vcek

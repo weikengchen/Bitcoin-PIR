@@ -1,5 +1,5 @@
 [Unit]
-Description=BitcoinPIR unified server (secondary: DPF-1 + HarmonyPIR hint)
+Description=BitcoinPIR unified server (secondary: DPF-1 + HarmonyPIR hint, fallback role)
 Documentation=https://github.com/Bitcoin-PIR/Bitcoin-PIR
 After=network-online.target
 Wants=network-online.target
@@ -9,9 +9,19 @@ Type=simple
 User=pir
 Group=pir
 WorkingDirectory=/home/pir/BitcoinPIR
+# Legacy companion to pir-primary from the single-host era when both
+# pir1.chenweikeng.com and pir2.chenweikeng.com terminated on this
+# Hetzner box (pir1 → 8091, pir2 → 8092). pir2.chenweikeng.com now
+# routes to VPSBG (Tier 3 SEV-SNP); this port is currently unrouted
+# but kept warm as a hint-pool fallback in case cloudflared
+# reconfigures back. Mode flags expose both serve-hints and
+# serve-queries so any future use of this port works without further
+# config drift.
 ExecStart=/home/pir/BitcoinPIR/target/release/unified_server \
     --port 8092 \
     --role secondary \
+    --serve-hints \
+    --serve-queries \
     --pool-size 8 \
     --config /home/pir/data/databases.toml
 Restart=on-failure

@@ -117,6 +117,23 @@ struct CliArgs {
     require_arc: bool,
     require_cashu: bool,
     cashu_keysets: Vec<(String, String)>,
+    /// Whether this server accepts HarmonyPIR hint requests
+    /// (`REQ_HARMONY_HINTS` / `REQ_HARMONY_HINTS_V2`). Default `false`;
+    /// must be explicitly enabled via `--serve-hints`. Combined with
+    /// `--serve-queries` to pin the role: pir1 (Hetzner, no-SEV) runs
+    /// `--serve-hints --serve-queries` (HarmonyPIR hint pool + DPF
+    /// server-0 + OnionPIR); pir2 (VPSBG, SEV-SNP Tier 3) runs
+    /// `--serve-queries` only (DPF server-1 + HarmonyPIR query phase).
+    /// Misconfiguration (client hits the wrong role) becomes a
+    /// wire-level rejection instead of silently falling through to
+    /// the legacy V1-on-demand path or producing confusing errors.
+    serve_hints: bool,
+    /// Whether this server accepts PIR query requests (DPF batches,
+    /// OnionPIR queries, HarmonyPIR query phase, Merkle siblings,
+    /// tree-tops). Default `false`; must be explicitly enabled via
+    /// `--serve-queries`. See `serve_hints` for the deployment
+    /// topology rationale.
+    serve_queries: bool,
 }
 
 fn parse_args() -> CliArgs {
@@ -136,6 +153,8 @@ fn parse_args() -> CliArgs {
     let mut require_arc = false;
     let mut require_cashu = false;
     let mut cashu_keysets: Vec<(String, String)> = Vec::new();
+    let mut serve_hints = false;
+    let mut serve_queries = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -230,12 +249,18 @@ fn parse_args() -> CliArgs {
                 }
                 i += 1;
             }
+            "--serve-hints" => {
+                serve_hints = true;
+            }
+            "--serve-queries" => {
+                serve_queries = true;
+            }
             _ => {}
         }
         i += 1;
     }
 
-    CliArgs { port, data_dir, role, warmup, config_path, checkpoints, deltas, admin_pubkey_hex, disable_onion, vcek_dir, pool_size, pool_dir, require_arc, require_cashu, cashu_keysets }
+    CliArgs { port, data_dir, role, warmup, config_path, checkpoints, deltas, admin_pubkey_hex, disable_onion, vcek_dir, pool_size, pool_dir, require_arc, require_cashu, cashu_keysets, serve_hints, serve_queries }
 }
 
 // ─── OnionPIR worker thread ─────────────────────────────────────────────────
@@ -458,6 +483,13 @@ struct UnifiedServerData {
     cashu_verifier: Option<std::sync::Mutex<pir_runtime_core::cashu_verifier::CashuVerifier>>,
     /// Whether Cashu BAT presentation is required for PIR queries.
     require_cashu: bool,
+    /// Whether this server accepts `REQ_HARMONY_HINTS` /
+    /// `REQ_HARMONY_HINTS_V2` opcodes (set via `--serve-hints`).
+    /// Mirrors `CliArgs::serve_hints`. Gated in the dispatch loop.
+    serve_hints: bool,
+    /// Whether this server accepts PIR query opcodes (DPF + OnionPIR +
+    /// HarmonyPIR query phase). Mirrors `CliArgs::serve_queries`.
+    serve_queries: bool,
 }
 
 impl UnifiedServerData {
@@ -1213,8 +1245,33 @@ async fn main() {
         ServerRole::Secondary => "secondary",
     };
 
+    // ── Mode validation ────────────────────────────────────────────────
+    // The server's accepted-opcode set is gated by two independent flags:
+    //   --serve-hints   → REQ_HARMONY_HINTS / REQ_HARMONY_HINTS_V2
+    //   --serve-queries → all PIR query opcodes (DPF batches, OnionPIR
+    //                      queries, HarmonyPIR query phase, Merkle siblings,
+    //                      tree-tops, batched index/chunk)
+    // At least one must be enabled, else the server has no useful role.
+    // Run-mode logged below; configure on each unit file (see
+    // `deploy/systemd/pir-primary.service` and
+    // `deploy/systemd/pir-secondary.service`).
+    if !args.serve_hints && !args.serve_queries {
+        eprintln!(
+            "ERROR: must enable at least one of --serve-hints / --serve-queries.\n  \
+             Hint-only deployment (HarmonyPIR V2 pool):  --serve-hints --pool-size N\n  \
+             Query-only deployment (DPF / OnionPIR / HarmonyPIR query): --serve-queries\n  \
+             Both (legacy single-host or pir1 Hetzner topology):       --serve-hints --serve-queries"
+        );
+        std::process::exit(2);
+    }
+
     println!("=== Unified PIR Server ({}) ===", role_name);
     println!("  Port:     {}", args.port);
+    println!(
+        "  Mode:     hints={}, queries={}",
+        if args.serve_hints { "yes" } else { "no" },
+        if args.serve_queries { "yes" } else { "no" },
+    );
     if let Some(ref config_path) = args.config_path {
         println!("  Config:   {}", config_path.display());
     } else {
@@ -1959,6 +2016,8 @@ async fn main() {
         require_arc,
         cashu_verifier,
         require_cashu,
+        serve_hints: args.serve_hints,
+        serve_queries: args.serve_queries,
     });
 
     // ── Accept WebSocket connections ────────────────────────────────────
@@ -2116,6 +2175,51 @@ async fn main() {
                         | REQ_ONIONPIR_MERKLE_DATA_TREE_TOP => {
                             let resp = Response::Error(
                                 "ARC credential required — send REQ_CREDENTIAL_PRESENT first".into(),
+                            );
+                            let _ = send_resp(&mut sink, channel_session.as_mut(), resp.encode()).await;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Mode gate: reject hint or query requests this server isn't
+                // configured for (`--serve-hints` / `--serve-queries` flags).
+                // Whitelisted opcodes (info / ping / attest / handshake /
+                // residency / credential / admin / db-catalog) always pass —
+                // they don't expose hint or query content, only metadata
+                // needed for clients to discover the server's capabilities.
+                if !server.serve_hints {
+                    match variant {
+                        REQ_HARMONY_HINTS | REQ_HARMONY_HINTS_V2 => {
+                            let resp = Response::Error(
+                                "server not configured to serve hints — start with --serve-hints (see deploy/systemd/*.service)".into(),
+                            );
+                            let _ = send_resp(&mut sink, channel_session.as_mut(), resp.encode()).await;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+                if !server.serve_queries {
+                    match variant {
+                        REQ_INDEX_BATCH
+                        | REQ_CHUNK_BATCH
+                        | REQ_MERKLE_SIBLING_BATCH
+                        | REQ_MERKLE_TREE_TOP
+                        | REQ_BUCKET_MERKLE_SIB_BATCH
+                        | REQ_BUCKET_MERKLE_TREE_TOPS
+                        | REQ_HARMONY_QUERY
+                        | REQ_HARMONY_BATCH_QUERY
+                        | REQ_REGISTER_KEYS
+                        | REQ_ONIONPIR_INDEX_QUERY
+                        | REQ_ONIONPIR_CHUNK_QUERY
+                        | REQ_ONIONPIR_MERKLE_INDEX_SIBLING
+                        | REQ_ONIONPIR_MERKLE_INDEX_TREE_TOP
+                        | REQ_ONIONPIR_MERKLE_DATA_SIBLING
+                        | REQ_ONIONPIR_MERKLE_DATA_TREE_TOP => {
+                            let resp = Response::Error(
+                                "server not configured to answer queries — start with --serve-queries (see deploy/systemd/*.service)".into(),
                             );
                             let _ = send_resp(&mut sink, channel_session.as_mut(), resp.encode()).await;
                             continue;
