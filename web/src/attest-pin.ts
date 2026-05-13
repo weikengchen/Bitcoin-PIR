@@ -97,12 +97,13 @@ export const PIR2_TIER3_PIN: ServerAttestPin = {
 export const PIR1_PIN: ServerAttestPin = {
   // No measurementHex — Hetzner has no SEV.
   // Bumped 2026-05-13 alongside the `--serve-hints` / `--serve-queries`
-  // mode-flag landing (commit fb8b8a64). pir1 (Hetzner) now runs the
-  // mode-pinned binary explicitly serving both hints (V2 pool) and
-  // queries (DPF-0 + OnionPIR + Harmony query phase). pir2 (VPSBG)
-  // still runs the v13 binary `d65b720...` until VPSBG redeploys to
-  // include the mode flags — see PIR2_TIER3_PIN below for that one.
+  // mode-flag landing (commit fb8b8a64) and rebuilt with the
+  // deterministic wrapper `scripts/build_unified_server.sh` so the
+  // binary embedded in the Tier 3 UKI (pir2/VPSBG) and the Hetzner
+  // pir-primary binary are byte-identical (`94a9dc8c…`). The v14
+  // UKI sha256 is `81acfd6c…` — pin published when pir2 reboots
+  // and the in-chip MEASUREMENT is captured.
   binarySha256Hex:
-    '4d95eb53429a5ebbdc58bfea2e620d66c2ea6045d643557a872b80377866cd4e',
+    '94a9dc8ca6bc7ea22cacfede50c0d4a5f44fead5e49af8e90df5aa40c4d40ea4',
   description: 'pir1.chenweikeng.com (Hetzner i7-8700, no SEV)',
 };
