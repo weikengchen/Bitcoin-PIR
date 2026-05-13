@@ -1667,53 +1667,33 @@ impl DpfClient {
             let results0 = decode_batch_response(&resp0[4..])?;
             let results1 = decode_batch_response(&resp1[4..])?;
 
-            // Extract chunk data + record per-chunk Merkle trace for
-            // each chunk in this round.
-            //
-            // The CHUNK Merkle Item-Count Symmetry invariant
-            // (CLAUDE.md) requires every query to contribute exactly
-            // M = CHUNK_MERKLE_ITEMS_PER_QUERY chunk Merkle items —
-            // one trace per slot in the padded list, real or
-            // synthetic. The legacy `0..M` synthetic padding
-            // (pre-commit 08d4725a) made `find_chunk_in_result`
-            // succeed on every synthetic too (chunks 0..15 always
-            // exist in the production DB); the scripthash-derived
-            // padding draws synthetics from a much wider space, so
-            // they almost certainly DON'T match the bin contents.
-            // Trace recording therefore must be independent of
-            // `find_chunk_in_result`: we record the bin's content
-            // verbatim at the cuckoo position we asked, regardless
-            // of whether the requested chunk_id was inside.
-            //
-            // Trace gets overwritten on each subsequent cuckoo
-            // position so a real chunk recovered at h=1 ends up
-            // with the h=1 trace (matching where it was actually
-            // placed). `chunk_data_map` and the `break` on recovery
-            // stay gated by `find_chunk_in_result` — only real
-            // recoveries contribute decoded UTXO bytes and stop
-            // further cuckoo retries.
+            // Extract chunk data for each chunk in this round
             for &(chunk_id, group_id) in round {
                 let mut found_any = false;
                 for h in 0..CHUNK_CUCKOO_NUM_HASHES {
                     let mut bin_content = results0[group_id][h].clone();
                     xor_into(&mut bin_content, &results1[group_id][h]);
-                    let bin_index = *real_locs.get(&(group_id, h)).ok_or_else(|| {
-                        PirError::InvalidState(format!(
-                            "missing recorded loc for chunk_id={} group={} h={}",
-                            chunk_id, group_id, h
-                        ))
-                    })?;
-                    chunk_trace_map.insert(
-                        chunk_id,
-                        ChunkBinTrace {
-                            pbc_group: group_id,
-                            bin_index,
-                            bin_content: bin_content.clone(),
-                        },
-                    );
-                    if let Some(payload) = find_chunk_in_result(&bin_content, chunk_id) {
-                        let data = payload.to_vec();
+
+                    if find_chunk_in_result(&bin_content, chunk_id).is_some() {
+                        // Slice the actual chunk payload for decoding.
+                        let data = find_chunk_in_result(&bin_content, chunk_id)
+                            .expect("find_chunk_in_result returned Some above")
+                            .to_vec();
+                        let bin_index = *real_locs.get(&(group_id, h)).ok_or_else(|| {
+                            PirError::InvalidState(format!(
+                                "missing recorded loc for chunk_id={} group={} h={}",
+                                chunk_id, group_id, h
+                            ))
+                        })?;
                         chunk_data_map.insert(chunk_id, data);
+                        chunk_trace_map.insert(
+                            chunk_id,
+                            ChunkBinTrace {
+                                pbc_group: group_id,
+                                bin_index,
+                                bin_content,
+                            },
+                        );
                         log::info!(
                             "[PIR-AUDIT] CHUNK FOUND: chunk_id={}, group={}, bin={}, cuckoo_h={}",
                             chunk_id, group_id, bin_index, h
@@ -1723,8 +1703,8 @@ impl DpfClient {
                     }
                 }
                 if !found_any {
-                    log::info!(
-                        "[PIR-AUDIT] CHUNK SYNTHETIC: chunk_id={}, group={} (M-pad slot, no real chunk; trace recorded for Merkle invariant)",
+                    log::warn!(
+                        "[PIR-AUDIT] CHUNK MISSING: chunk_id={}, group={} (no cuckoo position matched)",
                         chunk_id, group_id
                     );
                 }

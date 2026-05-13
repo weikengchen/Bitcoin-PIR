@@ -2905,61 +2905,28 @@ impl HarmonyClient {
                     .await?;
 
                 // Decode + reattribute to (sh_idx, slot).
-                //
-                // Trace recording is INDEPENDENT of whether the
-                // specific `cid` was found in the bin. The per-bucket
-                // Merkle invariant (CHUNK Merkle Item-Count Symmetry,
-                // CLAUDE.md) demands M trace entries per query — one
-                // per slot in the padded chunk list — so the
-                // wire-observable `ChunkMerkleSiblings` round count
-                // is uniform regardless of how many of those slots
-                // hold synthetic vs real chunk_ids.
-                //
-                // The legacy `0..M` padding (pre-commit 08d4725a)
-                // worked accidentally because the first M chunk_ids
-                // in any production DB are real and `find_chunk_in_result`
-                // therefore succeeded on every synthetic slot too;
-                // the scripthash-derived padding draws synthetics
-                // from a much larger ID space, so they almost
-                // certainly don't match real chunks in their cuckoo'd
-                // bin. Without this fix, found queries emit only N
-                // (= real_count) Merkle items and not-found queries
-                // emit 0 — the very leak the M-padding closes.
-                //
-                // `chunk_traces` is overwritten on each (pbc_round, h)
-                // we get an answer for, so a real chunk recovered at
-                // h=1 ends up with the h=1 trace (matching the bin
-                // it was actually placed in). Synthetics keep
-                // whichever bin we last queried; the verifier just
-                // attests "bin (g, b) has these bytes" — it doesn't
-                // care whether the specific chunk_id was inside.
-                // `chunk_data` and `recovered` stay gated by
-                // `find_chunk_in_result` — only real recoveries
-                // contribute decoded UTXO bytes and stop further
-                // retries.
                 for &(flat_idx, pbc_group) in &still_pending {
                     let (sh_idx, slot, cid) = flat[flat_idx];
-                    let Some(answer) = round_answers.get(&pbc_group) else {
-                        continue;
-                    };
-                    let key = pir_core::hash::derive_cuckoo_key(
-                        CHUNK_PARAMS.master_seed,
-                        pbc_group as usize,
-                        h,
-                    );
-                    let bin_index =
-                        pir_core::hash::cuckoo_hash_int(cid, key, chunk_bins) as u32;
-                    chunk_traces.insert(
-                        (sh_idx, slot),
-                        ChunkBinTrace {
-                            pbc_group: pbc_group as usize,
-                            bin_index,
-                            bin_content: answer.clone(),
-                        },
-                    );
-                    if let Some(data) = find_chunk_in_result(answer, cid) {
-                        chunk_data.insert((sh_idx, slot), data.to_vec());
-                        recovered.insert(flat_idx);
+                    if let Some(answer) = round_answers.get(&pbc_group) {
+                        if let Some(data) = find_chunk_in_result(answer, cid) {
+                            let key = pir_core::hash::derive_cuckoo_key(
+                                CHUNK_PARAMS.master_seed,
+                                pbc_group as usize,
+                                h,
+                            );
+                            let bin_index =
+                                pir_core::hash::cuckoo_hash_int(cid, key, chunk_bins) as u32;
+                            chunk_data.insert((sh_idx, slot), data.to_vec());
+                            chunk_traces.insert(
+                                (sh_idx, slot),
+                                ChunkBinTrace {
+                                    pbc_group: pbc_group as usize,
+                                    bin_index,
+                                    bin_content: answer.clone(),
+                                },
+                            );
+                            recovered.insert(flat_idx);
+                        }
                     }
                 }
             }
