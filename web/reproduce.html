@@ -228,6 +228,68 @@
             operator's claimed MEASUREMENT.
         </p>
 
+        <section id="non-collusion">
+            <h2>The non-collusion argument</h2>
+            <p>
+                The two-server PIR security model needs two
+                <em>non-colluding</em> servers to keep query content
+                private. <code>pir1.chenweikeng.com</code> and
+                <code>pir2.chenweikeng.com</code> run on different
+                physical machines — Hetzner i7-8700 and VPSBG AMD EPYC
+                respectively — but they share <em>one operator</em>.
+                So the deployment doesn't literally satisfy
+                non-collusion at the trust-boundary level.
+            </p>
+            <p>
+                SEV-SNP attestation closes that gap. The two hosts
+                deliberately play asymmetric roles:
+            </p>
+            <ul>
+                <li>
+                    <strong>pir1 (Hetzner, no SEV)</strong> serves the
+                    HarmonyPIR <em>hint</em> phase (offline
+                    preprocessing) plus DPF server-0 and OnionPIR
+                    queries. Its binary hash is pinned at build time
+                    (see <code>PIR1_PIN</code>) but there's no
+                    hardware-backed proof that the running code matches.
+                </li>
+                <li>
+                    <strong>pir2 (VPSBG, SEV-SNP, Tier 3 UKI)</strong>
+                    serves the HarmonyPIR <em>query</em> phase plus
+                    DPF server-1. It boots in a measured-boot UKI
+                    environment; AMD's PSP signs a <code>MEASUREMENT</code>
+                    over the loaded image and the client's
+                    pre-negotiated channel pubkey (REPORT_DATA binding
+                    via <code>pir_core::attest::build_report_data</code>).
+                </li>
+            </ul>
+            <p>
+                Wire-level enforcement: each server explicitly opts in
+                to its role via <code>--serve-hints</code> /
+                <code>--serve-queries</code> CLI flags
+                (<a href="https://github.com/Bitcoin-PIR/Bitcoin-PIR/blob/main/runtime/src/bin/unified_server.rs" target="_blank" rel="noopener"><code>runtime/src/bin/unified_server.rs</code></a>).
+                A client mistakenly asking <code>pir2</code> for
+                hints gets a clean wire-level rejection
+                (<em>"server not configured to serve hints"</em>)
+                rather than a silent fall-through to whichever box
+                the cloudflared tunnel happens to point at.
+            </p>
+            <p>
+                Combined: a malicious operator can't silently route
+                <code>pir2</code> traffic through <code>pir1</code>
+                (or any other unattested box) without either
+                <strong>flipping the pinned MEASUREMENT</strong> the
+                client checks against the chip's signed report, or
+                <strong>flipping the SEV STATUS</strong> from
+                <code>reportDataMatch</code> to something else. Both
+                are observable in the browser's attestation badge,
+                and both are version-controlled in
+                <code>web/src/attest-pin.ts</code>. The rest of this
+                page documents how to reproduce the pinned value
+                yourself from the published source.
+            </p>
+        </section>
+
         <section>
             <h2>Why this matters</h2>
             <p>

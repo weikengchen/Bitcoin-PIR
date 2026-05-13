@@ -849,13 +849,10 @@
 
             <div class="sb-disclaimer" role="note">
                 <strong>Non-collusion via SEV-SNP attestation.</strong>
-                pir1 (Hetzner, no SEV) and pir2 (VPSBG, SEV-SNP) are
-                <em>different machines</em> but one operator. pir2's
-                chip-signed MEASUREMENT lets the client verify the
-                exact code deployed there matches the published source,
-                so a malicious operator can't silently route pir2
-                queries through pir1 without flipping the pinned
-                MEASUREMENT. <a href="/reproduce.html">Verify yourself</a>.
+                pir1 and pir2 are <em>different machines</em>, one
+                operator. pir2's chip-signed MEASUREMENT keeps that
+                operator honest.
+                <a href="/reproduce.html#non-collusion">How &amp; verify yourself</a>.
             </div>
 
             <div class="sb-section">
