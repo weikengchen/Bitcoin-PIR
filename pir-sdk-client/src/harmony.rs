@@ -466,6 +466,17 @@ pub struct HarmonyClient {
     hint_server_url: String,
     query_server_url: String,
     hint_conn: Option<Box<dyn PirTransport>>,
+    /// Secondary hint-server WebSocket, used to split parallel sibling
+    /// hint downloads (INDEX-tree levels on primary, CHUNK-tree levels
+    /// on secondary) across two sockets. Same rationale as
+    /// [`query_conn_secondary`] — the bandwidth-delay-product cap on
+    /// one TCP stream is the bottleneck for the ~26 MB of sibling
+    /// hints, so two streams cut wall time substantially.
+    ///
+    /// `None` means single-socket fallback (identical behaviour to
+    /// pre-pool code). Set when `HARMONY_HINT_POOL_SIZE` env var is
+    /// 2 (default) or higher.
+    hint_conn_secondary: Option<Box<dyn PirTransport>>,
     query_conn: Option<Box<dyn PirTransport>>,
     /// Secondary query-server WebSocket, used to split parallel rounds
     /// (CHUNK h=0/h=1 pair, INDEX/CHUNK Merkle sub-trees) across two
@@ -562,6 +573,7 @@ impl HarmonyClient {
             hint_server_url: hint_server_url.to_string(),
             query_server_url: query_server_url.to_string(),
             hint_conn: None,
+            hint_conn_secondary: None,
             query_conn: None,
             query_conn_secondary: None,
             catalog: None,
@@ -599,6 +611,9 @@ impl HarmonyClient {
     pub fn set_metrics_recorder(&mut self, recorder: Option<Arc<dyn PirMetrics>>) {
         self.metrics_recorder = recorder.clone();
         if let Some(ref mut c) = self.hint_conn {
+            c.set_metrics_recorder(recorder.clone(), "harmony");
+        }
+        if let Some(ref mut c) = self.hint_conn_secondary {
             c.set_metrics_recorder(recorder.clone(), "harmony");
         }
         if let Some(ref mut c) = self.query_conn {
@@ -3174,100 +3189,262 @@ impl HarmonyClient {
             db_info.db_id, index_sib_levels, chunk_sib_levels
         );
 
-        // ── INDEX sibling groups ───────────────────────────────────────
-        let mut nodes: u64 = db_info.index_bins as u64;
-        for sl in 0..index_sib_levels {
-            let level_n = nodes.div_ceil(arity);
-            nodes = level_n;
-            let t_init = std::time::Instant::now();
-            for g in 0..k_index {
-                let group = HarmonyGroup::new_with_backend(
-                    level_n as u32,
-                    sib_w,
-                    0,
-                    &self.master_prp_key,
-                    // Matches server `compute_hints_for_group` for level 10+sl:
-                    //   k_offset = (k_index + k_chunk) + sl * k_index
-                    //   derived_key uses k_offset + group_id.
-                    ((k_index + k_chunk) + sl * k_index + g) as u32,
-                    self.prp_backend,
-                )
-                .map_err(|e| {
-                    PirError::BackendState(format!("INDEX sib HarmonyGroup init: {:?}", e))
-                })?;
-                self.index_sib_groups.insert((sl, g as u8), group);
-            }
-            let dt_init = t_init.elapsed();
-            let t_fetch = std::time::Instant::now();
-            self.fetch_and_load_hints_into(
-                db_info.db_id,
-                10 + sl as u8,
-                k_index as u8,
-                HintTarget::IndexSib(sl),
-                None,
-            )
-            .await?;
-            let dt_fetch = t_fetch.elapsed();
-            if std::env::var("HARMONY_BENCH").is_ok() {
-                eprintln!(
-                    "[HARMONY_BENCH]   sib INDEX L{}: group_init={:?}  fetch+load_hints={:?}  (k={}, level_n={})",
-                    sl, dt_init, dt_fetch, k_index, level_n,
-                );
-            }
-            log::info!(
-                "[PIR-AUDIT] HarmonyPIR INDEX sib L{}: loaded hints for {} groups (n={})",
-                sl, k_index, level_n
-            );
-        }
+        // Capture readonly state to avoid borrow-checker conflicts when
+        // taking mutable borrows of the various self fields below.
+        let master_prp_key = self.master_prp_key;
+        let prp_backend = self.prp_backend;
+        let db_id = db_info.db_id;
+        let index_bins_total = db_info.index_bins;
+        let chunk_bins_total = db_info.chunk_bins;
 
-        // ── CHUNK sibling groups ───────────────────────────────────────
-        let mut nodes: u64 = db_info.chunk_bins as u64;
-        for sl in 0..chunk_sib_levels {
-            let level_n = nodes.div_ceil(arity);
-            nodes = level_n;
-            let t_init = std::time::Instant::now();
-            for g in 0..k_chunk {
-                let group = HarmonyGroup::new_with_backend(
-                    level_n as u32,
-                    sib_w,
-                    0,
-                    &self.master_prp_key,
-                    // Matches server `compute_hints_for_group` for level 20+sl:
-                    //   k_offset = (k_index + k_chunk)
-                    //            + index_sib_levels * k_index
-                    //            + sl * k_chunk
-                    ((k_index + k_chunk)
-                        + index_sib_levels * k_index
-                        + sl * k_chunk
-                        + g) as u32,
-                    self.prp_backend,
-                )
-                .map_err(|e| {
-                    PirError::BackendState(format!("CHUNK sib HarmonyGroup init: {:?}", e))
-                })?;
-                self.chunk_sib_groups.insert((sl, g as u8), group);
+        if self.hint_conn_secondary.is_some() {
+            // ── Parallel path: INDEX siblings on hint primary, CHUNK
+            // siblings on hint secondary. Each tree's levels stay
+            // serial within its own future (level L+1 doesn't depend
+            // on level L's hints — the dependency is at Merkle-verify
+            // time, after sibling hints are loaded — but we keep the
+            // intra-tree order to minimize peak memory growth from
+            // group_init).
+            //
+            // Move everything the parallel futures need out of self
+            // so they can hold disjoint mutable state. Restored after
+            // the join.
+            let mut index_sib_groups = std::mem::take(&mut self.index_sib_groups);
+            let mut chunk_sib_groups = std::mem::take(&mut self.chunk_sib_groups);
+            let mut hint_primary =
+                self.hint_conn.take().ok_or(PirError::NotConnected)?;
+            let mut hint_secondary = self.hint_conn_secondary.take().expect(
+                "checked is_some above; field is private and not mutated mid-await",
+            );
+
+            let index_fut = async {
+                let mut profiles = Vec::with_capacity(index_sib_levels);
+                let mut nodes: u64 = index_bins_total as u64;
+                for sl in 0..index_sib_levels {
+                    let level_n = nodes.div_ceil(arity);
+                    nodes = level_n;
+                    let t_init = std::time::Instant::now();
+                    for g in 0..k_index {
+                        let group = HarmonyGroup::new_with_backend(
+                            level_n as u32,
+                            sib_w,
+                            0,
+                            &master_prp_key,
+                            ((k_index + k_chunk) + sl * k_index + g) as u32,
+                            prp_backend,
+                        )
+                        .map_err(|e| {
+                            PirError::BackendState(format!(
+                                "INDEX sib HarmonyGroup init: {:?}",
+                                e
+                            ))
+                        })?;
+                        index_sib_groups.insert((sl, g as u8), group);
+                    }
+                    let dt_init = t_init.elapsed();
+                    let t_fetch = std::time::Instant::now();
+                    let profile = fetch_and_load_sib_hints_into_map(
+                        hint_primary.as_mut(),
+                        &mut index_sib_groups,
+                        sl,
+                        db_id,
+                        10 + sl as u8,
+                        k_index as u8,
+                        &master_prp_key,
+                        prp_backend,
+                    )
+                    .await?;
+                    let dt_fetch = t_fetch.elapsed();
+                    if std::env::var("HARMONY_BENCH").is_ok() {
+                        eprintln!(
+                            "[HARMONY_BENCH]   sib INDEX L{} (parallel): group_init={:?}  fetch+load={:?}  (k={}, level_n={})",
+                            sl, dt_init, dt_fetch, k_index, level_n,
+                        );
+                    }
+                    profiles.push(profile);
+                }
+                Ok::<_, PirError>((hint_primary, index_sib_groups, profiles))
+            };
+
+            let chunk_fut = async {
+                let mut profiles = Vec::with_capacity(chunk_sib_levels);
+                let mut nodes: u64 = chunk_bins_total as u64;
+                for sl in 0..chunk_sib_levels {
+                    let level_n = nodes.div_ceil(arity);
+                    nodes = level_n;
+                    let t_init = std::time::Instant::now();
+                    for g in 0..k_chunk {
+                        let group = HarmonyGroup::new_with_backend(
+                            level_n as u32,
+                            sib_w,
+                            0,
+                            &master_prp_key,
+                            ((k_index + k_chunk)
+                                + index_sib_levels * k_index
+                                + sl * k_chunk
+                                + g) as u32,
+                            prp_backend,
+                        )
+                        .map_err(|e| {
+                            PirError::BackendState(format!(
+                                "CHUNK sib HarmonyGroup init: {:?}",
+                                e
+                            ))
+                        })?;
+                        chunk_sib_groups.insert((sl, g as u8), group);
+                    }
+                    let dt_init = t_init.elapsed();
+                    let t_fetch = std::time::Instant::now();
+                    let profile = fetch_and_load_sib_hints_into_map(
+                        hint_secondary.as_mut(),
+                        &mut chunk_sib_groups,
+                        sl,
+                        db_id,
+                        20 + sl as u8,
+                        k_chunk as u8,
+                        &master_prp_key,
+                        prp_backend,
+                    )
+                    .await?;
+                    let dt_fetch = t_fetch.elapsed();
+                    if std::env::var("HARMONY_BENCH").is_ok() {
+                        eprintln!(
+                            "[HARMONY_BENCH]   sib CHUNK L{} (parallel): group_init={:?}  fetch+load={:?}  (k={}, level_n={})",
+                            sl, dt_init, dt_fetch, k_chunk, level_n,
+                        );
+                    }
+                    profiles.push(profile);
+                }
+                Ok::<_, PirError>((hint_secondary, chunk_sib_groups, profiles))
+            };
+
+            #[cfg(not(target_arch = "wasm32"))]
+            let (idx_out, chk_out) = tokio::try_join!(index_fut, chunk_fut)?;
+            #[cfg(target_arch = "wasm32")]
+            let (idx_out, chk_out) = futures::future::try_join(index_fut, chunk_fut).await?;
+
+            let (hp, idx_groups, idx_profiles) = idx_out;
+            let (hs, chk_groups, chk_profiles) = chk_out;
+
+            // Restore connections + sib groups to self.
+            self.hint_conn = Some(hp);
+            self.hint_conn_secondary = Some(hs);
+            self.index_sib_groups = idx_groups;
+            self.chunk_sib_groups = chk_groups;
+
+            // Record one round per fetched level (deferred from inside
+            // the parallel futures — `record_round` needs `&mut self`
+            // which we couldn't hold there).
+            for p in idx_profiles {
+                self.record_round(p);
             }
-            let dt_init = t_init.elapsed();
-            let t_fetch = std::time::Instant::now();
-            self.fetch_and_load_hints_into(
-                db_info.db_id,
-                20 + sl as u8,
-                k_chunk as u8,
-                HintTarget::ChunkSib(sl),
-                None,
-            )
-            .await?;
-            let dt_fetch = t_fetch.elapsed();
-            if std::env::var("HARMONY_BENCH").is_ok() {
-                eprintln!(
-                    "[HARMONY_BENCH]   sib CHUNK L{}: group_init={:?}  fetch+load_hints={:?}  (k={}, level_n={})",
-                    sl, dt_init, dt_fetch, k_chunk, level_n,
+            for p in chk_profiles {
+                self.record_round(p);
+            }
+
+            log::info!(
+                "[PIR-AUDIT] HarmonyPIR sibling init (parallel 2-socket): INDEX L0..{} + CHUNK L0..{} fetched concurrently",
+                index_sib_levels,
+                chunk_sib_levels
+            );
+        } else {
+            // ── Single-socket fallback path (pre-pool semantics) ──
+
+            // ── INDEX sibling groups ───────────────────────────────────────
+            let mut nodes: u64 = db_info.index_bins as u64;
+            for sl in 0..index_sib_levels {
+                let level_n = nodes.div_ceil(arity);
+                nodes = level_n;
+                let t_init = std::time::Instant::now();
+                for g in 0..k_index {
+                    let group = HarmonyGroup::new_with_backend(
+                        level_n as u32,
+                        sib_w,
+                        0,
+                        &self.master_prp_key,
+                        // Matches server `compute_hints_for_group` for level 10+sl:
+                        //   k_offset = (k_index + k_chunk) + sl * k_index
+                        //   derived_key uses k_offset + group_id.
+                        ((k_index + k_chunk) + sl * k_index + g) as u32,
+                        self.prp_backend,
+                    )
+                    .map_err(|e| {
+                        PirError::BackendState(format!("INDEX sib HarmonyGroup init: {:?}", e))
+                    })?;
+                    self.index_sib_groups.insert((sl, g as u8), group);
+                }
+                let dt_init = t_init.elapsed();
+                let t_fetch = std::time::Instant::now();
+                self.fetch_and_load_hints_into(
+                    db_info.db_id,
+                    10 + sl as u8,
+                    k_index as u8,
+                    HintTarget::IndexSib(sl),
+                    None,
+                )
+                .await?;
+                let dt_fetch = t_fetch.elapsed();
+                if std::env::var("HARMONY_BENCH").is_ok() {
+                    eprintln!(
+                        "[HARMONY_BENCH]   sib INDEX L{}: group_init={:?}  fetch+load_hints={:?}  (k={}, level_n={})",
+                        sl, dt_init, dt_fetch, k_index, level_n,
+                    );
+                }
+                log::info!(
+                    "[PIR-AUDIT] HarmonyPIR INDEX sib L{}: loaded hints for {} groups (n={})",
+                    sl, k_index, level_n
                 );
             }
-            log::info!(
-                "[PIR-AUDIT] HarmonyPIR CHUNK sib L{}: loaded hints for {} groups (n={})",
-                sl, k_chunk, level_n
-            );
+
+            // ── CHUNK sibling groups ───────────────────────────────────────
+            let mut nodes: u64 = db_info.chunk_bins as u64;
+            for sl in 0..chunk_sib_levels {
+                let level_n = nodes.div_ceil(arity);
+                nodes = level_n;
+                let t_init = std::time::Instant::now();
+                for g in 0..k_chunk {
+                    let group = HarmonyGroup::new_with_backend(
+                        level_n as u32,
+                        sib_w,
+                        0,
+                        &self.master_prp_key,
+                        // Matches server `compute_hints_for_group` for level 20+sl:
+                        //   k_offset = (k_index + k_chunk)
+                        //            + index_sib_levels * k_index
+                        //            + sl * k_chunk
+                        ((k_index + k_chunk)
+                            + index_sib_levels * k_index
+                            + sl * k_chunk
+                            + g) as u32,
+                        self.prp_backend,
+                    )
+                    .map_err(|e| {
+                        PirError::BackendState(format!("CHUNK sib HarmonyGroup init: {:?}", e))
+                    })?;
+                    self.chunk_sib_groups.insert((sl, g as u8), group);
+                }
+                let dt_init = t_init.elapsed();
+                let t_fetch = std::time::Instant::now();
+                self.fetch_and_load_hints_into(
+                    db_info.db_id,
+                    20 + sl as u8,
+                    k_chunk as u8,
+                    HintTarget::ChunkSib(sl),
+                    None,
+                )
+                .await?;
+                let dt_fetch = t_fetch.elapsed();
+                if std::env::var("HARMONY_BENCH").is_ok() {
+                    eprintln!(
+                        "[HARMONY_BENCH]   sib CHUNK L{}: group_init={:?}  fetch+load_hints={:?}  (k={}, level_n={})",
+                        sl, dt_init, dt_fetch, k_chunk, level_n,
+                    );
+                }
+                log::info!(
+                    "[PIR-AUDIT] HarmonyPIR CHUNK sib L{}: loaded hints for {} groups (n={})",
+                    sl, k_chunk, level_n
+                );
+            }
         }
 
         self.sibling_hints_loaded = Some(db_info.db_id);
@@ -4287,6 +4464,123 @@ impl HarmonyClient {
     }
 }
 
+/// Free-function variant of [`HarmonyClient::fetch_and_load_hints_into`]
+/// for sibling hints — takes the connection and the specific sib_groups
+/// map by mutable reference so two instances can run on disjoint state
+/// in parallel via `tokio::try_join!`.
+///
+/// Used by the parallel path in `ensure_sibling_groups_ready` when a
+/// secondary hint socket is available: INDEX sibling hints fetch on
+/// the primary hint conn into `index_sib_groups`, CHUNK sibling hints
+/// on the secondary into `chunk_sib_groups`, with both futures
+/// polled concurrently.
+///
+/// Returns the `RoundProfile` to be recorded by the caller after the
+/// parallel join completes — `record_round` needs `&mut self`, which
+/// we don't hold inside the parallel future.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_and_load_sib_hints_into_map(
+    conn: &mut dyn PirTransport,
+    sib_groups: &mut HashMap<(usize, u8), HarmonyGroup>,
+    sib_level: usize,
+    db_id: u8,
+    wire_level: u8,
+    num_groups: u8,
+    master_prp_key: &[u8; 16],
+    prp_backend: u8,
+) -> PirResult<RoundProfile> {
+    let mut payload = Vec::with_capacity(16 + 1 + 1 + 1 + num_groups as usize + 1);
+    payload.extend_from_slice(master_prp_key);
+    payload.push(prp_backend);
+    payload.push(wire_level);
+    payload.push(num_groups);
+    for g in 0..num_groups {
+        payload.push(g);
+    }
+    if db_id != 0 {
+        payload.push(db_id);
+    }
+    let request = encode_request(REQ_HARMONY_HINTS, &payload);
+    let request_bytes = request.len() as u64;
+
+    let t_send = std::time::Instant::now();
+    conn.send(request).await?;
+    let dt_send = t_send.elapsed();
+
+    let mut received = 0u32;
+    let mut total_response_bytes: u64 = 0;
+    let t_first_byte = std::time::Instant::now();
+    let mut dt_first: Option<std::time::Duration> = None;
+    let mut dt_recv_total = std::time::Duration::ZERO;
+    let mut dt_load_total = std::time::Duration::ZERO;
+    while received < num_groups as u32 {
+        let t_msg = std::time::Instant::now();
+        let msg = conn.recv().await?;
+        dt_recv_total += t_msg.elapsed();
+        if dt_first.is_none() {
+            dt_first = Some(t_first_byte.elapsed());
+        }
+        total_response_bytes = total_response_bytes.saturating_add(msg.len() as u64);
+        if msg.len() < 5 {
+            return Err(PirError::Protocol("truncated sib hint response".into()));
+        }
+        let body = &msg[4..];
+        if body.is_empty() {
+            return Err(PirError::Protocol("empty sib hint response body".into()));
+        }
+        if body[0] == RESP_ERROR {
+            let reason = if body.len() > 1 {
+                String::from_utf8_lossy(&body[1..]).to_string()
+            } else {
+                "hint server error".into()
+            };
+            return Err(PirError::ServerError(reason));
+        }
+        if body[0] != RESP_HARMONY_HINTS {
+            return Err(PirError::Protocol(format!(
+                "unexpected sib hint response byte: 0x{:02x}",
+                body[0]
+            )));
+        }
+        if body.len() < 14 {
+            return Err(PirError::Protocol("sib hint response header truncated".into()));
+        }
+        let group_id = body[1];
+        let hints_data = &body[14..];
+        let group = sib_groups.get_mut(&(sib_level, group_id)).ok_or_else(|| {
+            PirError::Protocol(format!(
+                "sib hint for unknown group ({}, {}) at wire level {}",
+                sib_level, group_id, wire_level
+            ))
+        })?;
+        let t_load = std::time::Instant::now();
+        group
+            .load_hints(hints_data)
+            .map_err(|e| PirError::BackendState(format!("load_hints: {:?}", e)))?;
+        dt_load_total += t_load.elapsed();
+        received += 1;
+    }
+
+    if std::env::var("HARMONY_BENCH").is_ok() {
+        eprintln!(
+            "[HARMONY_BENCH]     sib_fetch(level={:02}): send={:?} first_byte={:?} recv_total={:?} load_total={:?} groups={} bytes={}",
+            wire_level, dt_send,
+            dt_first.unwrap_or_default(),
+            dt_recv_total, dt_load_total,
+            num_groups, total_response_bytes,
+        );
+    }
+
+    Ok(RoundProfile {
+        kind: RoundKind::HarmonyHintRefresh,
+        server_id: 1,
+        db_id: Some(db_id),
+        request_bytes,
+        response_bytes: total_response_bytes,
+        items: vec![1u32; num_groups as usize],
+    })
+}
+
 #[async_trait]
 impl PirClient for HarmonyClient {
     fn backend_type(&self) -> PirBackendType {
@@ -4302,90 +4596,164 @@ impl PirClient for HarmonyClient {
         );
         self.notify_state(ConnectionState::Connecting);
 
-        // Pool size: 1 = single-socket (legacy behaviour); 2 = open a
-        // secondary query socket too so parallel paths can fan rounds
-        // across A/B. We cap at 2 today — the structurally parallel
-        // axis count maxes out at 3 (CHUNK pair × INDEX-Merkle pass-pair
-        // × CHUNK-Merkle level), and within-level fan-out beyond the
+        // Pool sizes: 1 = single-socket (legacy behaviour); 2 = open a
+        // secondary socket too so parallel paths can fan rounds across
+        // A/B. We cap at 2 today — the structurally parallel axis
+        // count maxes out at 3 and within-level fan-out beyond the
         // current pipelining gives diminishing returns. Default is 2
         // because the iperf data on the public deployment shows
-        // ~3× wall-time savings vs single socket.
-        let pool_size: usize = std::env::var("HARMONY_QUERY_POOL_SIZE")
+        // ~3× wall-time savings vs single socket per server.
+        //
+        // `HARMONY_QUERY_POOL_SIZE` controls pir2 (query server).
+        // `HARMONY_HINT_POOL_SIZE`  controls pir1 (hint  server).
+        // Independent because the two servers have independent
+        // bandwidth-delay-product characteristics.
+        let query_pool: usize = std::env::var("HARMONY_QUERY_POOL_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2)
+            .clamp(1, 2);
+        let hint_pool: usize = std::env::var("HARMONY_HINT_POOL_SIZE")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(2)
             .clamp(1, 2);
 
-        // Native → tokio::try_join! over tokio-tungstenite; WASM →
-        // futures::future::try_join over web-sys WebSocket. See `DpfClient`
-        // for the same pattern with an explanation. The secondary
-        // query socket is dialled in parallel with the primary two so
-        // the cold-connect cost is one RTT, not three.
+        // Dial up to 4 sockets in parallel (2× hint, 2× query) so the
+        // cold-connect cost is one RTT, not four. The secondary slots
+        // for each server are `Option` because pool_size=1 leaves them
+        // empty (single-socket fallback).
+        type DialResult = PirResult<(
+            Box<dyn PirTransport>,
+            Option<Box<dyn PirTransport>>,
+            Box<dyn PirTransport>,
+            Option<Box<dyn PirTransport>>,
+        )>;
         #[cfg(not(target_arch = "wasm32"))]
-        let dial_result: PirResult<(
-            Box<dyn PirTransport>,
-            Box<dyn PirTransport>,
-            Option<Box<dyn PirTransport>>,
-        )> = async {
-            if pool_size >= 2 {
-                let (h, q1, q2) = tokio::try_join!(
-                    WsConnection::connect(&self.hint_server_url),
-                    WsConnection::connect(&self.query_server_url),
-                    WsConnection::connect(&self.query_server_url),
-                )?;
-                Ok((
-                    Box::new(h) as Box<dyn PirTransport>,
-                    Box::new(q1) as Box<dyn PirTransport>,
-                    Some(Box::new(q2) as Box<dyn PirTransport>),
-                ))
-            } else {
-                let (h, q) = tokio::try_join!(
-                    WsConnection::connect(&self.hint_server_url),
-                    WsConnection::connect(&self.query_server_url),
-                )?;
-                Ok((
-                    Box::new(h) as Box<dyn PirTransport>,
-                    Box::new(q) as Box<dyn PirTransport>,
-                    None,
-                ))
+        let dial_result: DialResult = {
+            // tokio::try_join! is variadic up to 64 args at compile
+            // time; we use a small fixed shape (1-4 sockets) here.
+            let hint_primary = WsConnection::connect(&self.hint_server_url);
+            let query_primary = WsConnection::connect(&self.query_server_url);
+            match (hint_pool >= 2, query_pool >= 2) {
+                (true, true) => {
+                    let hint_secondary = WsConnection::connect(&self.hint_server_url);
+                    let query_secondary = WsConnection::connect(&self.query_server_url);
+                    let (h, hs, q, qs) = tokio::try_join!(
+                        hint_primary,
+                        hint_secondary,
+                        query_primary,
+                        query_secondary
+                    )?;
+                    Ok((
+                        Box::new(h) as Box<dyn PirTransport>,
+                        Some(Box::new(hs) as Box<dyn PirTransport>),
+                        Box::new(q) as Box<dyn PirTransport>,
+                        Some(Box::new(qs) as Box<dyn PirTransport>),
+                    ))
+                }
+                (true, false) => {
+                    let hint_secondary = WsConnection::connect(&self.hint_server_url);
+                    let (h, hs, q) =
+                        tokio::try_join!(hint_primary, hint_secondary, query_primary)?;
+                    Ok((
+                        Box::new(h) as Box<dyn PirTransport>,
+                        Some(Box::new(hs) as Box<dyn PirTransport>),
+                        Box::new(q) as Box<dyn PirTransport>,
+                        None,
+                    ))
+                }
+                (false, true) => {
+                    let query_secondary = WsConnection::connect(&self.query_server_url);
+                    let (h, q, qs) =
+                        tokio::try_join!(hint_primary, query_primary, query_secondary)?;
+                    Ok((
+                        Box::new(h) as Box<dyn PirTransport>,
+                        None,
+                        Box::new(q) as Box<dyn PirTransport>,
+                        Some(Box::new(qs) as Box<dyn PirTransport>),
+                    ))
+                }
+                (false, false) => {
+                    let (h, q) = tokio::try_join!(hint_primary, query_primary)?;
+                    Ok((
+                        Box::new(h) as Box<dyn PirTransport>,
+                        None,
+                        Box::new(q) as Box<dyn PirTransport>,
+                        None,
+                    ))
+                }
             }
-        }
-        .await;
+        };
         #[cfg(target_arch = "wasm32")]
-        let dial_result: PirResult<(
-            Box<dyn PirTransport>,
-            Box<dyn PirTransport>,
-            Option<Box<dyn PirTransport>>,
-        )> = async {
+        let dial_result: DialResult = async {
             use crate::wasm_transport::WasmWebSocketTransport;
-            if pool_size >= 2 {
-                let (h, q1, q2) = futures::future::try_join3(
-                    WasmWebSocketTransport::connect(&self.hint_server_url),
-                    WasmWebSocketTransport::connect(&self.query_server_url),
-                    WasmWebSocketTransport::connect(&self.query_server_url),
-                )
-                .await?;
-                Ok((
-                    Box::new(h) as Box<dyn PirTransport>,
-                    Box::new(q1) as Box<dyn PirTransport>,
-                    Some(Box::new(q2) as Box<dyn PirTransport>),
-                ))
-            } else {
-                let (h, q) = futures::future::try_join(
-                    WasmWebSocketTransport::connect(&self.hint_server_url),
-                    WasmWebSocketTransport::connect(&self.query_server_url),
-                )
-                .await?;
-                Ok((
-                    Box::new(h) as Box<dyn PirTransport>,
-                    Box::new(q) as Box<dyn PirTransport>,
-                    None,
-                ))
+            // wasm32 doesn't have a 4-tuple try_join; fall back to
+            // try_join3 / try_join2 with the same shape conditionals.
+            let hint_primary = WasmWebSocketTransport::connect(&self.hint_server_url);
+            let query_primary = WasmWebSocketTransport::connect(&self.query_server_url);
+            match (hint_pool >= 2, query_pool >= 2) {
+                (true, true) => {
+                    let hint_secondary =
+                        WasmWebSocketTransport::connect(&self.hint_server_url);
+                    let query_secondary =
+                        WasmWebSocketTransport::connect(&self.query_server_url);
+                    // Pair-up two try_joins to avoid needing a 4-arg variant.
+                    let (a, b) = futures::future::try_join(
+                        futures::future::try_join(hint_primary, hint_secondary),
+                        futures::future::try_join(query_primary, query_secondary),
+                    )
+                    .await?;
+                    let (h, hs) = a;
+                    let (q, qs) = b;
+                    Ok((
+                        Box::new(h) as Box<dyn PirTransport>,
+                        Some(Box::new(hs) as Box<dyn PirTransport>),
+                        Box::new(q) as Box<dyn PirTransport>,
+                        Some(Box::new(qs) as Box<dyn PirTransport>),
+                    ))
+                }
+                (true, false) => {
+                    let hint_secondary =
+                        WasmWebSocketTransport::connect(&self.hint_server_url);
+                    let (h, hs, q) =
+                        futures::future::try_join3(hint_primary, hint_secondary, query_primary)
+                            .await?;
+                    Ok((
+                        Box::new(h) as Box<dyn PirTransport>,
+                        Some(Box::new(hs) as Box<dyn PirTransport>),
+                        Box::new(q) as Box<dyn PirTransport>,
+                        None,
+                    ))
+                }
+                (false, true) => {
+                    let query_secondary =
+                        WasmWebSocketTransport::connect(&self.query_server_url);
+                    let (h, q, qs) =
+                        futures::future::try_join3(hint_primary, query_primary, query_secondary)
+                            .await?;
+                    Ok((
+                        Box::new(h) as Box<dyn PirTransport>,
+                        None,
+                        Box::new(q) as Box<dyn PirTransport>,
+                        Some(Box::new(qs) as Box<dyn PirTransport>),
+                    ))
+                }
+                (false, false) => {
+                    let (h, q) = futures::future::try_join(hint_primary, query_primary).await?;
+                    Ok((
+                        Box::new(h) as Box<dyn PirTransport>,
+                        None,
+                        Box::new(q) as Box<dyn PirTransport>,
+                        None,
+                    ))
+                }
             }
         }
         .await;
 
-        let (hint_conn, query_conn, query_conn_secondary) = match dial_result {
+        let (hint_conn, hint_conn_secondary, query_conn, query_conn_secondary) = match dial_result
+        {
             Ok(v) => v,
             Err(e) => {
                 // Handshake failed — fall back to `Disconnected`, not
@@ -4397,6 +4765,7 @@ impl PirClient for HarmonyClient {
         };
 
         self.hint_conn = Some(hint_conn);
+        self.hint_conn_secondary = hint_conn_secondary;
         self.query_conn = Some(query_conn);
         self.query_conn_secondary = query_conn_secondary;
 
@@ -4408,6 +4777,9 @@ impl PirClient for HarmonyClient {
             if let Some(ref mut c) = self.hint_conn {
                 c.set_metrics_recorder(Some(rec.clone()), "harmony");
             }
+            if let Some(ref mut c) = self.hint_conn_secondary {
+                c.set_metrics_recorder(Some(rec.clone()), "harmony");
+            }
             if let Some(ref mut c) = self.query_conn {
                 c.set_metrics_recorder(Some(rec.clone()), "harmony");
             }
@@ -4417,10 +4789,14 @@ impl PirClient for HarmonyClient {
         }
 
         log::info!(
-            "Connected to HarmonyPIR servers (query pool size {})",
+            "Connected to HarmonyPIR servers (hint pool size {}, query pool size {})",
+            if self.hint_conn_secondary.is_some() { 2 } else { 1 },
             if self.query_conn_secondary.is_some() { 2 } else { 1 },
         );
         self.fire_connect(&self.hint_server_url);
+        if self.hint_conn_secondary.is_some() {
+            self.fire_connect(&self.hint_server_url);
+        }
         self.fire_connect(&self.query_server_url);
         if self.query_conn_secondary.is_some() {
             self.fire_connect(&self.query_server_url);
@@ -4434,6 +4810,9 @@ impl PirClient for HarmonyClient {
         if let Some(ref mut conn) = self.hint_conn {
             let _ = conn.close().await;
         }
+        if let Some(ref mut conn) = self.hint_conn_secondary {
+            let _ = conn.close().await;
+        }
         if let Some(ref mut conn) = self.query_conn {
             let _ = conn.close().await;
         }
@@ -4441,6 +4820,7 @@ impl PirClient for HarmonyClient {
             let _ = conn.close().await;
         }
         self.hint_conn = None;
+        self.hint_conn_secondary = None;
         self.query_conn = None;
         self.query_conn_secondary = None;
         self.catalog = None;
