@@ -45,26 +45,6 @@
             --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
         }
 
-        [data-theme="dark"] {
-            --bg:        oklch(18% 0.01 260);
-            --panel:     oklch(21% 0.01 260);
-            --sunken:    oklch(16% 0.01 260);
-            --ink:       oklch(94% 0.005 80);
-            --ink-soft:  oklch(78% 0.008 80);
-            --ink-mute:  oklch(62% 0.008 80);
-            --ink-faint: oklch(48% 0.008 80);
-            --line:      oklch(28% 0.01 260);
-            --line-soft: oklch(24% 0.01 260);
-            --accent-ink:  oklch(82% 0.12 70);
-            --accent-wash: oklch(30% 0.04 70);
-            --accent-line: oklch(42% 0.08 70);
-            --ok-wash:  oklch(28% 0.04 155);
-            --err-wash: oklch(30% 0.05 25);
-        }
-        [data-density="compact"] { --pad: 10px; --gap: 8px; }
-        :root                    { --pad: 14px; --gap: 12px; }
-        [data-density="cozy"]    { --pad: 18px; --gap: 16px; }
-
         * { box-sizing: border-box; }
         html, body { margin: 0; padding: 0; }
         body {
@@ -697,67 +677,6 @@
         .log-entry.success { color: oklch(78% 0.12 155); }
         .log-entry.error { color: oklch(72% 0.18 25); }
 
-        /* ── tweaks panel ─────────────────────────────────────────── */
-        .tweaks {
-            position: fixed; right: 20px; bottom: 240px; z-index: 50;
-            width: 260px;
-            background: var(--panel);
-            border: 1px solid var(--line);
-            border-radius: var(--r-lg);
-            box-shadow: var(--shadow);
-            display: none; overflow: hidden;
-        }
-        .tweaks.open { display: block; }
-        .tweaks-head {
-            padding: 10px 14px; border-bottom: 1px solid var(--line);
-            font-size: 12px; font-weight: 600;
-            display: flex; justify-content: space-between; align-items: center;
-        }
-        .tweaks-body { padding: 12px 14px; display: flex; flex-direction: column; gap: 12px; }
-        .tweaks-row { display: flex; flex-direction: column; gap: 6px; }
-        .tweaks-row label {
-            font-size: 10.5px; letter-spacing: 0.08em; text-transform: uppercase;
-            color: var(--ink-mute);
-        }
-        .tweaks-seg {
-            display: flex; border: 1px solid var(--line); border-radius: var(--r); overflow: hidden;
-        }
-        .tweaks-seg button {
-            flex: 1; padding: 5px 8px; font: inherit; font-size: 11.5px;
-            background: transparent; color: var(--ink-mute); border: none;
-            border-right: 1px solid var(--line); cursor: pointer;
-            font-family: var(--mono);
-        }
-        .tweaks-seg button:last-child { border-right: none; }
-        .tweaks-seg button.on { background: var(--accent-wash); color: var(--accent-ink); }
-        .fab-tweaks {
-            position: fixed; right: 20px; bottom: 50px; z-index: 49;
-            background: var(--panel); border: 1px solid var(--line);
-            border-radius: 999px; padding: 7px 12px;
-            font-size: 12px; font-family: var(--mono);
-            cursor: pointer; box-shadow: var(--shadow);
-            color: var(--ink-soft);
-            display: inline-flex; align-items: center; gap: 6px;
-        }
-        .fab-tweaks::before {
-            content: ""; width: 6px; height: 6px; background: var(--accent);
-            border-radius: 999px; display: inline-block;
-        }
-
-        /* accent variants */
-        body[data-accent="slate"] {
-            --accent:      oklch(55% 0.06 250);
-            --accent-ink:  oklch(38% 0.07 250);
-            --accent-wash: oklch(95% 0.02 250);
-            --accent-line: oklch(82% 0.04 250);
-        }
-        body[data-accent="violet"] {
-            --accent:      oklch(62% 0.16 290);
-            --accent-ink:  oklch(42% 0.14 290);
-            --accent-wash: oklch(96% 0.03 290);
-            --accent-line: oklch(86% 0.07 290);
-        }
-
         /* responsive */
         @media (max-width: 1080px) {
             .grid { grid-template-columns: 1fr; }
@@ -872,7 +791,7 @@
     <script src="/wasm/onionpir_client.js"></script>
     <!-- HarmonyPIR WASM loaded dynamically in loadWasm() based on PRP selection -->
 </head>
-<body data-theme="light" data-density="cozy">
+<body>
 
     <!-- ── TOP BAR ──────────────────────────────────────────────── -->
     <header class="topbar">
@@ -1500,39 +1419,6 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
             </div>
         </div>
     </section>
-
-    <!-- ── TWEAKS ────────────────────────────────────────────────── -->
-    <div class="tweaks" id="tweaksPanel">
-        <div class="tweaks-head">
-            <span>Tweaks</span>
-            <button class="btn ghost sm" id="tweaksClose" style="padding: 2px 8px;">×</button>
-        </div>
-        <div class="tweaks-body">
-            <div class="tweaks-row">
-                <label>Theme</label>
-                <div class="tweaks-seg" data-tweak="theme">
-                    <button data-v="light">light</button>
-                    <button data-v="dark">dark</button>
-                </div>
-            </div>
-            <div class="tweaks-row">
-                <label>Density</label>
-                <div class="tweaks-seg" data-tweak="density">
-                    <button data-v="compact">compact</button>
-                    <button data-v="cozy">cozy</button>
-                </div>
-            </div>
-            <div class="tweaks-row">
-                <label>Accent</label>
-                <div class="tweaks-seg" data-tweak="accent">
-                    <button data-v="amber">amber</button>
-                    <button data-v="slate">slate</button>
-                    <button data-v="violet">violet</button>
-                </div>
-            </div>
-        </div>
-    </div>
-    <button class="fab-tweaks" id="fabTweaks">Tweaks</button>
 
     <script type="module">
         import { BatchPirClientAdapter, OnionPirWebClient, HarmonyPirClientAdapter, hexToBytes, bytesToHex, scriptHash, scriptPubKeyToAddress, addressToScriptPubKey, decompileScript, decodeDeltaData, computeSyncPlan, mergeDeltaIntoSnapshot, mergeDeltaIntoHarmonySnapshot, SyncController, describeStep, initSdkWasm, isSdkWasmReady, AMD_TURIN_ARK_FINGERPRINT, PIR1_PIN, PIR2_TIER3_PIN } from './src/index.ts';
@@ -4754,40 +4640,6 @@ Cell at position R = ${r}:
                 term.classList.toggle('collapsed');
                 if (toggle) toggle.textContent = term.classList.contains('collapsed') ? '▴ expand' : '▾ collapse';
             });
-        })();
-
-        // ── Tweaks (theme / density / accent), persisted to localStorage ──
-        (function wireTweaks() {
-            const KEY = 'bitcoinpir.tweaks';
-            const defaults = { theme: 'light', density: 'cozy', accent: 'amber' };
-            let state;
-            try { state = { ...defaults, ...JSON.parse(localStorage.getItem(KEY) || '{}') }; }
-            catch { state = { ...defaults }; }
-
-            function apply() {
-                document.body.dataset.theme = state.theme;
-                document.body.dataset.density = state.density;
-                document.body.dataset.accent = state.accent;
-                document.querySelectorAll('.tweaks-seg').forEach(seg => {
-                    const k = seg.dataset.tweak;
-                    [...seg.children].forEach(b => b.classList.toggle('on', b.dataset.v === state[k]));
-                });
-            }
-            function persist(partial) {
-                Object.assign(state, partial);
-                apply();
-                try { localStorage.setItem(KEY, JSON.stringify(state)); } catch {}
-            }
-            document.querySelectorAll('.tweaks-seg').forEach(seg => {
-                const k = seg.dataset.tweak;
-                [...seg.children].forEach(b => b.addEventListener('click', () => persist({ [k]: b.dataset.v })));
-            });
-            const fab = document.getElementById('fabTweaks');
-            const panel = document.getElementById('tweaksPanel');
-            const closeBtn = document.getElementById('tweaksClose');
-            if (fab && panel) fab.addEventListener('click', () => panel.classList.toggle('open'));
-            if (closeBtn && panel) closeBtn.addEventListener('click', () => panel.classList.remove('open'));
-            apply();
         })();
     </script>
 </body>
