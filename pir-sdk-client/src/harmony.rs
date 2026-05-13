@@ -4264,28 +4264,52 @@ fn find_chunk_in_result(result: &[u8], chunk_id: u32) -> Option<&[u8]> {
 }
 
 /// Decode concatenated UTXO chunk bytes into a `Vec<UtxoEntry>`.
+/// Decode UTXO entries from assembled chunk bytes.
+///
+/// Wire format (matches the build pipeline at
+/// `build/src/build_utxo_chunks.rs::serialize_group_sorted` and the
+/// reference decoder at `pir_core::codec::parse_utxo_data`):
+///
+///   `[varint num_utxos][per entry: 32B txid | varint vout | varint amount]`
+///
+/// Padding bytes after the last entry (the assembled chunk_data is a
+/// `N * CHUNK_SIZE`-byte buffer; the encoded entries usually don't fill
+/// it exactly) are ignored.
+///
+/// **Bug history (2026-05-13).** The old in-file decoder here (and in
+/// `dpf.rs`) assumed fixed 40-byte slots — `[32B txid | 4B vout LE |
+/// 4B amount LE]` — which silently produced garbage `vout` / `amount`
+/// values from byte ranges that actually held the varint stream's
+/// continuation bytes. OnionPIR's decoder (`onion.rs:1892`) and
+/// `pir_core::codec::parse_utxo_data` were always correct; the
+/// regression only affected DPF + HarmonyPIR.
 fn decode_utxo_entries(data: &[u8]) -> Vec<UtxoEntry> {
     let mut entries = Vec::new();
-    let mut pos = 0;
-    while pos + CHUNK_SIZE <= data.len() {
+    if data.is_empty() {
+        return entries;
+    }
+    let (count, mut pos) = pir_core::codec::read_varint(data);
+    for _ in 0..count {
+        if pos + 32 > data.len() {
+            break;
+        }
         let mut txid = [0u8; 32];
         txid.copy_from_slice(&data[pos..pos + 32]);
         pos += 32;
-
-        let vout = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-        pos += 4;
-
-        let amount_compressed = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-        pos += 4;
-
-        if txid.iter().all(|&b| b == 0) {
-            continue;
+        if pos >= data.len() {
+            break;
         }
-
+        let (vout, vr) = pir_core::codec::read_varint(&data[pos..]);
+        pos += vr;
+        if pos >= data.len() {
+            break;
+        }
+        let (amount, ar) = pir_core::codec::read_varint(&data[pos..]);
+        pos += ar;
         entries.push(UtxoEntry {
             txid,
-            vout,
-            amount_sats: amount_compressed as u64,
+            vout: vout as u32,
+            amount_sats: amount,
         });
     }
     entries
