@@ -40,8 +40,13 @@ const DEFAULT_DELTA_ROOT: &str = "/Volumes/Bitcoin/data/deltas";
 
 const SCRIPT_HASH_SIZE: usize = 20;
 
-/// OnionPIR entry size: 2048 × 15 bits / 8 = 3840 bytes.
-const PACKED_ENTRY_SIZE: usize = 3840;
+/// OnionPIR entry size derived from the linked `onionpir` crate at runtime.
+/// Pre-port (SEAL build, PlainMod=15) this was 3840 bytes hardcoded.
+/// Post-port (BV build, default CONFIG_N2048_K1) it's 3328. Mirrors the
+/// runtime-derived approach used in `gen_1_onion::onion_entry_size`.
+fn onion_entry_size() -> usize {
+    onionpir::params_info(0).entry_size as usize
+}
 
 /// Onion index record: 20B script_hash + 4B entry_id + 2B byte_offset + 1B num_entries.
 const ONION_INDEX_RECORD_SIZE: usize = 20 + 4 + 2 + 1; // 27
@@ -58,17 +63,21 @@ struct Packer {
     entry_count: u64,
     total_padding: u64,
     total_data: u64,
+    /// Per-instance OnionPIR plaintext byte size, captured at ctor time
+    /// (matches `gen_1_onion::Packer::entry_size`).
+    entry_size: usize,
 }
 
 impl Packer {
-    fn new(file: File) -> Self {
+    fn new(file: File, entry_size: usize) -> Self {
         Packer {
             writer: BufWriter::with_capacity(1024 * 1024, file),
-            current_entry: vec![0u8; PACKED_ENTRY_SIZE],
+            current_entry: vec![0u8; entry_size],
             current_pos: 0,
             entry_count: 0,
             total_padding: 0,
             total_data: 0,
+            entry_size,
         }
     }
 
@@ -76,7 +85,7 @@ impl Packer {
     fn flush_entry(&mut self) {
         if self.current_pos > 0 {
             self.writer.write_all(&self.current_entry).unwrap();
-            self.total_padding += (PACKED_ENTRY_SIZE - self.current_pos) as u64;
+            self.total_padding += (self.entry_size - self.current_pos) as u64;
             self.entry_count += 1;
             self.current_entry.fill(0);
             self.current_pos = 0;
@@ -93,7 +102,7 @@ impl Packer {
         }
 
         // Case 1: fits in remaining space of current entry.
-        let remaining = PACKED_ENTRY_SIZE - self.current_pos;
+        let remaining = self.entry_size - self.current_pos;
         if data_len <= remaining {
             let entry_id = self.entry_count;
             let offset = self.current_pos;
@@ -101,7 +110,7 @@ impl Packer {
                 .copy_from_slice(data);
             self.current_pos += data_len;
 
-            if self.current_pos == PACKED_ENTRY_SIZE {
+            if self.current_pos == self.entry_size {
                 self.writer.write_all(&self.current_entry).unwrap();
                 self.entry_count += 1;
                 self.current_entry.fill(0);
@@ -114,11 +123,11 @@ impl Packer {
         self.flush_entry();
         let entry_id = self.entry_count;
 
-        if data_len <= PACKED_ENTRY_SIZE {
+        if data_len <= self.entry_size {
             self.current_entry[..data_len].copy_from_slice(data);
             self.current_pos = data_len;
 
-            if self.current_pos == PACKED_ENTRY_SIZE {
+            if self.current_pos == self.entry_size {
                 self.writer.write_all(&self.current_entry).unwrap();
                 self.entry_count += 1;
                 self.current_entry.fill(0);
@@ -128,7 +137,7 @@ impl Packer {
         }
 
         // Case 3: spans multiple entries.
-        let num_entries = (data_len + PACKED_ENTRY_SIZE - 1) / PACKED_ENTRY_SIZE;
+        let num_entries = (data_len + self.entry_size - 1) / self.entry_size;
         assert!(
             num_entries <= 255,
             "delta data {} bytes needs {} entries, exceeds u8",
@@ -137,7 +146,7 @@ impl Packer {
 
         let mut written = 0;
         for i in 0..num_entries {
-            let chunk_len = (data_len - written).min(PACKED_ENTRY_SIZE);
+            let chunk_len = (data_len - written).min(self.entry_size);
             self.current_entry[..chunk_len]
                 .copy_from_slice(&data[written..written + chunk_len]);
             written += chunk_len;
@@ -149,7 +158,7 @@ impl Packer {
                 self.current_pos = 0;
             } else {
                 self.current_pos = chunk_len;
-                if self.current_pos == PACKED_ENTRY_SIZE {
+                if self.current_pos == self.entry_size {
                     self.writer.write_all(&self.current_entry).unwrap();
                     self.entry_count += 1;
                     self.current_entry.fill(0);
@@ -239,11 +248,15 @@ fn main() {
     let packed_path = format!("{}/onion_packed_entries.bin", cli.data_dir);
     let index_path = format!("{}/onion_index.bin", cli.data_dir);
 
-    println!("=== delta_gen_1_onion: Pack Delta into OnionPIR 3840B Entries ===");
+    // OnionPIRv2 port (commit 5b extension): pull entry size from the
+    // linked onionpir crate (3328 default post-port, was 3840 pre-port).
+    let packed_entry_size = onion_entry_size();
+
+    println!("=== delta_gen_1_onion: Pack Delta into OnionPIR {}-byte Entries ===", packed_entry_size);
     println!();
     println!("Configuration:");
     println!("  Start/end height:   {} → {}", cli.start_height, cli.end_height);
-    println!("  Entry size:         {} bytes", PACKED_ENTRY_SIZE);
+    println!("  Entry size:         {} bytes (from onionpir::params_info(0))", packed_entry_size);
     println!("  Index record size:  {} bytes", ONION_INDEX_RECORD_SIZE);
     println!("  Input (grouped):    {}", input_path);
     println!("  Output packed:      {}", packed_path);
@@ -270,7 +283,7 @@ fn main() {
     // ── 2. Open output files ───────────────────────────────────────────────
     println!("[2] Opening output files...");
     let packed_file = File::create(&packed_path).expect("create packed entries file");
-    let mut packer = Packer::new(packed_file);
+    let mut packer = Packer::new(packed_file, packed_entry_size);
     let index_file = File::create(&index_path).expect("create index file");
     let mut index_writer = BufWriter::with_capacity(1024 * 1024, index_file);
     println!("  Done");
@@ -325,7 +338,7 @@ fn main() {
         }
 
         // Whale: drop entries that would span > 255 packed entries.
-        let num_blocks_if_packed = (data_len + PACKED_ENTRY_SIZE - 1) / PACKED_ENTRY_SIZE;
+        let num_blocks_if_packed = (data_len + packed_entry_size - 1) / packed_entry_size;
         if num_blocks_if_packed > 255 {
             index_writer.write_all(&script_hash).unwrap();
             index_writer.write_all(&0u32.to_le_bytes()).unwrap();
@@ -347,7 +360,7 @@ fn main() {
             size_histogram[3] += 1;
         } else if data_len <= 2000 {
             size_histogram[4] += 1;
-        } else if data_len <= PACKED_ENTRY_SIZE {
+        } else if data_len <= packed_entry_size {
             size_histogram[5] += 1;
         } else {
             size_histogram[6] += 1;
@@ -385,7 +398,7 @@ fn main() {
 
     // ── 5. Summary ─────────────────────────────────────────────────────────
     let total_elapsed = total_start.elapsed();
-    let packed_file_size = packer.entry_count * PACKED_ENTRY_SIZE as u64;
+    let packed_file_size = packer.entry_count * packed_entry_size as u64;
     let index_file_size = (total_groups + total_whale) * ONION_INDEX_RECORD_SIZE as u64;
 
     println!("=== Summary ===");
@@ -398,7 +411,7 @@ fn main() {
         "Packed file size:     {} ({} entries × {} B)",
         format_bytes(packed_file_size),
         packer.entry_count,
-        PACKED_ENTRY_SIZE
+        packed_entry_size
     );
     println!(
         "Index file size:      {} ({} entries × {} B)",

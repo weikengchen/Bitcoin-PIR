@@ -1805,7 +1805,13 @@ async fn main() {
                 // OnionPIRv2 port: KeyStore::new() takes no args now.
                 let mut key_store = Box::new(KeyStore::new());
 
-                // Set up chunk servers
+                // Set up chunk servers.
+                //
+                // OnionPIRv2 port (commit 6 / runtime-num_pt update): post the
+                // upstream `target_num_pt` refactor (`fb14f4e447b...`),
+                // `params_info(chunk_bins)` returns the LOCAL per-instance
+                // shape (small server sized for `chunk_bins` ~37K plaintexts).
+                // That's what each chunk worker's PirServer needs.
                 let p_chunk = onionpir::params_info(chunk_bins as u64);
                 let padded_chunk = p_chunk.num_entries as usize;
                 // OnionPIRv2 port: `set_shared_database` now takes
@@ -1823,6 +1829,28 @@ async fn main() {
                         ntt_mmap.len() / 8,
                     )
                 };
+
+                // Shared store's `num_pt` — what gen_2_onion's builder
+                // `PirServer::new(num_packed_entries)` was created with,
+                // which is what `set_shared_database`'s `shared_num_entries`
+                // argument wants. Pre-`fb14f4e` we passed
+                // `p_chunk.num_plaintexts` (the local per-instance value);
+                // post-refactor those are different numbers and the local
+                // one is wrong here. Derive from the NTT store file size
+                // instead — `len() / 8 / coeff_val_cnt` is the count of
+                // plaintext slots the builder saved.
+                let coeff_val_cnt =
+                    onionpir::params_info(0).coeff_val_cnt as usize;
+                assert!(
+                    coeff_val_cnt > 0
+                        && (ntt_u64_slice.len() % coeff_val_cnt) == 0,
+                    "chunk NTT store len ({} u64s) not divisible by \
+                     coeff_val_cnt ({}); file is the wrong shape",
+                    ntt_u64_slice.len(),
+                    coeff_val_cnt,
+                );
+                let chunk_shared_num_entries =
+                    (ntt_u64_slice.len() / coeff_val_cnt) as u64;
 
                 let mut chunk_index_tables: Vec<Vec<u32>> = Vec::with_capacity(k_chunk);
                 let mut chunk_servers: Vec<PirServer> = Vec::with_capacity(k_chunk);
@@ -1853,12 +1881,17 @@ async fn main() {
                         assert!(
                             server.set_shared_database(
                                 ntt_u64_slice,
-                                p_chunk.num_plaintexts,
+                                chunk_shared_num_entries,
                                 &index_table,
                             ),
-                            "set_shared_database failed (chunk worker {} group {})",
+                            "set_shared_database failed (chunk worker {} \
+                             group {}; chunk_shared_num_entries={}, \
+                             index_table.len={}, local_num_pt={})",
                             worker_label,
                             g,
+                            chunk_shared_num_entries,
+                            index_table.len(),
+                            p_chunk.num_plaintexts,
                         );
                         // OnionPIRv2 port: `set_key_store` takes Option now.
                         server.set_key_store(Some(&key_store));
@@ -1909,6 +1942,20 @@ async fn main() {
                             sib.ntt_mmap.len() / 8,
                         )
                     };
+                    // Per-level shared store's num_pt (= what gen_4's
+                    // builder saved with). Derived from file size for the
+                    // same reason as the chunk path above.
+                    assert!(
+                        coeff_val_cnt > 0
+                            && (sib_ntt_slice.len() % coeff_val_cnt) == 0,
+                        "sibling L{} NTT store len ({} u64s) not divisible \
+                         by coeff_val_cnt ({}); file is the wrong shape",
+                        li,
+                        sib_ntt_slice.len(),
+                        coeff_val_cnt,
+                    );
+                    let sib_shared_num_entries =
+                        (sib_ntt_slice.len() / coeff_val_cnt) as u64;
 
                     let mut level_index_tables: Vec<Vec<u32>> = Vec::with_capacity(sib.k);
                     let mut level_servers: Vec<PirServer> = Vec::with_capacity(sib.k);
@@ -1931,12 +1978,17 @@ async fn main() {
                             assert!(
                                 server.set_shared_database(
                                     sib_ntt_slice,
-                                    p_sib.num_plaintexts,
+                                    sib_shared_num_entries,
                                     &index_table,
                                 ),
-                                "set_shared_database failed (sibling L{} group {})",
+                                "set_shared_database failed (sibling L{} \
+                                 group {}; sib_shared_num_entries={}, \
+                                 index_table.len={}, local_num_pt={})",
                                 li,
                                 g,
+                                sib_shared_num_entries,
+                                index_table.len(),
+                                p_sib.num_plaintexts,
                             );
                             server.set_key_store(Some(&key_store));
                         }

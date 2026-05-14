@@ -24,17 +24,56 @@ that. This is the BitcoinPIR-specific punch list.
   ✅ §2 Commit 6         — SharedKeyStore audited (no-code-change); QueryQueue declined
   ✅ §2 Commit 7         — WASM swap (post-port .mjs) + TS API rename + unpack wiring (8dab8e29)
   ✅ Cleanup             — test_merkle_verify_onion runtime-arity polish
+  ✅ Upstream feature    — runtime-variable `target_num_pt` in PirParams (OnionPIRv2 fb14f4e)
+  ✅ Rebuild verified    — gen_1→gen_2→gen_3→gen_4 PASS end-to-end on chainstate at height 948454
 
 Branch: `worktree-feat+onionpir-port-migration` at
-`.claude/worktrees/feat+onionpir-port-migration/`. Eleven commits ahead
-of `d6c333de`. **Not pushed to BitcoinPIR's origin/main.**
+`.claude/worktrees/feat+onionpir-port-migration/`. **The migration is
+done, the post-port rebuild ran clean, and verification PASSED at every
+stage.**
 
-**The migration is functionally complete.** Every planned commit is
-landed or explicitly deferred with rationale. Production cut-over
-(rebuild every preprocessed_db.bin + onion_index_all.bin + Merkle
-tree-tops, rsync to pir1, swap via databases.toml, smoke a known-good
-scripthash) is unblocked and ready to execute on the operator's
-schedule.
+## Final rebuild numbers (chainstate height 948,454, 2026-05-15)
+
+| Step | Wall time | Output | Verification |
+|---|---|---|---|
+| gen_1_onion | 59 s | 946,287 entries × 3,328 B = 3.15 GB packed | — |
+| gen_2_onion | 166 s | `onion_shared_ntt.bin` 15.51 GB (num_pt = 946,688) | PASS (decrypted matches original entry, noise budget 1) |
+| gen_3_onion | 59 s | `onion_index_all.bin` 12.58 GB (75 × 160 MB per-group; padded num_pt = 10,240 PER GROUP) | PASS (tag match at slot 0, noise budget 1) |
+| gen_4_build_merkle_onion | 2 s | INDEX-MERKLE root + DATA-MERKLE root + 0.6 GB sibling NTT stores (ARITY = 104) | — |
+| **Total pipeline** | **~5 min** | **44 GB checkpoint** (onion ~28 GB + DPF/Harmony non-onion ~16 GB preserved) | — |
+
+Pre-port (for comparison): same workload took ~10 GB onion artifacts;
+post-port with per-instance num_pt: ~28 GB. The growth comes from
+needing slightly larger per-group DBs to hold the same data (entry_size
+3840 → 3328 → more entries → larger NTT store), partially offset by
+ARITY 120 → 104 reducing Merkle sibling sizes. End result: comfortably
+under Hetzner pir1's 954 GB budget; ~30 GB rsync to deploy.
+
+Pre-port preserved at `/Volumes/Bitcoin/data/preport_backup_2026-05-14/`
+(56 GB) for rollback.
+
+## What's blocking deploy from here
+
+**Nothing on the build side.** The post-port checkpoint is on disk and
+ready to rsync. Deploy gates:
+
+1. Build the post-port `unified_server` on Hetzner pir1 via the
+   existing `pir-hetzner` skill's deploy recipe.
+2. `rsync` `/Volumes/Bitcoin/data/checkpoints/948454/` (44 GB) →
+   `/home/pir/data/checkpoints/948454/` on pir1.
+3. Edit `/home/pir/data/databases.toml` if the height/path changed
+   (it didn't — same height 948454, same checkpoint dir name).
+4. `systemctl restart pir-primary pir-secondary` on pir1.
+5. Smoke a known-good scripthash via pir.chenweikeng.com against the
+   post-port WASM (already deployed in commit 7).
+
+Delta rebuilds (`delta_gen_1_onion` + downstream) can land after the
+main checkpoint cuts over — the delta files in
+`/Volumes/Bitcoin/data/deltas/940611_948454/` were also moved aside
+to the preport_backup_2026-05-14 directory and need re-generating.
+`delta_gen_1_onion.rs` was updated in this session to match the
+runtime-num_pt pattern; the downstream delta pipeline still needs
+running.
 
 `cargo check --workspace` is green. End-to-end smoke (build a real
 packed.bin → gen_2 → gen_3 → unified_server → pir-sdk-client query)
