@@ -134,6 +134,11 @@ impl RequestHandler {
             Request::HarmonyHintsV2(_) => {
                 Response::Error("HarmonyPIR V2 hints not supported in handler".into())
             }
+            Request::HarmonyHintsV2Half(_) => {
+                Response::Error(
+                    "HarmonyPIR V2 half-stream hints not supported in handler".into(),
+                )
+            }
             Request::HarmonyQuery(query) => self.handle_harmony_query(query),
             Request::HarmonyBatchQuery(query) => self.handle_harmony_batch_query(query),
             Request::Attest { nonce } => Response::Attest(self.handle_attest(*nonce)),

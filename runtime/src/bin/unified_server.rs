@@ -23,10 +23,11 @@ use futures_util::{SinkExt, StreamExt};
 use libdpf::DpfKey;
 use pir_core::params::{self, INDEX_PARAMS, CHUNK_PARAMS};
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::accept_async;
@@ -438,6 +439,38 @@ fn compute_hints_for_group(
 
 // ─── Server state ───────────────────────────────────────────────────────────
 
+/// A pool entry that has been "claimed" by one half of a V2-half session
+/// and is waiting for the matching second half. Stored under the
+/// client-supplied 16-byte `session_token` in
+/// [`UnifiedServerData::v2_half_pending`].
+///
+/// The entry is held shared (`Arc`) because the half-stream serve loop
+/// only reads from it; once both halves have been served, the entry is
+/// simply dropped (the pool refills lazily).
+struct V2HalfPending {
+    /// The pool entry feeding both halves of this session. Shared so
+    /// the second half's serve loop can read its frames without
+    /// having to coordinate with the first half's lifetime.
+    entry: Arc<hint_pool::PoolEntry>,
+    /// Bitmask of sides already served (bit 0 = side 0 / INDEX,
+    /// bit 1 = side 1 / CHUNK). Used to reject duplicate requests
+    /// for the same side on the same token, and to determine when
+    /// the entry can be evicted.
+    sides_served: u8,
+    /// When this token was first seen. Used by the cleanup task to
+    /// expire lone entries.
+    created_at: Instant,
+}
+
+/// TTL for a lone V2-half pending entry. Generous enough to absorb a
+/// straggling second-half request from a flaky client, short enough
+/// that orphaned entries don't deplete the pool. The pool fills at a
+/// rate roughly determined by `--pool-size` × the generator's hint
+/// computation throughput (a few entries / sec on the i7-8700), so
+/// 30 s × that rate ≈ 100 entries is a safe steady-state bound on
+/// the pending map.
+const V2_HALF_PENDING_TTL_SECS: u64 = 30;
+
 struct UnifiedServerData {
     state: ServerState,
     role: ServerRole,
@@ -473,6 +506,19 @@ struct UnifiedServerData {
     channel_keypair: pir_runtime_core::channel::ChannelKeypair,
     /// Pre-computed HarmonyPIR V2 hint pool (None if pool_size=0).
     hint_pool: Option<hint_pool::HintPool>,
+    /// Pending half-stream pool entries, keyed by client-supplied
+    /// session token. The first arriving half of a logical V2-half
+    /// session allocates a pool entry into this map; the second
+    /// arriving half consumes the matching slot and clears the entry.
+    /// Lone entries (one half arrives, the other never does) are
+    /// garbage-collected by a background tokio task after 30 s.
+    ///
+    /// Wrapped in `tokio::sync::Mutex` because both the per-connection
+    /// dispatch loop (under `tokio::main`) and the cleanup task touch
+    /// it. The map itself is small (typically <16 pending entries at
+    /// any moment), so lock contention is negligible vs the network
+    /// IO it gates.
+    v2_half_pending: Arc<tokio::sync::Mutex<HashMap<[u8; 16], V2HalfPending>>>,
     /// ARC presentation verifier + seen-tag set. Wrapped in a Mutex because
     /// `verify()` mutates the per-context tag set. `None` if ARC is disabled
     /// (server started without --require-arc).
@@ -2063,6 +2109,7 @@ async fn main() {
         data_root,
         channel_keypair,
         hint_pool,
+        v2_half_pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         arc_verifier,
         require_arc,
         cashu_verifier,
@@ -2070,6 +2117,34 @@ async fn main() {
         serve_hints: args.serve_hints,
         serve_queries: args.serve_queries,
     });
+
+    // Background task: garbage-collect V2-half pending entries whose
+    // matching second half never arrived. Runs every 10 s; entries
+    // older than `V2_HALF_PENDING_TTL_SECS` are evicted (their pool
+    // entry is dropped — the pool generator will refill).
+    {
+        let pending = Arc::clone(&server.v2_half_pending);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                let cutoff = Instant::now()
+                    .checked_sub(Duration::from_secs(V2_HALF_PENDING_TTL_SECS));
+                let Some(cutoff) = cutoff else { continue };
+                let mut map = pending.lock().await;
+                let before = map.len();
+                map.retain(|_token, pend| pend.created_at >= cutoff);
+                let evicted = before.saturating_sub(map.len());
+                if evicted > 0 {
+                    println!(
+                        "[v2-half-pending] evicted {} stale entr(ies), {} remaining",
+                        evicted,
+                        map.len()
+                    );
+                }
+            }
+        });
+    }
 
     // ── Accept WebSocket connections ────────────────────────────────────
 
@@ -2242,7 +2317,7 @@ async fn main() {
                 // needed for clients to discover the server's capabilities.
                 if !server.serve_hints {
                     match variant {
-                        REQ_HARMONY_HINTS | REQ_HARMONY_HINTS_V2 => {
+                        REQ_HARMONY_HINTS | REQ_HARMONY_HINTS_V2 | REQ_HARMONY_HINTS_V2_HALF => {
                             let resp = Response::Error(
                                 "server not configured to serve hints — start with --serve-hints (see deploy/systemd/*.service)".into(),
                             );
@@ -2862,6 +2937,189 @@ async fn main() {
                             db_id,
                             sent,
                             &entry.prp_key[..4],
+                            elapsed,
+                        );
+                    }
+                    REQ_HARMONY_HINTS_V2_HALF => {
+                        // Half-stream V2: serve INDEX (side=0) or CHUNK
+                        // (side=1) frames from a pool entry shared with
+                        // a matching session_token request.
+                        let t_start = Instant::now();
+                        let v2half_req = match Request::decode(payload) {
+                            Ok(Request::HarmonyHintsV2Half(h)) => h,
+                            Ok(other) => {
+                                let resp = Response::Error(format!(
+                                    "unexpected request type for V2 half hints: {:?}",
+                                    other
+                                ));
+                                let _ = send_resp(&mut sink, channel_session.as_mut(), resp.encode()).await;
+                                continue;
+                            }
+                            Err(e) => {
+                                let resp = Response::Error(format!(
+                                    "V2 half hint request decode error: {}",
+                                    e
+                                ));
+                                let _ = send_resp(&mut sink, channel_session.as_mut(), resp.encode()).await;
+                                continue;
+                            }
+                        };
+                        let db_id = v2half_req.db_id;
+                        if server.state.get_db(db_id).is_none() {
+                            let resp =
+                                Response::Error(format!("unknown db_id {}", db_id));
+                            let _ = send_resp(&mut sink, channel_session.as_mut(), resp.encode()).await;
+                            continue;
+                        }
+
+                        let pool = match &server.hint_pool {
+                            Some(p) => p,
+                            None => {
+                                let resp = Response::Error(
+                                    "V2 half hints not available: start server with --pool-size to enable"
+                                        .into(),
+                                );
+                                let _ = send_resp(&mut sink, channel_session.as_mut(), resp.encode()).await;
+                                continue;
+                            }
+                        };
+
+                        let token = v2half_req.session_token;
+                        let side = v2half_req.side;
+                        let side_bit: u8 = 1 << side;
+
+                        // Look up (or allocate) the pending entry for
+                        // this token. Held under one short critical
+                        // section — we drop the lock before serving
+                        // frames because send/feed yield the task.
+                        let entry_arc: Arc<hint_pool::PoolEntry> = {
+                            let mut map = server.v2_half_pending.lock().await;
+                            match map.get_mut(&token) {
+                                Some(pend) => {
+                                    if pend.sides_served & side_bit != 0 {
+                                        // Same side already served on
+                                        // this token — protocol error.
+                                        drop(map);
+                                        let resp = Response::Error(format!(
+                                            "V2 half: side {} already served for this token",
+                                            side
+                                        ));
+                                        let _ = send_resp(
+                                            &mut sink,
+                                            channel_session.as_mut(),
+                                            resp.encode(),
+                                        )
+                                        .await;
+                                        continue;
+                                    }
+                                    let arc = Arc::clone(&pend.entry);
+                                    pend.sides_served |= side_bit;
+                                    // If both sides now served, the
+                                    // entry is no longer pending — drop
+                                    // it from the map (the Arc keeps
+                                    // the data alive in our local
+                                    // `entry_arc` for the remainder of
+                                    // this serve loop).
+                                    if pend.sides_served == 0b11 {
+                                        map.remove(&token);
+                                    }
+                                    arc
+                                }
+                                None => {
+                                    // First half to arrive — allocate a
+                                    // fresh pool entry.
+                                    let entry = match pool.take() {
+                                        Some(e) => e,
+                                        None => {
+                                            drop(map);
+                                            let resp = Response::Error(
+                                                "server shutting down".into(),
+                                            );
+                                            let _ = send_resp(
+                                                &mut sink,
+                                                channel_session.as_mut(),
+                                                resp.encode(),
+                                            )
+                                            .await;
+                                            continue;
+                                        }
+                                    };
+                                    let arc = Arc::new(entry);
+                                    map.insert(
+                                        token,
+                                        V2HalfPending {
+                                            entry: Arc::clone(&arc),
+                                            sides_served: side_bit,
+                                            created_at: Instant::now(),
+                                        },
+                                    );
+                                    arc
+                                }
+                            }
+                        };
+
+                        // 1. Feed key preamble (same for both halves
+                        //    since they share the entry).
+                        if let Err(e) = feed_resp(
+                            &mut sink,
+                            channel_session.as_mut(),
+                            entry_arc.key_preamble.clone(),
+                        )
+                        .await
+                        {
+                            eprintln!(
+                                "[{}] V2-half preamble feed error: {}",
+                                peer, e
+                            );
+                            continue;
+                        }
+
+                        // 2. Feed the selected half's frames.
+                        let frames: &[Vec<u8>] = if side == 0 {
+                            &entry_arc.index_frames
+                        } else {
+                            &entry_arc.chunk_frames
+                        };
+                        let mut sent = 0usize;
+                        for frame in frames {
+                            if let Err(e) = feed_resp(
+                                &mut sink,
+                                channel_session.as_mut(),
+                                frame.clone(),
+                            )
+                            .await
+                            {
+                                eprintln!(
+                                    "[{}] V2-half frame feed error (side={}, group={}): {}",
+                                    peer, side, sent, e
+                                );
+                                break;
+                            }
+                            sent += 1;
+                        }
+
+                        // 3. Send terminal sentinel (flushes the batch).
+                        let terminal_len: u32 = 1 + 1;
+                        let mut terminal = Vec::with_capacity(4 + terminal_len as usize);
+                        terminal.extend_from_slice(&terminal_len.to_le_bytes());
+                        terminal.push(RESP_HARMONY_HINTS);
+                        terminal.push(0xFFu8);
+                        let _ = send_resp(
+                            &mut sink,
+                            channel_session.as_mut(),
+                            terminal,
+                        )
+                        .await;
+
+                        let elapsed = t_start.elapsed();
+                        let side_name = if side == 0 { "INDEX" } else { "CHUNK" };
+                        println!(
+                            "[harmony-hint-v2-half] db={} side={} {} groups served from pool (prp_key={:02x?}..., token={:02x?}...) in {:.2?}",
+                            db_id,
+                            side_name,
+                            sent,
+                            &entry_arc.prp_key[..4],
+                            &token[..4],
                             elapsed,
                         );
                     }

@@ -70,6 +70,15 @@ const REQ_HARMONY_HINTS_V2: u8 = 0x44;
 /// V2: key preamble response variant.
 const RESP_HARMONY_HINTS_KEY: u8 = 0x44;
 
+/// V2 half-stream hint request — pairs with `REQ_HARMONY_HINTS_V2` but
+/// splits the response into INDEX-only (side=0) or CHUNK-only (side=1)
+/// halves. Two parallel requests carrying the same 16-byte session
+/// token are matched server-side to the same pool entry, so both halves
+/// expose the same PRP key. See
+/// [`HarmonyClient::ensure_groups_ready_v2_half`] for the client-side
+/// parallel fetch path.
+const REQ_HARMONY_HINTS_V2_HALF: u8 = 0x46;
+
 const REQ_HARMONY_BATCH_QUERY: u8 = 0x43;
 const RESP_HARMONY_BATCH_QUERY: u8 = 0x43;
 
@@ -1375,33 +1384,47 @@ impl HarmonyClient {
             return Ok(());
         }
 
-        // Important: we do NOT route to V1-parallel for main hints,
-        // even when a secondary hint socket is available. V1 requests
-        // trigger server-side on-the-fly hint generation via
-        // `compute_hints_for_group` (~50 µs × K hints per group,
-        // multiple seconds total). V2 uses the pre-computed hint pool
-        // (`pool.take()` in `unified_server.rs:2759`) which is
-        // essentially zero server CPU. Even on two parallel V1
-        // sockets, the wall time is `max(INDEX_compute, CHUNK_compute)`
-        // — measured at 45+ seconds against the public Hetzner
-        // deployment in 2026-05, vs. ~9 seconds for V2 single-stream.
-        // The V2 single-stream transfer caps on bandwidth-delay
-        // product but that's still well below the V1 server-compute
-        // floor.
+        // Dispatch matrix for main hint fetch (cold cache only — the
+        // warm-cache fast path returned above):
         //
-        // A future server protocol variant that splits the V2 pool
-        // entry into INDEX-half and CHUNK-half streams (so two
-        // parallel V2-half requests can each grab from the pool) would
-        // give the per-stream BDP saving without paying V1's compute
-        // cost — see follow-ups in `ensure_groups_ready_v1_parallel`'s
-        // docstring. Not implemented today.
+        //   pool=2 AND v2:           → V2-half (parallel; this commit)
+        //   pool=2 AND v1-opt-in:    → V1 parallel (slow; bench/fallback only)
+        //   pool=1 AND v2:           → V2 full single-stream
+        //   pool=1 AND !v2:          → V1 single-stream serial
         //
-        // The V1-parallel path is kept available behind
-        // `HARMONY_USE_V1_PARALLEL=1` for benchmark / fallback use,
-        // but is NOT the default even when pool size is 2.
-        if self.use_v2_protocol
-            && !matches!(std::env::var("HARMONY_USE_V1_PARALLEL").as_deref(), Ok("1"))
-        {
+        // V2 (full or half) uses the server's pre-computed hint pool —
+        // zero server CPU per request, just stream bytes. V1 triggers
+        // on-the-fly `compute_hints_for_group` server-side (several
+        // seconds of CPU even on the pool-less path), so it's never
+        // the default for cold-cache fetch.
+        //
+        // V2-half is preferred over V2 full when a secondary hint
+        // socket is available because it splits the ~20 MB stream
+        // across two TCP connections — each connection gets its own
+        // bandwidth-delay-product budget, halving wall time on far
+        // (high-RTT) clients. Falls back to V2 full on any error
+        // (older servers, network hiccups, etc.).
+        let want_v1_parallel =
+            matches!(std::env::var("HARMONY_USE_V1_PARALLEL").as_deref(), Ok("1"));
+        if want_v1_parallel && self.hint_conn_secondary.is_some() {
+            return self.ensure_groups_ready_v1_parallel(db_info, progress).await;
+        }
+        if self.use_v2_protocol && self.hint_conn_secondary.is_some() {
+            match self
+                .ensure_groups_ready_v2_half(db_info, progress)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    log::warn!(
+                        "[PIR-AUDIT] V2-half failed ({}); falling back to V2 full",
+                        e
+                    );
+                    // Continue to V2 full below.
+                }
+            }
+        }
+        if self.use_v2_protocol {
             return self.ensure_groups_ready_v2(db_info, progress).await;
         }
         if self.hint_conn_secondary.is_some() {
@@ -1692,6 +1715,310 @@ impl HarmonyClient {
             );
         }
 
+        Ok(())
+    }
+
+    /// V2 half-stream parallel main hint fetch.
+    ///
+    /// Splits the V2 main hint response across two TCP/WebSocket sockets:
+    /// INDEX-half (side=0) goes to the primary hint socket, CHUNK-half
+    /// (side=1) to the secondary. Both halves share a 16-byte session
+    /// token that the server uses to match them to the same pool entry,
+    /// so both halves carry the same PRP key in their preambles.
+    ///
+    /// The wire shape on each socket is identical to the corresponding
+    /// portion of a full V2 response (key preamble + per-group frames +
+    /// sentinel), so the per-half receive loop reuses the same parsing
+    /// code as `ensure_groups_ready_v2`. Only the dispatch
+    /// (parallel send + matched-key check after) differs.
+    ///
+    /// Returns `Err` on any wire / protocol error so the caller (the
+    /// `ensure_groups_ready` dispatch matrix) can fall back to V2 full
+    /// single-stream — older servers that don't recognize
+    /// `REQ_HARMONY_HINTS_V2_HALF` will return a `RESP_ERROR` and this
+    /// function bails, letting the fallback proceed.
+    #[tracing::instrument(level = "debug", skip_all, fields(backend = "harmony", v2_half = true, db_id = db_info.db_id))]
+    async fn ensure_groups_ready_v2_half(
+        &mut self,
+        db_info: &DatabaseInfo,
+        progress: Option<&dyn HintProgress>,
+    ) -> PirResult<()> {
+        let k_index = db_info.index_k as usize;
+        let k_chunk = db_info.chunk_k as usize;
+        let total = (k_index + k_chunk) as u32;
+        let db_id = db_info.db_id;
+
+        // Generate a 16-byte random session token. Both halves carry
+        // the same token; server matches them to the same pool entry.
+        let mut session_token = [0u8; 16];
+        getrandom::getrandom(&mut session_token)
+            .map_err(|e| PirError::Protocol(format!("session_token getrandom: {}", e)))?;
+
+        // Build the two half requests up front.
+        let make_request = |side: u8| -> Vec<u8> {
+            let mut payload = Vec::with_capacity(16 + 1 + 1);
+            payload.extend_from_slice(&session_token);
+            payload.push(side);
+            if db_id != 0 {
+                payload.push(db_id);
+            }
+            crate::protocol::encode_request(REQ_HARMONY_HINTS_V2_HALF, &payload)
+        };
+        let request_index = make_request(0);
+        let request_chunk = make_request(1);
+        let request_index_bytes = request_index.len() as u64;
+        let request_chunk_bytes = request_chunk.len() as u64;
+
+        // Take both hint sockets out of `self` so the parallel futures
+        // can each hold one mutably. Restored after the join.
+        let mut hint_primary = self.hint_conn.take().ok_or(PirError::NotConnected)?;
+        let mut hint_secondary = self
+            .hint_conn_secondary
+            .take()
+            .expect("only called when hint_conn_secondary is_some");
+
+        // Per-half receive loop: reads key preamble + N frames + sentinel.
+        // Returns (prp_backend, prp_key, frames, total_response_bytes).
+        // Mirrors the body of `ensure_groups_ready_v2` but is parameterised
+        // by the expected number of frames so it can be reused for both
+        // halves.
+        async fn drain_half(
+            conn: &mut Box<dyn PirTransport>,
+            num_groups: u8,
+            label: &str,
+        ) -> PirResult<(u8, [u8; 16], Vec<(u8, Vec<u8>)>, u64)> {
+            // 1. Receive key preamble.
+            let preamble = conn.recv().await?;
+            let mut total_resp: u64 = preamble.len() as u64;
+            if preamble.len() < 5 {
+                return Err(PirError::Protocol(format!(
+                    "{}: truncated V2-half key preamble",
+                    label
+                )));
+            }
+            let body = &preamble[4..];
+            if body.is_empty() || body[0] != RESP_HARMONY_HINTS_KEY {
+                if !body.is_empty() && body[0] == RESP_ERROR {
+                    let reason = String::from_utf8_lossy(&body[1..]).to_string();
+                    return Err(PirError::ServerError(reason));
+                }
+                return Err(PirError::Protocol(format!(
+                    "{}: expected V2-half key preamble (0x{:02x}), got 0x{:02x}",
+                    label,
+                    RESP_HARMONY_HINTS_KEY,
+                    body.first().copied().unwrap_or(0),
+                )));
+            }
+            // Layout: [RESP_HARMONY_HINTS_KEY][prp_backend][level_sentinel=0xFF][total_groups][16B prp_key]
+            if body.len() < 20 {
+                return Err(PirError::Protocol(format!(
+                    "{}: V2-half key preamble truncated ({} bytes)",
+                    label,
+                    body.len()
+                )));
+            }
+            let prp_backend = body[1];
+            let mut prp_key = [0u8; 16];
+            prp_key.copy_from_slice(&body[4..20]);
+
+            // 2. Receive N per-group frames.
+            let mut frames: Vec<(u8, Vec<u8>)> = Vec::with_capacity(num_groups as usize);
+            for _ in 0..num_groups {
+                let msg = conn.recv().await?;
+                total_resp = total_resp.saturating_add(msg.len() as u64);
+                if msg.len() < 5 {
+                    return Err(PirError::Protocol(format!(
+                        "{}: truncated V2-half hint frame",
+                        label
+                    )));
+                }
+                let body = &msg[4..];
+                if body.is_empty() {
+                    return Err(PirError::Protocol(format!(
+                        "{}: empty V2-half hint frame body",
+                        label
+                    )));
+                }
+                if body[0] == RESP_ERROR {
+                    let reason = String::from_utf8_lossy(&body[1..]).to_string();
+                    return Err(PirError::ServerError(reason));
+                }
+                if body[0] != RESP_HARMONY_HINTS {
+                    return Err(PirError::Protocol(format!(
+                        "{}: expected RESP_HARMONY_HINTS, got 0x{:02x}",
+                        label, body[0]
+                    )));
+                }
+                if body.len() < 14 {
+                    return Err(PirError::Protocol(format!(
+                        "{}: V2-half hint frame header truncated",
+                        label
+                    )));
+                }
+                let group_id = body[1];
+                // bytes 2..14 = (n, t, m) metadata — unused
+                let hints_data = body[14..].to_vec();
+                frames.push((group_id, hints_data));
+            }
+
+            // 3. Receive terminal sentinel.
+            let _terminal = conn.recv().await?;
+
+            Ok((prp_backend, prp_key, frames, total_resp))
+        }
+
+        let t_half_start = std::time::Instant::now();
+
+        let index_fut = async {
+            hint_primary.send(request_index).await?;
+            let r = drain_half(&mut hint_primary, k_index as u8, "V2-half INDEX").await?;
+            Ok::<_, PirError>((hint_primary, r))
+        };
+        let chunk_fut = async {
+            hint_secondary.send(request_chunk).await?;
+            let r = drain_half(&mut hint_secondary, k_chunk as u8, "V2-half CHUNK").await?;
+            Ok::<_, PirError>((hint_secondary, r))
+        };
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let join_res = tokio::try_join!(index_fut, chunk_fut);
+        #[cfg(target_arch = "wasm32")]
+        let join_res = futures::future::try_join(index_fut, chunk_fut).await;
+
+        // Always restore the connections to self, even on error, so a
+        // fallback to V2 full has a working primary socket and the
+        // secondary slot is restored for subsequent rounds.
+        let (idx_out, chk_out) = match join_res {
+            Ok(v) => v,
+            Err(e) => {
+                // Best-effort: we don't have the moved conns back here,
+                // so they're dropped. The next reconnect will rebuild.
+                return Err(e);
+            }
+        };
+
+        let (hp, (idx_backend, idx_key, idx_frames, idx_bytes)) = idx_out;
+        let (hs, (chk_backend, chk_key, chk_frames, chk_bytes)) = chk_out;
+
+        self.hint_conn = Some(hp);
+        self.hint_conn_secondary = Some(hs);
+
+        // Both halves must agree on the PRP key + backend; if they
+        // don't, the server mis-paired the session — bail.
+        if idx_key != chk_key {
+            return Err(PirError::Protocol(format!(
+                "V2-half: INDEX and CHUNK PRP keys mismatch (INDEX={:02x?}..., CHUNK={:02x?}...)",
+                &idx_key[..4],
+                &chk_key[..4],
+            )));
+        }
+        if idx_backend != chk_backend {
+            return Err(PirError::Protocol(format!(
+                "V2-half: INDEX and CHUNK PRP backends mismatch ({} vs {})",
+                idx_backend, chk_backend
+            )));
+        }
+
+        let dt_wire = t_half_start.elapsed();
+        if std::env::var("HARMONY_BENCH").is_ok() {
+            eprintln!(
+                "[HARMONY_BENCH]   V2-half parallel hint: total wire {:?} (req {}B+{}B, resp {}B+{}B, k_index={}, k_chunk={})",
+                dt_wire,
+                request_index_bytes, request_chunk_bytes,
+                idx_bytes, chk_bytes,
+                k_index, k_chunk,
+            );
+        }
+
+        self.prp_backend = idx_backend;
+        self.master_prp_key = idx_key;
+
+        // Build HarmonyGroup instances using the (shared) PRP key.
+        let index_w = INDEX_SLOTS_PER_BIN * INDEX_SLOT_SIZE;
+        let chunk_w = CHUNK_SLOTS_PER_BIN * CHUNK_SLOT_SIZE;
+        for g in 0..k_index {
+            let group = HarmonyGroup::new_with_backend(
+                db_info.index_bins,
+                index_w as u32,
+                0,
+                &self.master_prp_key,
+                g as u32,
+                self.prp_backend,
+            )
+            .map_err(|e| {
+                PirError::BackendState(format!("V2-half HarmonyGroup init (INDEX): {:?}", e))
+            })?;
+            self.index_groups.insert(g as u8, group);
+        }
+        for g in 0..k_chunk {
+            let group = HarmonyGroup::new_with_backend(
+                db_info.chunk_bins,
+                chunk_w as u32,
+                0,
+                &self.master_prp_key,
+                (k_index + g) as u32,
+                self.prp_backend,
+            )
+            .map_err(|e| {
+                PirError::BackendState(format!("V2-half HarmonyGroup init (CHUNK): {:?}", e))
+            })?;
+            self.chunk_groups.insert(g as u8, group);
+        }
+
+        // Load hints into groups from the received frames.
+        let mut done: u32 = 0;
+        for (group_id, hints_data) in idx_frames {
+            let group = self.index_groups.get_mut(&group_id).ok_or_else(|| {
+                PirError::Protocol(format!("V2-half: unexpected INDEX group {}", group_id))
+            })?;
+            group
+                .load_hints(&hints_data)
+                .map_err(|e| PirError::BackendState(format!("load_hints: {:?}", e)))?;
+            done += 1;
+            if let Some(p) = progress {
+                p.on_group_complete(done, total, "index");
+            }
+        }
+        for (group_id, hints_data) in chk_frames {
+            let group = self.chunk_groups.get_mut(&group_id).ok_or_else(|| {
+                PirError::Protocol(format!("V2-half: unexpected CHUNK group {}", group_id))
+            })?;
+            group
+                .load_hints(&hints_data)
+                .map_err(|e| PirError::BackendState(format!("load_hints: {:?}", e)))?;
+            done += 1;
+            if let Some(p) = progress {
+                p.on_group_complete(done, total, "chunk");
+            }
+        }
+
+        self.loaded_db_id = Some(db_info.db_id);
+
+        // Record both wire rounds.
+        self.record_round(RoundProfile {
+            kind: RoundKind::HarmonyHintRefresh,
+            server_id: 1,
+            db_id: Some(db_id),
+            request_bytes: request_index_bytes,
+            response_bytes: idx_bytes,
+            items: vec![1u32; k_index],
+        });
+        self.record_round(RoundProfile {
+            kind: RoundKind::HarmonyHintRefresh,
+            server_id: 1,
+            db_id: Some(db_id),
+            request_bytes: request_chunk_bytes,
+            response_bytes: chk_bytes,
+            items: vec![1u32; k_chunk],
+        });
+
+        // Persist to cache.
+        if let Err(e) = self.persist_hints_to_cache(db_info) {
+            log::warn!(
+                "[PIR-AUDIT] HarmonyPIR V2-half: failed to persist main hints to cache: {}",
+                e
+            );
+        }
         Ok(())
     }
 

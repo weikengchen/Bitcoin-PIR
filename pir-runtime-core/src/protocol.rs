@@ -26,6 +26,21 @@ pub const REQ_HARMONY_QUERY: u8 = 0x42;
 pub const REQ_HARMONY_BATCH_QUERY: u8 = 0x43;
 /// V2 hint request: server generates the PRP key (client does not send one).
 pub const REQ_HARMONY_HINTS_V2: u8 = 0x44;
+/// HarmonyPIR V2 half-stream hint request.
+///
+/// Lets a client split the V2 main hint download across two TCP sockets:
+/// one fetches the INDEX half, the other fetches the CHUNK half. Both
+/// halves share the same PRP key — the server pairs the two requests
+/// by `session_token` and serves both halves from the same pool entry.
+/// This breaks the single-stream bandwidth-delay-product cap on the
+/// ~20 MB V2 stream without changing per-half wire shape: each half
+/// is structurally identical to the corresponding portion of the
+/// existing `REQ_HARMONY_HINTS_V2` response.
+///
+/// Wire: [16B session_token][1B side: 0=INDEX 1=CHUNK]
+///       [optional trailing 1B db_id, only when non-zero —
+///        backward compatible]
+pub const REQ_HARMONY_HINTS_V2_HALF: u8 = 0x46;
 
 // ─── Extended request variants (multi-database) ────────────────────────────
 
@@ -211,6 +226,39 @@ pub struct HarmonyHintRequestV2 {
     pub db_id: u8,
 }
 
+/// HarmonyPIR V2 half-stream hint request.
+///
+/// Pairs with [`HarmonyHintRequestV2`] but only emits one of the two
+/// trees (INDEX = side 0, CHUNK = side 1). The server matches two
+/// requests carrying the same `session_token` against the same pool
+/// entry — both halves therefore expose the same PRP key in their
+/// preambles.
+///
+/// Wire: [16B session_token][1B side: 0=INDEX, 1=CHUNK]
+///       [optional trailing 1B db_id, only when non-zero —
+///        backward compatible]
+///
+/// Response wire shape per side is identical to the corresponding
+/// portion of a [`HarmonyHintRequestV2`] response:
+///   `[KEY_PREAMBLE] + [INDEX or CHUNK frames] + [SENTINEL]`
+///
+/// The server's pending-pool map keeps a token-to-entry mapping with
+/// a short TTL (~30 s). The first arriving half allocates a fresh
+/// pool entry; the second matching half consumes its other side
+/// from the same entry. Lone tokens (one half arrives, the other
+/// never does) expire and release their pool entries to be re-used.
+#[derive(Clone, Debug)]
+pub struct HarmonyHintRequestV2Half {
+    /// 16-byte client-generated random token. Both halves of a logical
+    /// session carry the same token; the server uses it as the key
+    /// into its pending pool entry map.
+    pub session_token: [u8; 16],
+    /// Which half this request is for: 0 = INDEX, 1 = CHUNK.
+    pub side: u8,
+    /// Database ID (0 = main UTXO, 1+ = delta databases).
+    pub db_id: u8,
+}
+
 /// HarmonyPIR query: client sends T indices for one group to Query Server.
 ///
 /// Wire: [1B level][1B group_id][2B round_id][4B count][count × 4B u32 LE indices]
@@ -339,6 +387,7 @@ pub enum Request {
     HarmonyGetInfo,
     HarmonyHints(HarmonyHintRequest),
     HarmonyHintsV2(HarmonyHintRequestV2),
+    HarmonyHintsV2Half(HarmonyHintRequestV2Half),
     HarmonyQuery(HarmonyQuery),
     HarmonyBatchQuery(HarmonyBatchQuery),
 }
@@ -621,6 +670,14 @@ impl Request {
                     payload.push(h.db_id);
                 }
             }
+            Request::HarmonyHintsV2Half(h) => {
+                payload.push(REQ_HARMONY_HINTS_V2_HALF);
+                payload.extend_from_slice(&h.session_token);
+                payload.push(h.side);
+                if h.db_id != 0 {
+                    payload.push(h.db_id);
+                }
+            }
             Request::HarmonyQuery(q) => {
                 payload.push(REQ_HARMONY_QUERY);
                 payload.push(q.level);
@@ -760,6 +817,10 @@ impl Request {
             REQ_HARMONY_HINTS_V2 => {
                 let h = decode_harmony_hint_request_v2(&data[1..])?;
                 Ok(Request::HarmonyHintsV2(h))
+            }
+            REQ_HARMONY_HINTS_V2_HALF => {
+                let h = decode_harmony_hint_request_v2_half(&data[1..])?;
+                Ok(Request::HarmonyHintsV2Half(h))
             }
             REQ_HARMONY_QUERY => {
                 let q = decode_harmony_query(&data[1..])?;
@@ -1180,6 +1241,34 @@ fn decode_harmony_hint_request_v2(data: &[u8]) -> io::Result<HarmonyHintRequestV
     // data[1] is reserved, ignored.
     let db_id = if data.len() > 2 { data[2] } else { 0 };
     Ok(HarmonyHintRequestV2 { db_id })
+}
+
+/// V2 half-stream hint request wire format:
+/// [16B session_token][1B side: 0=INDEX, 1=CHUNK]
+/// [optional trailing 1B db_id]
+fn decode_harmony_hint_request_v2_half(data: &[u8]) -> io::Result<HarmonyHintRequestV2Half> {
+    // Minimum: session_token (16) + side (1)
+    if data.len() < 17 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "V2 half hint request too short",
+        ));
+    }
+    let mut session_token = [0u8; 16];
+    session_token.copy_from_slice(&data[..16]);
+    let side = data[16];
+    if side != 0 && side != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("V2 half hint request side must be 0 or 1, got {}", side),
+        ));
+    }
+    let db_id = if data.len() > 17 { data[17] } else { 0 };
+    Ok(HarmonyHintRequestV2Half {
+        session_token,
+        side,
+        db_id,
+    })
 }
 
 // ─── HarmonyPIR batch encoding helpers ─────────────────────────────────────
