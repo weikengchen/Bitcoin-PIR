@@ -5,35 +5,39 @@ Companion to upstream's [`INTEGRATION.md`](../../bitcoin-pir/OnionPIRv2/INTEGRAT
 
 The upstream `onionpir` crate was rebuilt to track the SEAL-free upstream
 fix for the GHS / "special prime" key-switching issue
-(ePrint 2025/1142 revision). BitcoinPIR currently pins
-`350ccc43e41338264aefabf80f639f23ea34f3ee`, which is the upstream
-`pre-port` tag — i.e. **BitcoinPIR is still on the old SEAL-based code.**
-The 77 post-port commits exist only in the user's local OnionPIRv2 working
-copy and have not been pushed to the GitHub fork.
+(ePrint 2025/1142 revision).
 
 This doc maps the integration spec onto BitcoinPIR's actual call sites so
 the migration can be done one ordered commit at a time. It does **not**
 describe the post-port API itself — read upstream's `INTEGRATION.md` for
 that. This is the BitcoinPIR-specific punch list.
 
----
+## Status at 2026-05-14
 
-## 0. Blocking step (operator)
+  ✅ §0  operator push   — OnionPIRv2/main pushed to GitHub at 92fceb01
+  ✅ §2 Commit 1         — rev bump + mechanical renames (4e12d0d9)
+  ✅ §2 Commit 2         — bit-unpack helper + every decrypt_response wired (0cf7ac21)
+  ✅ §2 Commit 3         — gen_2/3/4 push_plaintexts + save_db + runtime num_plaintexts (8e3dcddf)
+  ⬜ §2 Commit 4         — re-key clients (browser cache; Rust side already handled)
+  🟨 §2 Commit 5         — capacity math; client-side done (f0399024), build-side pending
+  ⬜ §2 Commit 6         — SharedKeyStore / QueryQueue (optional polish)
+  ⬜ §2 Commit 7         — WASM client A/B decision
 
-Push the local OnionPIRv2 work to the GitHub fork before any of the
-code-side migration below can land.
+Branch: `worktree-feat+onionpir-port-migration` at
+`.claude/worktrees/feat+onionpir-port-migration/`. Five commits ahead of
+`d6c333de`. **Not pushed to BitcoinPIR's origin/main.**
 
-```
-cd /Users/cusgadmin/bitcoin-pir/OnionPIRv2
-git push origin main
-# Optional but recommended: tag a fresh release so the BitcoinPIR dep
-# can pin something stable instead of a moving HEAD.
-git tag v3.0.0   # next available tag — v2.1.0 is pre-port
-git push origin v3.0.0
-```
+`cargo check --workspace` is green. End-to-end smoke (build a real
+packed.bin → gen_2 → gen_3 → unified_server → pir-sdk-client query)
+has NOT been run; requires a full chainstate input plus a 5-10 minute
+CMake/HEXL build of libonionpir.a. The Hetzner pir1 box still serves
+the pre-port binary.
 
-Local OnionPIRv2 HEAD at time of writing: `92fceb01` (`docs:
-INTEGRATION.md for downstream consumers`).
+## 0. Blocking step (operator) — DONE
+
+Local OnionPIRv2 HEAD at push time: `92fceb01` (`docs: INTEGRATION.md
+for downstream consumers`). BitcoinPIR's three Cargo.toml refs are
+pinned at that commit.
 
 ---
 
@@ -74,7 +78,7 @@ The cheapest sequencing is "compile-time changes first, semantic changes
 second, capacity-math last." Each commit below is independently
 mergeable into a `feat/onionpir-port` branch.
 
-### Commit 1 — Bump dep + mechanical renames (compile-only)
+### Commit 1 — Bump dep + mechanical renames (compile-only) — **LANDED `4e12d0d9`**
 
 Per §1.1 of upstream:
 
@@ -97,7 +101,18 @@ Note `OnionPirParamsInfo` has a new `rns_mod_count` field between
 `poly_degree` and `coeff_val_cnt`. Read it but don't pretend it doesn't
 exist — pattern-matches on the struct will need to be updated.
 
-### Commit 2 — Wire format helpers (silent-bug danger zone)
+### Commit 2 — Wire format helpers (silent-bug danger zone) — **LANDED `0cf7ac21`**
+
+Resolved by adding `pir-core::onion_unpack` with
+`pack_bytes_into_coefficients` / `unpack_onion_plaintext` /
+`bits_per_coeff` (45 lib tests; 8 cover the new module). Every
+`decrypt_response` call site now goes through `unpack_onion_plaintext`.
+The `bits_per_coeff` derivation lives at the helper level
+(`entry_size * 8 / poly_degree`) so no upstream `PlainMod` field is
+required.
+
+Original notes below for historical context:
+
 
 Per §1.2: SEAL `Serializable` is gone; all blobs are hand-rolled LE.
 Affects every site that sends/receives query / key / response bytes —
@@ -127,7 +142,33 @@ or `pir-core/src/`.
 The integration doc gives the packing recipe at lines 80-94; the
 unpacking is the same loop inverted.
 
-### Commit 3 — Server-side DB build pipeline
+### Commit 3 — Server-side DB build pipeline — **LANDED `8e3dcddf`**
+
+Replaced the gen_2/3/4 `ntt_expand_entry` / `push_chunk` / `preprocess`
+stubs (left by Commit 1) with the post-port flow:
+
+  1. Pack entry bytes → `poly_degree` pre-NTT u64 coeffs via
+     `pir_core::onion_unpack::pack_bytes_into_coefficients`.
+  2. `Server::push_plaintexts(coeffs_flat, count, offset, &[])` (NTT
+     runs internally).
+  3. `Server::save_db(temp_path)` → strip the 48-byte upstream header
+     into the canonical NTT-store file.
+  4. Runtime adapts via `set_shared_database(slice, num_plaintexts as u64,
+     index_table)` — sized for the compile-time DB shape (40448 slots),
+     not the dataset-dependent `num_packed_entries`. Empty slots stay at
+     `Server::new` initial state; cuckoo planner never lands on them.
+
+**Caveat carried into commit 5b**: when `entry_size_pt (3328) <
+ONIONPIR_ENTRY_SIZE / PACKED_ENTRY_SIZE (3840)`, gen_2/3/4 truncate
+the tail bytes when packing. Production data is built off
+`PACKED_ENTRY_SIZE = 3840`-aligned `packed.bin` files from gen_1, and
+that's still the case here. The truncation loses cuckoo slots 222-255
+per INDEX bin at the default config. A clean fix requires gen_1's
+`PACKED_ENTRY_SIZE` to also become runtime-derived (see commit 5b
+below).
+
+Original design notes below:
+
 
 §1.3 (preprocessed DB header changed) + §1.4 (`push_database_chunk` →
 `push_plaintexts`).
@@ -156,7 +197,22 @@ files. Production rebuild required — affects:
 
 Re-run the build pipeline before deploying.
 
-### Commit 4 — Re-key clients
+### Commit 4 — Re-key clients — **NOT STARTED** (Rust side already handled)
+
+Status update after commits 1-3: the Rust-side impact is already
+covered. `Client::from_secret_key` returns `Option<Self>`; pir-sdk-
+client wraps it in `.ok_or_else(|| PirError::InvalidState(...))?` so a
+stale SEAL-serialized secret key surfaces as a typed error, not a
+panic. Runtime CLI binaries use `.expect(...)` because they're not in
+a graceful-recovery context.
+
+The remaining work is web-side: `web/src/onionpir_client.ts` and
+whatever caches secret keys in browser localStorage need a version
+bump and a "re-key required" path. That's entangled with Commit 7
+(WASM client A/B) — defer until that decision lands.
+
+Original design notes below:
+
 
 Per §1.2: all SEAL-serialized galois / GSW / secret-key blobs are
 unparseable. Persisted client state must be discarded.
@@ -172,7 +228,39 @@ Spots:
 * `pir-sdk-client/tests/leakage_integration_test.rs` and the wasm test
   fixtures — regenerate, no production impact.
 
-### Commit 5 — Capacity math sweep
+### Commit 5 — Capacity math sweep — **CLIENT-SIDE LANDED `f0399024`**
+
+Client-side hardcoded `PACKED_ENTRY_SIZE = 3840` constants replaced
+with `packed_entry_size()` helpers that read
+`onionpir::params_info(0).entry_size` at runtime. Touched
+`pir-sdk-client/src/onion.rs` (the public client) and
+`runtime/src/bin/onionpir_client.rs` (the standalone CLI). After commit
+2's `onion_unpack` lands, the decoded bin is exactly
+`pinfo.entry_size` bytes, so the pre-port "if len ≥ PACKED_ENTRY_SIZE
+then trim else full" guard collapses to just hashing the full slice.
+
+### Commit 5b — Build-pipeline capacity math — **NOT STARTED**
+
+Build-side files still hardcode 3840:
+
+  build/src/gen_1_onion.rs              `const PACKED_ENTRY_SIZE: usize = 3840;`
+  build/src/gen_3_onion.rs              `const ONIONPIR_ENTRY_SIZE: usize = 3840;`
+                                        + `SLOTS_PER_BIN = 256` (256 × 15 = 3840)
+  build/src/gen_4_build_merkle_onion.rs `const PACKED_ENTRY_SIZE: usize = 3840;`
+
+The thorny piece: `serialize_cuckoo_bin -> [u8; ONIONPIR_ENTRY_SIZE]`
+in gen_3 uses the constant as a fixed-size array length, which
+requires `const` not `fn` — would need a `Vec<u8>` conversion. And
+gen_1's downstream packing logic is woven through ~500 lines of code
+that all assume a single per-entry size. Changing it invalidates every
+`onion_packed_entries.bin` already on disk — Hetzner's `pir1` plus any
+delta-build host. That's coordinated work, not a sed-style sweep.
+
+Tracking this as a separate commit (Commit 5b) so the runtime-side
+correctness improvement in 5a can land independently. The gen_2/3/4
+truncation noted in Commit 3 stays a documented limitation until 5b.
+
+Original design notes below:
 
 Per §4-§5 of upstream. New defaults:
 
