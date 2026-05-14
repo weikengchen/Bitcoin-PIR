@@ -1766,7 +1766,7 @@ impl HarmonyClient {
         let prp_backend = self.prp_backend;
         let db_id = db_info.db_id;
 
-        let t_main_start = std::time::Instant::now();
+        let t_main_start = Instant::now();
 
         let index_fut = async {
             let profile = fetch_and_load_main_hints_into_map(
@@ -1908,7 +1908,7 @@ impl HarmonyClient {
         let request = encode_request(REQ_HARMONY_HINTS, &payload);
         let request_bytes = request.len() as u64;
 
-        let t_send = std::time::Instant::now();
+        let t_send = Instant::now();
         let conn = self.hint_conn.as_mut().ok_or(PirError::NotConnected)?;
         conn.send(request).await?;
         let dt_send = t_send.elapsed();
@@ -1921,12 +1921,12 @@ impl HarmonyClient {
         // (matches the early-error semantics of the other rounds).
         let mut received = 0u32;
         let mut total_response_bytes: u64 = 0;
-        let t_first_byte = std::time::Instant::now();
+        let t_first_byte = Instant::now();
         let mut dt_first: Option<std::time::Duration> = None;
         let mut dt_recv_total = std::time::Duration::ZERO;
         let mut dt_load_total = std::time::Duration::ZERO;
         while received < num_groups as u32 {
-            let t_msg = std::time::Instant::now();
+            let t_msg = Instant::now();
             let msg = conn.recv().await?;
             dt_recv_total += t_msg.elapsed();
             if dt_first.is_none() {
@@ -1976,7 +1976,7 @@ impl HarmonyClient {
                     group_id, level
                 ))
             })?;
-            let t_load = std::time::Instant::now();
+            let t_load = Instant::now();
             group
                 .load_hints(hints_data)
                 .map_err(|e| PirError::BackendState(format!("load_hints: {:?}", e)))?;
@@ -2039,8 +2039,8 @@ impl HarmonyClient {
         // Phase-level timing for diagnostics. Guarded by env var so it
         // only fires when the operator explicitly opts in.
         let _bench = std::env::var("HARMONY_BENCH").is_ok();
-        let t_step_start = std::time::Instant::now();
-        let t_hint_start = std::time::Instant::now();
+        let t_step_start = Instant::now();
+        let t_hint_start = Instant::now();
         self.ensure_groups_ready(db_info, None).await?;
         let t_hint = t_hint_start.elapsed();
         if _bench {
@@ -2065,7 +2065,7 @@ impl HarmonyClient {
         // two INDEX Merkle items inherit a unique-per-batch
         // `pbc_group`, so `index_max_items_per_group_per_level = 2`
         // independently of the batch's collision pattern.
-        let t_index_start = std::time::Instant::now();
+        let t_index_start = Instant::now();
         let index_outcomes = self
             .query_index_phase_batched(script_hashes, db_info)
             .await?;
@@ -2099,7 +2099,7 @@ impl HarmonyClient {
             .saturating_mul(pir_core::params::CHUNK_SLOTS_PER_BIN as u32)
             .max(chunk_pad_m as u32);
 
-        let t_chunk_start = std::time::Instant::now();
+        let t_chunk_start = Instant::now();
 
         // Phase 2 PREPROCESS: project each scripthash's INDEX outcome into
         // (real_count, is_whale, has_real_match, padded_chunk_ids) up
@@ -2231,7 +2231,7 @@ impl HarmonyClient {
             eprintln!("[HARMONY_BENCH] db={} CHUNK phase ({} queries): {:?}", db_info.db_id, script_hashes.len(), t_chunk);
         }
 
-        let t_merkle_start = std::time::Instant::now();
+        let t_merkle_start = Instant::now();
         if db_info.has_bucket_merkle {
             self.run_merkle_verification(&mut results, &traces, db_info)
                 .await?;
@@ -2838,7 +2838,7 @@ impl HarmonyClient {
         // Note: `conn.recv()` returns the raw frame INCLUDING the 4-byte
         // length prefix (unlike `conn.roundtrip()`, which strips it).
         // We strip with `[4..]` below, mirroring `dpf.rs:1442-1443`.
-        let t_wire = std::time::Instant::now();
+        let t_wire = Instant::now();
         let (response_h0, response_h1) = if self.query_conn_secondary.is_some() {
             let conn0 = self.query_conn.as_mut().ok_or(PirError::NotConnected)?;
             let conn1 = self
@@ -3322,7 +3322,7 @@ impl HarmonyClient {
         db_info: &DatabaseInfo,
         tree_tops: &[TreeTop],
     ) -> PirResult<()> {
-        let _t_sib_start = std::time::Instant::now();
+        let _t_sib_start = Instant::now();
         let k_index = db_info.index_k as usize;
         let k_chunk = db_info.chunk_k as usize;
         if tree_tops.len() < k_index + k_chunk {
@@ -3406,7 +3406,7 @@ impl HarmonyClient {
                 for sl in 0..index_sib_levels {
                     let level_n = nodes.div_ceil(arity);
                     nodes = level_n;
-                    let t_init = std::time::Instant::now();
+                    let t_init = Instant::now();
                     for g in 0..k_index {
                         let group = HarmonyGroup::new_with_backend(
                             level_n as u32,
@@ -3425,7 +3425,7 @@ impl HarmonyClient {
                         index_sib_groups.insert((sl, g as u8), group);
                     }
                     let dt_init = t_init.elapsed();
-                    let t_fetch = std::time::Instant::now();
+                    let t_fetch = Instant::now();
                     let profile = fetch_and_load_sib_hints_into_map(
                         hint_primary.as_mut(),
                         &mut index_sib_groups,
@@ -3455,7 +3455,7 @@ impl HarmonyClient {
                 for sl in 0..chunk_sib_levels {
                     let level_n = nodes.div_ceil(arity);
                     nodes = level_n;
-                    let t_init = std::time::Instant::now();
+                    let t_init = Instant::now();
                     for g in 0..k_chunk {
                         let group = HarmonyGroup::new_with_backend(
                             level_n as u32,
@@ -3477,7 +3477,7 @@ impl HarmonyClient {
                         chunk_sib_groups.insert((sl, g as u8), group);
                     }
                     let dt_init = t_init.elapsed();
-                    let t_fetch = std::time::Instant::now();
+                    let t_fetch = Instant::now();
                     let profile = fetch_and_load_sib_hints_into_map(
                         hint_secondary.as_mut(),
                         &mut chunk_sib_groups,
@@ -3538,7 +3538,7 @@ impl HarmonyClient {
             for sl in 0..index_sib_levels {
                 let level_n = nodes.div_ceil(arity);
                 nodes = level_n;
-                let t_init = std::time::Instant::now();
+                let t_init = Instant::now();
                 for g in 0..k_index {
                     let group = HarmonyGroup::new_with_backend(
                         level_n as u32,
@@ -3557,7 +3557,7 @@ impl HarmonyClient {
                     self.index_sib_groups.insert((sl, g as u8), group);
                 }
                 let dt_init = t_init.elapsed();
-                let t_fetch = std::time::Instant::now();
+                let t_fetch = Instant::now();
                 self.fetch_and_load_hints_into(
                     db_info.db_id,
                     10 + sl as u8,
@@ -3584,7 +3584,7 @@ impl HarmonyClient {
             for sl in 0..chunk_sib_levels {
                 let level_n = nodes.div_ceil(arity);
                 nodes = level_n;
-                let t_init = std::time::Instant::now();
+                let t_init = Instant::now();
                 for g in 0..k_chunk {
                     let group = HarmonyGroup::new_with_backend(
                         level_n as u32,
@@ -3607,7 +3607,7 @@ impl HarmonyClient {
                     self.chunk_sib_groups.insert((sl, g as u8), group);
                 }
                 let dt_init = t_init.elapsed();
-                let t_fetch = std::time::Instant::now();
+                let t_fetch = Instant::now();
                 self.fetch_and_load_hints_into(
                     db_info.db_id,
                     20 + sl as u8,
@@ -4349,14 +4349,14 @@ impl HarmonyClient {
             });
         }
 
-        let t_build = std::time::Instant::now();
+        let t_build = Instant::now();
         let request = encode_batch_query(1, round_id, db_id, &batch_items);
         let dt_build = t_build.elapsed();
         let request_bytes = request.len() as u64;
         let items_per_group: Vec<u32> =
             batch_items.iter().map(|it| it.indices.len() as u32).collect();
         let conn = self.query_conn.as_mut().ok_or(PirError::NotConnected)?;
-        let t_wire = std::time::Instant::now();
+        let t_wire = Instant::now();
         let response = conn.roundtrip(&request).await?;
         let dt_wire = t_wire.elapsed();
         if std::env::var("HARMONY_BENCH").is_ok() {
@@ -4373,7 +4373,7 @@ impl HarmonyClient {
             response_bytes: (response.len() as u64).saturating_add(4),
             items: items_per_group,
         });
-        let t_decode = std::time::Instant::now();
+        let t_decode = Instant::now();
         let raw_results = decode_batch_response(&response)?;
 
         // Decode only the groups the role list marks as Real — same set
@@ -4525,7 +4525,7 @@ impl HarmonyClient {
         // Single-socket fallback: send both requests then recv both
         // (unchanged from pre-pool behaviour, kept identical so the
         // pool-size=1 code path is bit-for-bit equivalent).
-        let t_wire = std::time::Instant::now();
+        let t_wire = Instant::now();
         let (response_h0, response_h1) = if self.query_conn_secondary.is_some() {
             // Disjoint borrows on different `Option` fields → safe to
             // hold both `&mut` simultaneously.
@@ -4610,7 +4610,7 @@ impl HarmonyClient {
         let raw_results_h1 = decode_batch_response(&response_h1[4..])?;
 
         // Decode only real groups, via the pair API.
-        let t_decode = std::time::Instant::now();
+        let t_decode = Instant::now();
         let mut out_h0 = HashMap::new();
         let mut out_h1 = HashMap::new();
         for g in 0..k_chunk {
@@ -4682,18 +4682,18 @@ async fn fetch_and_load_main_hints_into_map(
     let request = encode_request(REQ_HARMONY_HINTS, &payload);
     let request_bytes = request.len() as u64;
 
-    let t_send = std::time::Instant::now();
+    let t_send = Instant::now();
     conn.send(request).await?;
     let dt_send = t_send.elapsed();
 
     let mut received = 0u32;
     let mut total_response_bytes: u64 = 0;
-    let t_first_byte = std::time::Instant::now();
+    let t_first_byte = Instant::now();
     let mut dt_first: Option<std::time::Duration> = None;
     let mut dt_recv_total = std::time::Duration::ZERO;
     let mut dt_load_total = std::time::Duration::ZERO;
     while received < num_groups as u32 {
-        let t_msg = std::time::Instant::now();
+        let t_msg = Instant::now();
         let msg = conn.recv().await?;
         dt_recv_total += t_msg.elapsed();
         if dt_first.is_none() {
@@ -4732,7 +4732,7 @@ async fn fetch_and_load_main_hints_into_map(
                 group_id, wire_level
             ))
         })?;
-        let t_load = std::time::Instant::now();
+        let t_load = Instant::now();
         group
             .load_hints(hints_data)
             .map_err(|e| PirError::BackendState(format!("load_hints: {:?}", e)))?;
@@ -4799,18 +4799,18 @@ async fn fetch_and_load_sib_hints_into_map(
     let request = encode_request(REQ_HARMONY_HINTS, &payload);
     let request_bytes = request.len() as u64;
 
-    let t_send = std::time::Instant::now();
+    let t_send = Instant::now();
     conn.send(request).await?;
     let dt_send = t_send.elapsed();
 
     let mut received = 0u32;
     let mut total_response_bytes: u64 = 0;
-    let t_first_byte = std::time::Instant::now();
+    let t_first_byte = Instant::now();
     let mut dt_first: Option<std::time::Duration> = None;
     let mut dt_recv_total = std::time::Duration::ZERO;
     let mut dt_load_total = std::time::Duration::ZERO;
     while received < num_groups as u32 {
-        let t_msg = std::time::Instant::now();
+        let t_msg = Instant::now();
         let msg = conn.recv().await?;
         dt_recv_total += t_msg.elapsed();
         if dt_first.is_none() {
@@ -4849,7 +4849,7 @@ async fn fetch_and_load_sib_hints_into_map(
                 sib_level, group_id, wire_level
             ))
         })?;
-        let t_load = std::time::Instant::now();
+        let t_load = Instant::now();
         group
             .load_hints(hints_data)
             .map_err(|e| PirError::BackendState(format!("load_hints: {:?}", e)))?;
@@ -5679,7 +5679,7 @@ impl BucketMerkleSiblingQuerier for HarmonySiblingQuerier<'_> {
         // so a test can assert the invariant directly.
         let items_per_group: Vec<u32> =
             batch_items.iter().map(|it| it.indices.len() as u32).collect();
-        let t_send = std::time::Instant::now();
+        let t_send = Instant::now();
         let response = self.query_conn.roundtrip(&request).await?;
         let dt_wire = t_send.elapsed();
         if std::env::var("HARMONY_BENCH").is_ok() {
@@ -5949,7 +5949,7 @@ impl BucketMerkleSiblingQuerier for HarmonySiblingQuerier<'_> {
             .collect();
 
         // ── Pipelined send / recv ──
-        let t_wire = std::time::Instant::now();
+        let t_wire = Instant::now();
         self.query_conn.send(request_h0).await?;
         self.query_conn.send(request_h1).await?;
         let resp_h0_raw = self.query_conn.recv().await?;
