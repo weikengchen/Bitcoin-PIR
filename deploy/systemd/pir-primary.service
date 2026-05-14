@@ -1,0 +1,62 @@
+[Unit]
+Description=BitcoinPIR unified server (primary: DPF-0 + OnionPIR + HarmonyPIR hints + HarmonyPIR query)
+Documentation=https://github.com/Bitcoin-PIR/Bitcoin-PIR
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pir
+Group=pir
+WorkingDirectory=/home/pir/BitcoinPIR
+# pir1 (Hetzner, no-SEV) handles both roles: HarmonyPIR V2 hint pool
+# (`--serve-hints` + `--pool-size`) plus DPF server-0 / OnionPIR /
+# HarmonyPIR query phase (`--serve-queries`). Mode flags landed
+# 2026-05-13 — without them, any deployment defaults to "neither" and
+# fails fast at startup, forcing explicit role assignment per host.
+# `--pool-dir` persists each generated V2 pool entry to disk and
+# reloads it on startup (the loader `remove_file`s each disk entry
+# after pushing it into the in-memory queue, so each prp_key is
+# still served at most once — see runtime/src/hint_pool.rs:634).
+# Without `--pool-dir`, after every restart the pool starts cold
+# and the first ~3 minutes of V2 hint requests block on generation.
+ExecStart=/home/pir/BitcoinPIR/target/release/unified_server \
+    --port 8091 \
+    --role primary \
+    --serve-hints \
+    --serve-queries \
+    --pool-size 8 \
+    --pool-dir /home/pir/data/hint-pool \
+    --config /home/pir/data/databases.toml
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+LimitNOFILE=65535
+
+# Reachability: bound to 0.0.0.0 by the binary; UFW blocks external access.
+# Cloudflare tunnel (run as your own service) connects outbound to 127.0.0.1:8091.
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/pir/BitcoinPIR /home/pir/data
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+SystemCallArchitectures=native
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pir-primary
+
+[Install]
+WantedBy=multi-user.target
