@@ -27,7 +27,15 @@ use tokio_tungstenite::tungstenite::Message;
 
 // ─── Constants for the new layout ───────────────────────────────────────────
 
-const PACKED_ENTRY_SIZE: usize = 3840;
+// OnionPIRv2 port (commit 5): `PACKED_ENTRY_SIZE` is no longer a constant.
+// The pre-port value was 3840 (CONFIG_N2048_K1 at PlainMod=15). Post-port
+// the byte count per decrypted bin equals `params_info(0).entry_size`,
+// which is 3328 for the default config. Use `packed_entry_size()` at
+// runtime.
+#[inline]
+fn packed_entry_size() -> usize {
+    onionpir::params_info(0).entry_size as usize
+}
 
 /// Chunk cuckoo: 6 hash functions, slots_per_bin=1
 const CHUNK_CUCKOO_NUM_HASHES: usize = 6;
@@ -725,8 +733,19 @@ async fn main() {
                 .expect("onion_unpack rejected INDEX plaintext from server");
 
                 if let Some(ir) = scan_index_bin(&entry_bytes, addr_infos[addr_idx].tag, index_slots_per_bin, index_slot_size) {
-                    // Per-bin Merkle: hash the full decrypted bin, record leaf position
-                    index_bin_hashes[addr_idx] = Some(merkle::sha256(&entry_bytes[..PACKED_ENTRY_SIZE]));
+                    // Per-bin Merkle: hash the full decrypted bin, record leaf position.
+                    // OnionPIRv2 port (commit 5): bin length equals
+                    // params.entry_size (3328 default). Pre-port this
+                    // sliced to a hardcoded 3840 — now we just hash the
+                    // full `entry_bytes` since unpack already returned
+                    // exactly entry_size bytes.
+                    let pes = packed_entry_size();
+                    let hash_slice = if entry_bytes.len() >= pes {
+                        &entry_bytes[..pes]
+                    } else {
+                        &entry_bytes[..]
+                    };
+                    index_bin_hashes[addr_idx] = Some(merkle::sha256(hash_slice));
                     index_leaf_positions[addr_idx] = Some(group * index_bins + bin as usize);
                     index_results[addr_idx] = Some(ir);
                     break;
@@ -871,9 +890,19 @@ async fn main() {
                 pinfo.entry_size as usize,
             )
             .expect("onion_unpack rejected CHUNK plaintext from server");
-            decrypted_entries.insert(cq.entry_id, entry_bytes[..PACKED_ENTRY_SIZE].to_vec());
+            // OnionPIRv2 port (commit 5): entry_bytes is exactly
+            // `pinfo.entry_size` bytes (3328 default). Use a length cap
+            // so this binary stays correct under any ACTIVE_CONFIG
+            // (`CONFIG_N4096_K2_MP` is 19968).
+            let pes = packed_entry_size();
+            let bin_slice = if entry_bytes.len() >= pes {
+                &entry_bytes[..pes]
+            } else {
+                &entry_bytes[..]
+            };
+            decrypted_entries.insert(cq.entry_id, bin_slice.to_vec());
             // Per-bin Merkle: hash the full decrypted data bin
-            data_bin_hashes.insert(cq.entry_id, merkle::sha256(&entry_bytes[..PACKED_ENTRY_SIZE]));
+            data_bin_hashes.insert(cq.entry_id, merkle::sha256(bin_slice));
             data_leaf_positions.insert(cq.entry_id, cq.group * chunk_bins + cq.bin);
         }
     }

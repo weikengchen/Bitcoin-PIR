@@ -207,8 +207,17 @@ const CHUNK_CUCKOO_SEED: u64 = 0xa3f7c2d918e4b065;
 const EMPTY: u32 = u32::MAX;
 
 /// Size of one packed entry bin in the CHUNK table.
+///
+/// Pre-port this was a hardcoded `3840` (CONFIG_N2048_K1 at PlainMod=15).
+/// Post-port (`onionpir` rev `92fceb01`+) the value is dictated by the
+/// compile-time OnionPIR config — `params_info(0).entry_size` — and is
+/// 3328 for the default `CONFIG_N2048_K1`. Use [`packed_entry_size`]
+/// at runtime instead of hardcoding.
 #[cfg(feature = "onion")]
-const PACKED_ENTRY_SIZE: usize = 3840;
+#[inline]
+fn packed_entry_size() -> usize {
+    onionpir::params_info(0).entry_size as usize
+}
 
 // ─── Per-DB OnionPIR parameters ─────────────────────────────────────────────
 
@@ -1401,11 +1410,13 @@ impl OnionClient {
                     // Emit a Merkle trace for EVERY probed bin (not just the
                     // matching one). Leaf position matches the server's
                     // flat-table ordering: `pbc_group * bins + bin`.
-                    let entry_for_hash = if entry.len() >= PACKED_ENTRY_SIZE {
-                        &entry[..PACKED_ENTRY_SIZE]
-                    } else {
-                        &entry[..]
-                    };
+                    //
+                    // OnionPIRv2 port (commit 5): the bin is exactly
+                    // `pinfo.entry_size` bytes after `onion_unpack`, so
+                    // the pre-port `if len >= PACKED_ENTRY_SIZE { trim }
+                    // else { full }` guard collapses to just the full
+                    // slice. We hash the full bin unconditionally.
+                    let entry_for_hash: &[u8] = &entry;
                     index_traces.push(IndexBinMerkle {
                         sh_idx,
                         leaf_pos: group * bins + bin as usize,
@@ -1639,14 +1650,21 @@ impl OnionClient {
                         pinfo.entry_size
                     ))
                 })?;
-                if bytes.len() < PACKED_ENTRY_SIZE {
-                    return Err(PirError::Protocol(format!(
-                        "decrypted chunk shorter than PACKED_ENTRY_SIZE: {} < {}",
-                        bytes.len(),
-                        PACKED_ENTRY_SIZE
-                    )));
-                }
-                let packed = &bytes[..PACKED_ENTRY_SIZE];
+                // OnionPIRv2 port (commit 5): after `onion_unpack`,
+                // `bytes.len() == pinfo.entry_size` exactly, so the
+                // pre-port short-bytes guard collapses to a redundant
+                // equality. We keep an assertion for defensive sanity
+                // — a server bug returning a wrong-shape plaintext
+                // would otherwise propagate silently into the Merkle
+                // hashes.
+                debug_assert_eq!(
+                    bytes.len(),
+                    pinfo.entry_size as usize,
+                    "CHUNK decrypt produced {} bytes, expected entry_size={}",
+                    bytes.len(),
+                    pinfo.entry_size
+                );
+                let packed: &[u8] = &bytes;
                 decrypted.insert(q.entry_id, packed.to_vec());
                 // DATA Merkle trace: one leaf per fetched entry_id. Leaf
                 // position matches server's flat-table layout
@@ -1921,7 +1939,9 @@ fn assemble_entry_bytes(
     chunk_data: &HashMap<u32, Vec<u8>>,
     db_id: u8,
 ) -> PirResult<Vec<u8>> {
-    let mut out = Vec::with_capacity(ir.num_entries as usize * PACKED_ENTRY_SIZE);
+    // OnionPIRv2 port (commit 5): capacity hint derived from runtime
+    // params instead of the pre-port `PACKED_ENTRY_SIZE = 3840` constant.
+    let mut out = Vec::with_capacity(ir.num_entries as usize * packed_entry_size());
     for i in 0..ir.num_entries as u32 {
         let eid = ir.entry_id + i;
         let entry = chunk_data.get(&eid).ok_or_else(|| {
