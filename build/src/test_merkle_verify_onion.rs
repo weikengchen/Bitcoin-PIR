@@ -17,8 +17,16 @@ use std::fs::File;
 use std::io::Read;
 
 const DEFAULT_DATA_DIR: &str = "/Volumes/Bitcoin/data";
-const ARITY: usize = 120;
-const PACKED_ENTRY_SIZE: usize = 3840;
+// OnionPIRv2 port (commit 5b cleanup): pre-port these were hardcoded
+// `const ARITY: usize = 120` + `const PACKED_ENTRY_SIZE: usize = 3840`.
+// Post-port, gen_4_build_merkle_onion produces trees whose arity is
+// pinned to `params_info(0).entry_size / 32` (104 for the default
+// CONFIG_N2048_K1), and writes that arity to the tree-top metadata file
+// (`merkle_onion_<kind>_tree_top.bin` at offset 5..7 as u16). The
+// loader at `load_tree_top_cache` already reads it; this test now
+// plumbs `cache.arity` through every walker that previously consumed
+// the const, so the verification picks up whatever the build pipeline
+// emitted.
 const DEFAULT_NUM_TESTS: usize = 100;
 
 // ─── Hash utilities (same as gen_4_build_merkle_onion) ──────────────────────
@@ -129,10 +137,16 @@ fn load_sibling_level(data_dir: &str, tree_kind: &str, level: usize) -> Option<S
 }
 
 /// Look up a group_id in the sibling level's cuckoo table.
-/// Returns the ARITY child hashes from the packed data.
-fn lookup_sibling_group(sib: &SiblingLevel, group_id: u32) -> Option<Vec<Hash256>> {
+/// Returns the `arity` child hashes from the packed data.
+///
+/// OnionPIRv2 port (commit 5b cleanup): `arity` was a const pre-port
+/// (always 120); post-port it's runtime-derived from
+/// `params_info(0).entry_size / 32` (104 by default). The packed
+/// entry size on disk is `arity * 32` bytes per Merkle node.
+fn lookup_sibling_group(sib: &SiblingLevel, group_id: u32, arity: usize) -> Option<Vec<Hash256>> {
     let pbc_groups = derive_pbc_groups(group_id, sib.k);
     let header_size = 36;
+    let packed_entry_size = arity * 32;
 
     for &pbc_group in &pbc_groups {
         let table_offset = header_size + pbc_group * sib.bins_per_table * 4;
@@ -148,12 +162,12 @@ fn lookup_sibling_group(sib: &SiblingLevel, group_id: u32) -> Option<Vec<Hash256
             );
 
             if stored_id == group_id {
-                let data_offset = group_id as usize * PACKED_ENTRY_SIZE;
-                if data_offset + PACKED_ENTRY_SIZE > sib.packed_mmap.len() { return None; }
+                let data_offset = group_id as usize * packed_entry_size;
+                if data_offset + packed_entry_size > sib.packed_mmap.len() { return None; }
 
-                let packed = &sib.packed_mmap[data_offset..data_offset + PACKED_ENTRY_SIZE];
-                let mut children = Vec::with_capacity(ARITY);
-                for c in 0..ARITY {
+                let packed = &sib.packed_mmap[data_offset..data_offset + packed_entry_size];
+                let mut children = Vec::with_capacity(arity);
+                for c in 0..arity {
                     let off = c * 32;
                     let mut h = [0u8; 32];
                     h.copy_from_slice(&packed[off..off + 32]);
@@ -241,11 +255,17 @@ fn verify_sub_tree(
         let mut node_idx = leaf_pos;
         let mut verified = true;
 
-        // Walk sibling levels
+        // Walk sibling levels.
+        // OnionPIRv2 port (commit 5b cleanup): `arity` is whatever the
+        // build pipeline wrote into the tree-top metadata (post-port:
+        // 104 for the default config; pre-port: 120). Every loop
+        // boundary that previously read the `ARITY` const now reads
+        // `cache.arity`.
+        let arity = cache.arity;
         for level in 0..num_sibling_levels {
-            let group_id = (node_idx / ARITY) as u32;
+            let group_id = (node_idx / arity) as u32;
 
-            let children = match lookup_sibling_group(&sib_levels[level], group_id) {
+            let children = match lookup_sibling_group(&sib_levels[level], group_id, arity) {
                 Some(c) => c,
                 None => {
                     println!("  [{}] FAIL: sibling group not found {} L{} leaf={} group={}",
@@ -257,7 +277,7 @@ fn verify_sub_tree(
 
             // The packed sibling data already contains all children including ours
             // But we need to replace our position with our current_hash
-            let child_pos = node_idx % ARITY;
+            let child_pos = node_idx % arity;
             let mut merged = children;
             merged[child_pos] = current_hash;
 
@@ -270,9 +290,9 @@ fn verify_sub_tree(
         // Walk tree-top cache
         for ci in 0..cache.levels.len().saturating_sub(1) {
             let level_nodes = &cache.levels[ci];
-            let parent_start = (node_idx / ARITY) * ARITY;
-            let mut children = Vec::with_capacity(ARITY);
-            for c in 0..ARITY {
+            let parent_start = (node_idx / arity) * arity;
+            let mut children = Vec::with_capacity(arity);
+            for c in 0..arity {
                 let child_idx = parent_start + c;
                 if child_idx < level_nodes.len() {
                     children.push(level_nodes[child_idx]);
@@ -281,7 +301,7 @@ fn verify_sub_tree(
                 }
             }
             current_hash = merkle::compute_parent_n(&children);
-            node_idx /= ARITY;
+            node_idx /= arity;
         }
 
         if current_hash == root {
@@ -317,7 +337,9 @@ fn main() {
         i += 1;
     }
 
-    println!("=== Per-Bin OnionPIR Merkle Verification Test (arity={}) ===\n", ARITY);
+    // Note: pre-port this printed `arity=120` from a const; the runtime
+    // arity is read from the per-tree metadata in `verify_sub_tree`.
+    println!("=== Per-Bin OnionPIR Merkle Verification Test ===\n");
 
     // Load INDEX bin hashes
     let index_hashes_path = format!("{}/onion_index_bin_hashes.bin", data_dir);

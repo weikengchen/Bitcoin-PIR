@@ -20,19 +20,21 @@ that. This is the BitcoinPIR-specific punch list.
   ✅ §2 Commit 3         — gen_2/3/4 push_plaintexts + save_db + runtime num_plaintexts (8e3dcddf)
   ✅ §2 Commit 4         — audit (no persistence to invalidate) + TS bit-unpack helper + diagnostic-friendly error messages
   ✅ §2 Commit 5a        — client-side PACKED_ENTRY_SIZE → runtime params (f0399024)
-  ✅ §2 Commit 5b        — gen_1/3/4 hardcoded constants → runtime params (this commit; truncation gone)
-  ⬜ §2 Commit 6         — SharedKeyStore / QueryQueue (optional polish)
-  ✅ §2 Commit 7         — WASM swap (post-port .mjs) + TS API rename + unpack wiring
+  ✅ §2 Commit 5b        — gen_1/3/4 hardcoded constants → runtime params (2bf2b3da; truncation gone)
+  ✅ §2 Commit 6         — SharedKeyStore audited (no-code-change); QueryQueue declined
+  ✅ §2 Commit 7         — WASM swap (post-port .mjs) + TS API rename + unpack wiring (8dab8e29)
+  ✅ Cleanup             — test_merkle_verify_onion runtime-arity polish
 
 Branch: `worktree-feat+onionpir-port-migration` at
-`.claude/worktrees/feat+onionpir-port-migration/`. Ten commits ahead of
-`d6c333de`. **Not pushed to BitcoinPIR's origin/main.**
+`.claude/worktrees/feat+onionpir-port-migration/`. Eleven commits ahead
+of `d6c333de`. **Not pushed to BitcoinPIR's origin/main.**
 
-After 5b lands, the **build pipeline is correctness-complete** — no
-more silent truncation. Production cut-over (rebuild every
-preprocessed_db.bin + onion_index_all.bin + Merkle tree-tops, rsync
-to pir1, swap via databases.toml, smoke a known-good scripthash)
-is unblocked.
+**The migration is functionally complete.** Every planned commit is
+landed or explicitly deferred with rationale. Production cut-over
+(rebuild every preprocessed_db.bin + onion_index_all.bin + Merkle
+tree-tops, rsync to pir1, swap via databases.toml, smoke a known-good
+scripthash) is unblocked and ready to execute on the operator's
+schedule.
 
 `cargo check --workspace` is green. End-to-end smoke (build a real
 packed.bin → gen_2 → gen_3 → unified_server → pir-sdk-client query)
@@ -386,7 +388,65 @@ Action items:
    back clean, but re-audit after rev bump — anything that compiled
    under power-of-2 assumptions is a silent-decode bug.
 
-### Commit 6 — Wire up SharedKeyStore / QueryQueue (optional)
+### Commit 6 — SharedKeyStore audited / QueryQueue declined — **LANDED**
+
+**SharedKeyStore (§2.1):** zero code change required. Commit 1's
+mechanical-rename sweep already updated every `KeyStore` call site
+in `runtime/src/bin/unified_server.rs` to the post-port shape:
+
+  Old (pre-port)                        New (post-port, in tree today)
+  -------------------------------       -----------------------------------
+  KeyStore::new(0)                      KeyStore::new()
+  key_store.set_galois_key(id, &g)      key_store.set_galois_keys(id, &g)
+  key_store.set_gsw_key(id, &g)         key_store.set_gsw_key(id, &g)   (no rename — singular kept)
+  server.set_key_store(&store)          server.set_key_store(Some(&store))
+
+Upstream KeyStore (`/Users/cusgadmin/.cargo/git/checkouts/.../92fceb0/rust/onionpir/src/lib.rs:392-440`)
+exposes additional methods that BitcoinPIR doesn't currently use:
+
+  has_client(id) -> bool                — proactive existence check
+  remove(id)                            — explicit eviction
+  size() -> u64                         — for telemetry / capacity alarms
+
+These would be useful additions for telemetry once the 100-client LRU
+cap becomes visible in production traffic. Not adopted now because the
+existing tracing instrumentation doesn't surface KeyStore-level
+metrics; deferring until profile data justifies the wiring.
+
+**QueryQueue (§2.2): declined.** Cost-benefit assessment:
+
+  Benefit: parallelize multiple concurrent OnionPIR queries through
+           one Server handle, replacing the per-DB worker-thread
+           mpsc serialization in unified_server.rs.
+
+  Cost:    non-trivial restructuring of the OnionPIR worker loop;
+           introduces internal worker-thread management (the upstream
+           QueryQueue spawns its own worker pool, separate from
+           tokio's runtime); changes how cancellation + back-pressure
+           work; requires careful coexistence with the existing
+           `tokio::task::spawn_blocking` paths.
+
+  When it pays off:
+           - High concurrent-client count per OnionPIR DB.
+           - Server CPU underutilized when a single client query is
+             stalled on I/O.
+
+  When it doesn't:
+           - pir1 today (single i7-8700, low concurrent OnionPIR
+             client count). The FHE compute itself (~10 s/query at
+             INDEX level, ~5 s at CHUNK) dominates wall time; serial
+             dispatch through mpsc is a rounding error.
+           - Pre-existing tokio + per-DB worker thread model already
+             handles multi-client serialization correctly; QueryQueue
+             would be parallel-redundant with that.
+
+QueryQueue stays available in the dep for future use — the upstream
+crate's public API is unchanged. If pir1's concurrent client count
+grows enough to make the per-DB serialization a bottleneck, the
+migration is straightforward (one place to change in
+unified_server.rs's PIR worker thread).
+
+Original design notes below:
 
 Per §2.1-§2.3. BitcoinPIR's `unified_server.rs` already uses
 `onionpir::KeyStore` (`[SharedKeyStore]` log lines visible in prod).
