@@ -1,118 +1,87 @@
-# BitcoinPIR bug: the ~3.1 MB OnionPIR `RegisterKeys` payload is truncated in transit
+# RESOLVED: the OnionPIR "2402b16 regression" was a contaminated incremental C++ build
 
-**Status:** root cause partially identified 2026-05-15. The *fact* of
-the truncation is established with byte-level evidence; the exact
-transport mechanism (which layer drops the bytes) needs one more
-focused investigation. This doc records what is known so the next
-session — or the reader — can finish it without re-deriving.
+**Status:** RESOLVED 2026-05-15. This file previously theorised a
+"transport truncation" bug. **That was wrong.** The real cause —
+proven with end-to-end byte-level instrumentation — is a contaminated
+incremental build of the `onionpir` crate's C++ library
+(`libonionpir.a`). The filename is kept for git continuity; treat the
+content below as the authoritative post-mortem.
 
-## Symptom
+## TL;DR
 
-OnionPIR end-to-end query (`test_onion_client_query_batch`) against
-a pir1 server built from onionpir rev `2402b16` panics with
-`SessionEvicted("…all-empty batch…")`. Server-side, "key
-registration" takes 55–60 s and every subsequent `answer_query`
-returns an empty `Vec`.
+Flipping the `onionpir` git rev in the three `Cargo.toml`s back and
+forth (`fb14f4e` ↔ `2402b16`, ~5 times in one debugging session)
+left the cargo/cmake **incremental** build of `libonionpir.a` in an
+inconsistent state. A contaminated `libonionpir.a` made the *client's*
+`Client::galois_keys()` emit a **malformed, undersized** BV-galois-key
+blob (379 KB of garbage instead of the correct 2,621,564 B). The
+server's `deserialize_bv_galois_keys` then read a bogus `num_keys`
+(`0x0410a15e` ≈ 68 M) from the garbage and spent ~60 s in a
+memset/malloc/free loop — the "60 s key registration" symptom.
 
-## What is proven
+**Fix:** wipe the onionpir build artifacts and rebuild clean whenever
+the pinned rev changes:
 
-1. **The 60 s is inside `deserialize_bv_galois_keys`** (C++ FFI).
-   Six gdb backtraces of the worker thread, 9 s apart, all land in
-   that function (`vector::assign` → memset, `munmap`/`free`). It is
-   looping on a garbage count. See
-   [`docs/UPSTREAM_REQUEST_2402b16_REGRESSION.md`](UPSTREAM_REQUEST_2402b16_REGRESSION.md).
-
-2. **The client serializes a perfect blob.** Client-side instrumentation
-   in `pir-sdk-client/src/onion.rs::register_keys`:
-   ```
-   register_keys: galois=2621564B head=[0a 00 00 00 01 08 00 00 08 00 00 00 …]
-   ```
-   `0a 00 00 00` = `num_keys = 10` (= `TREE_HEIGHT`); total
-   `2,621,564 B` = exactly `4 + 10·(12 + 8·2·2048·8)`. Well-formed.
-
-3. **The server receives a truncated, mis-aligned blob.** Server-side
-   instrumentation in `runtime/src/bin/unified_server.rs`'s
-   `PirCommand::RegisterKeys` handler:
-   ```
-   RegisterKeys recv: galois=379022B head=[5e a1 10 04 01 00 00 00 8e c8 05 00 …]
-   ```
-   `379,022 B` ≠ `2,621,564 B` — the galois field is ~14 % of what
-   was sent. The leading bytes `5e a1 10 04` are mid-blob garbage
-   (read as `num_keys = 67,936,606` → the 60 s loop). The gsw field
-   is likewise wrong: client sends `524,296 B`, server sees
-   `331,560 B`.
-
-So the ~3.1 MB `RegisterKeys` payload (2.6 MB galois + 0.5 MB gsw +
-framing) loses ~2.4 MB somewhere between
-`pir-sdk-client::register_keys` calling `conn.roundtrip(&payload)`
-and the server's `RegisterKeysMsg::decode` extracting the fields.
-
-## Wire path (where to look)
-
-`encode_register_keys` (`pir-sdk-client/src/onion.rs:2170`) builds:
+```bash
+rm -rf target/release/build/onionpir-* \
+       target/release/deps/*onionpir* \
+       target/release/.fingerprint/onionpir-*
+cargo build --release -p pir-sdk-client --features onion   # or -p runtime
 ```
-[payload_len u32][REQ_REGISTER_KEYS u8][galois_len u32][galois][gsw_len u32][gsw][db_id?]
-```
-→ `conn.roundtrip(&payload)` →
-  native `WsConnection` (`pir-sdk-client/src/connection.rs`) →
-  if an encrypted channel is up, the payload is AEAD-framed by
-  `pir-channel` / `pir-runtime-core::channel` →
-  `tokio-tungstenite` WebSocket →
-  server WS read loop (`unified_server.rs` ~line 2347) →
-  channel `open()` decrypt →
-  `RegisterKeysMsg::decode(body)` → the malformed `galois_keys` field.
 
-Suspects, in rough priority:
+(`cargo clean -p onionpir` is the tidy equivalent but the explicit
+`rm -rf` is what was verified.)
 
-1. **Encrypted-channel frame chunking.** A 3.1 MB plaintext almost
-   certainly exceeds one AEAD frame. If the channel splits it into N
-   frames and the server-side reassembly completes early (or a single
-   frame's plaintext-length field caps the payload), the decoded
-   `body` would be one-frame-sized. `379022 + 331560 + 13 ≈ 710 KB` —
-   check whether that's a channel max-frame-size.
-2. **`tokio-tungstenite` message-size cap.** tungstenite's default
-   `max_message_size` is 64 MB and `max_frame_size` 16 MB — 3.1 MB is
-   under both, so this is unlikely *unless* the BitcoinPIR transport
-   overrides them lower.
-3. **`RegisterKeysMsg::decode` mis-parse.** Less likely (the bytes it
-   extracts start mid-blob, consistent with a short `body`, not a
-   parser bug) but worth ruling out.
+## Proof
 
-## The unresolved puzzle
+End-to-end instrumentation (client `register_keys` + server WS-loop),
+two consecutive test runs against the *same* pir1 server:
 
-The fb14f4e end-to-end smoke test **passed** at 15:36 CET the same
-day — `registration 1.39 ms`, clean 2.6 MB deserialize — i.e. the
-same ~3.1 MB payload reached an fb14f4e server intact. The transport
-code (`pir-channel`, `WsConnection`, `tokio-tungstenite`) is
-**identical** regardless of the onionpir rev, so a pure size-cap
-truncation should fail on fb14f4e too.
+| Run | Client `onionpir` build | `ws_bin` at server | `body_head` (galois_len) | Registration |
+|---|---|---|---|---|
+| contaminated | incremental, after rev-flips | 710,595 B | `8e c8 05 00` = 379,022 (garbage) | **56 s** ❌ |
+| clean | `rm -rf onionpir-*` + rebuild | 3,145,873 B | `7c 00 28 00` = 2,621,564 ✓ | **1.12 ms** ✓ |
 
-Differences between the passing and failing runs, still to be
-bisected:
-- **Server rev**: fb14f4e (pass) vs 2402b16 (fail). The transport is
-  rev-independent, so if this matters it's via timing — the
-  thread-safety patch changes lock/scheduling behavior, which could
-  expose a race in a multi-frame reassembly path.
-- **Server flags**: the 15:36 pass used the systemd unit
-  (`--serve-hints --serve-queries --pool-size 8 --pool-dir …`); the
-  failing diagnostic runs used a hand-launched
-  `--serve-queries --pool-size 0` (no `--serve-hints`). If the hint
-  subsystem changes connection setup or buffer sizing, this is a
-  confound that must be eliminated.
+The server code, the transport, and the WebSocket layer never
+changed between those two runs — only the client's `libonionpir.a`
+was rebuilt clean. `3,145,873 B` is exactly the well-formed
+`encode_register_keys` size (`4 + 1 + 4 + 2,621,564 + 4 + 524,296`);
+`710,595 B` is exactly the *garbage-consistent* size the contaminated
+build produced. The bug was 100 % client-side key serialization.
 
-**Next diagnostic step (do this first):** rebuild pir1 with onionpir
-`2402b16` and run it under the *exact* systemd flags
-(`--serve-hints --serve-queries --pool-size 8 --pool-dir …`), wait
-for hint-pool quiescence, then test. If registration is now fast →
-the flag set, not the rev, was the variable, and the transport bug is
-flag-conditional. If still 60 s → it is the rev (→ timing/race), and
-the encrypted-channel reassembly is the place to instrument
-(log frame count + per-frame plaintext length on both ends).
+## Why earlier theories were wrong
 
-## Interim mitigation
+* **"2402b16 thread-safety patch regressed it"** — no. The macOS repro
+  agent built a *clean* `2402b16` and registration was 0.21 ms. The
+  patch is sound; `parallel_answer_query_via_shared_keystore` passes.
+* **"Hint-pool CPU thrashing"** — that *is* a real, separate startup
+  issue (fixed by the systemd stagger in
+  [`deploy/systemd/pir-secondary.service`](../deploy/systemd/pir-secondary.service)),
+  but it only slowed registration to ~100 s *while the CPU was
+  saturated*; the 55–60 s on a *quiesced* host was the contaminated
+  build.
+* **"Transport truncates the 3.1 MB message"** — no. The full
+  3,145,873 B arrives intact (`ws_bin=3145873B` above). The
+  contaminated build simply made the client *construct* a smaller,
+  garbage message.
 
-pir1 is rolled back to onionpir `fb14f4e` (commit `b50af83a`), which
-serves OnionPIR correctly end-to-end via SSH tunnel. The Cloudflare
-100 s timeout (the original reason for wanting `2402b16` +
-`.par_iter_mut()`) remains open and is gated behind this truncation
-bug + the upstream bounds-check ask.
+## Process lesson
+
+The `onionpir` crate wraps a CMake C++ build via `build.rs`. CMake
+incremental builds key off file mtimes and a configured build dir.
+When cargo switches the git rev, it uses a *different* checkout but
+can reuse build-script fingerprints / output dirs in ways that don't
+always force a full C++ recompile. The symptom (silently-wrong
+serialization, no compile error) is nasty. **Any change to the
+`onionpir` pinned rev must be followed by a clean rebuild of that
+crate** — add this to the migration runbook.
+
+## Residual hardening (low priority)
+
+A robust `deserialize_bv_galois_keys` should never spend 60 s on
+malformed input. The optional upstream bounds-check ask in
+[`UPSTREAM_REQUEST_2402b16_REGRESSION.md`](UPSTREAM_REQUEST_2402b16_REGRESSION.md)
+still stands as defense-in-depth — had it been there, this would have
+been a 1-second "deserialize threw: implausible num_keys" instead of
+a multi-hour hunt — but it is no longer urgent, because no real
+(clean-built) client ever emits a malformed blob.
