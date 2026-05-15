@@ -1,25 +1,43 @@
 # Bug report to OnionPIRv2: 2402b16 thread-safety patch regressed BitcoinPIR's pir1 deploy
 
-> ## WITHDRAWN 2026-05-15 (same day)
+> ## RE-OPENED 2026-05-15 (same day)
 >
-> The 2402b16 patch is **sound**. The slow-registration + all-empty-
-> answer_query symptom I attributed to it was actually a pir1
-> deployment ordering issue: both `pir-primary.service` and
-> `pir-secondary.service` auto-start at boot and burst the
-> 6-core i7-8700 to 1172 % CPU together for ~2 minutes generating
-> HarmonyPIR V2 hint-pool entries. Tests that connect during this
-> window see the OnionPIR mpsc worker thread starve.
+> Earlier today I marked this WITHDRAWN, attributing the slow
+> registration to a hint-pool CPU-thrashing issue
+> (`docs/PIR1_STARTUP_HINT_POOL_THRASHING.md`). After a more careful
+> repro with a quiesced pir1 (CPU idle, 1.5 cores load), I found
+> the issue **persists** with 2402b16 even when the host has no
+> CPU contention:
 >
-> Root cause + workaround filed at
-> [`docs/PIR1_STARTUP_HINT_POOL_THRASHING.md`](PIR1_STARTUP_HINT_POOL_THRASHING.md).
-> The earlier
-> [`UPSTREAM_REQUEST_THREAD_SAFETY.md`](UPSTREAM_REQUEST_THREAD_SAFETY.md)
-> remains valid — 2402b16 was a real, useful patch even though I
-> haven't yet exercised the parallel `answer_query` path it unlocks.
+> | Binary | Server state when test ran | First RegisterKeys |
+> |---|---|---|
+> | fb14f4e | Quiesced (CPU 91 % idle, load 3) | **1.39 ms** ✓ |
+> | 2402b16 serial | Quiesced (CPU 91 % idle, load 3) | **59.84 s** ❌ |
+> | 2402b16 parallel | Quiesced (CPU 91 % idle, load 3) | **55.65 s** ❌ |
 >
-> Sorry for the noise. The investigation note below is preserved for
-> archaeology — it documents a debug session that chased a symptom
-> through several false leads before correlating it with system load.
+> AND every per-group `answer_query` returns an empty `Vec` (the C++
+> `catch(...)` fires) after a slow registration on 2402b16 — same
+> SessionEvicted symptom as before. fb14f4e on the same quiesced
+> host returns valid responses (162 s sequential INDEX, full smoke
+> test passes in 375 s).
+>
+> So there are TWO separate issues:
+> 1. The hint-pool thrashing IS real (causes slow registration when
+>    CPU saturated, regardless of onionpir rev). Fixed by the
+>    systemd stagger in
+>    [`deploy/systemd/pir-secondary.service`](../deploy/systemd/pir-secondary.service).
+> 2. **2402b16 has a BitcoinPIR-side regression** that the upstream
+>    `parallel_answer_query_via_shared_keystore` test does NOT
+>    catch — the test uses 8 servers; BitcoinPIR attaches 205
+>    `Server`s to one `KeyStore`. Issue 2 is what this doc is about.
+>
+> pir1 currently runs fb14f4e (rolled back via commit `6c8fab5a`,
+> a revert of the 2402b16 re-bump `a6905602`). The full smoke test
+> passes end-to-end via SSH tunnel; CF still hits its 100 s timeout
+> until issue (2) lands, at which point the `.par_iter_mut()` switch
+> drops INDEX to ~25 s.
+>
+> Updated reproduction + evidence below.
 
 **Original status (now superseded):** authored 2026-05-15. Filed after applying the
 2402b16 thread-safety patch (per
