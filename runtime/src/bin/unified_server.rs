@@ -2012,56 +2012,80 @@ async fn main() {
                         }
                         PirCommand::AnswerBatch { client_id, level, round_id, queries, reply } => {
                             let t = Instant::now();
-                            // 2026-05-15: temporarily reverted to serial dispatch to
-                            // isolate a deploy-time regression. Bumping the onionpir
-                            // rev to 2402b16 + switching to .par_iter_mut() on pir1
-                            // produced two new symptoms:
-                            //   * `RegisterKeys` took 94 s (was 7 ms pre-bump) on the
-                            //     same code path that only calls `KeyStore::set_galois_keys`
-                            //     + `set_gsw_key` once each.
-                            //   * Every per-group `answer_query` returned an empty
-                            //     `Vec` (C++ catch fired immediately), making the
-                            //     client see SessionEvicted.
-                            // The upstream regression test
-                            // `parallel_answer_query_via_shared_keystore` passes
-                            // locally in 4.9 s, so the patch isn't fundamentally
-                            // broken — something is environment-specific. Run with
-                            // serial dispatch first to confirm the rev-bump alone is
-                            // sound, then re-introduce parallelism with whatever
-                            // additional change is needed (likely a rayon pool
-                            // pre-init or per-thread state warmup).
+                            // OnionPIRv2 port (2402b16): rayon-parallel `answer_query`
+                            // across the per-group PirServer Vec. Safe after upstream
+                            // 2402b16 made g_scratch / NTT cache / TimerLogger
+                            // thread_local + added a mutex to SharedKeyStore. Each
+                            // rayon worker gets one exclusive `&mut PirServer`
+                            // (Send-but-not-Sync), so per-server state is single-
+                            // threaded; the shared SharedKeyStore is mutex-guarded.
+                            //
+                            // The bd1a2928 attempt to ship this was reverted after a
+                            // pir1 deploy showed 60 s registrations + empty
+                            // answer_query. That turned out NOT to be a 2402b16 bug —
+                            // it was a contaminated incremental libonionpir.a build
+                            // from flipping the onionpir git rev repeatedly without a
+                            // clean rebuild (see docs/PIR1_REGISTER_KEYS_TRUNCATION.md).
+                            // With a clean build, 2402b16 registers keys in ~1 ms and
+                            // the parallel path is sound.
+                            //
+                            // Wall-time projection (i7-8700, 6 cores):
+                            //   INDEX 142 s → ~25 s ; CHUNK 157 s → ~25 s. Total batch
+                            //   ≈ 60 s — under Cloudflare's ~100 s WS idle timeout.
+                            let worker_label = &worker_label;
+                            let queries_ref = &queries;
                             let (name, results): (&str, Vec<Vec<u8>>) = if level == 0 {
-                                let results = queries.iter().enumerate().map(|(i, q)| {
-                                    let g = i / 2;
-                                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                        index_servers[g].answer_query(client_id, q)
-                                    })) {
-                                        Ok(r) => r,
-                                        Err(e) => { eprintln!("[OnionPIR:{}] panic in index group {}: {:?}", worker_label, g, e); Vec::new() }
-                                    }
-                                }).collect();
+                                let results: Vec<Vec<u8>> = index_servers
+                                    .par_iter_mut()
+                                    .enumerate()
+                                    .flat_map_iter(|(g, server)| {
+                                        let q0 = &queries_ref[2 * g];
+                                        let q1 = &queries_ref[2 * g + 1];
+                                        let r0 = match std::panic::catch_unwind(
+                                            std::panic::AssertUnwindSafe(|| server.answer_query(client_id, q0)),
+                                        ) {
+                                            Ok(r) => r,
+                                            Err(e) => { eprintln!("[OnionPIR:{}] panic in index group {} q0: {:?}", worker_label, g, e); Vec::new() }
+                                        };
+                                        let r1 = match std::panic::catch_unwind(
+                                            std::panic::AssertUnwindSafe(|| server.answer_query(client_id, q1)),
+                                        ) {
+                                            Ok(r) => r,
+                                            Err(e) => { eprintln!("[OnionPIR:{}] panic in index group {} q1: {:?}", worker_label, g, e); Vec::new() }
+                                        };
+                                        std::iter::once(r0).chain(std::iter::once(r1))
+                                    })
+                                    .collect();
                                 ("index", results)
                             } else if level == 1 {
-                                let results = queries.iter().enumerate().map(|(b, q)| {
-                                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                        chunk_servers[b].answer_query(client_id, q)
-                                    })) {
-                                        Ok(r) => r,
-                                        Err(e) => { eprintln!("[OnionPIR:{}] panic in chunk group {}: {:?}", worker_label, b, e); Vec::new() }
-                                    }
-                                }).collect();
+                                let results: Vec<Vec<u8>> = chunk_servers
+                                    .par_iter_mut()
+                                    .enumerate()
+                                    .map(|(b, server)| {
+                                        match std::panic::catch_unwind(
+                                            std::panic::AssertUnwindSafe(|| server.answer_query(client_id, &queries_ref[b])),
+                                        ) {
+                                            Ok(r) => r,
+                                            Err(e) => { eprintln!("[OnionPIR:{}] panic in chunk group {}: {:?}", worker_label, b, e); Vec::new() }
+                                        }
+                                    })
+                                    .collect();
                                 ("chunk", results)
                             } else if level >= 10 && (level as usize - 10) < sibling_all_servers.len() {
                                 let sib_level = level as usize - 10;
                                 let servers = &mut sibling_all_servers[sib_level];
-                                let results = queries.iter().enumerate().map(|(b, q)| {
-                                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                        servers[b].answer_query(client_id, q)
-                                    })) {
-                                        Ok(r) => r,
-                                        Err(e) => { eprintln!("[OnionPIR:{}] panic in sibling L{} group {}: {:?}", worker_label, sib_level, b, e); Vec::new() }
-                                    }
-                                }).collect();
+                                let results: Vec<Vec<u8>> = servers
+                                    .par_iter_mut()
+                                    .enumerate()
+                                    .map(|(b, server)| {
+                                        match std::panic::catch_unwind(
+                                            std::panic::AssertUnwindSafe(|| server.answer_query(client_id, &queries_ref[b])),
+                                        ) {
+                                            Ok(r) => r,
+                                            Err(e) => { eprintln!("[OnionPIR:{}] panic in sibling L{} group {}: {:?}", worker_label, sib_level, b, e); Vec::new() }
+                                        }
+                                    })
+                                    .collect();
                                 ("sibling", results)
                             } else {
                                 eprintln!("[OnionPIR:{}] unknown level {}", worker_label, level);
