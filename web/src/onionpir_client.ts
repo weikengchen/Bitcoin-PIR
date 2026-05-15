@@ -26,6 +26,7 @@ import {
 
 import { cuckooPlace, planRounds } from './pbc.js';
 import { decodeUtxoData, DummyRng } from './codec.js';
+import { unpackOnionPlaintext } from './onion-unpack.js';
 import { findEntryInOnionPirIndexResult } from './scan.js';
 import { ManagedWebSocket } from './ws.js';
 import { fetchServerInfoJson } from './server-info.js';
@@ -47,6 +48,13 @@ import type { LeakageRecorder, RoundProfile } from './leakage.js';
 
 // ─── Constants for OnionPIR v2 layout ─────────────────────────────────────
 
+// Post-port (commit 7): the byte count per decrypted bin is no longer a
+// hardcoded 3840 — it equals `params_info().entry_size` (3328 for
+// CONFIG_N2048_K1, 19968 for CONFIG_N4096_K2_MP). The TS port of the
+// Rust `pir-core::onion_unpack` helper at `./onion-unpack.ts` returns
+// exactly `entry_size` bytes from `decryptResponse`. The legacy
+// constant is kept as a defensive upper-bound fallback only; the
+// runtime `params.entrySize` is the source of truth at each call site.
 const PACKED_ENTRY_SIZE = 3840;
 
 /** Chunk cuckoo: 6 hash functions, group_size=1 */
@@ -72,36 +80,93 @@ const RESP_ONIONPIR_INDEX_RESULT  = 0x51;
 const RESP_ONIONPIR_CHUNK_RESULT  = 0x52;
 
 // ─── WASM module types ────────────────────────────────────────────────────
+//
+// Post-port surface (onionpir rev 92fceb01, upstream's wasm/bindings.cpp +
+// hand-written .d.ts at web/public/wasm/onionpir_client.d.ts):
+//
+//   * `OnionPirClient` ctor takes no args (DB shape is compile-time, not
+//     a runtime parameter).
+//   * `createClientFromSecretKey(clientId, secretKey)` drops the
+//     `numEntries` first arg and now returns `OnionPirClient | null`
+//     (per upstream Rust: `from_secret_key -> Option<Self>`).
+//   * `paramsInfo()` drops its `numEntries` arg; returns a fully-
+//     populated `OnionPirParamsInfo` with all compile-time fields.
+//   * Method renames: `generateGaloisKeys` → `galoisKeys`,
+//     `generateGswKeys` → `gswKey`, `decryptResponse(idx, resp)` →
+//     `decryptResponse(resp)` (caller now bit-unpacks via
+//     `unpackOnionPlaintext`).
+//   * Cuckoo helper key encoding flipped from `Uint32Array` lo/hi pairs
+//     to `Float64Array` treated as u64-bytes (see
+//     `buildCuckooKeysFloat64Array` below).
+
+interface OnionPirParamsInfo {
+  numEntries:     number;
+  entrySize:      number;
+  numPlaintexts:  number;
+  fstDimSz:       number;
+  otherDimSz:     number;
+  polyDegree:     number;
+  rnsModCount:    number;
+  coeffValCnt:    number;
+  dbSizeMB:       number;
+  physicalSizeMB: number;
+}
 
 interface OnionPirModule {
-  OnionPirClient: { new(numEntries: number): WasmPirClient };
-  createClientFromSecretKey(numEntries: number, clientId: number, secretKey: Uint8Array): WasmPirClient;
-  paramsInfo(numEntries: number): { numEntries: number; entrySize: number };
-  buildCuckooBs1(entries: Uint32Array, keys: Uint32Array, numBins: number): Uint32Array;
+  OnionPirClient: { new(): WasmPirClient };
+  createClientFromSecretKey(clientId: number, secretKey: Uint8Array): WasmPirClient | null;
+  paramsInfo(): OnionPirParamsInfo;
+  splitmix64(x: number): number;
+  cuckooHashInt(entryId: number, key: number, numBins: number): number;
+  buildCuckooBs1(entries: Uint32Array, keys: Float64Array, numBins: number): Uint32Array;
 }
 
 interface WasmPirClient {
   id(): number;
   exportSecretKey(): Uint8Array;
-  generateGaloisKeys(): Uint8Array;
-  generateGswKeys(): Uint8Array;
+  galoisKeys(): Uint8Array;
+  gswKey(): Uint8Array;
   generateQuery(entryIndex: number): Uint8Array;
-  decryptResponse(entryIndex: number, response: Uint8Array): Uint8Array;
+  decryptResponse(response: Uint8Array): Uint8Array;
   delete(): void;
 }
 
 // ─── WASM module loader ───────────────────────────────────────────────────
+//
+// Post-port the upstream WASM is emitted as an ES module
+// (`onionpir_client.mjs`) with a default-exported async factory. The
+// pre-port `<script>` tag + `globalThis.createOnionPirModule` global
+// is gone — the browser HTML no longer ships the script tag (see
+// commit 7 of the onionpir-port branch). Node tests dynamically
+// `await import(...)` the same path; see
+// `web/src/__tests__/onion_leakage_diff.test.ts` for the test-side
+// loader.
+//
+// `globalThis.__onionpirWasmFactory` is a test-time escape hatch: when
+// running under Node / vitest, the test harness can pre-install the
+// factory there (resolved off the local filesystem) to avoid the
+// browser-only `/wasm/onionpir_client.mjs` URL resolution path.
+
+type OnionPirFactory = (moduleArg?: object) => Promise<OnionPirModule>;
 
 let wasmModulePromise: Promise<OnionPirModule> | null = null;
 
 async function loadWasmModule(): Promise<OnionPirModule> {
   if (!wasmModulePromise) {
     wasmModulePromise = (async () => {
-      const factory = (globalThis as any).createOnionPirModule;
-      if (!factory) {
-        throw new Error(
-          'OnionPIR WASM not loaded. Add <script src="/wasm/onionpir_client.js"></script> to HTML.'
-        );
+      const installed = (globalThis as { __onionpirWasmFactory?: OnionPirFactory }).__onionpirWasmFactory;
+      let factory: OnionPirFactory;
+      if (installed) {
+        factory = installed;
+      } else {
+        // The path is built at runtime so `tsc --noEmit` doesn't try to
+        // resolve the .mjs module under web/public/wasm/ at type-check
+        // time. The browser fetches it from /wasm/onionpir_client.mjs
+        // (Vite serves the public/ tree verbatim); node tests install
+        // a factory via `globalThis.__onionpirWasmFactory`.
+        const wasmModuleUrl = '/wasm/onionpir_client.mjs';
+        const mod = await import(/* @vite-ignore */ wasmModuleUrl);
+        factory = (mod as { default: OnionPirFactory }).default;
       }
       return await factory();
     })();
@@ -192,15 +257,37 @@ function buildChunkCuckooForGroup(
   const entries = reverseIndex.get(groupId) ?? [];
   // entries are already sorted since the reverse index is built in eid order
 
-  // Derive 6 hash keys and encode as lo/hi u32 pairs for WASM
-  const keysU32 = new Uint32Array(CHUNK_CUCKOO_NUM_HASHES * 2);
-  for (let h = 0; h < CHUNK_CUCKOO_NUM_HASHES; h++) {
-    const key64 = chunkDeriveCuckooKey(groupId, h);
-    keysU32[h * 2]     = Number(key64 & 0xFFFFFFFFn);  // lo
-    keysU32[h * 2 + 1] = Number(key64 >> 32n);          // hi
-  }
+  // Post-port (commit 7): upstream's `buildCuckooBs1` takes a
+  // `Float64Array` of 6 keys, each element bit-reinterpreted as a u64.
+  // Build a shared ArrayBuffer, write u64s via the BigUint64Array view,
+  // pass the Float64Array view to the WASM call.
+  return wasmModule.buildCuckooBs1(
+    new Uint32Array(entries),
+    buildCuckooKeysFloat64(groupId, chunkDeriveCuckooKey, CHUNK_CUCKOO_NUM_HASHES),
+    binsPerTable,
+  );
+}
 
-  return wasmModule.buildCuckooBs1(new Uint32Array(entries), keysU32, binsPerTable);
+/**
+ * Pack `numHashes` u64 cuckoo-hash keys into a `Float64Array` for the
+ * upstream `buildCuckooBs1(entries, keys, numBins)` post-port WASM
+ * helper. Each Float64 element is the bit-pattern of one u64 key, not
+ * a numeric value — Float64Array is just the upstream binding's
+ * chosen transport for u64 arrays (Float64Array is JS-side ABI-stable
+ * for 8-byte-per-element typed arrays in a way BigInt64Array isn't
+ * on every embind/wasm path).
+ */
+function buildCuckooKeysFloat64(
+  groupId: number,
+  deriveKey: (groupId: number, hashFn: number) => bigint,
+  numHashes: number,
+): Float64Array {
+  const buf = new ArrayBuffer(numHashes * 8);
+  const u64 = new BigUint64Array(buf);
+  for (let h = 0; h < numHashes; h++) {
+    u64[h] = deriveKey(groupId, h);
+  }
+  return new Float64Array(buf);
 }
 
 function findEntryInCuckoo(
@@ -912,14 +999,16 @@ export class OnionPirWebClient {
     this.log(`[PIR-AUDIT] Query parameters: K=${this.indexK} index groups, K_CHUNK=${this.chunkK} chunk groups, INDEX_CUCKOO_NUM_HASHES=${INDEX_CUCKOO_NUM_HASHES}`);
 
     // ── Generate keys and create per-level clients ─────────────────────
-    // Generate keys with a real num_entries (not 0) — keys generated with
-    // num_entries=0 can produce incorrect decryptions due to mismatched
-    // BFV parameters. Keys are reusable across different num_entries values.
+    // Post-port (commit 7): `OnionPirClient` ctor + `createClientFromSecretKey`
+    // no longer take `numEntries` — the DB shape is fixed at WASM compile
+    // time (upstream `params_info()`'s `num_plaintexts`). All level clients
+    // share the same BV/GSW keys and the index/chunk PIR queries select
+    // plaintext slots by absolute index.
     progress('Setup', 'Creating PIR client...');
-    const keygenClient = new this.wasmModule.OnionPirClient(this.indexBins);
+    const keygenClient = new this.wasmModule.OnionPirClient();
     const clientId = keygenClient.id();
-    const galoisKeys = keygenClient.generateGaloisKeys();
-    const gswKeys = keygenClient.generateGswKeys();
+    const galoisKeys = keygenClient.galoisKeys();
+    const gswKeys = keygenClient.gswKey();
     const secretKey = keygenClient.exportSecretKey();
     keygenClient.delete();
 
@@ -927,7 +1016,18 @@ export class OnionPirWebClient {
     this.fheClientId = clientId;
     this.fheSecretKey = secretKey;
 
-    const indexClient = this.wasmModule.createClientFromSecretKey(this.indexBins, clientId, secretKey);
+    const indexClient = this.wasmModule.createClientFromSecretKey(clientId, secretKey);
+    if (!indexClient) {
+      // Upstream's `from_secret_key` returns `Option<Self>` and the WASM
+      // binding maps None → null. None can only fire on size/format
+      // mismatch — for a freshly-exported secret key this should be
+      // unreachable. Throw to surface the inconsistency.
+      throw new Error(
+        `OnionPIR createClientFromSecretKey returned null for freshly-exported sk ` +
+        `(clientId=${clientId}, sk.len=${secretKey.length}). ` +
+        `Likely cause: WASM module / .d.ts drift.`
+      );
+    }
     let chunkClient: WasmPirClient | null = null;
 
     try {
@@ -1054,12 +1154,33 @@ export class OnionPirWebClient {
           // Track ALL bins probed for this address.
           const binsForAddr: { hash: Uint8Array; leafPos: number }[] = [];
           let foundMatch = false;
+          // Post-port (commit 7): query `paramsInfo()` once per
+          // round; we need polyDegree + entrySize to unpack the
+          // raw plaintext bytes.
+          const wasmParams = this.wasmModule.paramsInfo();
           for (let h = 0; h < INDEX_CUCKOO_NUM_HASHES; h++) {
             const qi = group * 2 + h;
             const bin = queryBins[qi];
-            const entryBytes = indexClient.decryptResponse(bin, results[qi]);
+            // Post-port: `decryptResponse(response)` returns the raw
+            // plaintext as `[u32 N][u64 coeff_0]...`; the TS port of
+            // pir-core::onion_unpack handles the inverse-bit-pack.
+            const rawPt = indexClient.decryptResponse(results[qi]);
+            const entryBytes = unpackOnionPlaintext(
+              rawPt, wasmParams.polyDegree, wasmParams.entrySize,
+            );
+            if (!entryBytes) {
+              throw new Error(
+                `onion_unpack rejected INDEX plaintext (raw.len=${rawPt.length} ` +
+                `N=${wasmParams.polyDegree} es=${wasmParams.entrySize})`
+              );
+            }
             decrypted++;
-            const binHash = sha256(entryBytes.slice(0, PACKED_ENTRY_SIZE));
+            // Hash the full unpacked bin (entry_size bytes). The
+            // legacy `PACKED_ENTRY_SIZE = 3840` slice would overshoot
+            // the new 3328-byte bin and read past the end; bound the
+            // slice by the actual unpack length.
+            const hashLen = Math.min(entryBytes.length, PACKED_ENTRY_SIZE);
+            const binHash = sha256(entryBytes.slice(0, hashLen));
             const leafPos = group * this.indexBins + bin;
             binsForAddr.push({ hash: binHash, leafPos });
 
@@ -1183,10 +1304,17 @@ export class OnionPirWebClient {
       let chunkRoundsCount = 0;
 
       if (uniqueEntryIds.length > 0) {
-        // Create chunk client from same secret key (no extra registration needed)
+        // Create chunk client from same secret key (no extra registration needed).
+        // Post-port (commit 7): no `numEntries` arg; null check on stale-key.
         progress('Level 2', 'Setting up chunk phase...');
         await yieldToMain();
-        chunkClient = this.wasmModule!.createClientFromSecretKey(this.chunkBins, clientId, secretKey);
+        chunkClient = this.wasmModule!.createClientFromSecretKey(clientId, secretKey);
+        if (!chunkClient) {
+          throw new Error(
+            `OnionPIR chunk createClientFromSecretKey returned null ` +
+            `(clientId=${clientId}, sk.len=${secretKey.length})`
+          );
+        }
 
         // Build reverse index once: group → entry_ids (single pass over 815K entries)
         // This is 80× faster than scanning per-group.
@@ -1267,11 +1395,24 @@ export class OnionPirWebClient {
           const { results } = decodeBatchResult(respPayload, 1);
 
           let chunkDecrypted = 0;
+          // Post-port (commit 7): unpack the raw plaintext exactly as
+          // in the INDEX block above.
+          const chunkWasmParams = this.wasmModule!.paramsInfo();
           for (const qi of queryInfos) {
-            const entryBytes = chunkClient!.decryptResponse(qi.bin, results[qi.group]);
-            decryptedEntries.set(qi.entryId, entryBytes.slice(0, PACKED_ENTRY_SIZE));
+            const rawPt = chunkClient!.decryptResponse(results[qi.group]);
+            const entryBytes = unpackOnionPlaintext(
+              rawPt, chunkWasmParams.polyDegree, chunkWasmParams.entrySize,
+            );
+            if (!entryBytes) {
+              throw new Error(
+                `onion_unpack rejected CHUNK plaintext (raw.len=${rawPt.length} ` +
+                `N=${chunkWasmParams.polyDegree} es=${chunkWasmParams.entrySize})`
+              );
+            }
+            const hashLen = Math.min(entryBytes.length, PACKED_ENTRY_SIZE);
+            decryptedEntries.set(qi.entryId, entryBytes.slice(0, hashLen));
             // Per-bin Merkle: hash the full decrypted data bin
-            dataBinHashes.set(qi.entryId, sha256(entryBytes.slice(0, PACKED_ENTRY_SIZE)));
+            dataBinHashes.set(qi.entryId, sha256(entryBytes.slice(0, hashLen)));
             dataLeafPositions.set(qi.entryId, qi.group * this.chunkBins + qi.bin);
             chunkDecrypted++;
             progress('Level 2', `Chunk round ${ri + 1}/${chunkRounds.length}: decrypted ${chunkDecrypted}/${queryInfos.length}...`);
@@ -1635,13 +1776,17 @@ export class OnionPirWebClient {
           for (let h = 0; h < ONIONPIR_MERKLE_SIBLING_CUCKOO_NUM_HASHES; h++) {
             sibKeys.push(deriveCuckooKeyGeneric(levelSeed, pbcGroup, h));
           }
-          const keysU32 = new Uint32Array(ONIONPIR_MERKLE_SIBLING_CUCKOO_NUM_HASHES * 2);
+          // Post-port (commit 7): Float64Array u64-bytes encoding. See
+          // `buildCuckooKeysFloat64` near the top of this file.
+          const sibKeysBuf = new ArrayBuffer(ONIONPIR_MERKLE_SIBLING_CUCKOO_NUM_HASHES * 8);
+          const sibKeysU64 = new BigUint64Array(sibKeysBuf);
           for (let h = 0; h < ONIONPIR_MERKLE_SIBLING_CUCKOO_NUM_HASHES; h++) {
-            keysU32[h * 2] = Number(sibKeys[h] & 0xFFFFFFFFn);
-            keysU32[h * 2 + 1] = Number(sibKeys[h] >> 32n);
+            sibKeysU64[h] = sibKeys[h];
           }
           const cuckooTable = this.wasmModule!.buildCuckooBs1(
-            new Uint32Array(groupEntries), keysU32, levelInfo.bins_per_table,
+            new Uint32Array(groupEntries),
+            new Float64Array(sibKeysBuf),
+            levelInfo.bins_per_table,
           );
 
           let targetBin: number | null = null;
@@ -1657,10 +1802,21 @@ export class OnionPirWebClient {
           await yieldToMain();
         }
 
-        // Generate K FHE queries
+        // Generate K FHE queries.
+        // Post-port (commit 7): no `numEntries` arg; null check on stale-key.
         const sibClient = this.wasmModule!.createClientFromSecretKey(
-          levelInfo.bins_per_table, this.fheClientId, this.fheSecretKey!,
+          this.fheClientId, this.fheSecretKey!,
         );
+        if (!sibClient) {
+          throw new Error(
+            `OnionPIR sib createClientFromSecretKey returned null ` +
+            `(clientId=${this.fheClientId}, sk.len=${this.fheSecretKey!.length})`
+          );
+        }
+        // `levelInfo.bins_per_table` was used pre-port to size the
+        // OnionPirClient; post-port the DB shape is compile-time so
+        // this is informational only.
+        void levelInfo.bins_per_table;
         try {
           const queries: Uint8Array[] = [];
           for (let b = 0; b < levelInfo.k; b++) {
@@ -1691,8 +1847,20 @@ export class OnionPirWebClient {
           }
           const { results: sibResults } = decodeBatchResult(respPayload, 1);
 
+          // Post-port (commit 7): unpack raw plaintext to bytes.
+          const sibWasmParams = this.wasmModule!.paramsInfo();
           for (const [pbcGroup, info] of groupInfo) {
-            const decrypted = sibClient.decryptResponse(info.targetBin, sibResults[pbcGroup]);
+            const rawPt = sibClient.decryptResponse(sibResults[pbcGroup]);
+            const decrypted = unpackOnionPlaintext(
+              rawPt, sibWasmParams.polyDegree, sibWasmParams.entrySize,
+            );
+            if (!decrypted) {
+              throw new Error(
+                `onion_unpack rejected sibling plaintext ` +
+                `(raw.len=${rawPt.length} N=${sibWasmParams.polyDegree} ` +
+                `es=${sibWasmParams.entrySize})`
+              );
+            }
             siblingData.set(info.gid, decrypted);
           }
         } finally {

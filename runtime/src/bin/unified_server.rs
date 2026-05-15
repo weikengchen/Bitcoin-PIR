@@ -1326,6 +1326,83 @@ where
     sink.feed(Message::Binary(to_send.into())).await
 }
 
+// ─── Transport-level message chunking (Cloudflare large-message workaround) ──
+//
+// Cloudflare's WebSocket proxy silently corrupts single messages above
+// ~1 MB (a 3.1 MB OnionPIR RegisterKeys upload arrives truncated — see
+// docs/PIR1_REGISTER_KEYS_TRUNCATION.md). Messages over CHUNK_SIZE are
+// split into `[4B len][CHUNK_MAGIC][seq:u16][total:u16][piece]` frames;
+// the peer reassembles. These constants MUST stay in sync with
+// `pir-sdk-client/src/connection.rs` (CHUNK_MAGIC / CHUNK_SIZE) and
+// `web/src/onionpir_client.ts`.
+const CHUNK_MAGIC: u8 = 0xc7;
+const CHUNK_SIZE: usize = 256 * 1024;
+const CHUNK_HDR: usize = 1 + 2 + 2; // magic + seq + total
+const MAX_REASSEMBLED: usize = 64 * 1024 * 1024;
+
+/// Like [`send_resp`], but when `allow_chunk` is set and the framed
+/// message exceeds `CHUNK_SIZE`, splits it into chunk frames the client
+/// reassembles. Used for the large OnionPIR result messages
+/// (INDEX/CHUNK batches ~1–2 MB, Merkle tree-tops ~1 MB) sent to
+/// chunk-capable clients. `allow_chunk` is the per-connection
+/// `client_supports_chunks` flag — false for legacy / WASM DPF/Harmony
+/// clients, which never receive a large enough OnionPIR message anyway.
+async fn send_resp_chunked<S>(
+    sink: &mut S,
+    session: Option<&mut pir_runtime_core::channel::Session>,
+    payload: Vec<u8>,
+    allow_chunk: bool,
+) -> tokio_tungstenite::tungstenite::Result<()>
+where
+    S: futures_util::SinkExt<tokio_tungstenite::tungstenite::Message, Error = tokio_tungstenite::tungstenite::Error>
+        + Unpin,
+{
+    use tokio_tungstenite::tungstenite::{Error as TungError, Message};
+    // Frame (and optionally seal) exactly like send_resp.
+    let to_send = match session {
+        Some(s) => {
+            if payload.len() < 4 {
+                payload
+            } else {
+                let inner = &payload[4..];
+                let sealed = s
+                    .seal(pir_runtime_core::channel::Direction::ServerToClient, inner)
+                    .map_err(|e| {
+                        TungError::Io(std::io::Error::other(format!("channel seal: {}", e)))
+                    })?;
+                let mut framed = Vec::with_capacity(4 + sealed.len());
+                framed.extend_from_slice(&(sealed.len() as u32).to_le_bytes());
+                framed.extend_from_slice(&sealed);
+                framed
+            }
+        }
+        None => payload,
+    };
+    if !allow_chunk || to_send.len() <= CHUNK_SIZE {
+        return sink.send(Message::Binary(to_send.into())).await;
+    }
+    let total = to_send.len().div_ceil(CHUNK_SIZE);
+    if total > u16::MAX as usize {
+        return Err(TungError::Io(std::io::Error::other(format!(
+            "response too large to chunk: {} bytes",
+            to_send.len()
+        ))));
+    }
+    for seq in 0..total {
+        let start = seq * CHUNK_SIZE;
+        let end = (start + CHUNK_SIZE).min(to_send.len());
+        let piece = &to_send[start..end];
+        let mut frame = Vec::with_capacity(4 + CHUNK_HDR + piece.len());
+        frame.extend_from_slice(&((CHUNK_HDR + piece.len()) as u32).to_le_bytes());
+        frame.push(CHUNK_MAGIC);
+        frame.extend_from_slice(&(seq as u16).to_le_bytes());
+        frame.extend_from_slice(&(total as u16).to_le_bytes());
+        frame.extend_from_slice(piece);
+        sink.send(Message::Binary(frame.into())).await?;
+    }
+    Ok(())
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -1802,12 +1879,55 @@ async fn main() {
 
             // Spawn PIR worker thread (one per DB)
             std::thread::spawn(move || {
-                let mut key_store = Box::new(KeyStore::new(0));
+                // OnionPIRv2 port: KeyStore::new() takes no args now.
+                let mut key_store = Box::new(KeyStore::new());
 
-                // Set up chunk servers
+                // Set up chunk servers.
+                //
+                // OnionPIRv2 port (commit 6 / runtime-num_pt update): post the
+                // upstream `target_num_pt` refactor (`fb14f4e447b...`),
+                // `params_info(chunk_bins)` returns the LOCAL per-instance
+                // shape (small server sized for `chunk_bins` ~37K plaintexts).
+                // That's what each chunk worker's PirServer needs.
                 let p_chunk = onionpir::params_info(chunk_bins as u64);
                 let padded_chunk = p_chunk.num_entries as usize;
-                let ntt_u64_ptr = ntt_mmap.as_ptr() as *const u64;
+                // OnionPIRv2 port: `set_shared_database` now takes
+                // `&[u64]` rather than a raw `*const u64` + count. The
+                // unsafe slice construction below is sound for the same
+                // reason the old raw-pointer call was: `ntt_mmap` is
+                // captured by-move into this worker-thread closure and
+                // outlives every `PirServer` we attach to it.
+                //
+                // SAFETY: `ntt_mmap` is a `&[u8]` with `len() % 8 == 0`
+                // (preprocessed_db.bin payload is u64-aligned by build).
+                let ntt_u64_slice: &[u64] = unsafe {
+                    std::slice::from_raw_parts(
+                        ntt_mmap.as_ptr() as *const u64,
+                        ntt_mmap.len() / 8,
+                    )
+                };
+
+                // Shared store's `num_pt` — what gen_2_onion's builder
+                // `PirServer::new(num_packed_entries)` was created with,
+                // which is what `set_shared_database`'s `shared_num_entries`
+                // argument wants. Pre-`fb14f4e` we passed
+                // `p_chunk.num_plaintexts` (the local per-instance value);
+                // post-refactor those are different numbers and the local
+                // one is wrong here. Derive from the NTT store file size
+                // instead — `len() / 8 / coeff_val_cnt` is the count of
+                // plaintext slots the builder saved.
+                let coeff_val_cnt =
+                    onionpir::params_info(0).coeff_val_cnt as usize;
+                assert!(
+                    coeff_val_cnt > 0
+                        && (ntt_u64_slice.len() % coeff_val_cnt) == 0,
+                    "chunk NTT store len ({} u64s) not divisible by \
+                     coeff_val_cnt ({}); file is the wrong shape",
+                    ntt_u64_slice.len(),
+                    coeff_val_cnt,
+                );
+                let chunk_shared_num_entries =
+                    (ntt_u64_slice.len() / coeff_val_cnt) as u64;
 
                 let mut chunk_index_tables: Vec<Vec<u32>> = Vec::with_capacity(k_chunk);
                 let mut chunk_servers: Vec<PirServer> = Vec::with_capacity(k_chunk);
@@ -1821,8 +1941,37 @@ async fn main() {
                         }
                     }
                     unsafe {
-                        server.set_shared_database(ntt_u64_ptr, ch.num_packed_entries, &index_table);
-                        server.set_key_store(&key_store);
+                        // OnionPIRv2 port: `set_shared_database` returns
+                        // bool now (false on validation failure). Wrap in
+                        // assert! so silent failures don't ship.
+                        // OnionPIRv2 port (commit 3a): pass
+                        // `num_plaintexts` (compile-time DB shape) as
+                        // `shared_num_entries`, not the pre-port
+                        // `num_packed_entries` (dataset size). The NTT
+                        // store from gen_2_onion's post-port save_db
+                        // payload is sized for the full num_plaintexts
+                        // slot count; passing the smaller
+                        // num_packed_entries would lie about the layout.
+                        // Cuckoo placement only assigns to
+                        // [0, num_packed_entries) so empty slots beyond
+                        // that range are never queried.
+                        assert!(
+                            server.set_shared_database(
+                                ntt_u64_slice,
+                                chunk_shared_num_entries,
+                                &index_table,
+                            ),
+                            "set_shared_database failed (chunk worker {} \
+                             group {}; chunk_shared_num_entries={}, \
+                             index_table.len={}, local_num_pt={})",
+                            worker_label,
+                            g,
+                            chunk_shared_num_entries,
+                            index_table.len(),
+                            p_chunk.num_plaintexts,
+                        );
+                        // OnionPIRv2 port: `set_key_store` takes Option now.
+                        server.set_key_store(Some(&key_store));
                     }
                     chunk_index_tables.push(index_table);
                     chunk_servers.push(server);
@@ -1846,11 +1995,12 @@ async fn main() {
                     // munmap the borrowed buffer on drop (fd = -1 path inside
                     // load_db_from_borrowed).
                     assert!(
-                        unsafe { server.load_db_from_bytes(slice) },
+                        unsafe { server.load_db_from_borrowed(slice) },
                         "Failed to load index group {} from consolidated index_all (offset {}, len {})",
                         b, off, slice.len(),
                     );
-                    unsafe { server.set_key_store(&key_store); }
+                    // OnionPIRv2 port: `set_key_store` takes Option now.
+                    unsafe { server.set_key_store(Some(&key_store)); }
                     index_servers.push(server);
                 }
                 println!("  [OnionPIR:{}] {} index servers ready (via onion_index_all.bin mmap)", worker_label, k_index);
@@ -1862,7 +2012,27 @@ async fn main() {
                 for (li, sib) in sibling_levels.iter().enumerate() {
                     let p_sib = onionpir::params_info(sib.bins_per_table as u64);
                     let padded = p_sib.num_entries as usize;
-                    let sib_ntt_ptr = sib.ntt_mmap.as_ptr() as *const u64;
+                    // OnionPIRv2 port: see comment on chunk-server slice above.
+                    let sib_ntt_slice: &[u64] = unsafe {
+                        std::slice::from_raw_parts(
+                            sib.ntt_mmap.as_ptr() as *const u64,
+                            sib.ntt_mmap.len() / 8,
+                        )
+                    };
+                    // Per-level shared store's num_pt (= what gen_4's
+                    // builder saved with). Derived from file size for the
+                    // same reason as the chunk path above.
+                    assert!(
+                        coeff_val_cnt > 0
+                            && (sib_ntt_slice.len() % coeff_val_cnt) == 0,
+                        "sibling L{} NTT store len ({} u64s) not divisible \
+                         by coeff_val_cnt ({}); file is the wrong shape",
+                        li,
+                        sib_ntt_slice.len(),
+                        coeff_val_cnt,
+                    );
+                    let sib_shared_num_entries =
+                        (sib_ntt_slice.len() / coeff_val_cnt) as u64;
 
                     let mut level_index_tables: Vec<Vec<u32>> = Vec::with_capacity(sib.k);
                     let mut level_servers: Vec<PirServer> = Vec::with_capacity(sib.k);
@@ -1877,8 +2047,27 @@ async fn main() {
                             }
                         }
                         unsafe {
-                            server.set_shared_database(sib_ntt_ptr, sib.num_groups, &index_table);
-                            server.set_key_store(&key_store);
+                            // OnionPIRv2 port: see chunk-server block above.
+                            // OnionPIRv2 port (commit 3a): see chunk
+                            // block above. sibling NTT store is also
+                            // sized for num_plaintexts (the
+                            // compile-time DB shape).
+                            assert!(
+                                server.set_shared_database(
+                                    sib_ntt_slice,
+                                    sib_shared_num_entries,
+                                    &index_table,
+                                ),
+                                "set_shared_database failed (sibling L{} \
+                                 group {}; sib_shared_num_entries={}, \
+                                 index_table.len={}, local_num_pt={})",
+                                li,
+                                g,
+                                sib_shared_num_entries,
+                                index_table.len(),
+                                p_sib.num_plaintexts,
+                            );
+                            server.set_key_store(Some(&key_store));
                         }
                         level_index_tables.push(index_table);
                         level_servers.push(server);
@@ -1893,51 +2082,109 @@ async fn main() {
                     match cmd {
                         PirCommand::RegisterKeys { client_id, galois_keys, gsw_keys, reply } => {
                             let t = Instant::now();
-                            key_store.set_galois_key(client_id, &galois_keys);
+                            key_store.set_galois_keys(client_id, &galois_keys);
                             key_store.set_gsw_key(client_id, &gsw_keys);
                             println!("  [OnionPIR:{}] client {} keys registered in {:.2?}", worker_label, client_id, t.elapsed());
                             let _ = reply.send(());
                         }
                         PirCommand::AnswerBatch { client_id, level, round_id, queries, reply } => {
                             let t = Instant::now();
+                            // OnionPIRv2 port (2402b16): rayon-parallel `answer_query`
+                            // across the per-group PirServer Vec. Safe after upstream
+                            // 2402b16 made g_scratch / NTT cache / TimerLogger
+                            // thread_local + added a mutex to SharedKeyStore. Each
+                            // rayon worker gets one exclusive `&mut PirServer`
+                            // (Send-but-not-Sync), so per-server state is single-
+                            // threaded; the shared SharedKeyStore is mutex-guarded.
+                            //
+                            // The bd1a2928 attempt to ship this was reverted after a
+                            // pir1 deploy showed 60 s registrations + empty
+                            // answer_query. That turned out NOT to be a 2402b16 bug —
+                            // it was a contaminated incremental libonionpir.a build
+                            // from flipping the onionpir git rev repeatedly without a
+                            // clean rebuild (see docs/PIR1_REGISTER_KEYS_TRUNCATION.md).
+                            // With a clean build, 2402b16 registers keys in ~1 ms and
+                            // the parallel path is sound.
+                            //
+                            // Wall-time projection (i7-8700, 6 cores):
+                            //   INDEX 142 s → ~25 s ; CHUNK 157 s → ~25 s. Total batch
+                            //   ≈ 60 s — under Cloudflare's ~100 s WS idle timeout.
+                            let worker_label = &worker_label;
+                            let queries_ref = &queries;
                             let (name, results): (&str, Vec<Vec<u8>>) = if level == 0 {
-                                let results = queries.iter().enumerate().map(|(i, q)| {
-                                    let g = i / 2;
-                                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                        index_servers[g].answer_query(client_id, q)
-                                    })) {
-                                        Ok(r) => r,
-                                        Err(e) => { eprintln!("[OnionPIR:{}] panic in index group {}: {:?}", worker_label, g, e); Vec::new() }
-                                    }
-                                }).collect();
+                                let results: Vec<Vec<u8>> = index_servers
+                                    .par_iter_mut()
+                                    .enumerate()
+                                    .flat_map_iter(|(g, server)| {
+                                        let q0 = &queries_ref[2 * g];
+                                        let q1 = &queries_ref[2 * g + 1];
+                                        let r0 = match std::panic::catch_unwind(
+                                            std::panic::AssertUnwindSafe(|| server.answer_query(client_id, q0)),
+                                        ) {
+                                            Ok(r) => r,
+                                            Err(e) => { eprintln!("[OnionPIR:{}] panic in index group {} q0: {:?}", worker_label, g, e); Vec::new() }
+                                        };
+                                        let r1 = match std::panic::catch_unwind(
+                                            std::panic::AssertUnwindSafe(|| server.answer_query(client_id, q1)),
+                                        ) {
+                                            Ok(r) => r,
+                                            Err(e) => { eprintln!("[OnionPIR:{}] panic in index group {} q1: {:?}", worker_label, g, e); Vec::new() }
+                                        };
+                                        std::iter::once(r0).chain(std::iter::once(r1))
+                                    })
+                                    .collect();
                                 ("index", results)
                             } else if level == 1 {
-                                let results = queries.iter().enumerate().map(|(b, q)| {
-                                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                        chunk_servers[b].answer_query(client_id, q)
-                                    })) {
-                                        Ok(r) => r,
-                                        Err(e) => { eprintln!("[OnionPIR:{}] panic in chunk group {}: {:?}", worker_label, b, e); Vec::new() }
-                                    }
-                                }).collect();
+                                let results: Vec<Vec<u8>> = chunk_servers
+                                    .par_iter_mut()
+                                    .enumerate()
+                                    .map(|(b, server)| {
+                                        match std::panic::catch_unwind(
+                                            std::panic::AssertUnwindSafe(|| server.answer_query(client_id, &queries_ref[b])),
+                                        ) {
+                                            Ok(r) => r,
+                                            Err(e) => { eprintln!("[OnionPIR:{}] panic in chunk group {}: {:?}", worker_label, b, e); Vec::new() }
+                                        }
+                                    })
+                                    .collect();
                                 ("chunk", results)
                             } else if level >= 10 && (level as usize - 10) < sibling_all_servers.len() {
                                 let sib_level = level as usize - 10;
                                 let servers = &mut sibling_all_servers[sib_level];
-                                let results = queries.iter().enumerate().map(|(b, q)| {
-                                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                        servers[b].answer_query(client_id, q)
-                                    })) {
-                                        Ok(r) => r,
-                                        Err(e) => { eprintln!("[OnionPIR:{}] panic in sibling L{} group {}: {:?}", worker_label, sib_level, b, e); Vec::new() }
-                                    }
-                                }).collect();
+                                let results: Vec<Vec<u8>> = servers
+                                    .par_iter_mut()
+                                    .enumerate()
+                                    .map(|(b, server)| {
+                                        match std::panic::catch_unwind(
+                                            std::panic::AssertUnwindSafe(|| server.answer_query(client_id, &queries_ref[b])),
+                                        ) {
+                                            Ok(r) => r,
+                                            Err(e) => { eprintln!("[OnionPIR:{}] panic in sibling L{} group {}: {:?}", worker_label, sib_level, b, e); Vec::new() }
+                                        }
+                                    })
+                                    .collect();
                                 ("sibling", results)
                             } else {
                                 eprintln!("[OnionPIR:{}] unknown level {}", worker_label, level);
                                 ("unknown", Vec::new())
                             };
-                            println!("  [OnionPIR:{}] {} r{} {} queries in {:.2?}", worker_label, name, round_id, queries.len(), t.elapsed());
+                            // OnionPIRv2 port: report empty/nonempty result split
+                            // alongside the existing wall-clock log so a future
+                            // "all-empty batch" client-side report (see
+                            // `pir-sdk-client/src/onion.rs::batch_looks_evicted`)
+                            // can be triaged from server logs alone — either the
+                            // C++ answer_query catch fired (empty=N/N, fast wall
+                            // time → keystore drift or query malformed) or the
+                            // matmul completed (empty=0/N, full wall time →
+                            // client decode / decryption-noise bug).
+                            let empty_count = results.iter().filter(|r| r.is_empty()).count();
+                            let nonempty_bytes: usize = results.iter().filter(|r| !r.is_empty()).map(|r| r.len()).sum();
+                            let first_resp_len = results.iter().find(|r| !r.is_empty()).map(|r| r.len()).unwrap_or(0);
+                            println!(
+                                "  [OnionPIR:{}] {} r{} {} queries in {:.2?} (empty={}/{}, nonempty_total={}B, resp_len={}B, client_id={})",
+                                worker_label, name, round_id, queries.len(), t.elapsed(),
+                                empty_count, results.len(), nonempty_bytes, first_resp_len, client_id,
+                            );
                             let _ = reply.send(results);
                         }
                     }
@@ -2225,17 +2472,68 @@ async fn main() {
             let mut arc_pres_ctx: Option<Vec<u8>> = None;
             let mut cashu_ok: bool = false;
 
+            // Per-connection transport-level chunk reassembly state. A
+            // client that sends a multi-MB message (OnionPIR RegisterKeys
+            // / query batches) splits it into CHUNK_MAGIC frames; we
+            // reassemble before dispatch. `client_supports_chunks` flips
+            // true on the first chunk frame seen and gates whether the
+            // server chunks its (large) responses back.
+            let mut chunk_acc: Vec<u8> = Vec::new();
+            let mut chunk_expected: u16 = 0;
+            let mut chunk_total: u16 = 0;
+            let mut client_supports_chunks = false;
+
             while let Some(msg) = ws_stream.next().await {
                 let msg = match msg {
                     Ok(m) => m,
                     Err(e) => { eprintln!("[{}] Read error: {}", peer, e); break; }
                 };
 
-                let bin = match msg {
+                let raw_bin = match msg {
                     Message::Binary(b) => b,
                     Message::Ping(p) => { let _ = sink.send(Message::Pong(p)).await; continue; }
                     Message::Close(_) => break,
                     _ => continue,
+                };
+
+                // Transport-level chunk reassembly. A chunk frame is
+                // `[4B len][CHUNK_MAGIC][seq:u16][total:u16][piece]`; a
+                // normal message never carries CHUNK_MAGIC at offset 4.
+                let bin: Vec<u8> = if raw_bin.len() >= 4 + CHUNK_HDR && raw_bin[4] == CHUNK_MAGIC {
+                    client_supports_chunks = true;
+                    let seq = u16::from_le_bytes([raw_bin[5], raw_bin[6]]);
+                    let total = u16::from_le_bytes([raw_bin[7], raw_bin[8]]);
+                    if total == 0 || seq != chunk_expected {
+                        eprintln!("[{}] bad chunk frame (seq={} total={} expected={}) — resetting", peer, seq, total, chunk_expected);
+                        chunk_acc.clear();
+                        chunk_expected = 0;
+                        continue;
+                    }
+                    if seq == 0 {
+                        chunk_total = total;
+                        chunk_acc.clear();
+                    } else if total != chunk_total {
+                        eprintln!("[{}] chunk total changed mid-stream — resetting", peer);
+                        chunk_acc.clear();
+                        chunk_expected = 0;
+                        continue;
+                    }
+                    let piece = &raw_bin[4 + CHUNK_HDR..];
+                    if chunk_acc.len() + piece.len() > MAX_REASSEMBLED {
+                        eprintln!("[{}] reassembled message exceeds cap — resetting", peer);
+                        chunk_acc.clear();
+                        chunk_expected = 0;
+                        continue;
+                    }
+                    chunk_acc.extend_from_slice(piece);
+                    chunk_expected += 1;
+                    if chunk_expected < chunk_total {
+                        continue; // wait for the next chunk frame
+                    }
+                    chunk_expected = 0;
+                    std::mem::take(&mut chunk_acc)
+                } else {
+                    raw_bin.to_vec()
                 };
 
                 if bin.len() < 5 { continue; }
@@ -3199,7 +3497,7 @@ async fn main() {
                             }).await;
                             let results = reply_rx.await.unwrap();
                             let result_msg = OnionPirBatchResult { round_id: batch.round_id, results };
-                            let _ = send_resp(&mut sink, channel_session.as_mut(), result_msg.encode(RESP_ONIONPIR_INDEX_RESULT)).await;
+                            let _ = send_resp_chunked(&mut sink, channel_session.as_mut(), result_msg.encode(RESP_ONIONPIR_INDEX_RESULT), client_supports_chunks).await;
                         }
                     }
                     REQ_ONIONPIR_CHUNK_QUERY if server.has_any_onionpir() => {
@@ -3220,7 +3518,7 @@ async fn main() {
                             }).await;
                             let results = reply_rx.await.unwrap();
                             let result_msg = OnionPirBatchResult { round_id: batch.round_id, results };
-                            let _ = send_resp(&mut sink, channel_session.as_mut(), result_msg.encode(RESP_ONIONPIR_CHUNK_RESULT)).await;
+                            let _ = send_resp_chunked(&mut sink, channel_session.as_mut(), result_msg.encode(RESP_ONIONPIR_CHUNK_RESULT), client_supports_chunks).await;
                         }
                     }
                     REQ_ONIONPIR_MERKLE_INDEX_TREE_TOP if server.has_any_onionpir_merkle() => {
@@ -3240,7 +3538,7 @@ async fn main() {
                         msg.extend_from_slice(&(payload_len as u32).to_le_bytes());
                         msg.push(RESP_ONIONPIR_MERKLE_INDEX_TREE_TOP);
                         msg.extend_from_slice(top);
-                        let _ = send_resp(&mut sink, channel_session.as_mut(), msg).await;
+                        let _ = send_resp_chunked(&mut sink, channel_session.as_mut(), msg, client_supports_chunks).await;
                         println!("[onion-merkle-index-top] db={} sent {} bytes", db_id, top.len());
                     }
                     REQ_ONIONPIR_MERKLE_DATA_TREE_TOP if server.has_any_onionpir_merkle() => {
@@ -3260,7 +3558,7 @@ async fn main() {
                         msg.extend_from_slice(&(payload_len as u32).to_le_bytes());
                         msg.push(RESP_ONIONPIR_MERKLE_DATA_TREE_TOP);
                         msg.extend_from_slice(top);
-                        let _ = send_resp(&mut sink, channel_session.as_mut(), msg).await;
+                        let _ = send_resp_chunked(&mut sink, channel_session.as_mut(), msg, client_supports_chunks).await;
                         println!("[onion-merkle-data-top] db={} sent {} bytes", db_id, top.len());
                     }
                     REQ_ONIONPIR_MERKLE_INDEX_SIBLING if server.has_any_onionpir() => {
@@ -3290,7 +3588,7 @@ async fn main() {
                             }).await;
                             let results = reply_rx.await.unwrap();
                             let result_msg = OnionPirBatchResult { round_id: batch.round_id, results };
-                            let _ = send_resp(&mut sink, channel_session.as_mut(), result_msg.encode(RESP_ONIONPIR_MERKLE_INDEX_SIBLING)).await;
+                            let _ = send_resp_chunked(&mut sink, channel_session.as_mut(), result_msg.encode(RESP_ONIONPIR_MERKLE_INDEX_SIBLING), client_supports_chunks).await;
                         }
                     }
                     REQ_ONIONPIR_MERKLE_DATA_SIBLING if server.has_any_onionpir() && server.has_any_onionpir_merkle() => {
@@ -3323,7 +3621,7 @@ async fn main() {
                             }).await;
                             let results = reply_rx.await.unwrap();
                             let result_msg = OnionPirBatchResult { round_id: batch.round_id, results };
-                            let _ = send_resp(&mut sink, channel_session.as_mut(), result_msg.encode(RESP_ONIONPIR_MERKLE_DATA_SIBLING)).await;
+                            let _ = send_resp_chunked(&mut sink, channel_session.as_mut(), result_msg.encode(RESP_ONIONPIR_MERKLE_DATA_SIBLING), client_supports_chunks).await;
                         }
                     }
 

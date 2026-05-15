@@ -19,6 +19,7 @@ use build::common::*;
 use futures_util::{SinkExt, StreamExt};
 use onionpir::Client as PirClient;
 use pir_core::merkle;
+use pir_core::onion_unpack;
 use std::collections::HashMap;
 use std::time::Instant;
 use tokio_tungstenite::connect_async;
@@ -26,7 +27,15 @@ use tokio_tungstenite::tungstenite::Message;
 
 // ─── Constants for the new layout ───────────────────────────────────────────
 
-const PACKED_ENTRY_SIZE: usize = 3840;
+// OnionPIRv2 port (commit 5): `PACKED_ENTRY_SIZE` is no longer a constant.
+// The pre-port value was 3840 (CONFIG_N2048_K1 at PlainMod=15). Post-port
+// the byte count per decrypted bin equals `params_info(0).entry_size`,
+// which is 3328 for the default config. Use `packed_entry_size()` at
+// runtime.
+#[inline]
+fn packed_entry_size() -> usize {
+    onionpir::params_info(0).entry_size as usize
+}
 
 /// Chunk cuckoo: 6 hash functions, slots_per_bin=1
 const CHUNK_CUCKOO_NUM_HASHES: usize = 6;
@@ -606,18 +615,22 @@ async fn main() {
     let key_start = Instant::now();
     let mut keygen_client = PirClient::new(index_bins as u64);
     let client_id = keygen_client.id();
-    let galois = keygen_client.generate_galois_keys();
-    let gsw = keygen_client.generate_gsw_keys();
+    let galois = keygen_client.galois_keys();
+    let gsw = keygen_client.gsw_key();
     let secret_key = keygen_client.export_secret_key();
     println!("  Key generation: {:.2?}", key_start.elapsed());
 
-    // Create per-level clients sharing the same secret key
-    let mut index_client = PirClient::new_from_secret_key(
+    // Create per-level clients sharing the same secret key.
+    // OnionPIRv2 port: rename `new_from_secret_key` → `from_secret_key`,
+    // returns `Option<Self>` now.
+    let mut index_client = PirClient::from_secret_key(
         index_bins as u64, client_id, &secret_key,
-    );
-    let mut chunk_client = PirClient::new_from_secret_key(
+    )
+    .expect("freshly-generated secret key must round-trip (index)");
+    let mut chunk_client = PirClient::from_secret_key(
         chunk_bins as u64, client_id, &secret_key,
-    );
+    )
+    .expect("freshly-generated secret key must round-trip (chunk)");
 
     // Register keys once — shared across all levels
     let reg_msg = RegisterKeysMsg {
@@ -701,14 +714,38 @@ async fn main() {
             for h in 0..INDEX_CUCKOO_NUM_HASHES {
                 let qi = group * 2 + h;
                 let bin = query_bins[qi];
-                let entry_bytes = index_client.decrypt_response(
-                    bin,
+                // OnionPIRv2 port (commit 2): bit-unpack the raw plaintext
+                // returned by `decrypt_response`. `entry_bytes` is now
+                // `params.entry_size` bytes (3328 with default config,
+                // was 3840 pre-port). Downstream PACKED_ENTRY_SIZE
+                // slicing will produce wrong-but-non-panicking bytes
+                // until commit 5 (capacity math) lands.
+                let _ = bin;
+                let raw_pt = index_client.decrypt_response(
                     &result_batch.results[qi],
                 );
+                let pinfo = onionpir::params_info(index_bins as u64);
+                let entry_bytes = onion_unpack::unpack_onion_plaintext(
+                    &raw_pt,
+                    pinfo.poly_degree as usize,
+                    pinfo.entry_size as usize,
+                )
+                .expect("onion_unpack rejected INDEX plaintext from server");
 
                 if let Some(ir) = scan_index_bin(&entry_bytes, addr_infos[addr_idx].tag, index_slots_per_bin, index_slot_size) {
-                    // Per-bin Merkle: hash the full decrypted bin, record leaf position
-                    index_bin_hashes[addr_idx] = Some(merkle::sha256(&entry_bytes[..PACKED_ENTRY_SIZE]));
+                    // Per-bin Merkle: hash the full decrypted bin, record leaf position.
+                    // OnionPIRv2 port (commit 5): bin length equals
+                    // params.entry_size (3328 default). Pre-port this
+                    // sliced to a hardcoded 3840 — now we just hash the
+                    // full `entry_bytes` since unpack already returned
+                    // exactly entry_size bytes.
+                    let pes = packed_entry_size();
+                    let hash_slice = if entry_bytes.len() >= pes {
+                        &entry_bytes[..pes]
+                    } else {
+                        &entry_bytes[..]
+                    };
+                    index_bin_hashes[addr_idx] = Some(merkle::sha256(hash_slice));
                     index_leaf_positions[addr_idx] = Some(group * index_bins + bin as usize);
                     index_results[addr_idx] = Some(ir);
                     break;
@@ -841,13 +878,31 @@ async fn main() {
 
         // Decrypt and store entries
         for cq in &chunk_queries {
-            let entry_bytes = chunk_client.decrypt_response(
-                cq.bin as u64,
+            // OnionPIRv2 port (commit 2): bit-unpack the raw plaintext.
+            let _ = cq.bin;
+            let raw_pt = chunk_client.decrypt_response(
                 &result_batch.results[cq.group],
             );
-            decrypted_entries.insert(cq.entry_id, entry_bytes[..PACKED_ENTRY_SIZE].to_vec());
+            let pinfo = onionpir::params_info(chunk_bins as u64);
+            let entry_bytes = onion_unpack::unpack_onion_plaintext(
+                &raw_pt,
+                pinfo.poly_degree as usize,
+                pinfo.entry_size as usize,
+            )
+            .expect("onion_unpack rejected CHUNK plaintext from server");
+            // OnionPIRv2 port (commit 5): entry_bytes is exactly
+            // `pinfo.entry_size` bytes (3328 default). Use a length cap
+            // so this binary stays correct under any ACTIVE_CONFIG
+            // (`CONFIG_N4096_K2_MP` is 19968).
+            let pes = packed_entry_size();
+            let bin_slice = if entry_bytes.len() >= pes {
+                &entry_bytes[..pes]
+            } else {
+                &entry_bytes[..]
+            };
+            decrypted_entries.insert(cq.entry_id, bin_slice.to_vec());
             // Per-bin Merkle: hash the full decrypted data bin
-            data_bin_hashes.insert(cq.entry_id, merkle::sha256(&entry_bytes[..PACKED_ENTRY_SIZE]));
+            data_bin_hashes.insert(cq.entry_id, merkle::sha256(bin_slice));
             data_leaf_positions.insert(cq.entry_id, cq.group * chunk_bins + cq.bin);
         }
     }
@@ -1053,9 +1108,11 @@ async fn main() {
                         group_info.insert(pbc_group, (gid, target_bin));
                     }
 
-                    let mut sib_client = PirClient::new_from_secret_key(
+                    // OnionPIRv2 port: rename + Option<Self> return.
+                    let mut sib_client = PirClient::from_secret_key(
                         li.bins_per_table as u64, client_id, &secret_key,
-                    );
+                    )
+                    .expect("freshly-generated secret key must round-trip (sibling)");
                     let mut sib_queries = Vec::with_capacity(li.k);
                     for b in 0..li.k {
                         let bin = if let Some(&(_, target_bin)) = group_info.get(&b) {
@@ -1075,9 +1132,18 @@ async fn main() {
                     let result_batch = OnionPirBatchResult::decode(&resp_payload[1..]).expect("decode sibling");
 
                     for (&pbc_group, &(gid, target_bin)) in &group_info {
-                        let decrypted = sib_client.decrypt_response(
-                            target_bin as u64, &result_batch.results[pbc_group],
+                        // OnionPIRv2 port (commit 2): bit-unpack the raw plaintext.
+                        let _ = target_bin;
+                        let raw_pt = sib_client.decrypt_response(
+                            &result_batch.results[pbc_group],
                         );
+                        let pinfo = onionpir::params_info(li.bins_per_table as u64);
+                        let decrypted = onion_unpack::unpack_onion_plaintext(
+                            &raw_pt,
+                            pinfo.poly_degree as usize,
+                            pinfo.entry_size as usize,
+                        )
+                        .expect("onion_unpack rejected sibling plaintext from server");
                         sibling_data.insert(gid, decrypted);
                     }
                     println!("    {} L{} PBC round {}/{}: {} groups ✓",

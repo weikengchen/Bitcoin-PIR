@@ -1,7 +1,7 @@
 [Unit]
 Description=BitcoinPIR unified server (secondary: DPF-1 + HarmonyPIR hint, fallback role)
 Documentation=https://github.com/Bitcoin-PIR/Bitcoin-PIR
-After=network-online.target
+After=network-online.target pir-primary.service
 Wants=network-online.target
 
 [Service]
@@ -17,6 +17,31 @@ WorkingDirectory=/home/pir/BitcoinPIR
 # reconfigures back. Mode flags expose both serve-hints and
 # serve-queries so any future use of this port works without further
 # config drift.
+#
+# Startup-stagger note (2026-05-15): when BOTH pir-primary and
+# pir-secondary launch concurrently on boot, each fires its
+# `--pool-size 8` HarmonyPIR V2 hint-pool generation on its own
+# rayon worker pool. Together they burst the 6-core i7-8700 to
+# 1172 % CPU sustained for ~2 minutes (load avg ≥ 15), saturating
+# every logical core. Any OnionPIR client that connects during
+# that window sees `KeyStore::set_galois_keys` balloon from 7 ms to
+# 60-190 s (the mpsc-served worker thread gets only sporadic time
+# slices), and subsequent answer_query calls return empty Vecs as
+# the C++ try/catch swallows partial-progress exceptions. See
+# docs/PIR1_STARTUP_HINT_POOL_THRASHING.md for the partial RCA
+# (also see docs/UPSTREAM_REQUEST_2402b16_REGRESSION.md for the
+# RELATED 2402b16-specific BitcoinPIR-side regression that the
+# stagger alone does NOT fix; rolled back pir1 to fb14f4e until
+# upstream resolves it).
+#
+# `After=pir-primary.service` + `ExecStartPre=/bin/sleep 90` together
+# enforce a clean serialization: pir-primary starts, runs its hint-pool
+# alone (~96 s on 6 cores), goes idle; THEN pir-secondary starts and
+# runs its hint-pool with the CPU to itself. End-to-end "both services
+# ready to serve queries" still hits ~3 minutes after boot — same as
+# before — but during that window no client's OnionPIR worker thread
+# competes with 12-way hint-pool parallelism.
+ExecStartPre=/bin/sleep 90
 ExecStart=/home/pir/BitcoinPIR/target/release/unified_server \
     --port 8092 \
     --role secondary \

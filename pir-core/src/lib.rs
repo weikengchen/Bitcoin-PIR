@@ -12,3 +12,4 @@ pub mod codec;
 pub mod pbc;
 pub mod cuckoo;
 pub mod merkle;
+pub mod onion_unpack;

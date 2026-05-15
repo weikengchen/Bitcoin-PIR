@@ -845,11 +845,32 @@ async fn verify_sub_tree(
             // Wrap the FFI client in `SibSendClient` so the enclosing future
             // stays `Send` across the roundtrip `.await` below — the raw
             // `onionpir::Client` holds a `*mut c_void` which is `!Send`.
-            let mut sib_client = SibSendClient(onionpir::Client::new_from_secret_key(
-                level_info.bins_per_table as u64,
-                client_id,
-                secret_key,
-            ));
+            // OnionPIRv2 port: rename + return type changed to `Option<Self>`.
+            // The caller (`OnionMerkleVerifier`) provides `secret_key`
+            // from the parent `OnionClient::fhe.secret_key`, which was
+            // generated this session by `Client::new`. A None return
+            // here means the same as in pir-sdk-client/onion.rs's
+            // `get_level_client` — see the analogous error there for
+            // the recovery procedure.
+            let mut sib_client = SibSendClient(
+                onionpir::Client::from_secret_key(
+                    level_info.bins_per_table as u64,
+                    client_id,
+                    secret_key,
+                )
+                .ok_or_else(|| {
+                    PirError::InvalidState(format!(
+                        "OnionPIR sib Client::from_secret_key returned None \
+                         (bins_per_table={}, client_id={}, sk_len={}). \
+                         Likely cause: onionpir rev / ACTIVE_CONFIG drift \
+                         between this binary and the session-master key. \
+                         Recovery: drop FheState + restart the session.",
+                        level_info.bins_per_table,
+                        client_id,
+                        secret_key.len()
+                    ))
+                })?,
+            );
             let mut queries = Vec::with_capacity(level_info.k);
             for b in 0..level_info.k {
                 let bin = if let Some(a) = group_info.get(&b) {
@@ -917,9 +938,27 @@ async fn verify_sub_tree(
                     }
                     continue;
                 }
-                let decrypted = sib_client
-                    .0
-                    .decrypt_response(assigned.target_bin as u64, &batch[pbc_group]);
+                // OnionPIRv2 port (commit 2): unpack the raw plaintext
+                // returned by `decrypt_response`. `decrypted` is
+                // `params.entry_size` bytes (no longer the pre-port
+                // PACKED_ENTRY_SIZE = 3840). Downstream Merkle code
+                // hashes the whole buffer regardless of length.
+                let _ = assigned.target_bin;
+                let raw_pt = sib_client.0.decrypt_response(&batch[pbc_group]);
+                let pinfo = onionpir::params_info(level_info.bins_per_table as u64);
+                let decrypted = pir_core::onion_unpack::unpack_onion_plaintext(
+                    &raw_pt,
+                    pinfo.poly_degree as usize,
+                    pinfo.entry_size as usize,
+                )
+                .ok_or_else(|| {
+                    PirError::Protocol(format!(
+                        "onion_unpack rejected sibling plaintext (len={} N={} es={})",
+                        raw_pt.len(),
+                        pinfo.poly_degree,
+                        pinfo.entry_size
+                    ))
+                })?;
                 sibling_data.insert(assigned.gid, decrypted);
             }
         }

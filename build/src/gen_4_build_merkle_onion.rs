@@ -32,8 +32,24 @@ use std::io::Write as IoWrite;
 use std::io::{BufWriter, Write};
 use std::time::Instant;
 
-const ARITY: usize = 120;
-const PACKED_ENTRY_SIZE: usize = 3840; // 120 × 32
+// OnionPIRv2 port (commit 5b): the Merkle fan-out is `entry_size / 32`
+// — pinned to the OnionPIR plaintext size so each internal node's
+// ARITY child hashes (32 bytes each) fit in exactly one plaintext.
+//
+//   CONFIG_N2048_K1 (default post-port): entry_size=3328 → ARITY=104
+//   pre-port (PlainMod=15):                 entry_size=3840 → ARITY=120
+//
+// The tree depth, sibling-proof shape, and tree-top cache layout all
+// flow from ARITY, so changing the linked onionpir rev re-shapes
+// every tree. The runtime publishes ARITY back to the client via the
+// metadata file (see `write_tree_top_cache`'s `arity` field).
+fn onion_merkle_arity() -> usize {
+    onionpir::params_info(0).entry_size as usize / 32
+}
+
+fn onion_merkle_packed_entry_size() -> usize {
+    onion_merkle_arity() * 32
+}
 
 // ─── Adaptive K for PBC groups ──────────────────────────────────────────────
 
@@ -208,23 +224,26 @@ fn build_sibling_level(
     tree_kind: &str,
     data_dir: &str,
 ) {
+    let arity = onion_merkle_arity();
+    let packed_entry_size = onion_merkle_packed_entry_size();
+
     let t = Instant::now();
     let nodes_at_level = level_nodes.len();
-    let num_groups = (nodes_at_level + ARITY - 1) / ARITY;
+    let num_groups = (nodes_at_level + arity - 1) / arity;
     let k = adaptive_k(num_groups);
     let master_seed = level_master_seed(tree_kind, level);
 
     println!("    L{}: {} nodes, {} groups, K={}", level, nodes_at_level, num_groups, k);
 
-    // ── 1. Pack groups as 3840B entries ─────────────────────────────────────
+    // ── 1. Pack groups as `packed_entry_size`-byte entries ──────────────────
 
     let packed_path = format!("{}/merkle_onion_{}_sib_L{}_packed.bin", data_dir, tree_kind, level);
     {
         let f = File::create(&packed_path).expect("create packed file");
         let mut w = BufWriter::with_capacity(16 * 1024 * 1024, f);
         for group_id in 0..num_groups {
-            let first = group_id * ARITY;
-            for c in 0..ARITY {
+            let first = group_id * arity;
+            for c in 0..arity {
                 let idx = first + c;
                 if idx < level_nodes.len() {
                     w.write_all(&level_nodes[idx]).unwrap();
@@ -235,49 +254,108 @@ fn build_sibling_level(
         }
         w.flush().unwrap();
     }
-    let packed_size = num_groups * PACKED_ENTRY_SIZE;
+    let packed_size = num_groups * packed_entry_size;
     println!("      Packed: {} entries × {}B = {:.1} MB",
-        num_groups, PACKED_ENTRY_SIZE, packed_size as f64 / 1e6);
+        num_groups, packed_entry_size, packed_size as f64 / 1e6);
 
     // ── 2. NTT expansion → shared NTT store ────────────────────────────────
+    //
+    // OnionPIRv2 port (commit 3c): mirrors gen_2_onion's push_plaintexts +
+    // save_db pattern. Build a temporary Server, push all entries via
+    // `push_plaintexts` (NTT runs internally), `save_db` to a temp file,
+    // strip the 48-byte header into the final ntt_path. The runtime
+    // mmaps ntt_path, reinterprets as `&[u64]`, and passes
+    // `num_plaintexts` (not `num_groups`) as `shared_num_entries` to
+    // `set_shared_database`.
 
     let p = onionpir::params_info(num_groups as u64);
-    let coeff_val_cnt = p.coeff_val_cnt as usize;
-    let ntt_store_bytes = coeff_val_cnt * num_groups * 8;
+    let poly_degree = p.poly_degree as usize;
+    let entry_size_pt = p.entry_size as usize;
+    let num_plaintexts = p.num_plaintexts as usize;
 
     let ntt_path = format!("{}/merkle_onion_{}_sib_L{}_ntt.bin", data_dir, tree_kind, level);
-    let ntt_file = OpenOptions::new()
-        .read(true).write(true).create(true).truncate(true)
-        .open(&ntt_path).expect("create NTT store");
-    ntt_file.set_len(ntt_store_bytes as u64).expect("set NTT size");
-    let mut ntt_mmap = unsafe { MmapMut::map_mut(&ntt_file) }.expect("mmap NTT");
-
-    let expander = PirServer::new(num_groups as u64);
+    let temp_ntt_path = format!("{}.savetmp", ntt_path);
 
     // Mmap the packed file for reading
     let packed_file = File::open(&packed_path).expect("open packed");
     let packed_mmap = unsafe { memmap2::Mmap::map(&packed_file) }.expect("mmap packed");
 
+    if num_groups > num_plaintexts {
+        panic!(
+            "num_groups ({}) > num_plaintexts ({}). Compile-time OnionPIR DB \
+             shape too small — rebuild with larger DB_SIZE_MB.",
+            num_groups, num_plaintexts
+        );
+    }
+
+    // OnionPIRv2 port (commit 5b): ARITY is now pinned to
+    // `entry_size_pt / 32`, so each packed Merkle entry is exactly
+    // `entry_size_pt` bytes — the commit-3 truncation guard is now
+    // a no-op and is removed.
+    assert_eq!(
+        packed_entry_size, entry_size_pt,
+        "onion_merkle_packed_entry_size ({}) drifted from \
+         params_info.entry_size ({}); a stale onionpir crate is linked",
+        packed_entry_size, entry_size_pt
+    );
+
+    const PUSH_BATCH_ENTRIES: usize = 256;
+    let mut server = PirServer::new(num_groups as u64);
     let one_pct = num_groups.max(1) / 100;
-    for entry_id in 0..num_groups {
-        let raw = &packed_mmap[entry_id * PACKED_ENTRY_SIZE..(entry_id + 1) * PACKED_ENTRY_SIZE];
-        let coeffs = expander.ntt_expand_entry(raw, coeff_val_cnt);
-
-        let ntt_u64: &mut [u64] = unsafe {
-            std::slice::from_raw_parts_mut(ntt_mmap.as_mut_ptr() as *mut u64, coeff_val_cnt * num_groups)
-        };
-        for lvl in 0..coeff_val_cnt {
-            ntt_u64[lvl * num_groups + entry_id] = coeffs[lvl];
+    let mut entry_id = 0usize;
+    let t_push = Instant::now();
+    while entry_id < num_groups {
+        let n_this_batch = PUSH_BATCH_ENTRIES.min(num_groups - entry_id);
+        let mut batch_coeffs: Vec<u64> = Vec::with_capacity(n_this_batch * poly_degree);
+        for i in 0..n_this_batch {
+            let off = (entry_id + i) * packed_entry_size;
+            let raw = &packed_mmap[off..off + packed_entry_size];
+            let coeffs = pir_core::onion_unpack::pack_bytes_into_coefficients(
+                raw,
+                entry_size_pt,
+                poly_degree,
+            );
+            batch_coeffs.extend_from_slice(&coeffs);
         }
-
-        if one_pct > 0 && (entry_id + 1) % one_pct == 0 {
-            eprint!("\r      NTT: {}%", (entry_id + 1) / one_pct);
+        let ok = server.push_plaintexts(
+            &batch_coeffs,
+            n_this_batch as u64,
+            entry_id as u64,
+            &[],
+        );
+        assert!(
+            ok,
+            "push_plaintexts failed at entry_id={} (batch size {})",
+            entry_id, n_this_batch
+        );
+        entry_id += n_this_batch;
+        if one_pct > 0 && entry_id % (one_pct * 5).max(1) == 0 {
+            eprint!("\r      NTT: {}%", entry_id * 100 / num_groups.max(1));
         }
     }
     eprintln!();
-    ntt_mmap.flush().expect("flush NTT");
-    println!("      NTT store: {} coeffs × {} entries × 8B = {:.1} GB",
-        coeff_val_cnt, num_groups, ntt_store_bytes as f64 / 1e9);
+    assert!(
+        server.save_db(&temp_ntt_path),
+        "save_db failed for Merkle level {} → {}",
+        level,
+        temp_ntt_path
+    );
+
+    let raw_save = std::fs::read(&temp_ntt_path).expect("read save_db output");
+    assert!(
+        raw_save.len() > 48,
+        "save_db output too small ({} bytes)",
+        raw_save.len()
+    );
+    let payload = &raw_save[48..];
+    std::fs::write(&ntt_path, payload).expect("write NTT store");
+    std::fs::remove_file(&temp_ntt_path).expect("rm temp");
+    println!(
+        "      NTT store: {} ({:.1} GB) in {:.2?}",
+        ntt_path,
+        payload.len() as f64 / 1e9,
+        t_push.elapsed()
+    );
 
     // ── 3. Assign entries to PBC groups ────────────────────────────────────
 
@@ -347,24 +425,25 @@ fn build_tree(
     num_real: usize,
     data_dir: &str,
 ) {
+    let arity = onion_merkle_arity();
     let t_total = Instant::now();
 
     // No power-of-arity padding needed: compute_next_level handles partial
     // last groups by implicitly padding with ZERO_HASH. This avoids
-    // creating millions of empty NTT entries (120^4 = 207M vs 2.6M real).
+    // creating millions of empty NTT entries.
     let mut current_level = leaf_hashes;
 
     let mut depth = 0;
-    { let mut v = num_real; while v > 1 { v = (v + ARITY - 1) / ARITY; depth += 1; } }
+    { let mut v = num_real; while v > 1 { v = (v + arity - 1) / arity; depth += 1; } }
 
-    println!("  {} leaves, depth {}", num_real, depth);
+    println!("  {} leaves, depth {} (arity={})", num_real, depth, arity);
 
     let mut cached_levels: Vec<Vec<Hash256>> = Vec::new();
     let mut cache_from_level = depth;
     let root;
 
     for level in 0..depth {
-        let num_groups = (current_level.len() + ARITY - 1) / ARITY;
+        let num_groups = (current_level.len() + arity - 1) / arity;
 
         if num_groups <= TREE_TOP_GROUP_THRESHOLD {
             if cached_levels.is_empty() {
@@ -377,7 +456,7 @@ fn build_tree(
             build_sibling_level(&current_level, level, tree_kind, data_dir);
         }
 
-        let next_level = compute_next_level(&current_level, ARITY);
+        let next_level = compute_next_level(&current_level, arity);
         current_level = next_level;
     }
 
@@ -396,7 +475,7 @@ fn build_tree(
 
     // Write tree-top cache
     let top_path = format!("{}/merkle_onion_{}_tree_top.bin", data_dir, tree_kind);
-    write_tree_top_cache(&top_path, cache_from_level, &cached_levels, ARITY);
+    write_tree_top_cache(&top_path, cache_from_level, &cached_levels, arity);
 
     let num_sib_levels = cache_from_level;
     println!("    Sibling levels: {} (L0..L{}), tree-top: L{}..L{}",
@@ -409,9 +488,15 @@ fn build_tree(
 fn main() {
     let data_dir = parse_data_dir();
 
-    println!("=== Gen 4: Build Per-Bin OnionPIR Merkle Trees (arity={}) ===", ARITY);
+    // OnionPIRv2 port (commit 5b): pull arity from the linked
+    // onionpir crate's entry size. Pinned so each Merkle node's
+    // (arity × 32) bytes fit in exactly one OnionPIR plaintext.
+    let arity = onion_merkle_arity();
+    let packed_entry_size = onion_merkle_packed_entry_size();
+
+    println!("=== Gen 4: Build Per-Bin OnionPIR Merkle Trees (arity={}) ===", arity);
     println!("Data dir: {}", data_dir);
-    println!("Entry size: {} bytes ({}×32)", PACKED_ENTRY_SIZE, ARITY);
+    println!("Entry size: {} bytes ({}×32) — from params_info(0).entry_size", packed_entry_size, arity);
     println!("Tree-top cache: groups ≤ {}", TREE_TOP_GROUP_THRESHOLD);
     println!("Two trees: INDEX-MERKLE (per INDEX bin) + DATA-MERKLE (per DATA bin)");
     println!();
@@ -443,7 +528,7 @@ fn main() {
     // ── Summary ─────────────────────────────────────────────────────────────
     println!();
     println!("=== Summary ===");
-    println!("Arity:           {}", ARITY);
+    println!("Arity:           {}", arity);
     println!("INDEX-MERKLE:    {} leaves (K={}, bins={})", index_total, index_k, index_bins);
     println!("DATA-MERKLE:     {} leaves (K={}, bins={})", data_total, data_k, data_bins);
     println!("Per-bin leaves:  no tree_loc, no sorted-order assignment");

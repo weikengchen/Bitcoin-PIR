@@ -20,6 +20,11 @@ WorkingDirectory=/home/pir/BitcoinPIR
 # still served at most once — see runtime/src/hint_pool.rs:634).
 # Without `--pool-dir`, after every restart the pool starts cold
 # and the first ~3 minutes of V2 hint requests block on generation.
+#
+# Startup-stagger note (2026-05-15): pir-secondary.service is
+# `After=pir-primary.service` + `ExecStartPre=/bin/sleep 90` so the
+# two unified_server processes don't run their hint-pool generators
+# concurrently. See docs/PIR1_STARTUP_HINT_POOL_THRASHING.md.
 ExecStart=/home/pir/BitcoinPIR/target/release/unified_server \
     --port 8091 \
     --role primary \

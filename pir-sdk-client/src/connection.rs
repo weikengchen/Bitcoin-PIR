@@ -48,6 +48,32 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 const MAX_WS_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
 const MAX_WS_FRAME_SIZE: usize = 256 * 1024 * 1024;
 
+// ─── Transport-level message chunking (Cloudflare large-message workaround) ──
+//
+// Cloudflare's WebSocket proxy silently corrupts single messages above
+// ~1 MB — a 3.1 MB OnionPIR `RegisterKeys` upload arrives truncated
+// (see docs/PIR1_REGISTER_KEYS_TRUNCATION.md). Any outbound message
+// larger than `CHUNK_SIZE` is split into `CHUNK_SIZE`-byte pieces, each
+// sent as its own WebSocket Binary message tagged
+// `[4B len][CHUNK_MAGIC][seq:u16][total:u16][piece]`; the peer
+// reassembles before dispatching. Small messages are sent unwrapped, so
+// peers that never receive a large message never see a chunk frame.
+//
+// `CHUNK_MAGIC` sits at byte offset 4 (where a normal message has its
+// variant byte / the 0xfe channel magic). 0xc7 collides with no
+// protocol opcode (0x00-0x09, 0x30-0x34, 0x50-0x56, 0x71, 0xaa-0xcd,
+// 0xfe-0xff are the live values).
+pub const CHUNK_MAGIC: u8 = 0xc7;
+/// Max bytes of original message per chunk frame. 256 KiB is far below
+/// any plausible Cloudflare WebSocket message ceiling.
+pub const CHUNK_SIZE: usize = 256 * 1024;
+/// Chunk-frame header after the 4-byte length prefix: magic + seq + total.
+const CHUNK_HDR: usize = 1 + 2 + 2;
+/// Reassembly safety cap — a legitimate PIR message tops out around
+/// ~5 MB (a 150-query OnionPIR INDEX batch); 64 MiB is generous
+/// headroom while bounding memory against a malicious peer.
+const MAX_REASSEMBLED: usize = 64 * 1024 * 1024;
+
 /// Default deadline for establishing a new WebSocket connection. A slow
 /// TLS handshake over a stressed link can legitimately take several
 /// seconds, but anything past 30s is almost certainly a wedged server
@@ -418,6 +444,8 @@ impl WsConnection {
     }
 
     /// Send a binary message, subject to the per-request deadline.
+    /// Messages over [`CHUNK_SIZE`] are split into chunk frames; see
+    /// [`send_chunked`](Self::send_chunked).
     pub async fn send(&mut self, data: Vec<u8>) -> PirResult<()> {
         // Capture the read-only bits before `self.sink` is mutably
         // borrowed by `send(...)` — otherwise the borrow checker can't
@@ -425,7 +453,7 @@ impl WsConnection {
         let request_timeout = self.request_timeout;
         let url = self.url.clone();
         let bytes_out = data.len();
-        let send_fut = self.sink.send(Message::Binary(data.into()));
+        let send_fut = self.send_chunked(&data);
         match tokio::time::timeout(request_timeout, send_fut).await {
             Ok(Ok(())) => {
                 // Only fire after a confirmed successful send — a failed
@@ -434,12 +462,55 @@ impl WsConnection {
                 self.fire_bytes_sent(bytes_out);
                 Ok(())
             }
-            Ok(Err(e)) => Err(PirError::ConnectionClosed(format!("send: {}", e))),
+            Ok(Err(e)) => Err(e),
             Err(_) => Err(PirError::Timeout(format!(
                 "send to {} took longer than {:?}",
                 url, request_timeout,
             ))),
         }
+    }
+
+    /// Send `data` as a single WebSocket Binary message, or — when it
+    /// exceeds [`CHUNK_SIZE`] — as a sequence of `[4B len][CHUNK_MAGIC]
+    /// [seq:u16][total:u16][piece]` chunk frames the peer reassembles.
+    /// Cloudflare's WebSocket proxy corrupts single multi-MB messages;
+    /// chunking keeps every wire message small.
+    async fn send_chunked(&mut self, data: &[u8]) -> PirResult<()> {
+        if data.len() <= CHUNK_SIZE {
+            return self
+                .sink
+                .send(Message::Binary(data.to_vec().into()))
+                .await
+                .map_err(|e| PirError::ConnectionClosed(format!("send: {}", e)));
+        }
+        let total = data.len().div_ceil(CHUNK_SIZE);
+        if total > u16::MAX as usize {
+            return Err(PirError::Protocol(format!(
+                "message too large to chunk: {} bytes",
+                data.len()
+            )));
+        }
+        for seq in 0..total {
+            let start = seq * CHUNK_SIZE;
+            let end = (start + CHUNK_SIZE).min(data.len());
+            let piece = &data[start..end];
+            let mut frame = Vec::with_capacity(4 + CHUNK_HDR + piece.len());
+            frame.extend_from_slice(&((CHUNK_HDR + piece.len()) as u32).to_le_bytes());
+            frame.push(CHUNK_MAGIC);
+            frame.extend_from_slice(&(seq as u16).to_le_bytes());
+            frame.extend_from_slice(&(total as u16).to_le_bytes());
+            frame.extend_from_slice(piece);
+            self.sink
+                .send(Message::Binary(frame.into()))
+                .await
+                .map_err(|e| {
+                    PirError::ConnectionClosed(format!(
+                        "send chunk {}/{}: {}",
+                        seq, total, e
+                    ))
+                })?;
+        }
+        Ok(())
     }
 
     /// Receive a binary message, handling ping/pong automatically,
@@ -466,8 +537,14 @@ impl WsConnection {
     }
 
     /// Inner recv loop — same behaviour as the old `recv`, no timeout.
-    /// Wrapped by `recv` with `tokio::time::timeout`.
+    /// Wrapped by `recv` with `tokio::time::timeout`. Transparently
+    /// reassembles chunk frames (see [`send_chunked`](Self::send_chunked)):
+    /// a chunked logical message spans several WebSocket frames, so the
+    /// loop keeps reading until the final chunk before returning.
     async fn recv_inner(&mut self) -> PirResult<Vec<u8>> {
+        let mut chunk_acc: Vec<u8> = Vec::new();
+        let mut chunk_expected: u16 = 0;
+        let mut chunk_total: u16 = 0;
         loop {
             let msg = self
                 .stream
@@ -477,7 +554,49 @@ impl WsConnection {
                 .map_err(|e| PirError::ConnectionClosed(format!("recv: {}", e)))?;
 
             match msg {
-                Message::Binary(b) => return Ok(b.into()),
+                Message::Binary(b) => {
+                    let b: Vec<u8> = b.into();
+                    // Chunk frame: [4B len][CHUNK_MAGIC][seq:u16][total:u16][piece].
+                    // A normal message never has CHUNK_MAGIC at offset 4
+                    // (it is not a valid variant byte / channel magic).
+                    if b.len() >= 4 + CHUNK_HDR && b[4] == CHUNK_MAGIC {
+                        let seq = u16::from_le_bytes([b[5], b[6]]);
+                        let total = u16::from_le_bytes([b[7], b[8]]);
+                        if total == 0 {
+                            return Err(PirError::Protocol(
+                                "chunk frame with total=0".into(),
+                            ));
+                        }
+                        if seq != chunk_expected {
+                            return Err(PirError::Protocol(format!(
+                                "chunk out of order: seq {} expected {}",
+                                seq, chunk_expected
+                            )));
+                        }
+                        if seq == 0 {
+                            chunk_total = total;
+                            chunk_acc.clear();
+                        } else if total != chunk_total {
+                            return Err(PirError::Protocol(
+                                "chunk total changed mid-stream".into(),
+                            ));
+                        }
+                        let piece = &b[4 + CHUNK_HDR..];
+                        if chunk_acc.len() + piece.len() > MAX_REASSEMBLED {
+                            return Err(PirError::Protocol(
+                                "reassembled message exceeds cap".into(),
+                            ));
+                        }
+                        chunk_acc.extend_from_slice(piece);
+                        chunk_expected += 1;
+                        if chunk_expected == chunk_total {
+                            return Ok(std::mem::take(&mut chunk_acc));
+                        }
+                        // else: keep looping for the next chunk frame
+                    } else {
+                        return Ok(b);
+                    }
+                }
                 Message::Ping(p) => {
                     let _ = self.sink.send(Message::Pong(p)).await;
                 }
@@ -524,11 +643,9 @@ impl WsConnection {
         let mut send_succeeded = false;
         let fut = async {
             // Send request (already includes length prefix from protocol
-            // encoding).
-            let send_fut = self.sink.send(Message::Binary(request.to_vec().into()));
-            send_fut
-                .await
-                .map_err(|e| PirError::ConnectionClosed(format!("send: {}", e)))?;
+            // encoding). `send_chunked` splits it into chunk frames if it
+            // exceeds CHUNK_SIZE so Cloudflare doesn't corrupt it.
+            self.send_chunked(request).await?;
             send_succeeded = true;
 
             // Receive response.

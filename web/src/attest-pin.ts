@@ -65,36 +65,26 @@ export interface ServerAttestPin {
 }
 
 /**
- * pir2.chenweikeng.com — VPSBG Tier 3 (Slice 3 lockdown), v4. Same
- * reproducibility flags as v3 (sub-tasks 1 + 2 + 3(b) + 4) but rebuilt
- * with the upstream OnionPIR CMake-4.x compatibility fix landed (rev
- * 0c84595f), so the build no longer needs the in-place cargo-cache
- * patch hack we used for v3.
- * Pinned 2026-05-04 from the v4 deploy (UKI sha `e835a516…f8396da0`).
+ * pir2.chenweikeng.com — VPSBG Tier 3 UKI v16, pinned 2026-05-16.
+ * Deterministic build (scripts/build_unified_server.sh +
+ * build_uki_tier3.sh) on the Hetzner build host with VPSBG kernel
+ * 7.0.0-15 + dracut 110.
  */
 export const PIR2_TIER3_PIN: ServerAttestPin = {
-  // Tier 3 UKI v15 — 2026-05-13. Built on Hetzner with VPSBG kernel
-  // 7.0.0-15, kmod 34.2, dracut 110. Bumped from v13 to ship the
-  // explicit `--serve-hints` / `--serve-queries` mode flags (commit
-  // fb8b8a64): pir2 runs `--serve-queries` only — no hint pool, no
-  // `--pool-size`. Hints come from pir1 (Hetzner, non-SEV) per the
-  // production topology (memory:
-  // `project_pir1_hint_pir2_query_split.md`).
-  //
-  // v14 (sha256 `81acfd6c…`) was the first attempt but the Tier 3
-  // runit init script still invoked unified_server with no mode
-  // flags → exit(2) crash loop. v15 (sha256 `9cd506ea…`) ships the
-  // corrected `scripts/dracut/97bpir-tier3-init/unified-server-run.sh`
-  // (commit 714eb832).
-  //
-  // The embedded binary (`94a9dc8c…`) is byte-identical to the one
-  // running on Hetzner pir-primary / pir-secondary so PIR1_PIN and
-  // PIR2_TIER3_PIN share the same `binarySha256Hex`.
+  // Tier 3 UKI v16 — 2026-05-16. Rebuilt to ship the transport-level
+  // WebSocket chunking fix (commit 49db31da) so OnionPIR's large
+  // RegisterKeys upload survives Cloudflare. pir2 runs `--serve-queries`
+  // only — no hint pool. The embedded binary (`f63b3535…`) comes from
+  // the deterministic wrapper `scripts/build_unified_server.sh` and is
+  // byte-identical to the one running on Hetzner pir-primary /
+  // pir-secondary, so PIR1_PIN and PIR2_TIER3_PIN share the same
+  // `binarySha256Hex`. MEASUREMENT captured from the v16 deploy via
+  // `bpir-admin attest wss://pir2.chenweikeng.com`.
   measurementHex:
-    '895dbc799144f24bddf266408c3221dda1b5e1b64dcdd2236cb1e84ba1fba4cb3b75c0054a0e0ee238780e78da10466d',
+    '59e276f34881fec46f68f07582b863d46944868206db14402e32000e49ab568e3d41a9df9155991345ed578c31a7ab4a',
   binarySha256Hex:
-    '94a9dc8ca6bc7ea22cacfede50c0d4a5f44fead5e49af8e90df5aa40c4d40ea4',
-  description: 'pir2.chenweikeng.com (VPSBG, SEV-SNP, Tier 3 UKI v15)',
+    'f63b35354c3f02037d5063a25696c3a919d14cccbcf4946f98cf6c5e75117ecd',
+  description: 'pir2.chenweikeng.com (VPSBG, SEV-SNP, Tier 3 UKI v16)',
 };
 
 /**
@@ -106,14 +96,11 @@ export const PIR2_TIER3_PIN: ServerAttestPin = {
  */
 export const PIR1_PIN: ServerAttestPin = {
   // No measurementHex — Hetzner has no SEV.
-  // Bumped 2026-05-13 alongside the `--serve-hints` / `--serve-queries`
-  // mode-flag landing (commit fb8b8a64) and rebuilt with the
-  // deterministic wrapper `scripts/build_unified_server.sh` so the
-  // binary embedded in the Tier 3 UKI (pir2/VPSBG) and the Hetzner
-  // pir-primary binary are byte-identical (`94a9dc8c…`). The v14
-  // UKI sha256 is `81acfd6c…` — pin published when pir2 reboots
-  // and the in-chip MEASUREMENT is captured.
+  // Bumped 2026-05-16: rebuilt with the deterministic wrapper
+  // `scripts/build_unified_server.sh` from commit 49db31da (the
+  // transport-level WS chunking fix). The binary (`f63b3535…`) is
+  // byte-identical to the one baked into the pir2 Tier 3 UKI v16.
   binarySha256Hex:
-    '94a9dc8ca6bc7ea22cacfede50c0d4a5f44fead5e49af8e90df5aa40c4d40ea4',
+    'f63b35354c3f02037d5063a25696c3a919d14cccbcf4946f98cf6c5e75117ecd',
   description: 'pir1.chenweikeng.com (Hetzner i7-8700, no SEV)',
 };

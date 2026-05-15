@@ -116,7 +116,6 @@ const MASTER_SEED: u64 = 0x71a2ef38b4c90d15;
 
 /// Cuckoo parameters for index level
 const CUCKOO_NUM_HASHES: usize = 2;
-const SLOTS_PER_BIN: usize = 256; // 256 × 15B = 3840B
 const CUCKOO_LOAD_FACTOR: f64 = 0.95;
 const CUCKOO_MAX_KICKS: usize = 5000;
 const EMPTY: u32 = u32::MAX;
@@ -124,8 +123,25 @@ const EMPTY: u32 = u32::MAX;
 /// Tag seed for fingerprint computation
 const TAG_SEED: u64 = 0xd4e5f6a7b8c91023;
 
-/// OnionPIR entry size (must equal SLOTS_PER_BIN * INDEX_SLOT_SIZE)
-const ONIONPIR_ENTRY_SIZE: usize = 3840;
+/// OnionPIRv2 port (commit 5b): SLOTS_PER_BIN and ONIONPIR_ENTRY_SIZE are
+/// no longer compile-time constants. They derive from the linked
+/// onionpir crate at startup:
+///
+///   ONIONPIR_ENTRY_SIZE = `onionpir::params_info(0).entry_size` (3328
+///     for the default `CONFIG_N2048_K1`, was 3840 pre-port at PlainMod=15).
+///   SLOTS_PER_BIN       = `ONIONPIR_ENTRY_SIZE / INDEX_SLOT_SIZE`     (221
+///     for CONFIG_N2048_K1 with 15-byte slots, was 256 pre-port).
+///
+/// The pair must satisfy `slots_per_bin * INDEX_SLOT_SIZE <= entry_size`
+/// — asserted in `main()`. The cuckoo table layout, serialized bin
+/// shape, and `bins_per_table` sizing all flow from these runtime values.
+fn onionpir_entry_size() -> usize {
+    onionpir::params_info(0).entry_size as usize
+}
+
+fn slots_per_bin() -> usize {
+    onionpir_entry_size() / INDEX_SLOT_SIZE
+}
 
 const FLAG_WHALE: u8 = 0x40;
 
@@ -218,17 +234,23 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-// ─── Cuckoo table builder (2-hash, slots_per_bin=256) ───────────────────────
+// ─── Cuckoo table builder (2-hash, slots_per_bin=runtime) ───────────────────
 
 /// Build a 2-hash cuckoo table with large slots_per_bin.
-/// Returns (table, success). table[bin * SLOTS_PER_BIN + slot] = entry index.
+/// Returns (table, success). table[bin * slots_per_bin + slot] = entry index.
+///
+/// OnionPIRv2 port (commit 5b): `slots_per_bin` is a runtime parameter
+/// (derived from `params_info(0).entry_size / INDEX_SLOT_SIZE` in main())
+/// instead of a const. CONFIG_N2048_K1 gives 221 (was 256 pre-port at
+/// PlainMod=15).
 fn build_index_cuckoo(
     group_id: usize,
     entries: &[u32],
     mmap: &[u8],
     num_bins: usize,
+    slots_per_bin: usize,
 ) -> (Vec<u32>, bool) {
-    let total_slots = num_bins * SLOTS_PER_BIN;
+    let total_slots = num_bins * slots_per_bin;
     let mut table = vec![EMPTY; total_slots];
     let mut bin_occupancy = vec![0u16; num_bins];
 
@@ -255,15 +277,15 @@ fn build_index_cuckoo(
         };
 
         let occ0 = bin_occupancy[first] as usize;
-        if occ0 < SLOTS_PER_BIN {
-            table[first * SLOTS_PER_BIN + occ0] = idx;
+        if occ0 < slots_per_bin {
+            table[first * slots_per_bin + occ0] = idx;
             bin_occupancy[first] += 1;
             continue;
         }
 
         let occ1 = bin_occupancy[second] as usize;
-        if occ1 < SLOTS_PER_BIN {
-            table[second * SLOTS_PER_BIN + occ1] = idx;
+        if occ1 < slots_per_bin {
+            table[second * slots_per_bin + occ1] = idx;
             bin_occupancy[second] += 1;
             continue;
         }
@@ -276,8 +298,8 @@ fn build_index_cuckoo(
         for kick in 0..CUCKOO_MAX_KICKS {
             let occ = bin_occupancy[current_bin] as usize;
             let evict_slot = kick % occ;
-            let evicted = table[current_bin * SLOTS_PER_BIN + evict_slot];
-            table[current_bin * SLOTS_PER_BIN + evict_slot] = current_idx;
+            let evicted = table[current_bin * slots_per_bin + evict_slot];
+            table[current_bin * slots_per_bin + evict_slot] = current_idx;
 
             let ev_sh = get_sh(evicted);
             let ev_bin0 = cuckoo_hash(ev_sh, key0, num_bins);
@@ -285,8 +307,8 @@ fn build_index_cuckoo(
             let alt_bin = if ev_bin0 == current_bin { ev_bin1 } else { ev_bin0 };
 
             let alt_occ = bin_occupancy[alt_bin] as usize;
-            if alt_occ < SLOTS_PER_BIN {
-                table[alt_bin * SLOTS_PER_BIN + alt_occ] = evicted;
+            if alt_occ < slots_per_bin {
+                table[alt_bin * slots_per_bin + alt_occ] = evicted;
                 bin_occupancy[alt_bin] += 1;
                 success = true;
                 break;
@@ -304,17 +326,25 @@ fn build_index_cuckoo(
     (table, stash == 0)
 }
 
-/// Serialize a cuckoo table into OnionPIR entries.
-/// Each bin (256 slots × 15 bytes) becomes one 3840-byte OnionPIR entry.
+/// Serialize a cuckoo table into one OnionPIR entry's worth of bytes.
+/// Each bin (`slots_per_bin` slots × 15 bytes) becomes one
+/// `entry_size`-byte OnionPIR entry.
+///
+/// OnionPIRv2 port (commit 5b): both `slots_per_bin` and `entry_size`
+/// are runtime values now — the return type became `Vec<u8>` because
+/// Rust fixed-size array lengths must be `const`. Length is always
+/// exactly `entry_size`.
 fn serialize_cuckoo_bin(
     table: &[u32],
     bin: usize,
     mmap: &[u8],
-) -> [u8; ONIONPIR_ENTRY_SIZE] {
-    let mut entry = [0u8; ONIONPIR_ENTRY_SIZE];
-    let base = bin * SLOTS_PER_BIN;
+    slots_per_bin: usize,
+    entry_size: usize,
+) -> Vec<u8> {
+    let mut entry = vec![0u8; entry_size];
+    let base = bin * slots_per_bin;
 
-    for slot in 0..SLOTS_PER_BIN {
+    for slot in 0..slots_per_bin {
         let idx = table[base + slot];
         let slot_offset = slot * INDEX_SLOT_SIZE;
 
@@ -437,14 +467,20 @@ fn consolidate_only_main(
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 fn main() {
+    // OnionPIRv2 port (commit 5b): pull the OnionPIR entry size from
+    // the linked crate at startup; derive slots_per_bin from it.
+    let onionpir_entry_size = onionpir_entry_size();
+    let slots_per_bin = slots_per_bin();
     assert!(
-        SLOTS_PER_BIN * INDEX_SLOT_SIZE <= ONIONPIR_ENTRY_SIZE,
+        slots_per_bin * INDEX_SLOT_SIZE <= onionpir_entry_size,
         "slots_per_bin * slot_size must fit within OnionPIR entry size ({}*{}={} > {})",
-        SLOTS_PER_BIN, INDEX_SLOT_SIZE,
-        SLOTS_PER_BIN * INDEX_SLOT_SIZE, ONIONPIR_ENTRY_SIZE,
+        slots_per_bin, INDEX_SLOT_SIZE,
+        slots_per_bin * INDEX_SLOT_SIZE, onionpir_entry_size,
     );
 
     println!("=== gen_3_onion: Build OnionPIR Index Database ===\n");
+    println!("OnionPIR shape (from params_info): entry_size={} B, slots_per_bin={}, slot_size={} B",
+        onionpir_entry_size, slots_per_bin, INDEX_SLOT_SIZE);
     let total_start = Instant::now();
 
     let gen_args = resolve_paths();
@@ -528,10 +564,10 @@ fn main() {
 
     // ── 3. Build cuckoo tables in parallel ──────────────────────────────
     let bins_per_table =
-        ((max_group as f64) / (SLOTS_PER_BIN as f64 * CUCKOO_LOAD_FACTOR)).ceil() as usize;
+        ((max_group as f64) / (slots_per_bin as f64 * CUCKOO_LOAD_FACTOR)).ceil() as usize;
 
     println!("\n[3] Building cuckoo tables ({}-hash, bs={}, bins_per_table={})...",
-        CUCKOO_NUM_HASHES, SLOTS_PER_BIN, bins_per_table);
+        CUCKOO_NUM_HASHES, slots_per_bin, bins_per_table);
     let t_cuckoo = Instant::now();
 
     let mmap_slice: &[u8] = &mmap;
@@ -541,7 +577,9 @@ fn main() {
         .into_par_iter()
         .enumerate()
         .map(|(group_id, entries)| {
-            let (table, success) = build_index_cuckoo(group_id, &entries, mmap_slice, bins_per_table);
+            let (table, success) = build_index_cuckoo(
+                group_id, &entries, mmap_slice, bins_per_table, slots_per_bin,
+            );
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
             if done % 10 == 0 || done == K {
                 eprint!("\r  Progress: {}/{} groups", done, K);
@@ -579,6 +617,25 @@ fn main() {
     println!("  Physical size per group: {:.2} MB", p.physical_size_mb);
     println!("  Total for {} groups: {:.2} GB", K, p.physical_size_mb * K as f64 / 1024.0);
 
+    // OnionPIRv2 port (commit 3b + 5b): per-group build uses
+    // `push_plaintexts` + `save_db`. The pre-port `push_chunk` +
+    // `preprocess` pair is gone; NTT runs inside push_plaintexts. The
+    // chunk-loop structure is preserved (one push call per `fst_dim`-
+    // sized batch) for memory efficiency on multi-thousand-bin groups.
+    //
+    // Commit 5b: `serialize_cuckoo_bin` now returns exactly
+    // `onionpir_entry_size` bytes (since `slots_per_bin * INDEX_SLOT_SIZE`
+    // equals it). The earlier commit-3 stub had a `take_bytes_per_entry =
+    // entry_size.min(ONIONPIR_ENTRY_SIZE)` truncation guard that's now
+    // a no-op — assert it and skip the conditional.
+    let poly_degree = p.poly_degree as usize;
+    assert_eq!(
+        entry_size, onionpir_entry_size,
+        "params_info.entry_size ({}) drifted from onion_entry_size() ({}); \
+         a stale onionpir crate is linked",
+        entry_size, onionpir_entry_size
+    );
+
     // Process groups sequentially (OnionPIR Server is not Send)
     for (group_id, table, _) in &cuckoo_results {
         let preproc_path = output_dir.join(format!("group_{}.bin", group_id));
@@ -598,23 +655,44 @@ fn main() {
 
         let t_group = Instant::now();
 
-        // Populate: each cuckoo bin → one OnionPIR entry
-        let chunk_size = fst_dim * entry_size;
+        // Populate: each cuckoo bin → one OnionPIR plaintext (N pre-NTT
+        // coefficients packed from the bin's slot byte stream).
         for chunk_idx in 0..other_dim {
-            let mut chunk_data = vec![0u8; chunk_size];
+            let mut batch_coeffs: Vec<u64> = Vec::with_capacity(fst_dim * poly_degree);
             for i in 0..fst_dim {
                 let global_bin = chunk_idx * fst_dim + i;
-                if global_bin < bins_per_table {
-                    let entry_bytes = serialize_cuckoo_bin(table, global_bin, mmap_slice);
-                    let offset = i * entry_size;
-                    chunk_data[offset..offset + entry_size].copy_from_slice(&entry_bytes);
-                }
+                let entry_bytes_full: Vec<u8> = if global_bin < bins_per_table {
+                    serialize_cuckoo_bin(table, global_bin, mmap_slice, slots_per_bin, entry_size)
+                } else {
+                    vec![0u8; entry_size]
+                };
+                let coeffs = pir_core::onion_unpack::pack_bytes_into_coefficients(
+                    &entry_bytes_full,
+                    entry_size,
+                    poly_degree,
+                );
+                batch_coeffs.extend_from_slice(&coeffs);
             }
-            server.push_chunk(&chunk_data, chunk_idx);
+            let plaintext_offset = (chunk_idx * fst_dim) as u64;
+            let ok = server.push_plaintexts(
+                &batch_coeffs,
+                fst_dim as u64,
+                plaintext_offset,
+                &[],
+            );
+            assert!(
+                ok,
+                "push_plaintexts failed (group={} chunk_idx={} offset={})",
+                group_id, chunk_idx, plaintext_offset
+            );
         }
 
-        server.preprocess();
-        server.save_db(preproc_path.to_str().unwrap());
+        assert!(
+            server.save_db(preproc_path.to_str().unwrap()),
+            "save_db failed for group {} → {:?}",
+            group_id,
+            preproc_path
+        );
 
         if *group_id % 10 == 0 || *group_id + 1 == K {
             eprintln!("  Group {}/{} preprocessed in {:.2?}", group_id + 1, K, t_group.elapsed());
@@ -631,7 +709,7 @@ fn main() {
         w.write_all(&magic.to_le_bytes()).unwrap();
         w.write_all(&(K as u32).to_le_bytes()).unwrap();
         w.write_all(&(CUCKOO_NUM_HASHES as u32).to_le_bytes()).unwrap();
-        w.write_all(&(SLOTS_PER_BIN as u32).to_le_bytes()).unwrap();
+        w.write_all(&(slots_per_bin as u32).to_le_bytes()).unwrap();
         w.write_all(&(bins_per_table as u32).to_le_bytes()).unwrap();
         w.write_all(&MASTER_SEED.to_le_bytes()).unwrap();
         w.write_all(&TAG_SEED.to_le_bytes()).unwrap();
@@ -648,7 +726,9 @@ fn main() {
         let mut bin_hashes = Vec::with_capacity(total_bins * 32);
         for (group_id, table, _) in &cuckoo_results {
             for bin in 0..bins_per_table {
-                let entry_bytes = serialize_cuckoo_bin(table, bin, mmap_slice);
+                let entry_bytes = serialize_cuckoo_bin(
+                    table, bin, mmap_slice, slots_per_bin, entry_size,
+                );
                 let hash = pir_core::merkle::sha256(&entry_bytes);
                 bin_hashes.extend_from_slice(&hash);
             }
@@ -698,8 +778,8 @@ fn main() {
 
     let mut found_bin = None;
     for &candidate_bin in &[bin0, bin1] {
-        let base = candidate_bin * SLOTS_PER_BIN;
-        for slot in 0..SLOTS_PER_BIN {
+        let base = candidate_bin * slots_per_bin;
+        for slot in 0..slots_per_bin {
             if test_table[base + slot] == test_idx as u32 {
                 found_bin = Some(candidate_bin);
                 break;
@@ -718,17 +798,26 @@ fn main() {
 
     let mut client = PirClient::new(bins_per_table as u64);
     let client_id = client.id();
-    server.set_galois_key(client_id, &client.generate_galois_keys());
-    server.set_gsw_key(client_id, &client.generate_gsw_keys());
+    server.set_galois_keys(client_id, &client.galois_keys());
+    server.set_gsw_key(client_id, &client.gsw_key());
 
     let query = client.generate_query(test_bin as u64);
     let response = server.answer_query(client_id, &query);
-    let decrypted = client.decrypt_response(test_bin as u64, &response);
+    // OnionPIRv2 port (commit 2): bit-unpack — see gen_2_onion.
+    let _ = test_bin;
+    let raw_pt = client.decrypt_response(&response);
+    let pinfo = onionpir::params_info(bins_per_table as u64);
+    let decrypted = pir_core::onion_unpack::unpack_onion_plaintext(
+        &raw_pt,
+        pinfo.poly_degree as usize,
+        pinfo.entry_size as usize,
+    )
+    .expect("onion_unpack rejected gen_3_onion plaintext");
 
-    // The decrypted data is a 3840-byte bin with 256 × 15-byte slots.
-    // Scan for our tag.
+    // The decrypted data is one `entry_size`-byte bin with
+    // `slots_per_bin` × 15-byte slots. Scan for our tag.
     let mut tag_found = false;
-    for slot in 0..SLOTS_PER_BIN {
+    for slot in 0..slots_per_bin {
         let offset = slot * INDEX_SLOT_SIZE;
         if offset + 8 > decrypted.len() { break; }
         let slot_tag = u64::from_le_bytes(decrypted[offset..offset + 8].try_into().unwrap());
@@ -833,7 +922,7 @@ fn main() {
     println!("Index entries:     {} ({} non-whale)", n, non_whale);
     println!("PBC groups:        {}", K);
     println!("Bins per table:    {} ({} slots × {} bytes = {} B/bin)",
-        bins_per_table, SLOTS_PER_BIN, INDEX_SLOT_SIZE, ONIONPIR_ENTRY_SIZE);
+        bins_per_table, slots_per_bin, INDEX_SLOT_SIZE, onionpir_entry_size);
     println!("OnionPIR per group: {:.2} MB (NTT-expanded)", p.physical_size_mb);
     println!("Total NTT storage: {:.2} GB", p.physical_size_mb * K as f64 / 1024.0);
     println!("Total time:        {:.2?}", total_start.elapsed());

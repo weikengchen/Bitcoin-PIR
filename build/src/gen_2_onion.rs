@@ -18,10 +18,10 @@
 //! With `--data-dir <D>`, reads `<D>/onion_packed_entries.bin` and writes
 //! all outputs under `<D>/`. Use this for delta DB builds.
 
-use memmap2::{Mmap, MmapMut};
+use memmap2::Mmap;
 use onionpir::{self, Client as PirClient, Server as PirServer};
 use std::env;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::time::Instant;
 
@@ -63,7 +63,14 @@ fn resolve_paths() -> (String, String, String, String) {
     }
 }
 
-const PACKED_ENTRY_SIZE: usize = 3840;
+// OnionPIRv2 port (commit 5b): the on-disk packed entry size is now
+// `onionpir::params_info(0).entry_size` (3328 for the default
+// CONFIG_N2048_K1, was 3840 pre-port at PlainMod=15). Read once in
+// main() and flowed through per-call-site. The const definition is
+// gone; usages take a local `packed_entry_size` parameter.
+fn onion_entry_size() -> usize {
+    onionpir::params_info(0).entry_size as usize
+}
 
 /// PBC parameters (same as production)
 const K_CHUNK: usize = 80;
@@ -223,62 +230,160 @@ fn main() {
     println!();
 
     // ── 1. Read packed entries ───────────────────────────────────────────
+    //
+    // OnionPIRv2 port (commit 5b): `packed_entry_size` is pulled from
+    // the linked onionpir crate at startup (matches gen_1_onion's
+    // packing size). The pre-port hardcoded `PACKED_ENTRY_SIZE = 3840`
+    // is gone.
+    let packed_entry_size = onion_entry_size();
     println!("[1] Memory-mapping packed entries: {}", packed_file_path);
     let packed_file = File::open(&packed_file_path).expect("open packed entries file");
     let packed_mmap = unsafe { Mmap::map(&packed_file) }.expect("mmap packed entries");
-    let num_entries = packed_mmap.len() / PACKED_ENTRY_SIZE;
-    assert_eq!(packed_mmap.len() % PACKED_ENTRY_SIZE, 0, "packed file not aligned");
-    println!("  {} entries ({:.2} GB)", num_entries, packed_mmap.len() as f64 / 1e9);
+    assert_eq!(
+        packed_mmap.len() % packed_entry_size, 0,
+        "packed file not aligned: {} bytes, packed_entry_size={}",
+        packed_mmap.len(), packed_entry_size
+    );
+    let num_entries = packed_mmap.len() / packed_entry_size;
+    println!("  {} entries ({:.2} GB), entry_size={} B", num_entries,
+        packed_mmap.len() as f64 / 1e9, packed_entry_size);
 
     // ── 2. Get OnionPIR params ──────────────────────────────────────────
-    // We need a Server instance to call ntt_expand_entry, but we won't populate it.
-    // Use num_entries just for params (the Server for shared DB doesn't own data).
     let p = onionpir::params_info(num_entries as u64);
     let coeff_val_cnt = p.coeff_val_cnt as usize;
-    println!("\n[2] OnionPIR params for {} entries:", num_entries);
-    println!("  entry_size:      {} B", p.entry_size);
-    println!("  coeff_val_cnt:   {} (coefficients per NTT-expanded entry)", coeff_val_cnt);
-    println!("  NTT bytes/entry: {} B", coeff_val_cnt * 8);
+    let poly_degree = p.poly_degree as usize;
+    let entry_size_pt = p.entry_size as usize;
+    let num_plaintexts = p.num_plaintexts as usize;
+    println!("\n[2] OnionPIR params (post-port, BV key-switching):");
+    println!("  poly_degree:      {} (N — coeffs per pre-NTT plaintext)", poly_degree);
+    println!("  entry_size:       {} B (payload per plaintext)", entry_size_pt);
+    println!("  num_plaintexts:   {} (compiled-in DB slot count)", num_plaintexts);
+    println!("  coeff_val_cnt:    {} (post-NTT coeff count per plaintext)", coeff_val_cnt);
+    assert_eq!(
+        entry_size_pt, packed_entry_size,
+        "params_info.entry_size ({}) != packed_entry_size ({}); a stale \
+         packed.bin produced by a different onionpir rev is being read",
+        entry_size_pt, packed_entry_size
+    );
+    if num_entries > num_plaintexts {
+        panic!(
+            "num_entries ({}) > num_plaintexts ({}). Compile-time DB shape \
+             is too small for this dataset — rebuild onionpir with a larger \
+             DB_SIZE_MB.",
+            num_entries, num_plaintexts
+        );
+    }
 
-    // ── 3. Build shared NTT store (level-major) ─────────────────────────
-    let ntt_store_bytes = coeff_val_cnt * num_entries * 8;
-    println!("\n[3] Building shared NTT store ({})...", format_bytes(ntt_store_bytes as u64));
-    println!("  Layout: level-major, {} levels × {} entries × 8 bytes", coeff_val_cnt, num_entries);
-
-    // Create and mmap the output file
-    let ntt_file = OpenOptions::new()
-        .read(true).write(true).create(true).truncate(true)
-        .open(&ntt_store_file).expect("create NTT store file");
-    ntt_file.set_len(ntt_store_bytes as u64).expect("set NTT file size");
-    let mut ntt_mmap = unsafe { MmapMut::map_mut(&ntt_file) }.expect("mmap NTT store");
-
-    // Use a temporary Server just for ntt_expand_entry
-    let expander = PirServer::new(num_entries as u64);
-
+    // ── 3. Build shared NTT store via push_plaintexts + save_db ─────────
+    //
+    // OnionPIRv2 port (commit 3a): the old `ntt_expand_entry` + level-major
+    // mmap scatter is gone. The new flow is:
+    //
+    //   1. Bit-pack each entry's bytes into `poly_degree` pre-NTT u64
+    //      coefficients (see `pir_core::onion_unpack::pack_bytes_into_coefficients`).
+    //   2. Feed batches of coefficients to a temporary Server via
+    //      `push_plaintexts(coeffs, count, offset, &[])`. The server runs
+    //      NTT internally and stores the post-NTT level-major data.
+    //   3. `save_db(temp_path)` writes a file shaped:
+    //        [48-byte header][raw `[u64]` level-major payload]
+    //      Header layout per INTEGRATION.md §1.3 + upstream `PREPROC_*`
+    //      magic. The payload is exactly what the runtime needs to pass
+    //      to `set_shared_database`.
+    //   4. Strip the 48-byte header into the final `ntt_store_file`. The
+    //      stripped payload is `coeff_val_cnt × num_plaintexts × 8` bytes
+    //      — NOT `× num_entries` like pre-port — because save_db sizes
+    //      for the compile-time DB shape. The runtime adapts by passing
+    //      `num_plaintexts` (not `num_packed_entries`) as
+    //      `shared_num_entries` to `set_shared_database`.
+    //
+    //   Empty slots `[num_entries, num_plaintexts)` contain whatever
+    //   `Server::new` left them as (zeros in practice). The PBC cuckoo
+    //   planner only assigns to `[0, num_entries)`, so real queries never
+    //   land on those slots.
+    const PUSH_BATCH_ENTRIES: usize = 256;
+    println!(
+        "\n[3] Pushing {} plaintexts ({} per batch) and running NTT...",
+        num_entries, PUSH_BATCH_ENTRIES
+    );
     let t_ntt = Instant::now();
+    let mut server = PirServer::new(num_entries as u64);
     let one_percent = num_entries.max(1) / 100;
-    for entry_id in 0..num_entries {
-        let raw = &packed_mmap[entry_id * PACKED_ENTRY_SIZE..(entry_id + 1) * PACKED_ENTRY_SIZE];
-        let coeffs = expander.ntt_expand_entry(raw, coeff_val_cnt);
+    // OnionPIRv2 port (commit 5b): the commit-3 `take_bytes_per_entry`
+    // truncation guard is gone — gen_1's packed entry size matches
+    // `params_info.entry_size` exactly (asserted above), so the full
+    // entry packs cleanly into one plaintext.
 
-        // Scatter to level-major: store[level * num_entries + entry_id]
-        let ntt_u64: &mut [u64] = unsafe {
-            std::slice::from_raw_parts_mut(ntt_mmap.as_mut_ptr() as *mut u64, coeff_val_cnt * num_entries)
-        };
-        for level in 0..coeff_val_cnt {
-            ntt_u64[level * num_entries + entry_id] = coeffs[level];
+    let mut entry_id = 0;
+    while entry_id < num_entries {
+        let n_this_batch = PUSH_BATCH_ENTRIES.min(num_entries - entry_id);
+        let mut batch_coeffs: Vec<u64> = Vec::with_capacity(n_this_batch * poly_degree);
+        for i in 0..n_this_batch {
+            let off = (entry_id + i) * packed_entry_size;
+            let raw = &packed_mmap[off..off + packed_entry_size];
+            // OnionPIRv2 port (commit 5b): no truncation — `raw.len() ==
+            // packed_entry_size == entry_size_pt` by the earlier assert.
+            let coeffs = pir_core::onion_unpack::pack_bytes_into_coefficients(
+                raw,
+                entry_size_pt,
+                poly_degree,
+            );
+            batch_coeffs.extend_from_slice(&coeffs);
         }
-
-        if one_percent > 0 && (entry_id + 1) % one_percent == 0 {
-            let pct = (entry_id + 1) / one_percent;
-            eprint!("\r  NTT expanding: {}%", pct);
+        let ok = server.push_plaintexts(
+            &batch_coeffs,
+            n_this_batch as u64,
+            entry_id as u64,
+            &[],
+        );
+        assert!(
+            ok,
+            "push_plaintexts failed at entry_id={} (batch size {})",
+            entry_id, n_this_batch
+        );
+        entry_id += n_this_batch;
+        if one_percent > 0 && entry_id % (one_percent * 5).max(1) == 0 {
+            eprint!("\r  push_plaintexts: {}%", entry_id * 100 / num_entries.max(1));
             let _ = std::io::stderr().flush();
         }
     }
     eprintln!();
-    ntt_mmap.flush().expect("flush NTT store");
-    println!("  NTT expansion: {:.2?}", t_ntt.elapsed());
-    println!("  NTT store file: {} ({})", ntt_store_file, format_bytes(ntt_store_bytes as u64));
+    println!("  push_plaintexts + NTT: {:.2?}", t_ntt.elapsed());
+
+    // Save to a temp file, strip the 48-byte header into the final NTT
+    // store file. The header carries `[u64 magic][u64 version][u64 layout_id]
+    // [u64 num_pt][u64 coeff_val_cnt][u64 data_bytes]`.
+    let temp_path = format!("{}.savetmp", ntt_store_file);
+    let t_save = Instant::now();
+    assert!(server.save_db(&temp_path), "save_db failed for temp NTT store");
+    println!("  save_db: {:.2?}", t_save.elapsed());
+
+    let raw_save = std::fs::read(&temp_path).expect("read save_db output");
+    assert!(
+        raw_save.len() > 48,
+        "save_db output too small ({} bytes) — missing header / payload",
+        raw_save.len()
+    );
+    let payload = &raw_save[48..];
+    // Sanity-check the size against what set_shared_database expects:
+    // payload = `coeff_val_cnt × num_plaintexts × 8` bytes.
+    let expected_payload = coeff_val_cnt * num_plaintexts * 8;
+    assert_eq!(
+        payload.len(),
+        expected_payload,
+        "save_db payload size mismatch: got {}, expected {} = {} × {} × 8 \
+         (coeff_val_cnt × num_plaintexts × 8)",
+        payload.len(),
+        expected_payload,
+        coeff_val_cnt,
+        num_plaintexts
+    );
+    std::fs::write(&ntt_store_file, payload).expect("write NTT store file");
+    std::fs::remove_file(&temp_path).expect("rm save_db temp");
+    println!(
+        "  NTT store file: {} ({})",
+        ntt_store_file,
+        format_bytes(payload.len() as u64)
+    );
 
     // ── 4. Assign entries to PBC groups ─────────────────────────────────
     println!("\n[4] Assigning {} entries to {} PBC groups ({} copies each)...",
@@ -369,7 +474,9 @@ fn main() {
     println!("\n[7] Computing DATA bin hashes for per-bin Merkle...");
     let t_hash = Instant::now();
     {
-        let zero_entry = [0u8; PACKED_ENTRY_SIZE];
+        // OnionPIRv2 port (commit 5b): zero_entry is `packed_entry_size`
+        // bytes (was a fixed `[u8; 3840]` array pre-port).
+        let zero_entry = vec![0u8; packed_entry_size];
         let total_bins = K_CHUNK * bins_per_table;
         let mut bin_hashes = Vec::with_capacity(total_bins * 32);
 
@@ -380,8 +487,8 @@ fn main() {
                 let bin_bytes: &[u8] = if entry_id == EMPTY {
                     &zero_entry
                 } else {
-                    let off = entry_id as usize * PACKED_ENTRY_SIZE;
-                    &packed_mmap[off..off + PACKED_ENTRY_SIZE]
+                    let off = entry_id as usize * packed_entry_size;
+                    &packed_mmap[off..off + packed_entry_size]
                 };
                 let hash = pir_core::merkle::sha256(bin_bytes);
                 bin_hashes.extend_from_slice(&hash);
@@ -427,33 +534,69 @@ fn main() {
     // Pad remaining indices (bins_per_table..padded_num) with 0
     // Already done by default initialization
 
-    // Set up server with shared database
+    // Set up server with shared database. The NTT store on disk is the
+    // post-port save_db payload (header stripped above); mmap it,
+    // reinterpret as `&[u64]`, and pass num_plaintexts as
+    // shared_num_entries — matching the upstream
+    // `shared_database_identity_index_table` test pattern.
+    let sanity_ntt_file = File::open(&ntt_store_file).expect("re-open NTT store");
+    let sanity_ntt_mmap = unsafe { Mmap::map(&sanity_ntt_file) }.expect("mmap NTT store");
+    assert_eq!(
+        sanity_ntt_mmap.len() % 8,
+        0,
+        "NTT store size {} is not u64-aligned",
+        sanity_ntt_mmap.len()
+    );
     let ntt_u64: &[u64] = unsafe {
-        std::slice::from_raw_parts(ntt_mmap.as_ptr() as *const u64, coeff_val_cnt * num_entries)
+        std::slice::from_raw_parts(
+            sanity_ntt_mmap.as_ptr() as *const u64,
+            sanity_ntt_mmap.len() / 8,
+        )
     };
 
     let mut server = PirServer::new(bins_per_table as u64);
     unsafe {
-        server.set_shared_database(ntt_u64.as_ptr(), num_entries, &index_table);
+        // OnionPIRv2 port (commit 3a): pass `num_plaintexts` as
+        // `shared_num_entries`. save_db sizes the payload for the compile-
+        // time DB shape, not for `num_entries`.
+        assert!(
+            server.set_shared_database(ntt_u64, num_plaintexts as u64, &index_table),
+            "set_shared_database failed in gen_2_onion sanity check"
+        );
     }
 
     // Create client, generate keys, query
     let mut client = PirClient::new(bins_per_table as u64);
     let client_id = client.id();
-    let galois = client.generate_galois_keys();
-    let gsw = client.generate_gsw_keys();
-    server.set_galois_key(client_id, &galois);
+    let galois = client.galois_keys();
+    let gsw = client.gsw_key();
+    server.set_galois_keys(client_id, &galois);
     server.set_gsw_key(client_id, &gsw);
 
     let query = client.generate_query(test_bin as u64);
     let response = server.answer_query(client_id, &query);
-    let decrypted = client.decrypt_response(test_bin as u64, &response);
+    // OnionPIRv2 port (commit 2): bit-unpack the raw plaintext returned
+    // by `decrypt_response`. `decrypted.len()` is now `params.entry_size`
+    // (3328 default), not PACKED_ENTRY_SIZE (3840) — the comparison
+    // below will only succeed once the build pipeline regenerates DBs
+    // with entry_size-aligned packing (commit 3 / 5).
+    let _ = test_bin;
+    let raw_pt = client.decrypt_response(&response);
+    let pinfo = onionpir::params_info(bins_per_table as u64);
+    let decrypted = pir_core::onion_unpack::unpack_onion_plaintext(
+        &raw_pt,
+        pinfo.poly_degree as usize,
+        pinfo.entry_size as usize,
+    )
+    .expect("onion_unpack rejected gen_2_onion plaintext");
 
-    // Compare with original packed entry
-    let expected = &packed_mmap[test_entry_id as usize * PACKED_ENTRY_SIZE
-        ..(test_entry_id as usize + 1) * PACKED_ENTRY_SIZE];
+    // Compare with original packed entry. Post-commit-5b `decrypted.len() ==
+    // packed_entry_size == params.entry_size`, so the comparison is a
+    // direct byte-for-byte equality with no truncation.
+    let expected = &packed_mmap[test_entry_id as usize * packed_entry_size
+        ..(test_entry_id as usize + 1) * packed_entry_size];
 
-    if decrypted.len() >= PACKED_ENTRY_SIZE && decrypted[..PACKED_ENTRY_SIZE] == *expected {
+    if decrypted.len() == packed_entry_size && decrypted[..] == *expected {
         println!("  Verification: PASS (decrypted matches original entry)");
     } else if decrypted.len() >= 8 && decrypted[..8] == expected[..8] {
         println!("  Verification: PASS (first 8 bytes match)");
@@ -466,8 +609,10 @@ fn main() {
     // ── Summary ─────────────────────────────────────────────────────────
     println!("\n=== Summary ===");
     println!("Packed entries:    {} ({:.2} GB)", num_entries, packed_mmap.len() as f64 / 1e9);
-    println!("NTT store:         {} (level-major, 4.27x expansion)",
-        format_bytes(ntt_store_bytes as u64));
+    println!("NTT store:         {} (level-major × num_plaintexts)",
+        format_bytes(
+            std::fs::metadata(&ntt_store_file).map(|m| m.len()).unwrap_or(0),
+        ));
     println!("Cuckoo tables:     {} groups × {} bins = {}",
         K_CHUNK, bins_per_table, format_bytes(cuckoo_file_size as u64));
     println!("Total time:        {:.2?}", total_start.elapsed());

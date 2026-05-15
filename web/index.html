@@ -788,7 +788,10 @@
         .attest-badge-plaintext     { border-left-color: var(--ink-mute); background: var(--bg); }
         .attest-badge-unattested    { border-left-color: var(--ink-mute); background: var(--bg); color: var(--ink-mute); }
     </style>
-    <script src="/wasm/onionpir_client.js"></script>
+    <!-- OnionPIR WASM (post-port ES module) loaded dynamically via
+         `await import('/wasm/onionpir_client.mjs')` in
+         web/src/onionpir_client.ts. The pre-port script-tag UMD
+         loader was removed in commit 7 of the onionpir-port branch. -->
     <!-- HarmonyPIR WASM loaded dynamically in loadWasm() based on PRP selection -->
 </head>
 <body>

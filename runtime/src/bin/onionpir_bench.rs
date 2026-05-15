@@ -82,25 +82,27 @@ fn bench_config(label: &str, num_entries: u64, save_path: &str) -> (Vec<u8>, Vec
 
     let t_populate = Instant::now();
     for chunk_idx in 0..(p.other_dim_sz as usize) {
-        let mut chunk_data = vec![0u8; chunk_size];
-        for i in 0..fst_dim {
-            let global_idx = chunk_idx * fst_dim * entries_per_pt + i;
-            if global_idx < padded {
-                let offset = i * entry_size;
-                chunk_data[offset..offset + entry_size]
-                    .copy_from_slice(&entries[global_idx]);
-            }
-        }
-        server.push_chunk(&chunk_data, chunk_idx);
+        // OnionPIRv2 port (commit-1 stub): `push_chunk` removed upstream.
+        // Production replacement is `push_plaintexts` (different
+        // semantics — operates at plaintext-coefficient level, not raw
+        // bytes). See docs/ONIONPIR_PORT_MIGRATION.md §2 Commit 3.
+        // For now the populate loop is a no-op; gen_data below fills
+        // with random data and runs NTT in one shot.
+        let _ = (chunk_size, fst_dim, entries_per_pt, padded, entries.clone());
+        let _ = chunk_idx;
     }
-    println!("  populate time: {:.2?}", t_populate.elapsed());
+    server.gen_data(&[]); // random data + NTT in one call (test path)
+    println!("  populate time (test-path gen_data, populate+preprocess fused): {:.2?}", t_populate.elapsed());
 
     // ── Preprocess (NTT) ────────────────────────────────────────────────────
+    // OnionPIRv2 port: `preprocess()` removed; NTT runs inside `gen_data`
+    // / `push_plaintexts` automatically. Section retained for output
+    // formatting parity, but timing now reflects fused populate+NTT.
     println!("\n[2b] Preprocessing (NTT transforms)...");
     let t_preprocess = Instant::now();
-    server.preprocess();
+    // No-op — gen_data above already preprocessed.
     let preprocess_time = t_preprocess.elapsed();
-    println!("  preprocess time: {:.2?}", preprocess_time);
+    println!("  preprocess time (fused into populate above): {:.2?}", preprocess_time);
 
     // ── 3. Save and check file size ─────────────────────────────────────────
     println!("\n[3] Saving preprocessed DB to {}...", save_path);
@@ -120,11 +122,11 @@ fn bench_config(label: &str, num_entries: u64, save_path: &str) -> (Vec<u8>, Vec
     let client_id = client.id();
 
     let t_gk = Instant::now();
-    let galois_keys = client.generate_galois_keys();
+    let galois_keys = client.galois_keys();
     let gk_time = t_gk.elapsed();
 
     let t_gsw = Instant::now();
-    let gsw_keys = client.generate_gsw_keys();
+    let gsw_keys = client.gsw_key();
     let gsw_time = t_gsw.elapsed();
 
     println!("  client_id:       {}", client_id);
@@ -146,7 +148,7 @@ fn bench_config(label: &str, num_entries: u64, save_path: &str) -> (Vec<u8>, Vec
     // ── 5. Register keys ────────────────────────────────────────────────────
     println!("\n[5] Registering keys with server...");
     let t_reg = Instant::now();
-    server.set_galois_key(client_id, &galois_keys);
+    server.set_galois_keys(client_id, &galois_keys);
     server.set_gsw_key(client_id, &gsw_keys);
     println!("  registration time: {:.2?}", t_reg.elapsed());
 
@@ -187,7 +189,17 @@ fn bench_config(label: &str, num_entries: u64, save_path: &str) -> (Vec<u8>, Vec
     // ── 9. Decrypt and verify ───────────────────────────────────────────────
     println!("\n[8] Decrypting response...");
     let t_dec = Instant::now();
-    let decrypted = client.decrypt_response(test_index, &response);
+    // OnionPIRv2 port (commit 2): bit-unpack the raw plaintext for a
+    // byte-level verify. `decrypted` is now `params.entry_size` bytes.
+    let _ = test_index;
+    let raw_pt = client.decrypt_response(&response);
+    let pinfo = onionpir::params_info(INDEX_NUM_ENTRIES);
+    let decrypted = pir_core::onion_unpack::unpack_onion_plaintext(
+        &raw_pt,
+        pinfo.poly_degree as usize,
+        pinfo.entry_size as usize,
+    )
+    .expect("onion_unpack rejected bench plaintext");
     let dec_time = t_dec.elapsed();
     println!(
         "  decrypted size:  {} (time: {:.2?})",
@@ -265,16 +277,17 @@ fn main() {
     let entry_size = p.entry_size as usize;
     let fst_dim = p.fst_dim_sz as usize;
     let chunk_size = fst_dim * entry_size;
+    // OnionPIRv2 port stub: see populate-loop comment in main bench above.
+    let _ = chunk_size;
     for chunk_idx in 0..(p.other_dim_sz as usize) {
-        let chunk_data = vec![0u8; chunk_size];
-        cross_server.push_chunk(&chunk_data, chunk_idx);
+        let _ = chunk_idx;
     }
-    cross_server.preprocess();
+    cross_server.gen_data(&[]);
 
     // Try registering index-level keys with chunk-level server
     let cross_client_id = 99999;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        cross_server.set_galois_key(cross_client_id, &index_gk);
+        cross_server.set_galois_keys(cross_client_id, &index_gk);
         cross_server.set_gsw_key(cross_client_id, &index_gsw);
     }));
 
@@ -300,12 +313,12 @@ fn main() {
     // Also test: same num_entries, same keys = should always work
     println!("\nControl test: keys from num_entries={} on server with same num_entries...", CHUNK_NUM_ENTRIES);
     let mut control_server = PirServer::new(CHUNK_NUM_ENTRIES);
+    // OnionPIRv2 port stub: see populate-loop comment in main bench above.
     for chunk_idx in 0..(p.other_dim_sz as usize) {
-        let chunk_data = vec![0u8; chunk_size];
-        control_server.push_chunk(&chunk_data, chunk_idx);
+        let _ = chunk_idx;
     }
-    control_server.preprocess();
-    control_server.set_galois_key(cross_client_id, &chunk_gk);
+    control_server.gen_data(&[]);
+    control_server.set_galois_keys(cross_client_id, &chunk_gk);
     control_server.set_gsw_key(cross_client_id, &chunk_gsw);
     let mut control_client = PirClient::new(CHUNK_NUM_ENTRIES);
     let control_query = control_client.generate_query(0);

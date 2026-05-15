@@ -426,9 +426,14 @@ async fn main() {
                                 q.level, n, q.sub_queries_per_group, wall);
                             result
                         }
-                        Request::HarmonyHints(_) | Request::HarmonyHintsV2(_) => {
-                            // Hint generation is handled by the dedicated Hint Server,
-                            // not the Query Server.
+                        Request::HarmonyHints(_)
+                        | Request::HarmonyHintsV2(_)
+                        | Request::HarmonyHintsV2Half(_) => {
+                            // Hint generation (V1, V2 full, V2 half-stream) is
+                            // handled by the dedicated Hint Server, not the
+                            // Query Server. V2-half landed 2026-05-14 — see
+                            // pir-runtime-core/src/protocol.rs:336 for the
+                            // request shape (session_token + side + db_id).
                             Response::Error("hint requests not supported on query server".into())
                         }
                         Request::AdminAuthChallenge

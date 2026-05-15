@@ -28,17 +28,18 @@
  * # Environment polyfills
  *
  * vitest runs in node, which on Node 18 lacks `WebSocket`. We polyfill
- * `globalThis.WebSocket` with the `ws` package, and load the
- * Emscripten OnionPIR module via CommonJS (`module.exports`) before
- * importing `OnionPirWebClient` so `(globalThis as any).createOnionPirModule`
- * is set when the client first asks for it.
+ * `globalThis.WebSocket` with the `ws` package. The Emscripten OnionPIR
+ * module is now an ES module (`.mjs`) since the upstream port; we
+ * dynamic-import the factory and install it on
+ * `globalThis.__onionpirWasmFactory` (the post-port test hook in
+ * `onionpir_client.ts::loadWasmModule`) before the client first asks
+ * for it. The pre-port `createOnionPirModule` CommonJS global is gone.
  */
 
 import { describe, it, expect, beforeAll } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createRequire } from 'node:module';
 
 import {
   BufferingLeakageRecorder,
@@ -50,10 +51,9 @@ import {
 // `__dirname` in ESM context — vitest runs as ESM by default.
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const require = createRequire(import.meta.url);
 
 const FIXTURE_PATH = resolve(__dirname, '../../test/fixtures/onion_corpus.json');
-const WASM_JS_PATH = resolve(__dirname, '../../public/wasm/onionpir_client.js');
+const WASM_MJS_PATH = resolve(__dirname, '../../public/wasm/onionpir_client.mjs');
 
 const RUN_LIVE = process.env.RUN_LIVE_DIFF === '1';
 
@@ -88,11 +88,16 @@ describe('OnionPIR cross-language leakage diff (Phase 2.3 step D)', () => {
     const wsModule = await import('ws');
     (globalThis as unknown as { WebSocket: unknown }).WebSocket = wsModule.WebSocket;
 
-    // (2) OnionPIR WASM factory — Emscripten module supports node via
-    //     `fs.readFileSync(...)` for the .wasm load. The TS client
-    //     looks for `globalThis.createOnionPirModule`, so install it.
-    const factory = require(WASM_JS_PATH);
-    (globalThis as unknown as { createOnionPirModule: unknown }).createOnionPirModule = factory;
+    // (2) OnionPIR WASM factory — post-port the module is an ES
+    //     module with a default-exported async factory. Dynamic
+    //     import + install on `globalThis.__onionpirWasmFactory`, the
+    //     post-port test hook in `onionpir_client.ts::loadWasmModule`.
+    //     Use a `file://` URL because `await import(absolutePath)`
+    //     without a scheme is treated as a bare module specifier by
+    //     Node ESM.
+    const wasmUrl = `file://${WASM_MJS_PATH}`;
+    const mod = await import(/* @vite-ignore */ wasmUrl);
+    (globalThis as unknown as { __onionpirWasmFactory: unknown }).__onionpirWasmFactory = mod.default;
   });
 
   test('two not-found queries: TS profiles match the Rust corpus byte-for-byte', async () => {

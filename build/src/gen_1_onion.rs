@@ -33,8 +33,15 @@ const ENTRY_SIZE_RAW: usize = 68; // raw UTXO entry from utxo_set.bin
 const SCRIPT_HASH_SIZE: usize = 20;
 const TXID_SIZE: usize = 32;
 
-/// OnionPIR entry size: 2048 × 15 bits / 8 = 3840 bytes
-const PACKED_ENTRY_SIZE: usize = 3840;
+/// OnionPIR entry size derived from the linked `onionpir` crate at runtime.
+/// Pre-port (SEAL build at PlainMod=15) this was 3840 bytes hardcoded
+/// (`2048 × 15 / 8`). Post-port (BV build at PlainMod=14, the default
+/// `CONFIG_N2048_K1`) it's 3328. Read once at startup in `main()` and
+/// flowed through every consumer via the `Packer` struct + local
+/// variables so the build pipeline stays config-agnostic.
+fn onion_entry_size() -> usize {
+    onionpir::params_info(0).entry_size as usize
+}
 
 /// New index entry: 20B script_hash + 4B entry_id + 2B byte_offset + 1B num_entries
 const ONION_INDEX_RECORD_SIZE: usize = 20 + 4 + 2 + 1; // 27
@@ -136,17 +143,22 @@ struct Packer {
     entry_count: u64,
     total_padding: u64,
     total_data: u64,
+    /// Byte size of one packed entry. Equals `onionpir::params_info(0).entry_size`
+    /// at the time the `Packer` was constructed. Captured per-instance so
+    /// the OnionPIR linker step doesn't have to run on every `pack` call.
+    entry_size: usize,
 }
 
 impl Packer {
-    fn new(file: File) -> Self {
+    fn new(file: File, entry_size: usize) -> Self {
         Packer {
             writer: BufWriter::with_capacity(1024 * 1024, file),
-            current_entry: vec![0u8; PACKED_ENTRY_SIZE],
+            current_entry: vec![0u8; entry_size],
             current_pos: 0,
             entry_count: 0,
             total_padding: 0,
             total_data: 0,
+            entry_size,
         }
     }
 
@@ -155,7 +167,7 @@ impl Packer {
         if self.current_pos > 0 {
             // Remaining bytes are already zero from initialization
             self.writer.write_all(&self.current_entry).unwrap();
-            self.total_padding += (PACKED_ENTRY_SIZE - self.current_pos) as u64;
+            self.total_padding += (self.entry_size - self.current_pos) as u64;
             self.entry_count += 1;
             // Reset for next entry
             self.current_entry.fill(0);
@@ -179,7 +191,7 @@ impl Packer {
         }
 
         // Case 1: fits in remaining space of current entry
-        let remaining = PACKED_ENTRY_SIZE - self.current_pos;
+        let remaining = self.entry_size - self.current_pos;
         if data_len <= remaining {
             let entry_id = self.entry_count;
             let offset = self.current_pos;
@@ -188,7 +200,7 @@ impl Packer {
             self.current_pos += data_len;
 
             // If entry is exactly full, flush it
-            if self.current_pos == PACKED_ENTRY_SIZE {
+            if self.current_pos == self.entry_size {
                 self.writer.write_all(&self.current_entry).unwrap();
                 self.entry_count += 1;
                 self.current_entry.fill(0);
@@ -204,12 +216,12 @@ impl Packer {
         // Now current_pos == 0, entry is fresh
         let entry_id = self.entry_count;
 
-        if data_len <= PACKED_ENTRY_SIZE {
+        if data_len <= self.entry_size {
             // Fits in a single fresh entry
             self.current_entry[..data_len].copy_from_slice(data);
             self.current_pos = data_len;
 
-            if self.current_pos == PACKED_ENTRY_SIZE {
+            if self.current_pos == self.entry_size {
                 self.writer.write_all(&self.current_entry).unwrap();
                 self.entry_count += 1;
                 self.current_entry.fill(0);
@@ -220,13 +232,13 @@ impl Packer {
         }
 
         // Case 3: spans multiple entries
-        let num_entries = (data_len + PACKED_ENTRY_SIZE - 1) / PACKED_ENTRY_SIZE;
+        let num_entries = (data_len + self.entry_size - 1) / self.entry_size;
         assert!(num_entries <= 255, "address data {} bytes needs {} entries, exceeds u8",
             data_len, num_entries);
 
         let mut written = 0;
         for i in 0..num_entries {
-            let chunk_len = (data_len - written).min(PACKED_ENTRY_SIZE);
+            let chunk_len = (data_len - written).min(self.entry_size);
             self.current_entry[..chunk_len].copy_from_slice(&data[written..written + chunk_len]);
             // Remaining bytes are already zero
             written += chunk_len;
@@ -240,7 +252,7 @@ impl Packer {
             } else {
                 // Last entry — might have space for more addresses
                 self.current_pos = chunk_len;
-                if self.current_pos == PACKED_ENTRY_SIZE {
+                if self.current_pos == self.entry_size {
                     self.writer.write_all(&self.current_entry).unwrap();
                     self.entry_count += 1;
                     self.current_entry.fill(0);
@@ -262,7 +274,15 @@ impl Packer {
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 fn main() {
-    println!("=== gen_1_onion: Pack UTXOs into 3840B OnionPIR Entries ===");
+    // OnionPIRv2 port (commit 5b): pull the entry size from the
+    // linked onionpir crate once at startup instead of hardcoding
+    // 3840. Captured here so every downstream consumer sees the
+    // same value even if the linked rev changes mid-run (unlikely
+    // — onionpir is a build dep, not dynamic — but explicit is
+    // better than implicit).
+    let packed_entry_size = onion_entry_size();
+
+    println!("=== gen_1_onion: Pack UTXOs into {}-byte OnionPIR Entries ===", packed_entry_size);
     println!();
 
     let (num_partitions, data_dir) = parse_cli();
@@ -272,7 +292,7 @@ fn main() {
     let onion_index_path = format!("{}/onion_index.bin", data_dir);
 
     println!("Configuration:");
-    println!("  OnionPIR entry size: {} bytes", PACKED_ENTRY_SIZE);
+    println!("  OnionPIR entry size: {} bytes (from onionpir::params_info(0))", packed_entry_size);
     println!("  Index entry size:    {} bytes", ONION_INDEX_RECORD_SIZE);
     println!("  Partitions:          {}", num_partitions);
     println!("  Dust threshold:      {} sats", DUST_THRESHOLD);
@@ -296,7 +316,7 @@ fn main() {
     // ── 2. Open output files ───────────────────────────────────────────
     println!("[2] Opening output files...");
     let packed_file = File::create(&packed_path).expect("create packed entries file");
-    let mut packer = Packer::new(packed_file);
+    let mut packer = Packer::new(packed_file, packed_entry_size);
     let index_file = File::create(&onion_index_path).expect("create index file");
     let mut index_writer = BufWriter::with_capacity(1024 * 1024, index_file);
     println!("  Done");
@@ -417,7 +437,7 @@ fn main() {
                 size_histogram[3] += 1;
             } else if data_len <= 2000 {
                 size_histogram[4] += 1;
-            } else if data_len <= PACKED_ENTRY_SIZE {
+            } else if data_len <= packed_entry_size {
                 size_histogram[5] += 1;
             } else {
                 size_histogram[6] += 1;
@@ -454,7 +474,7 @@ fn main() {
 
     // ── 5. Summary ─────────────────────────────────────────────────────
     let total_elapsed = total_start.elapsed();
-    let packed_file_size = packer.entry_count * PACKED_ENTRY_SIZE as u64;
+    let packed_file_size = packer.entry_count * packed_entry_size as u64;
     let index_file_size = (total_groups + total_whale) * ONION_INDEX_RECORD_SIZE as u64;
 
     println!("=== Summary ===");
@@ -465,7 +485,7 @@ fn main() {
     println!();
     println!("OnionPIR entries:     {}", packer.entry_count);
     println!("Packed file size:     {} ({} entries × {} B)",
-        format_bytes(packed_file_size), packer.entry_count, PACKED_ENTRY_SIZE);
+        format_bytes(packed_file_size), packer.entry_count, packed_entry_size);
     println!("Index file size:      {} ({} entries × {} B)",
         format_bytes(index_file_size), total_groups + total_whale, ONION_INDEX_RECORD_SIZE);
     println!();
@@ -502,7 +522,7 @@ fn main() {
     if packer.entry_count > u32::MAX as u64 {
         println!("WARNING: entry_count {} overflows u32!", packer.entry_count);
     }
-    if max_serialized_len > 255 * PACKED_ENTRY_SIZE {
+    if max_serialized_len > 255 * packed_entry_size {
         println!("WARNING: max serialized length {} exceeds u8 num_entries capacity!", max_serialized_len);
     }
 }
