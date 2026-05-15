@@ -2049,7 +2049,14 @@ async fn main() {
                                 eprintln!("[OnionPIR:{}] unknown level {}", worker_label, level);
                                 ("unknown", Vec::new())
                             };
-                            println!("  [OnionPIR:{}] {} r{} {} queries in {:.2?}", worker_label, name, round_id, queries.len(), t.elapsed());
+                            let empty_count = results.iter().filter(|r| r.is_empty()).count();
+                            let nonempty_bytes: usize = results.iter().filter(|r| !r.is_empty()).map(|r| r.len()).sum();
+                            let nonempty_lens: Vec<usize> = results.iter().filter(|r| !r.is_empty()).take(3).map(|r| r.len()).collect();
+                            println!(
+                                "  [OnionPIR:{}] {} r{} {} queries in {:.2?} (empty={}/{}, nonempty_total={}B, first_lens={:?}, client_id={})",
+                                worker_label, name, round_id, queries.len(), t.elapsed(),
+                                empty_count, results.len(), nonempty_bytes, nonempty_lens, client_id,
+                            );
                             let _ = reply.send(results);
                         }
                     }
