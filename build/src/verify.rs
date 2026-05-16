@@ -21,7 +21,6 @@ const INDEX_RECORD_SIZE: usize = 25;
 const SCRIPT_HASH_SIZE: usize = 20;
 const MAGIC: u64 = 0xBA7C_C000_C000_0004;
 const HEADER_SIZE: usize = 40; // includes tag_seed
-const EMPTY: u32 = u32::MAX;
 
 /// Number of random lookups for verification
 const NUM_VERIFY: usize = 1_000_000;
@@ -400,7 +399,7 @@ fn main() {
             }
         }
 
-        if (entry_idx as usize + 1) % 5_000_000 == 0 {
+        if (entry_idx as usize + 1).is_multiple_of(5_000_000) {
             eprint!("\r  Swept: {}/{}", entry_idx + 1, n);
             let _ = std::io::Write::flush(&mut std::io::stderr());
         }

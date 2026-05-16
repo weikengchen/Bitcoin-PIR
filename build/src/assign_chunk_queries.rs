@@ -107,10 +107,10 @@ fn main() {
     let mut groups: [Option<usize>; K_CHUNK] = [None; K_CHUNK];
 
     let mut success = true;
-    for i in 0..num_chunk_queries {
+    for (i, &chunk_id) in chunk_queries.iter().enumerate() {
         if !pbc_cuckoo_place(&candidates, &mut groups, i, MAX_KICKS, NUM_HASHES) {
             eprintln!("  FAILED to place chunk query {} (chunk_id={}) after {} kicks",
-                i, chunk_queries[i], MAX_KICKS);
+                i, chunk_id, MAX_KICKS);
             success = false;
             break;
         }
@@ -135,8 +135,8 @@ fn main() {
     // ── 7. Display assignment with cuckoo locations ──────────────────────
     println!("[5] Final assignment with cuckoo locations:");
     println!(
-        "  {:>6}  {:>10}  {:>6}  {:>8}  {:>8}  {:}",
-        "#", "Chunk ID", "Group", "loc0", "loc1", "Candidates"
+        "  {:>6}  {:>10}  {:>6}  {:>8}  {:>8}  Candidates",
+        "#", "Chunk ID", "Group", "loc0", "loc1"
     );
     println!(
         "  {}  {}  {}  {}  {}  {}",

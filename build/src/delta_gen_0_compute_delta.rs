@@ -126,7 +126,7 @@ fn main() {
         utxo_map.insert((txid_bytes, vout), script_hash);
 
         loaded += 1;
-        if loaded % 5_000_000 == 0 {
+        if loaded.is_multiple_of(5_000_000) {
             let pct = 100.0 * loaded as f64 / total as f64;
             let elapsed = t.elapsed().as_secs_f64();
             let eta = elapsed / (loaded as f64 / total as f64) - elapsed;

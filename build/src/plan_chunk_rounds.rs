@@ -43,7 +43,7 @@ struct SpkState {
 
 impl SpkState {
     fn new(sh: [u8; SCRIPT_HASH_SIZE], start_chunk: u32, num_chunks: u32) -> Self {
-        let nu = (num_chunks as usize + CHUNKS_PER_UNIT - 1) / CHUNKS_PER_UNIT;
+        let nu = (num_chunks as usize).div_ceil(CHUNKS_PER_UNIT);
         Self {
             script_hash: sh,
             start_chunk,
@@ -90,7 +90,7 @@ impl SpkState {
 ///
 ///   est_rounds_left = remaining_units / K_CHUNK
 ///
-///   > 100 rounds left  →   3 kicks  (direct placement + minimal eviction)
+///   \> 100 rounds left  →   3 kicks  (direct placement + minimal eviction)
 ///   10–100 rounds left →  20 kicks
 ///   2–10 rounds left   → 100 kicks
 ///   last round         → 500 kicks  (try hard, avoid an extra round)
@@ -189,7 +189,7 @@ fn main() {
             } else {
                 println!("  Whale: {} ({} chunks → {} units, start_chunk={})",
                     whale_hex, num_chunks,
-                    (num_chunks as usize + CHUNKS_PER_UNIT - 1) / CHUNKS_PER_UNIT,
+                    (num_chunks as usize).div_ceil(CHUNKS_PER_UNIT),
                     start_chunk);
                 spks.push(SpkState::new(whale_sh, start_chunk, num_chunks));
                 println!("  Added as scriptpubkey #{}", spks.len() - 1);
@@ -209,8 +209,8 @@ fn main() {
     println!();
     println!("[3] Scriptpubkey summary:");
     println!(
-        "  {:>4}  {:>8}  {:>6}  {:>12}  {}",
-        "#", "Chunks", "Units", "Start", "Script Hash"
+        "  {:>4}  {:>8}  {:>6}  {:>12}  Script Hash",
+        "#", "Chunks", "Units", "Start"
     );
     println!(
         "  {}  {}  {}  {}  {}",
@@ -235,7 +235,7 @@ fn main() {
     println!("  Groups per round:   {}", K_CHUNK);
     println!(
         "  Theoretical min rounds: {} (ceil({}/{})) ",
-        (total_units + K_CHUNK - 1) / K_CHUNK,
+        total_units.div_ceil(K_CHUNK),
         total_units,
         K_CHUNK
     );
@@ -268,9 +268,9 @@ fn main() {
         // ── Phase 1: one unit per unfinished scriptpubkey ────────────
         let mut candidates: Vec<(usize, usize, u32)> = Vec::new(); // (spk_idx, unit_idx, chunk_id)
 
-        for si in 0..num_spks {
-            if spks[si].remaining > 0 && candidates.len() < K_CHUNK {
-                let cands = spks[si].get_candidates(1);
+        for (si, spk) in spks.iter().enumerate().take(num_spks) {
+            if spk.remaining > 0 && candidates.len() < K_CHUNK {
+                let cands = spk.get_candidates(1);
                 if let Some(&(uid, cid)) = cands.first() {
                     candidates.push((si, uid, cid));
                 }
@@ -334,8 +334,8 @@ fn main() {
 
         // Record this round's plan: extract (chunk_id, group_id) from groups
         let mut round_entries: Vec<(u32, u8)> = Vec::new();
-        for b in 0..K_CHUNK {
-            if let Some(ci) = groups[b] {
+        for (b, group) in groups.iter().enumerate().take(K_CHUNK) {
+            if let Some(ci) = *group {
                 let (_, _, chunk_id) = candidates[ci];
                 round_entries.push((chunk_id, b as u8));
             }
@@ -363,7 +363,7 @@ fn main() {
 
         // Progress
         let new_remaining = total_remaining - placed.len();
-        if round <= 5 || round % 100 == 0 || new_remaining == 0 {
+        if round <= 5 || round.is_multiple_of(100) || new_remaining == 0 {
             println!(
                 "  Round {:>5}: placed {:>3}/{:>3}, failed {:>2}, kicks={:>3}, remaining {:>8}",
                 round,
@@ -447,11 +447,11 @@ fn main() {
     }
     println!(
         "  Theoretical minimum rounds:   {}",
-        (total_units + K_CHUNK - 1) / K_CHUNK
+        total_units.div_ceil(K_CHUNK)
     );
     println!(
         "  Overhead vs theoretical:      {:.2}%",
-        (round as f64 / ((total_units + K_CHUNK - 1) / K_CHUNK) as f64 - 1.0) * 100.0
+        (round as f64 / total_units.div_ceil(K_CHUNK) as f64 - 1.0) * 100.0
     );
     println!("  Simulation time:              {:.2?}", sim_elapsed);
     println!("  Total time:                   {:.2?}", start.elapsed());

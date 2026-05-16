@@ -85,7 +85,6 @@ fn main() {
     let mut total_dust_utxos: u64 = 0;
     // Track script_hashes that had *only* dust (they won't appear in `map`)
     // We do this via a separate set of all script_hashes seen (dust or not).
-    let all_script_hashes: u64;
     let mut dust_only_scripts: HashMap<[u8; SCRIPT_HASH_SIZE], bool> =
         HashMap::with_capacity(1_000_000);
 
@@ -147,7 +146,7 @@ fn main() {
     eprintln!();
 
     let dust_only_count = dust_only_scripts.values().filter(|&&v| v).count() as u64;
-    all_script_hashes = map.len() as u64 + dust_only_count;
+    let all_script_hashes = map.len() as u64 + dust_only_count;
     drop(dust_only_scripts);
 
     let num_groups = map.len();
@@ -306,7 +305,7 @@ fn main() {
         let chunks = if s <= BLOCK_SIZE {
             1
         } else {
-            (s + BLOCK_SIZE - 1) / BLOCK_SIZE
+            s.div_ceil(BLOCK_SIZE)
         };
         let entry = chunk_counts.entry(chunks).or_insert((0, 0));
         entry.0 += 1;

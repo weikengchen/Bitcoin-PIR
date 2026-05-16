@@ -70,8 +70,8 @@ fn test_index_cuckoo() {
     let seed = 0x71a2ef38b4c90d15_u64;
 
     let mut keys = [0u64; NUM_HASHES];
-    for h in 0..NUM_HASHES {
-        keys[h] = derive_cuckoo_key(seed, group_id, h);
+    for (h, key) in keys.iter_mut().enumerate() {
+        *key = derive_cuckoo_key(seed, group_id, h);
     }
 
     // Each bin has SLOTS_PER_BIN slots; each slot holds an entry_id (u32).
@@ -183,9 +183,9 @@ fn test_index_cuckoo() {
     }
     println!("      ...");
     let high_start = if avg_occ > 10.0 { avg_occ as usize - 5 } else { 0 };
-    for occ in high_start..=SLOTS_PER_BIN {
-        if occ_histogram[occ] > 0 {
-            println!("      {} slots: {} bins", occ, occ_histogram[occ]);
+    for (occ, &count) in occ_histogram.iter().enumerate().skip(high_start) {
+        if count > 0 {
+            println!("      {} slots: {} bins", occ, count);
         }
     }
 
@@ -248,8 +248,8 @@ fn build_cuckoo_bs1(
     for &entry_id in entries {
         // Try all hash positions for an empty slot
         let mut placed = false;
-        for h in 0..num_hashes {
-            let bin = cuckoo_hash_int(entry_id, keys[h], num_bins);
+        for &key in keys {
+            let bin = cuckoo_hash_int(entry_id, key, num_bins);
             if table[bin] == EMPTY {
                 table[bin] = entry_id;
                 placed = true;
@@ -343,8 +343,8 @@ fn test_chunk_cuckoo() {
     let seed = 0xa3f7c2d918e4b065_u64; // chunk master seed
 
     let mut keys = [0u64; NUM_HASHES];
-    for h in 0..NUM_HASHES {
-        keys[h] = derive_cuckoo_key(seed, group_id, h);
+    for (h, key) in keys.iter_mut().enumerate() {
+        *key = derive_cuckoo_key(seed, group_id, h);
     }
 
     // Generate sorted entry IDs (deterministic order is key!)
@@ -407,8 +407,8 @@ fn test_chunk_cuckoo() {
     let mut not_found = 0usize;
     for &entry_id in &entries {
         let mut entry_found = false;
-        for h in 0..NUM_HASHES {
-            let bin = cuckoo_hash_int(entry_id, keys[h], num_bins);
+        for &key in &keys {
+            let bin = cuckoo_hash_int(entry_id, key, num_bins);
             if table1[bin] == entry_id {
                 entry_found = true;
                 break;
@@ -429,8 +429,8 @@ fn test_chunk_cuckoo() {
     // Client rebuilds the table (same as build 2)
     // Then looks up: for each hash fn, check if table[hash(entry, key)] == entry
     let mut lookup_bin = None;
-    for h in 0..NUM_HASHES {
-        let bin = cuckoo_hash_int(test_entry, keys[h], num_bins);
+    for (h, &key) in keys.iter().enumerate() {
+        let bin = cuckoo_hash_int(test_entry, key, num_bins);
         if table2[bin] == test_entry {
             lookup_bin = Some((h, bin));
             break;

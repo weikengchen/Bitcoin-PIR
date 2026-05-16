@@ -137,7 +137,7 @@ impl Packer {
         }
 
         // Case 3: spans multiple entries.
-        let num_entries = (data_len + self.entry_size - 1) / self.entry_size;
+        let num_entries = data_len.div_ceil(self.entry_size);
         assert!(
             num_entries <= 255,
             "delta data {} bytes needs {} entries, exceeds u8",
@@ -338,7 +338,7 @@ fn main() {
         }
 
         // Whale: drop entries that would span > 255 packed entries.
-        let num_blocks_if_packed = (data_len + packed_entry_size - 1) / packed_entry_size;
+        let num_blocks_if_packed = data_len.div_ceil(packed_entry_size);
         if num_blocks_if_packed > 255 {
             index_writer.write_all(&script_hash).unwrap();
             index_writer.write_all(&0u32.to_le_bytes()).unwrap();

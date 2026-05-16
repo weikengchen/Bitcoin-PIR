@@ -182,11 +182,7 @@ impl Packer {
 
         if data_len == 0 {
             // Shouldn't happen, but handle gracefully
-            let entry_id = if self.current_pos > 0 {
-                self.entry_count
-            } else {
-                self.entry_count
-            };
+            let entry_id = self.entry_count;
             return (entry_id as u32, self.current_pos as u16, 1);
         }
 
@@ -232,7 +228,7 @@ impl Packer {
         }
 
         // Case 3: spans multiple entries
-        let num_entries = (data_len + self.entry_size - 1) / self.entry_size;
+        let num_entries = data_len.div_ceil(self.entry_size);
         assert!(num_entries <= 255, "address data {} bytes needs {} entries, exceeds u8",
             data_len, num_entries);
 

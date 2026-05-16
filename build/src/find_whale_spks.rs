@@ -42,7 +42,7 @@ fn main() {
 
     for txout in dump {
         count += 1;
-        if count % 20_000_000 == 0 {
+        if count.is_multiple_of(20_000_000) {
             eprintln!("  Scanned {}M entries, found {}/{}...",
                 count / 1_000_000, found.len(), targets.len());
         }

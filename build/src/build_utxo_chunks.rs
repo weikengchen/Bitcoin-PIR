@@ -296,7 +296,7 @@ fn main() {
             }
 
             // ── Write to chunks file ────────────────────────────────────
-            let num_chunks = (data_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            let num_chunks = data_len.div_ceil(BLOCK_SIZE);
             let padded_len = num_chunks * BLOCK_SIZE;
             let padding = padded_len - data_len;
 
@@ -387,7 +387,7 @@ fn main() {
     println!("  Top 10 largest groups:");
     println!("  {:>4}  {:>12}  {:>8}  script_hash (hex)", "Rank", "Data (B)", "Chunks");
     for (i, (data_len, script_hash, _txid, _vout)) in top_entries.iter().take(10).enumerate() {
-        let num_chunks = (data_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        let num_chunks = data_len.div_ceil(BLOCK_SIZE);
         let hash_hex: String = script_hash.iter().map(|b| format!("{:02x}", b)).collect();
         println!("  {:>4}  {:>12}  {:>8}  {}", i + 1, data_len, num_chunks, hash_hex);
     }

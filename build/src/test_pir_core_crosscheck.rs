@@ -302,7 +302,7 @@ fn main() {
             }
 
             // Basic sanity checks
-            let mut sane = true;
+            let sane = true;
             for e in &entries {
                 if e.amount == 0 {
                     // Amount can be 0 for some edge cases, but shouldn't be common

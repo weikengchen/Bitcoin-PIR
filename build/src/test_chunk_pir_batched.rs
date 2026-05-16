@@ -34,8 +34,6 @@ const RESULT_SIZE: usize = SLOTS * SLOT_SIZE;
 
 // DPF_N is computed from bins_per_table at runtime via pir_core::params::compute_dpf_n
 
-const EMPTY: u32 = u32::MAX;
-
 // ─── Plan file reader ───────────────────────────────────────────────────────
 
 struct SpkInfo {
@@ -306,8 +304,8 @@ fn main() {
         let mut s0_round = Vec::with_capacity(K_CHUNK);
         let mut s1_round = Vec::with_capacity(K_CHUNK);
 
-        for b in 0..K_CHUNK {
-            let (alpha0, alpha1) = match group_targets[b] {
+        for &slot in &group_targets {
+            let (alpha0, alpha1) = match slot {
                 Some(targets) => targets,
                 None => {
                     let r0 = rng.next_u64() % bins_per_table as u64;
@@ -325,14 +323,13 @@ fn main() {
         keys_s1.push(s1_round);
     }
 
-    let dpf_key_wire_size = (dpf_n as usize + 2) * 16 + (dpf_n as usize + 7) / 8;
+    let dpf_key_wire_size = (dpf_n as usize + 2) * 16 + (dpf_n as usize).div_ceil(8);
     let keygen_elapsed = keygen_start.elapsed();
     println!("  Key generation: {:.2?}", keygen_elapsed);
     println!("  DPF key wire size (est.): {} bytes", dpf_key_wire_size);
     println!();
 
     // ── 4. Server processing: group-major over sample rounds ────────────
-    let slots_per_table = bins_per_table * SLOTS;
     let table_byte_size = bins_per_table * RESULT_SIZE; // bins × SLOTS × SLOT_SIZE
 
     println!("[4] Both servers: {} groups × {} rounds (group-major, concurrent)...", K_CHUNK, sample_rounds);
@@ -393,7 +390,7 @@ fn main() {
     let mut unit_to_spk: std::collections::HashMap<u32, usize> =
         std::collections::HashMap::new();
     for (si, spk) in plan.spks.iter().enumerate() {
-        let num_units = (spk.num_chunks as usize + CHUNKS_PER_UNIT - 1) / CHUNKS_PER_UNIT;
+        let num_units = (spk.num_chunks as usize).div_ceil(CHUNKS_PER_UNIT);
         for u in 0..num_units {
             let unit_start = spk.start_chunk + (u * CHUNKS_PER_UNIT) as u32;
             unit_to_spk.insert(unit_start, si);

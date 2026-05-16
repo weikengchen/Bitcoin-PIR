@@ -101,9 +101,9 @@ pub fn build_bucket_merkle(data_dir: &str) {
     let chunk_sib_levels = compute_sibling_levels(chunk_bins);
     println!();
     println!("INDEX sibling levels: {} (groups: {:?})", index_sib_levels.len(),
-        index_sib_levels.iter().map(|&n| n).collect::<Vec<_>>());
+        index_sib_levels);
     println!("CHUNK sibling levels: {} (groups: {:?})", chunk_sib_levels.len(),
-        chunk_sib_levels.iter().map(|&n| n).collect::<Vec<_>>());
+        chunk_sib_levels);
 
     // Write sibling tables
     println!();
@@ -152,7 +152,7 @@ pub fn build_bucket_merkle(data_dir: &str) {
     let super_root = merkle::sha256(&super_preimage);
 
     let super_root_path = Path::new(data_dir).join("merkle_bucket_root.bin");
-    std::fs::write(&super_root_path, &super_root).expect("write super root");
+    std::fs::write(&super_root_path, super_root).expect("write super root");
     println!("    Super-root: {:02x}{:02x}{:02x}{:02x}...", super_root[0], super_root[1], super_root[2], super_root[3]);
 
     println!();
@@ -218,7 +218,7 @@ fn build_group_tree(
     loop {
         let prev = levels.last().unwrap();
         if prev.len() <= 1 { break; }
-        let next_len = (prev.len() + ARITY - 1) / ARITY;
+        let next_len = prev.len().div_ceil(ARITY);
         let mut next_level = Vec::with_capacity(next_len);
         for i in 0..next_len {
             let start = i * ARITY;
@@ -243,7 +243,7 @@ fn compute_sibling_levels(bins_per_table: usize) -> Vec<usize> {
     let mut nodes_at_level = bins_per_table;
 
     loop {
-        let num_groups = (nodes_at_level + ARITY - 1) / ARITY;
+        let num_groups = nodes_at_level.div_ceil(ARITY);
         if num_groups <= TREE_TOP_THRESHOLD {
             break;
         }
@@ -290,8 +290,7 @@ fn write_flat_sibling_table(
     // The sibling row for group_id g at parent r contains the ARITY children:
     //   tree.levels[level_idx][r*ARITY + 0], ..., tree.levels[level_idx][r*ARITY + ARITY-1]
     // These children's parent is tree.levels[level_idx + 1][r].
-    for g in 0..k {
-        let tree = &trees[g];
+    for tree in trees.iter().take(k) {
         // The children live at tree.levels[level_idx]
         // (level_idx here corresponds to the Merkle tree level where the children are)
         // Sibling L0 queries: children are at levels[0] (the leaves), grouped into parents

@@ -80,8 +80,8 @@ fn derive_chunk_groups(chunk_id: u32) -> [usize; NUM_HASHES] {
         nonce += 1;
 
         let mut dup = false;
-        for i in 0..count {
-            if groups[i] == group {
+        for &g in groups.iter().take(count) {
+            if g == group {
                 dup = true;
                 break;
             }
@@ -148,8 +148,8 @@ fn build_cuckoo_for_group(
     let mut table = vec![EMPTY; table_slots];
 
     let mut keys = [0u64; CUCKOO_NUM_HASHES];
-    for h in 0..CUCKOO_NUM_HASHES {
-        keys[h] = derive_cuckoo_key(group_id, h);
+    for (h, key) in keys.iter_mut().enumerate() {
+        *key = derive_cuckoo_key(group_id, h);
     }
 
     let mut success = true;
@@ -196,8 +196,8 @@ fn cuckoo_insert(
     let bins = compute_bins(chunk_id, keys, num_bins);
 
     // Try all bins for an empty slot
-    for h in 0..CUCKOO_NUM_HASHES {
-        let base = bins[h] * SLOTS_PER_BIN;
+    for &bin in bins.iter() {
+        let base = bin * SLOTS_PER_BIN;
         for s in 0..SLOTS_PER_BIN {
             if table[base + s] == EMPTY {
                 table[base + s] = chunk_id;
@@ -264,7 +264,7 @@ fn main() {
         std::process::exit(1);
     });
     let file_size = file_meta.len() as usize;
-    if file_size % CHUNK_SIZE != 0 {
+    if !file_size.is_multiple_of(CHUNK_SIZE) {
         eprintln!(
             "Chunks file size ({}) is not a multiple of chunk size ({})",
             file_size, CHUNK_SIZE
@@ -300,7 +300,7 @@ fn main() {
             groups[b].push(chunk_id);
         }
 
-        if (chunk_id as usize + 1) % 10_000_000 == 0 {
+        if (chunk_id as usize + 1).is_multiple_of(10_000_000) {
             eprint!("\r  Assigned: {}/{}", chunk_id + 1, n_chunks);
             let _ = io::stderr().flush();
         }

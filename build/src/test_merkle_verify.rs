@@ -55,8 +55,8 @@ fn lookup_merkle_data(
             .map(|hf| hash::derive_cuckoo_key(master_seed, group_id, hf))
             .collect();
 
-        for hf in 0..cuckoo_num_hashes {
-            let bin = hash::cuckoo_hash(scripthash, keys[hf], bins_per_table);
+        for &key in &keys {
+            let bin = hash::cuckoo_hash(scripthash, key, bins_per_table);
 
             for slot in 0..slots_per_bin {
                 let global_slot = group_id * bins_per_table * slots_per_bin
@@ -102,8 +102,8 @@ fn lookup_sibling(
             .map(|hf| hash::derive_cuckoo_key(master_seed, group_id, hf))
             .collect();
 
-        for hf in 0..cuckoo_num_hashes {
-            let bin = hash::cuckoo_hash_int(node_local, keys[hf], bins_per_table);
+        for &key in &keys {
+            let bin = hash::cuckoo_hash_int(node_local, key, bins_per_table);
 
             for slot in 0..slots_per_bin {
                 let global_slot = group_id * bins_per_table * slots_per_bin

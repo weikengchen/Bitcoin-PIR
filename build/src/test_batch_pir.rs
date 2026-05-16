@@ -138,13 +138,13 @@ fn server_process(
 
     let mut results = Vec::with_capacity(K);
 
-    for b in 0..K {
+    for (b, dpf_key) in dpf_keys.iter().enumerate().take(K) {
         let table_offset = HEADER_SIZE + b * table_byte_size;
         let table_bytes = &cuckoo_data[table_offset..table_offset + table_byte_size];
 
         // Evaluate both DPF keys (full domain)
-        let eval0 = dpf.eval_full(&dpf_keys[b].0);
-        let eval1 = dpf.eval_full(&dpf_keys[b].1);
+        let eval0 = dpf.eval_full(&dpf_key.0);
+        let eval1 = dpf.eval_full(&dpf_key.1);
 
         let (r0, r1) = process_group(&eval0, &eval1, table_bytes, bins_per_table);
         results.push((r0, r1));
@@ -238,8 +238,8 @@ fn main() {
     let mut server0_keys: Vec<(DpfKey, DpfKey)> = Vec::with_capacity(K);
     let mut server1_keys: Vec<(DpfKey, DpfKey)> = Vec::with_capacity(K);
 
-    for b in 0..K {
-        let (alpha_q0, alpha_q1) = if let Some(qi) = group_assignment[b] {
+    for &assignment in group_assignment.iter().take(K) {
+        let (alpha_q0, alpha_q1) = if let Some(qi) = assignment {
             (query_locs[qi].0 as u64, query_locs[qi].1 as u64)
         } else {
             (0u64, 0u64) // dummy for empty groups

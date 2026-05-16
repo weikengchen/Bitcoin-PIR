@@ -55,7 +55,7 @@ fn derive_pbc_groups(entry_id: u32, k: usize) -> [usize; 3] {
         let group = (h % k as u64) as usize;
         nonce += 1;
         let mut dup = false;
-        for i in 0..count { if groups[i] == group { dup = true; break; } }
+        for &g in &groups[..count] { if g == group { dup = true; break; } }
         if dup { continue; }
         groups[count] = group;
         count += 1;
@@ -233,8 +233,6 @@ fn verify_sub_tree(
             None => break,
         }
     }
-    let num_sibling_levels = sib_levels.len();
-
     let num_bins = bin_hashes.len();
     let actual_tests = num_tests.min(num_bins);
 
@@ -262,10 +260,10 @@ fn verify_sub_tree(
         // boundary that previously read the `ARITY` const now reads
         // `cache.arity`.
         let arity = cache.arity;
-        for level in 0..num_sibling_levels {
+        for (level, sib_level) in sib_levels.iter().enumerate() {
             let group_id = (node_idx / arity) as u32;
 
-            let children = match lookup_sibling_group(&sib_levels[level], group_id, arity) {
+            let children = match lookup_sibling_group(sib_level, group_id, arity) {
                 Some(c) => c,
                 None => {
                     println!("  [{}] FAIL: sibling group not found {} L{} leaf={} group={}",

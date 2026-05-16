@@ -19,7 +19,7 @@
 //! Usage:
 //!   delta_gen_1 <start_height> <end_height>
 
-use pir_core::codec::{read_varint, write_varint};
+use pir_core::codec::read_varint;
 use std::env;
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
@@ -28,7 +28,6 @@ use std::time::Instant;
 const DATA_DIR: &str = "/Volumes/Bitcoin/data/intermediate";
 const BLOCK_SIZE: usize = 40;
 const SCRIPT_HASH_SIZE: usize = 20;
-const INDEX_RECORD_SIZE: usize = 20 + 4 + 1; // 25
 const MAX_CHUNKS_PER_SPK: usize = 255; // u8 max
 const ZERO_PAD: [u8; BLOCK_SIZE] = [0u8; BLOCK_SIZE];
 
@@ -111,7 +110,7 @@ fn main() {
         let delta_bytes = &data[data_start..data_end];
 
         // Compute number of 40-byte chunks needed
-        let num_blocks = (delta_bytes.len() + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        let num_blocks = delta_bytes.len().div_ceil(BLOCK_SIZE);
 
         if num_blocks > MAX_CHUNKS_PER_SPK {
             // Write sentinel index entry (num_chunks = 0)

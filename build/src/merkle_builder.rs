@@ -153,7 +153,7 @@ pub fn prepare_leaves(data_dir: &str, arity: usize) -> PreparedLeaves {
     leaf_hashes.resize(num_leaves_padded, ZERO_HASH);
 
     let mut depth = 0;
-    { let mut v = num_leaves_padded; while v > 1 { v = (v + arity - 1) / arity; depth += 1; } }
+    { let mut v = num_leaves_padded; while v > 1 { v = v.div_ceil(arity); depth += 1; } }
     println!("    {} real, {} padded, depth {}", num_entries, num_leaves_padded, depth);
     println!("    Done in {:.2?}", t.elapsed());
 
@@ -212,7 +212,7 @@ pub fn write_tree_top_cache(
 
 /// Compute the next level from the current level: group by arity, hash each group.
 pub fn compute_next_level(current: &[Hash256], arity: usize) -> Vec<Hash256> {
-    let next_len = (current.len() + arity - 1) / arity;
+    let next_len = current.len().div_ceil(arity);
     (0..next_len)
         .into_par_iter()
         .map(|i| {
@@ -244,7 +244,7 @@ fn build_and_write_sibling_table(
 ) {
     let t = Instant::now();
     let nodes_at_level = level_nodes.len();
-    let num_groups = (nodes_at_level + arity - 1) / arity;
+    let num_groups = nodes_at_level.div_ceil(arity);
     let sib_slot_size = merkle::merkle_sibling_slot_size(arity);
     let mut sib_params = merkle_sibling_params(level, arity, slots_per_bin);
 
@@ -283,8 +283,7 @@ fn build_and_write_sibling_table(
             let table = &tables[group_id];
             let items = &pbc_group_items[group_id];
 
-            for slot_idx in 0..(bins * sib_params.slots_per_bin) {
-                let entry_local = table[slot_idx];
+            for &entry_local in table.iter().take(bins * sib_params.slots_per_bin) {
                 if entry_local == cuckoo::EMPTY {
                     w.write_all(&zero_slot).unwrap();
                 } else {
@@ -341,13 +340,12 @@ pub fn build_merkle_n(arity: usize, slots_per_bin: usize, suffix: &str) {
     let mut cached_levels: Vec<Vec<Hash256>> = Vec::new();
     let mut cache_from_level = depth;
     let mut num_sibling_levels = 0;
-    let root;
 
     println!("[5] Building sibling tables level-by-level (arity={}, slot={}B)...", arity, sib_slot_size);
 
     for level in 0..depth {
         let nodes_at_level = current_level.len();
-        let num_groups = (nodes_at_level + arity - 1) / arity;
+        let num_groups = nodes_at_level.div_ceil(arity);
 
         if num_groups <= TREE_TOP_GROUP_THRESHOLD {
             if cached_levels.is_empty() {
@@ -369,7 +367,7 @@ pub fn build_merkle_n(arity: usize, slots_per_bin: usize, suffix: &str) {
 
     // The final level (root)
     assert_eq!(current_level.len(), 1);
-    root = current_level[0];
+    let root = current_level[0];
     if cached_levels.is_empty() {
         cache_from_level = depth;
     }
@@ -382,7 +380,7 @@ pub fn build_merkle_n(arity: usize, slots_per_bin: usize, suffix: &str) {
     // ── Step 7: Write merkle_root.bin ───────────────────────────────────────
 
     let root_path = format!("{}/merkle_root{}.bin", data_dir, suffix);
-    std::fs::write(&root_path, &root).expect("write merkle_root.bin");
+    std::fs::write(&root_path, root).expect("write merkle_root.bin");
     println!("    Root: {:?}", &root[..8]);
     println!("    Wrote root to {}", root_path);
 

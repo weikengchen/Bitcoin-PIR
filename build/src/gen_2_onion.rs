@@ -110,8 +110,8 @@ fn derive_chunk_groups(entry_id: u32) -> [usize; NUM_HASHES] {
         let group = (h % K_CHUNK as u64) as usize;
         nonce += 1;
         let mut dup = false;
-        for i in 0..count {
-            if groups[i] == group {
+        for &existing in groups.iter().take(count) {
+            if existing == group {
                 dup = true;
                 break;
             }
@@ -158,8 +158,8 @@ fn build_cuckoo_bs1(
 
     for &entry_id in entries {
         let mut placed = false;
-        for h in 0..CUCKOO_NUM_HASHES {
-            let bin = cuckoo_hash_int(entry_id, keys[h], num_bins);
+        for &key in keys.iter().take(CUCKOO_NUM_HASHES) {
+            let bin = cuckoo_hash_int(entry_id, key, num_bins);
             if table[bin] == EMPTY {
                 table[bin] = entry_id;
                 placed = true;
@@ -417,14 +417,14 @@ fn main() {
     let t_cuckoo = Instant::now();
 
     let mut all_cuckoo_tables: Vec<Vec<u32>> = Vec::with_capacity(K_CHUNK);
-    for group_id in 0..K_CHUNK {
+    for (group_id, group) in groups.iter().enumerate().take(K_CHUNK) {
         // Sort entries for deterministic insertion
-        let mut entries = groups[group_id].clone();
+        let mut entries = group.clone();
         entries.sort_unstable();
 
         let mut keys = [0u64; CUCKOO_NUM_HASHES];
-        for h in 0..CUCKOO_NUM_HASHES {
-            keys[h] = derive_cuckoo_key(group_id, h);
+        for (h, key) in keys.iter_mut().enumerate().take(CUCKOO_NUM_HASHES) {
+            *key = derive_cuckoo_key(group_id, h);
         }
 
         let table = build_cuckoo_bs1(&entries, &keys, bins_per_table);
@@ -480,10 +480,8 @@ fn main() {
         let total_bins = K_CHUNK * bins_per_table;
         let mut bin_hashes = Vec::with_capacity(total_bins * 32);
 
-        for group_id in 0..K_CHUNK {
-            let table = &all_cuckoo_tables[group_id];
-            for bin in 0..bins_per_table {
-                let entry_id = table[bin];
+        for (group_id, table) in all_cuckoo_tables.iter().enumerate().take(K_CHUNK) {
+            for &entry_id in table.iter().take(bins_per_table) {
                 let bin_bytes: &[u8] = if entry_id == EMPTY {
                     &zero_entry
                 } else {
@@ -566,7 +564,7 @@ fn main() {
     }
 
     // Create client, generate keys, query
-    let mut client = PirClient::new(bins_per_table as u64);
+    let client = PirClient::new(bins_per_table as u64);
     let client_id = client.id();
     let galois = client.galois_keys();
     let gsw = client.gsw_key();

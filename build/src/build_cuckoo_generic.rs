@@ -23,8 +23,6 @@ use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-const CUCKOO_LOAD_FACTOR: f64 = 0.95;
-const CUCKOO_MAX_KICKS: usize = 2000;
 const TAG_SEED: u64 = 0xd4e5f6a7b8c91023;
 
 fn main() {
@@ -112,7 +110,7 @@ fn build_index_cuckoo(index_file: &str, output_file: &str) {
             let table = cuckoo::build_byte_keyed_table(&script_hashes, group_id, params, bins_per_table);
 
             let d = done_count.fetch_add(1, Ordering::Relaxed) + 1;
-            if d % 10 == 0 || d == params.k {
+            if d.is_multiple_of(10) || d == params.k {
                 eprint!("\r    {}/{} tables built   ", d, params.k);
             }
             table
@@ -135,8 +133,7 @@ fn build_index_cuckoo(index_file: &str, output_file: &str) {
         let table = &tables[group_id];
         let entries = &group_entries[group_id];
 
-        for slot_idx in 0..(bins_per_table * params.slots_per_bin) {
-            let entry_local = table[slot_idx];
+        for &entry_local in table.iter().take(bins_per_table * params.slots_per_bin) {
             if entry_local == cuckoo::EMPTY {
                 // Empty slot: write zeros (13 bytes = INDEX_SLOT_SIZE)
                 w.write_all(&[0u8; INDEX_SLOT_SIZE]).unwrap();
@@ -208,7 +205,7 @@ fn build_chunk_cuckoo(chunks_file: &str, index_file: &str, output_file: &str) {
             let table = cuckoo::build_int_keyed_table(ids, group_id, params, bins_per_table);
 
             let d = done_count.fetch_add(1, Ordering::Relaxed) + 1;
-            if d % 10 == 0 || d == params.k {
+            if d.is_multiple_of(10) || d == params.k {
                 eprint!("\r    {}/{} tables built   ", d, params.k);
             }
             table
@@ -234,8 +231,7 @@ fn build_chunk_cuckoo(chunks_file: &str, index_file: &str, output_file: &str) {
         let table = &tables[group_id];
         let ids = &group_chunks[group_id];
 
-        for slot_idx in 0..(bins_per_table * params.slots_per_bin) {
-            let entry_local = table[slot_idx];
+        for &entry_local in table.iter().take(bins_per_table * params.slots_per_bin) {
             if entry_local == cuckoo::EMPTY {
                 w.write_all(&zero_slot).unwrap();
             } else {

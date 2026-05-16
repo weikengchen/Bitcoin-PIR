@@ -72,8 +72,8 @@ fn derive_groups(sh: &[u8]) -> [usize; NUM_BATCH_HASHES] {
         let group = (h % K as u64) as usize;
         nonce += 1;
         let mut dup = false;
-        for i in 0..count {
-            if groups[i] == group { dup = true; break; }
+        for &g in groups.iter().take(count) {
+            if g == group { dup = true; break; }
         }
         if dup { continue; }
         groups[count] = group;
@@ -103,7 +103,6 @@ fn cuckoo_hash(sh: &[u8], key: u64, num_bins: usize) -> usize {
 struct GroupResult {
     group_id: usize,
     num_entries: usize,
-    num_bins: usize,
     stash_size: usize,
     total_kicks: u64,
     max_kick_chain: u64,
@@ -122,8 +121,8 @@ fn build_cuckoo_for_group(
     let total_slots = num_bins * SLOTS_PER_BIN;
 
     let mut keys = [0u64; CUCKOO_NUM_HASHES];
-    for h in 0..CUCKOO_NUM_HASHES {
-        keys[h] = derive_cuckoo_key(group_id, h);
+    for (h, key) in keys.iter_mut().enumerate() {
+        *key = derive_cuckoo_key(group_id, h);
     }
 
     let mut table = vec![EMPTY; total_slots];
@@ -257,7 +256,6 @@ fn build_cuckoo_for_group(
     GroupResult {
         group_id,
         num_entries,
-        num_bins,
         stash_size: stash.len(),
         total_kicks,
         max_kick_chain,
@@ -321,7 +319,7 @@ fn main() {
         .map(|(gid, entries)| {
             let r = build_cuckoo_for_group(gid, &entries, mmap_slice, bins_per_table);
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-            if done % 10 == 0 || done == K {
+            if done.is_multiple_of(10) || done == K {
                 eprint!("\r  Progress: {}/{} groups", done, K);
             }
             r
@@ -348,7 +346,7 @@ fn main() {
     println!("  Fill rate: {:.4}% ({} / {} slots)", total_occupied as f64 / total_slots as f64 * 100.0, total_occupied, total_slots);
 
     // Aggregate occupancy
-    let mut agg_occupancy = vec![0u64; SLOTS_PER_BIN + 1];
+    let mut agg_occupancy = [0u64; SLOTS_PER_BIN + 1];
     for r in &results {
         for (occ, &count) in r.occupancy_counts.iter().enumerate() {
             agg_occupancy[occ] += count;
@@ -356,10 +354,10 @@ fn main() {
     }
     let total_bins = K * bins_per_table;
     println!("\n[5] Bin occupancy (across all {} groups, {} total bins):", K, total_bins);
-    for occ in 0..=SLOTS_PER_BIN {
+    for (occ, &count) in agg_occupancy.iter().enumerate() {
         println!("  {}/{} slots used: {} bins ({:.2}%)",
-            occ, SLOTS_PER_BIN, agg_occupancy[occ],
-            agg_occupancy[occ] as f64 / total_bins as f64 * 100.0);
+            occ, SLOTS_PER_BIN, count,
+            count as f64 / total_bins as f64 * 100.0);
     }
 
     // Show worst groups
@@ -374,16 +372,16 @@ fn main() {
     }
 
     // Hash location stats
-    let mut agg_hash_loc = vec![0u64; CUCKOO_NUM_HASHES];
+    let mut agg_hash_loc = [0u64; CUCKOO_NUM_HASHES];
     for r in &results {
         for (h, &count) in r.hash_location_counts.iter().enumerate() {
             agg_hash_loc[h] += count;
         }
     }
     println!("\n[6] Hash location distribution (which hash fn each entry landed in):");
-    for h in 0..CUCKOO_NUM_HASHES {
+    for (h, &count) in agg_hash_loc.iter().enumerate() {
         println!("  Hash {}: {} entries ({:.2}%)",
-            h, agg_hash_loc[h], agg_hash_loc[h] as f64 / total_occupied as f64 * 100.0);
+            h, count, count as f64 / total_occupied as f64 * 100.0);
     }
 
     // Show worst groups

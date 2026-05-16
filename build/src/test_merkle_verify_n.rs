@@ -19,7 +19,6 @@ use std::fs::File;
 use std::io::Read;
 
 const DEFAULT_DATA_DIR: &str = "/Volumes/Bitcoin/data";
-const TAG_SEED: u64 = 0xd4e5f6a7b8c91023;
 const CHUNK_SIZE_BYTES: usize = 40;
 const DEFAULT_NUM_TESTS: usize = 100;
 
@@ -57,8 +56,8 @@ fn lookup_sibling_group(
             .map(|hf| hash::derive_cuckoo_key(master_seed, pbc_group, hf))
             .collect();
 
-        for hf in 0..cuckoo_num_hashes {
-            let bin = hash::cuckoo_hash_int(group_id, keys[hf], bins_per_table);
+        for &key in &keys {
+            let bin = hash::cuckoo_hash_int(group_id, key, bins_per_table);
 
             for slot in 0..slots_per_bin {
                 let global_slot = pbc_group * bins_per_table * slots_per_bin
@@ -241,8 +240,10 @@ fn main() {
         let mut verified = true;
 
         // Levels L0..L{cache_from_level-1}: sibling groups from cuckoo tables
-        for level in 0..num_sibling_levels {
-            let (sib_bins, sib_header, sib_slots_per_bin, ref sib_mmap) = sib_tables[level];
+        for (level, sib_table) in sib_tables.iter().enumerate() {
+            let (sib_bins, sib_header, sib_slots_per_bin, sib_mmap) = sib_table;
+            let (sib_bins, sib_header, sib_slots_per_bin) =
+                (*sib_bins, *sib_header, *sib_slots_per_bin);
 
             let children = match lookup_sibling_group(
                 sib_mmap, sib_header, sib_bins, sib_slots_per_bin,

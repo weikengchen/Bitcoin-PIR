@@ -136,8 +136,8 @@ fn derive_groups(script_hash: &[u8]) -> [usize; NUM_HASHES] {
         nonce += 1;
 
         let mut dup = false;
-        for i in 0..count {
-            if groups[i] == group {
+        for &existing in groups.iter().take(count) {
+            if existing == group {
                 dup = true;
                 break;
             }

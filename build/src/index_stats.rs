@@ -179,8 +179,8 @@ fn main() {
     // ── Top N ────────────────────────────────────────────────────────────
     println!("[5] Top {} addresses by num_chunks:", TOP_N);
     println!(
-        "  {:>4}  {:>8}  {:>10}  {:>12}  {}",
-        "#", "Chunks", "Data (B)", "Offset/2", "Script Hash"
+        "  {:>4}  {:>8}  {:>10}  {:>12}  Script Hash",
+        "#", "Chunks", "Data (B)", "Offset/2"
     );
     println!(
         "  {}  {}  {}  {}  {}",

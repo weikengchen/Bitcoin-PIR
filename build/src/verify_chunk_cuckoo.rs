@@ -274,7 +274,7 @@ fn main() {
             }
         }
 
-        if (chunk_id as usize + 1) % 10_000_000 == 0 {
+        if (chunk_id as usize + 1).is_multiple_of(10_000_000) {
             eprint!("\r  Swept: {}/{}", chunk_id + 1, n);
             let _ = std::io::Write::flush(&mut std::io::stderr());
         }

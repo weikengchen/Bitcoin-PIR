@@ -188,8 +188,8 @@ fn derive_groups(sh: &[u8]) -> [usize; NUM_HASHES] {
         let group = (h % K as u64) as usize;
         nonce += 1;
         let mut dup = false;
-        for i in 0..count {
-            if groups[i] == group { dup = true; break; }
+        for &existing in groups.iter().take(count) {
+            if existing == group { dup = true; break; }
         }
         if dup { continue; }
         groups[count] = group;
@@ -515,7 +515,7 @@ fn main() {
 
     // ── 1. Read index file ──────────────────────────────────────────────
     println!("[1] Memory-mapping index file: {}", index_file_path);
-    let file = File::open(&index_file_path).expect("open index file");
+    let file = File::open(index_file_path).expect("open index file");
     let mmap = unsafe { Mmap::map(&file) }.expect("mmap index");
     let n = mmap.len() / ONION_INDEX_RECORD_SIZE;
     assert_eq!(mmap.len() % ONION_INDEX_RECORD_SIZE, 0, "index file not aligned");
@@ -581,7 +581,7 @@ fn main() {
                 group_id, &entries, mmap_slice, bins_per_table, slots_per_bin,
             );
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-            if done % 10 == 0 || done == K {
+            if done.is_multiple_of(10) || done == K {
                 eprint!("\r  Progress: {}/{} groups", done, K);
                 let _ = io::stderr().flush();
             }
@@ -603,7 +603,7 @@ fn main() {
 
     // ── 4. Build OnionPIR databases ─────────────────────────────────────
     println!("\n[4] Building OnionPIR databases (push_chunk → preprocess → save)...");
-    fs::create_dir_all(&output_dir).expect("create output dir");
+    fs::create_dir_all(output_dir).expect("create output dir");
 
     let t_pir = Instant::now();
     let p = onionpir::params_info(bins_per_table as u64);
@@ -703,7 +703,7 @@ fn main() {
     // ── 5. Save metadata ────────────────────────────────────────────────
     println!("\n[5] Saving metadata to {}...", meta_file);
     {
-        let meta_out = File::create(&meta_file).expect("create meta file");
+        let meta_out = File::create(meta_file).expect("create meta file");
         let mut w = BufWriter::new(meta_out);
         let magic: u64 = 0xBA7C_0010_0000_0002;
         w.write_all(&magic.to_le_bytes()).unwrap();
@@ -739,7 +739,7 @@ fn main() {
         eprintln!();
 
         // Header: [4B K][4B bins_per_table]
-        let f = File::create(&bin_hashes_file).expect("create bin hashes file");
+        let f = File::create(bin_hashes_file).expect("create bin hashes file");
         let mut w = BufWriter::new(f);
         w.write_all(&(K as u32).to_le_bytes()).unwrap();
         w.write_all(&(bins_per_table as u32).to_le_bytes()).unwrap();
@@ -796,7 +796,7 @@ fn main() {
     let mut server = PirServer::new(bins_per_table as u64);
     assert!(server.load_db(preproc_path.to_str().unwrap()), "failed to load group_0.bin");
 
-    let mut client = PirClient::new(bins_per_table as u64);
+    let client = PirClient::new(bins_per_table as u64);
     let client_id = client.id();
     server.set_galois_keys(client_id, &client.galois_keys());
     server.set_gsw_key(client_id, &client.gsw_key());
@@ -913,7 +913,7 @@ fn main() {
         // consolidated layout. The server's load path is fully switched to
         // the consolidated file.
         println!("  Wrote {} bytes; removing scratch dir {}", written, output_dir.display());
-        fs::remove_dir_all(&output_dir).expect("remove per-group dir");
+        fs::remove_dir_all(output_dir).expect("remove per-group dir");
     }
     println!("  Consolidated in {:.2?}", t_consolidate.elapsed());
 

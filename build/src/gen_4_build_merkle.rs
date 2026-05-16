@@ -129,9 +129,6 @@ fn main() {
     struct LeafInfo {
         scripthash: [u8; 20],
         data_hash: Hash256,
-        // Original index entry data for MERKLE_DATA table
-        start_chunk_id: u32,
-        num_chunks_val: u8,
     }
 
     let leaf_infos: Vec<LeafInfo> = (0..num_entries)
@@ -157,7 +154,7 @@ fn main() {
                 merkle::ZERO_HASH
             };
 
-            LeafInfo { scripthash, data_hash, start_chunk_id, num_chunks_val }
+            LeafInfo { scripthash, data_hash }
         })
         .collect();
 
@@ -232,8 +229,8 @@ fn main() {
 
     // Assign to groups (same as INDEX — by scripthash)
     let mut md_group_entries: Vec<Vec<usize>> = vec![Vec::new(); md_params.k];
-    for i in 0..num_entries {
-        let groups = hash::derive_groups_3(&leaf_infos[i].scripthash, md_params.k);
+    for (i, leaf) in leaf_infos.iter().enumerate().take(num_entries) {
+        let groups = hash::derive_groups_3(&leaf.scripthash, md_params.k);
         for &b in &groups {
             md_group_entries[b].push(i);
         }
@@ -253,7 +250,7 @@ fn main() {
                 .collect();
             let table = cuckoo::build_byte_keyed_table(&script_hashes, group_id, &md_params, md_bins);
             let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if d % 10 == 0 || d == md_params.k { eprint!("\r    {}/{} tables   ", d, md_params.k); }
+            if d.is_multiple_of(10) || d == md_params.k { eprint!("\r    {}/{} tables   ", d, md_params.k); }
             table
         })
         .collect();
@@ -271,8 +268,7 @@ fn main() {
             let table = &md_tables[group_id];
             let entries = &md_group_entries[group_id];
 
-            for slot_idx in 0..(md_bins * md_params.slots_per_bin) {
-                let entry_local = table[slot_idx];
+            for &entry_local in table.iter().take(md_bins * md_params.slots_per_bin) {
                 if entry_local == cuckoo::EMPTY {
                     w.write_all(&[0u8; MERKLE_DATA_SLOT_SIZE]).unwrap();
                 } else {
@@ -303,11 +299,7 @@ fn main() {
 
     // ── Step 8: Build per-level sibling cuckoo tables ───────────────────────
 
-    let num_sibling_levels = if tree.depth > cache_from_level {
-        tree.depth - cache_from_level
-    } else {
-        0
-    };
+    let num_sibling_levels = tree.depth.saturating_sub(cache_from_level);
 
     // L0 siblings are embedded in MERKLE_DATA, so sibling tables cover L1..L(num_sibling_levels).
     // After that, tree-top cache covers the remaining levels up to root.
@@ -382,8 +374,7 @@ fn main() {
                 let table = &tables[group_id];
                 let items = &group_items[group_id];
 
-                for slot_idx in 0..(bins * sib_params.slots_per_bin) {
-                    let entry_local = table[slot_idx];
+                for &entry_local in table.iter().take(bins * sib_params.slots_per_bin) {
                     if entry_local == cuckoo::EMPTY {
                         w.write_all(&zero_slot).unwrap();
                     } else {
@@ -411,9 +402,9 @@ fn main() {
     println!();
     println!("=== Summary ===");
     println!("Merkle tree:     {} leaves, depth {}", tree.num_real_leaves, tree.depth);
-    println!("MERKLE_DATA:     {}", format!("{}/merkle_data_cuckoo.bin", data_dir));
+    println!("MERKLE_DATA:     {}/merkle_data_cuckoo.bin", data_dir);
     println!("Sibling levels:  {} (L1..L{}, L0 embedded in MERKLE_DATA)", num_sibling_levels, num_sibling_levels);
     println!("Tree-top cache:  {} levels ({} nodes)", cache_from_level, top_cache.len());
-    println!("Root:            {}", format!("{}/merkle_root.bin", data_dir));
+    println!("Root:            {}/merkle_root.bin", data_dir);
     println!("Total time:      {:.1}s", t_total.elapsed().as_secs_f64());
 }

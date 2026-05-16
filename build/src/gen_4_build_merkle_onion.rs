@@ -20,16 +20,15 @@
 
 mod merkle_builder;
 
-use memmap2::MmapMut;
 use merkle_builder::{
     compute_next_level, parse_data_dir, write_tree_top_cache,
     TREE_TOP_GROUP_THRESHOLD_PUB as TREE_TOP_GROUP_THRESHOLD,
 };
 use onionpir::{self, Server as PirServer};
 use pir_core::merkle::{Hash256, ZERO_HASH};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Write as IoWrite;
-use std::io::{BufWriter, Write};
+use std::io::BufWriter;
 use std::time::Instant;
 
 // OnionPIRv2 port (commit 5b): the Merkle fan-out is `entry_size / 32`
@@ -86,8 +85,8 @@ fn derive_pbc_groups(entry_id: u32, k: usize) -> [usize; 3] {
         let group = (h % k as u64) as usize;
         nonce += 1;
         let mut dup = false;
-        for i in 0..count {
-            if groups[i] == group { dup = true; break; }
+        for &existing in groups.iter().take(count) {
+            if existing == group { dup = true; break; }
         }
         if dup { continue; }
         groups[count] = group;
@@ -138,8 +137,8 @@ fn build_cuckoo_bs1(
 
     for &entry_id in entries {
         let mut placed = false;
-        for h in 0..CUCKOO_NUM_HASHES {
-            let bin = cuckoo_hash_int(entry_id, keys[h], num_bins);
+        for &key in keys.iter().take(CUCKOO_NUM_HASHES) {
+            let bin = cuckoo_hash_int(entry_id, key, num_bins);
             if table[bin] == EMPTY {
                 table[bin] = entry_id;
                 placed = true;
@@ -229,7 +228,7 @@ fn build_sibling_level(
 
     let t = Instant::now();
     let nodes_at_level = level_nodes.len();
-    let num_groups = (nodes_at_level + arity - 1) / arity;
+    let num_groups = nodes_at_level.div_ceil(arity);
     let k = adaptive_k(num_groups);
     let master_seed = level_master_seed(tree_kind, level);
 
@@ -329,7 +328,7 @@ fn build_sibling_level(
             entry_id, n_this_batch
         );
         entry_id += n_this_batch;
-        if one_pct > 0 && entry_id % (one_pct * 5).max(1) == 0 {
+        if one_pct > 0 && entry_id.is_multiple_of((one_pct * 5).max(1)) {
             eprint!("\r      NTT: {}%", entry_id * 100 / num_groups.max(1));
         }
     }
@@ -375,13 +374,13 @@ fn build_sibling_level(
     // ── 4. Build 6-hash cuckoo tables ──────────────────────────────────────
 
     let mut all_tables: Vec<Vec<u32>> = Vec::with_capacity(k);
-    for group_id in 0..k {
-        let mut entries = groups[group_id].clone();
+    for (group_id, group) in groups.iter().enumerate().take(k) {
+        let mut entries = group.clone();
         entries.sort_unstable();
 
         let mut keys = [0u64; CUCKOO_NUM_HASHES];
-        for h in 0..CUCKOO_NUM_HASHES {
-            keys[h] = derive_cuckoo_key(master_seed, group_id, h);
+        for (h, key) in keys.iter_mut().enumerate().take(CUCKOO_NUM_HASHES) {
+            *key = derive_cuckoo_key(master_seed, group_id, h);
         }
 
         let table = build_cuckoo_bs1(&entries, &keys, bins_per_table);
@@ -434,16 +433,15 @@ fn build_tree(
     let mut current_level = leaf_hashes;
 
     let mut depth = 0;
-    { let mut v = num_real; while v > 1 { v = (v + arity - 1) / arity; depth += 1; } }
+    { let mut v = num_real; while v > 1 { v = v.div_ceil(arity); depth += 1; } }
 
     println!("  {} leaves, depth {} (arity={})", num_real, depth, arity);
 
     let mut cached_levels: Vec<Vec<Hash256>> = Vec::new();
     let mut cache_from_level = depth;
-    let root;
 
     for level in 0..depth {
-        let num_groups = (current_level.len() + arity - 1) / arity;
+        let num_groups = current_level.len().div_ceil(arity);
 
         if num_groups <= TREE_TOP_GROUP_THRESHOLD {
             if cached_levels.is_empty() {
@@ -461,7 +459,7 @@ fn build_tree(
     }
 
     assert_eq!(current_level.len(), 1);
-    root = current_level[0];
+    let root = current_level[0];
     if cached_levels.is_empty() {
         cache_from_level = depth;
     }
@@ -469,7 +467,7 @@ fn build_tree(
 
     // Write root
     let root_path = format!("{}/merkle_onion_{}_root.bin", data_dir, tree_kind);
-    std::fs::write(&root_path, &root).expect("write root");
+    std::fs::write(&root_path, root).expect("write root");
     let root_hex: String = root.iter().take(8).map(|b| format!("{:02x}", b)).collect();
     println!("    Root: {}...", root_hex);
 

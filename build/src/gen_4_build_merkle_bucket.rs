@@ -23,12 +23,9 @@ fn main() {
 
     let mut i = 1;
     while i < args.len() {
-        match args[i].as_str() {
-            "--data-dir" => {
-                data_dir = args[i + 1].clone();
-                i += 1;
-            }
-            _ => {}
+        if args[i].as_str() == "--data-dir" {
+            data_dir = args[i + 1].clone();
+            i += 1;
         }
         i += 1;
     }

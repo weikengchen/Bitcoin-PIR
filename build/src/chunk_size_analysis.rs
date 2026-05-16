@@ -75,7 +75,7 @@ fn main() {
         let mut ratios: Vec<f64> = Vec::with_capacity(total_groups);
 
         for &sz in &data_sizes {
-            let nblocks = (sz + bs - 1) / bs;
+            let nblocks = sz.div_ceil(bs);
             let fetched = nblocks * bs;
             total_fetched += fetched as u64;
             ratios.push(sz as f64 / fetched as f64);
@@ -115,7 +115,7 @@ fn main() {
         let mut total_blocks: u64 = 0;
         let mut total_rounds: u64 = 0;
         for &sz in &data_sizes {
-            let n = ((sz + bs - 1) / bs) as u64;
+            let n = sz.div_ceil(bs) as u64;
             total_blocks += n;
             total_rounds += n;
         }
@@ -150,7 +150,7 @@ fn main() {
         for &sz in &sorted_for_packing {
             if sz > bs {
                 if started && cur > 0 { pk_blocks += 1; }
-                pk_blocks += ((sz + bs - 1) / bs) as u64;
+                pk_blocks += sz.div_ceil(bs) as u64;
                 cur = 0; started = false;
             } else if !started || cur + sz > bs {
                 if started && cur > 0 { pk_blocks += 1; }
@@ -164,7 +164,7 @@ fn main() {
         // Rounds per query is still based on individual group size
         let mut total_rounds: u64 = 0;
         for &sz in &data_sizes {
-            total_rounds += ((sz + bs - 1) / bs) as u64;
+            total_rounds += sz.div_ceil(bs) as u64;
         }
 
         let bins = (pk_blocks as f64 / K_CHUNK as f64
@@ -194,13 +194,13 @@ fn main() {
         "block", "model", "rounds", "blk_bytes", "PIR_bw", "useful", "util%");
 
     for &bs in &[40, 48, 64, 80, 128, 256] {
-        let rounds_med = (median_useful + bs - 1) / bs;
+        let rounds_med = median_useful.div_ceil(bs);
         let blk_bytes = rounds_med * bs;
 
         // Isolated
         let mut iso_blocks: u64 = 0;
         for &sz in &data_sizes {
-            iso_blocks += ((sz + bs - 1) / bs) as u64;
+            iso_blocks += sz.div_ceil(bs) as u64;
         }
         let iso_bins = (iso_blocks as f64 / K_CHUNK as f64
             / (CHUNK_SLOTS_PER_BIN as f64 * 0.95)).ceil() as u64;
@@ -218,7 +218,7 @@ fn main() {
         for &sz in &sorted_for_packing {
             if sz > bs {
                 if started && cur > 0 { pk_blocks += 1; }
-                pk_blocks += ((sz + bs - 1) / bs) as u64;
+                pk_blocks += sz.div_ceil(bs) as u64;
                 cur = 0; started = false;
             } else if !started || cur + sz > bs {
                 if started && cur > 0 { pk_blocks += 1; }

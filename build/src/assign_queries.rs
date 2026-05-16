@@ -101,8 +101,8 @@ fn main() {
     // ── Display: assignment + per-group cuckoo locations ────────────────
     println!("[4] Final assignment with cuckoo locations:");
     println!(
-        "  {:>4}  {:>6}  {:>8}  {:>8}  {:>42}  {:}",
-        "#", "Group", "loc0", "loc1", "Script Hash", "Candidates"
+        "  {:>4}  {:>6}  {:>8}  {:>8}  {:>42}  Candidates",
+        "#", "Group", "loc0", "loc1", "Script Hash"
     );
     println!(
         "  {}  {}  {}  {}  {}  {}",
