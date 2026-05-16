@@ -81,8 +81,9 @@ const RESP_ONIONPIR_CHUNK_RESULT  = 0x52;
 
 // ─── WASM module types ────────────────────────────────────────────────────
 //
-// Post-port surface (onionpir rev 92fceb01, upstream's wasm/bindings.cpp +
-// hand-written .d.ts at web/public/wasm/onionpir_client.d.ts):
+// Post-port surface (onionpir rev 2402b16, upstream's wasm/bindings.cpp +
+// hand-written .d.ts at web/public/wasm/onionpir_client.d.ts). The
+// onionpir_client.wasm in web/public/wasm/ is rebuilt from this rev:
 //
 //   * `OnionPirClient` ctor takes no args (DB shape is compile-time, not
 //     a runtime parameter).
