@@ -83,13 +83,14 @@ export interface OnionPirModule {
     /**
      * Build a cuckoo hash table for a group of entries.
      * - entries: sorted Uint32Array of entry ids in this group
-     * - keys: Float64Array (treated as uint64s) of 6 hash function keys
+     * - keys: Uint32Array of numHashes*2 elements — each key as a
+     *   consecutive (lo32, hi32) pair
      * - numBins: table size
      * Returns Uint32Array of length numBins; bin == 0xFFFFFFFF means empty.
      */
     buildCuckooBs1(
         entries: Uint32Array,
-        keys: Float64Array,
+        keys: Uint32Array,
         numBins: number,
     ): Uint32Array;
 }

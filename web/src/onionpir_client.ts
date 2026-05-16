@@ -119,7 +119,7 @@ interface OnionPirModule {
   paramsInfo(): OnionPirParamsInfo;
   splitmix64(x: number): number;
   cuckooHashInt(entryId: number, key: number, numBins: number): number;
-  buildCuckooBs1(entries: Uint32Array, keys: Float64Array, numBins: number): Uint32Array;
+  buildCuckooBs1(entries: Uint32Array, keys: Uint32Array, numBins: number): Uint32Array;
 }
 
 interface WasmPirClient {
@@ -258,37 +258,34 @@ function buildChunkCuckooForGroup(
   const entries = reverseIndex.get(groupId) ?? [];
   // entries are already sorted since the reverse index is built in eid order
 
-  // Post-port (commit 7): upstream's `buildCuckooBs1` takes a
-  // `Float64Array` of 6 keys, each element bit-reinterpreted as a u64.
-  // Build a shared ArrayBuffer, write u64s via the BigUint64Array view,
-  // pass the Float64Array view to the WASM call.
+  // onionpir 2402b16's `buildCuckooBs1` embind wrapper expects the cuckoo
+  // keys as a `Uint32Array` of `numHashes * 2` consecutive (lo32, hi32)
+  // pairs — see wasm/hash_utils.cpp `hash_build_cuckoo_bs1_embind`. (The
+  // pre-2402b16 WASM took a `Float64Array` of u64 bit-patterns; the fork
+  // switched the key ABI to avoid double-precision loss.)
+  const keys: bigint[] = [];
+  for (let h = 0; h < CHUNK_CUCKOO_NUM_HASHES; h++) {
+    keys.push(chunkDeriveCuckooKey(groupId, h));
+  }
   return wasmModule.buildCuckooBs1(
     new Uint32Array(entries),
-    buildCuckooKeysFloat64(groupId, chunkDeriveCuckooKey, CHUNK_CUCKOO_NUM_HASHES),
+    packCuckooKeysU32(keys),
     binsPerTable,
   );
 }
 
 /**
- * Pack `numHashes` u64 cuckoo-hash keys into a `Float64Array` for the
- * upstream `buildCuckooBs1(entries, keys, numBins)` post-port WASM
- * helper. Each Float64 element is the bit-pattern of one u64 key, not
- * a numeric value — Float64Array is just the upstream binding's
- * chosen transport for u64 arrays (Float64Array is JS-side ABI-stable
- * for 8-byte-per-element typed arrays in a way BigInt64Array isn't
- * on every embind/wasm path).
+ * Pack u64 cuckoo-hash keys into the `Uint32Array` layout the onionpir
+ * 2402b16 `buildCuckooBs1` embind wrapper expects: `keys.length * 2`
+ * elements, each key as a consecutive (lo32, hi32) pair.
  */
-function buildCuckooKeysFloat64(
-  groupId: number,
-  deriveKey: (groupId: number, hashFn: number) => bigint,
-  numHashes: number,
-): Float64Array {
-  const buf = new ArrayBuffer(numHashes * 8);
-  const u64 = new BigUint64Array(buf);
-  for (let h = 0; h < numHashes; h++) {
-    u64[h] = deriveKey(groupId, h);
+function packCuckooKeysU32(keys: bigint[]): Uint32Array {
+  const out = new Uint32Array(keys.length * 2);
+  for (let i = 0; i < keys.length; i++) {
+    out[i * 2] = Number(keys[i] & 0xFFFFFFFFn);
+    out[i * 2 + 1] = Number((keys[i] >> 32n) & 0xFFFFFFFFn);
   }
-  return new Float64Array(buf);
+  return out;
 }
 
 function findEntryInCuckoo(
@@ -1777,16 +1774,10 @@ export class OnionPirWebClient {
           for (let h = 0; h < ONIONPIR_MERKLE_SIBLING_CUCKOO_NUM_HASHES; h++) {
             sibKeys.push(deriveCuckooKeyGeneric(levelSeed, pbcGroup, h));
           }
-          // Post-port (commit 7): Float64Array u64-bytes encoding. See
-          // `buildCuckooKeysFloat64` near the top of this file.
-          const sibKeysBuf = new ArrayBuffer(ONIONPIR_MERKLE_SIBLING_CUCKOO_NUM_HASHES * 8);
-          const sibKeysU64 = new BigUint64Array(sibKeysBuf);
-          for (let h = 0; h < ONIONPIR_MERKLE_SIBLING_CUCKOO_NUM_HASHES; h++) {
-            sibKeysU64[h] = sibKeys[h];
-          }
+          // 2402b16 buildCuckooBs1 ABI: Uint32Array of (lo32,hi32) key pairs.
           const cuckooTable = this.wasmModule!.buildCuckooBs1(
             new Uint32Array(groupEntries),
-            new Float64Array(sibKeysBuf),
+            packCuckooKeysU32(sibKeys),
             levelInfo.bins_per_table,
           );
 
