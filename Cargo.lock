@@ -432,7 +432,7 @@ dependencies = [
  "brk_rpc",
  "libdpf",
  "memmap2",
- "onionpir 0.2.0 (git+https://github.com/Bitcoin-PIR/OnionPIRv2-fork.git?rev=2402b16e5caa4b64a546640b4b25f6f9fe321e4f)",
+ "onionpir",
  "pir-core",
  "rayon",
  "txoutset",
@@ -1564,14 +1564,6 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "onionpir"
 version = "0.2.0"
-source = "git+https://github.com/Bitcoin-PIR/OnionPIRv2-fork.git?rev=2402b16e5caa4b64a546640b4b25f6f9fe321e4f#2402b16e5caa4b64a546640b4b25f6f9fe321e4f"
-dependencies = [
- "cmake",
-]
-
-[[package]]
-name = "onionpir"
-version = "0.2.0"
 source = "git+https://github.com/Bitcoin-PIR/OnionPIRv2-fork.git?rev=f164451a6bc89694ec39e8b799def51ab1261285#f164451a6bc89694ec39e8b799def51ab1261285"
 dependencies = [
  "cmake",
@@ -1754,7 +1746,7 @@ dependencies = [
  "js-sys",
  "libdpf",
  "log",
- "onionpir 0.2.0 (git+https://github.com/Bitcoin-PIR/OnionPIRv2-fork.git?rev=f164451a6bc89694ec39e8b799def51ab1261285)",
+ "onionpir",
  "pir-channel",
  "pir-core",
  "pir-sdk",
@@ -2166,7 +2158,7 @@ dependencies = [
  "libc",
  "libdpf",
  "memmap2",
- "onionpir 0.2.0 (git+https://github.com/Bitcoin-PIR/OnionPIRv2-fork.git?rev=f164451a6bc89694ec39e8b799def51ab1261285)",
+ "onionpir",
  "pir-core",
  "pir-runtime-core",
  "rand 0.8.5",
