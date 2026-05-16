@@ -93,7 +93,7 @@ safe to expose for external testing.
 1. **Web client** — auto-deployed by `.github/workflows/deploy-web.yml` on every
    push to `main`. `f699d79` is already published via GitHub Pages (run
    succeeded in ~1 min). No manual action needed.
-2. **Production PIR server(s)** — on the host serving `pir1.chenweikeng.com`:
+2. **Production PIR server(s)** — on the host serving `weikeng1.bitcoinpir.org`:
    ```bash
    git pull
    ./scripts/start_pir_servers.sh

@@ -43,7 +43,7 @@ use std::sync::Arc;
 use pir_sdk::BufferingLeakageRecorder;
 use pir_sdk_client::{OnionClient, PirClient, ScriptHash};
 
-const DEFAULT_SERVER: &str = "wss://pir1.chenweikeng.com";
+const DEFAULT_SERVER: &str = "wss://weikeng1.bitcoinpir.org";
 
 struct Args {
     server_url: String,

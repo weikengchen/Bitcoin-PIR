@@ -41,7 +41,7 @@ deployment).
 ## 1. The symptom (production observation)
 
 Downstream consumer BitcoinPIR fronts pir1 via a Cloudflare WebSocket
-tunnel (`wss://pir1.chenweikeng.com`). The CF Free plan terminates
+tunnel (`wss://weikeng1.bitcoinpir.org`). The CF Free plan terminates
 idle WebSocket connections at ~100 s. Sequential server-side
 processing of one OnionPIR INDEX batch (K = 75 groups × ~1.1 s
 per-server matmul on i7-8700, single thread) takes ~162 s. CF closes

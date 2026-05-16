@@ -32,7 +32,7 @@
 # & Protection → Advanced: Measured Boot → UKI → Upload, then Save & Reboot.
 #
 # After the reboot, run from your laptop:
-#   bpir-admin attest wss://pir2.chenweikeng.com
+#   bpir-admin attest wss://weikeng2.bitcoinpir.org
 # and capture the new MEASUREMENT — that's what you publish for verifiers.
 
 set -euo pipefail
@@ -173,7 +173,7 @@ echo "       scp vpsbg-pir:$OUT ./bpir.efi"
 echo "  3. VPSBG dashboard → Confidentiality & Protection →"
 echo "     Advanced: Measured Boot → UKI → Upload bpir.efi → Save & Reboot"
 echo "  4. After reboot, fetch the new MEASUREMENT:"
-echo "       bpir-admin attest wss://pir2.chenweikeng.com"
+echo "       bpir-admin attest wss://weikeng2.bitcoinpir.org"
 echo "  5. Publish the new MEASUREMENT alongside this UKI's sha256:"
 echo "       UKI sha256:   $UKI_SHA"
 echo "       Binary sha256: $BIN_HASH"
@@ -184,6 +184,6 @@ echo "       reboot   # watch VPSBG VNC for [bpir-verify] FATAL: binary hash mis
 echo "       # then in the emergency shell: mount -o remount,rw /sysroot &&"
 echo "       #   cp /sysroot${BINARY}.bak /sysroot${BINARY} && reboot"
 echo "  7. Verifiers run:"
-echo "       bpir-admin attest wss://pir2.chenweikeng.com \\"
+echo "       bpir-admin attest wss://weikeng2.bitcoinpir.org \\"
 echo "           --expect-measurement <published MEASUREMENT> \\"
 echo "           --expect-binary $BIN_HASH"

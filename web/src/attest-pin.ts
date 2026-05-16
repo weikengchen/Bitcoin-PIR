@@ -65,7 +65,7 @@ export interface ServerAttestPin {
 }
 
 /**
- * pir2.chenweikeng.com — VPSBG Tier 3 UKI v16, pinned 2026-05-16.
+ * weikeng2.bitcoinpir.org — VPSBG Tier 3 UKI v16, pinned 2026-05-16.
  * Deterministic build (scripts/build_unified_server.sh +
  * build_uki_tier3.sh) on the Hetzner build host with VPSBG kernel
  * 7.0.0-15 + dracut 110.
@@ -79,16 +79,16 @@ export const PIR2_TIER3_PIN: ServerAttestPin = {
   // byte-identical to the one running on Hetzner pir-primary /
   // pir-secondary, so PIR1_PIN and PIR2_TIER3_PIN share the same
   // `binarySha256Hex`. MEASUREMENT captured from the v16 deploy via
-  // `bpir-admin attest wss://pir2.chenweikeng.com`.
+  // `bpir-admin attest wss://weikeng2.bitcoinpir.org`.
   measurementHex:
     '59e276f34881fec46f68f07582b863d46944868206db14402e32000e49ab568e3d41a9df9155991345ed578c31a7ab4a',
   binarySha256Hex:
     'f63b35354c3f02037d5063a25696c3a919d14cccbcf4946f98cf6c5e75117ecd',
-  description: 'pir2.chenweikeng.com (VPSBG, SEV-SNP, Tier 3 UKI v16)',
+  description: 'weikeng2.bitcoinpir.org (VPSBG, SEV-SNP, Tier 3 UKI v16)',
 };
 
 /**
- * pir1.chenweikeng.com — Hetzner i7-8700, Intel chip, NO SEV-SNP.
+ * weikeng1.bitcoinpir.org — Hetzner i7-8700, Intel chip, NO SEV-SNP.
  * No MEASUREMENT to pin (no SEV report). binary_sha256 IS pinnable —
  * the value isn't hardware-backed without SEV, but pinning still
  * detects accidental drift between what the operator claims is
@@ -102,5 +102,5 @@ export const PIR1_PIN: ServerAttestPin = {
   // byte-identical to the one baked into the pir2 Tier 3 UKI v16.
   binarySha256Hex:
     'f63b35354c3f02037d5063a25696c3a919d14cccbcf4946f98cf6c5e75117ecd',
-  description: 'pir1.chenweikeng.com (Hetzner i7-8700, no SEV)',
+  description: 'weikeng1.bitcoinpir.org (Hetzner i7-8700, no SEV)',
 };

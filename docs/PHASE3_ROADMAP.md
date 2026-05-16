@@ -4,7 +4,7 @@ Snapshot of work that landed across the 2026-05-02 / 2026-05-03
 deployment cycle:
 - Slices 1–4 of the dynamic attestation surface (DB manifests,
   `/attest`, ed25519 admin auth, DB upload protocol, `bpir-admin` CLI)
-- VPSBG as the second non-collusion server + `pir2.chenweikeng.com`
+- VPSBG as the second non-collusion server + `weikeng2.bitcoinpir.org`
   Cloudflare tunnel
 - Phase 3 Slice 1 (UKI builder + `--expect-measurement` verifier flag)
 - Phase 3 Slice 2 (dracut hook enforces the binary pin at pre-pivot
@@ -14,7 +14,7 @@ deployment cycle:
   bound into REPORT_DATA via the V2 layout. Per-session ECDH +
   ChaCha20-Poly1305 AEAD frame wrapping. cloudflared sees only
   ciphertext for any client that runs the handshake. End-to-end
-  verified via `bpir-admin channel-test wss://pir2.chenweikeng.com`.
+  verified via `bpir-admin channel-test wss://weikeng2.bitcoinpir.org`.
 - **Phase 3 Slice 3 — Tier 3 Lockdown** (deployed 2026-05-03 evening):
   unified_server now runs from inside the UKI's initramfs (binary
   bytes directly in MEASUREMENT, not just transitively pinned).
@@ -36,8 +36,8 @@ to whichever slice you want to start on.
 
 | | |
 |---|---|
-| `pir1.chenweikeng.com` | Hetzner i7-8700, role=primary, DPF + OnionPIR + HarmonyPIR query, 125 GB RAM, 944 GB disk. Cloudflared tunnel terminates here. **Not** SEV-attested (Intel chip). |
-| `pir2.chenweikeng.com` | VPSBG EPYC 9745 (Zen 5), role=secondary, DPF + HarmonyPIR hint, **SEV-SNP active** at VMPL0, **Tier 3 UKI loaded**: `unified_server` runs from initramfs, no rootfs pivot for the service, sshd gone. cloudflared also runs from initramfs (supervised by runit alongside unified_server). Rootfs is mounted (rw) only to expose `/home/pir/data` for DBs + VCEK chain. 48 GB disk, 22 GB used. |
+| `weikeng1.bitcoinpir.org` | Hetzner i7-8700, role=primary, DPF + OnionPIR + HarmonyPIR query, 125 GB RAM, 944 GB disk. Cloudflared tunnel terminates here. **Not** SEV-attested (Intel chip). |
+| `weikeng2.bitcoinpir.org` | VPSBG EPYC 9745 (Zen 5), role=secondary, DPF + HarmonyPIR hint, **SEV-SNP active** at VMPL0, **Tier 3 UKI loaded**: `unified_server` runs from initramfs, no rootfs pivot for the service, sshd gone. cloudflared also runs from initramfs (supervised by runit alongside unified_server). Rootfs is mounted (rw) only to expose `/home/pir/data` for DBs + VCEK chain. 48 GB disk, 22 GB used. |
 | Cloudflare tunnels | Two: Hetzner (existing) for pir1, VPSBG (new) for pir2. Both healthy. |
 | DBs in production | `main` (height 940611), `delta_940611_944000`. Both have `MANIFEST.toml`. |
 | Hetzner `pir-secondary.service` | Stopped + disabled (port 8092 free). Unit file kept for hot-spare revival via `systemctl start pir-secondary`. |
@@ -47,7 +47,7 @@ to whichever slice you want to start on.
 These are live values from the running pir2 — anyone can verify with `bpir-admin attest`.
 
 ```
-Server: wss://pir2.chenweikeng.com
+Server: wss://weikeng2.bitcoinpir.org
 
 Launch MEASUREMENT (covers OVMF + Tier 3 UKI bytes — UKI now contains
 the unified_server BINARY itself in initramfs, NOT just a cmdline hash
@@ -89,12 +89,12 @@ but it'll be different next reboot.
 Verifiers can cross-check end-to-end with:
 ```bash
 # Static checks: report binding + binary + measurement + ARK chain
-bpir-admin attest wss://pir2.chenweikeng.com \
+bpir-admin attest wss://weikeng2.bitcoinpir.org \
     --expect-measurement 2ad9490a64a48d7ab9af1045c5a5abe2b8308edcb13f966a9c95eea3709c4018faf161f52eb3c6063c1e241f19fd6fe5 \
     --expect-binary 324c3883510c56a344221ec379a6466c3089099f51e566e7ad9b1356156eee7e
 
 # Live encrypted channel + AMD VCEK chain validation
-bpir-admin channel-test wss://pir2.chenweikeng.com \
+bpir-admin channel-test wss://weikeng2.bitcoinpir.org \
     --expect-ark-fingerprint 1f084161a44bb6d93778a904877d4819cafa5d05ef4193b2ded9dd9c73dd3f6a
 ```
 
@@ -132,7 +132,7 @@ sev-snp-measure --mode snp \
 # expected output: 2ad9490a64a48d7ab9af1045c5a5abe2b8308edcb13f966a9c95eea3709c4018faf161f52eb3c6063c1e241f19fd6fe5
 
 # 4. Cross-check against the chip's signed report.
-bpir-admin attest wss://pir2.chenweikeng.com \
+bpir-admin attest wss://weikeng2.bitcoinpir.org \
     --expect-measurement 2ad9490a64a48d7ab9af1045c5a5abe2b8308edcb13f966a9c95eea3709c4018faf161f52eb3c6063c1e241f19fd6fe5
 ```
 
@@ -234,9 +234,9 @@ ssh vpsbg-pir '/home/pir/BitcoinPIR/scripts/build_uki_tier3.sh'
 scp vpsbg-pir:/tmp/bpir-tier3.efi ./deploy/uki/bpir-tier3-vNNN.efi
 # 4. Upload via VPSBG portal → Measured Boot → UKI → Save & Reboot.
 # 5. After reboot, capture + republish the new MEASUREMENT + binary sha.
-./target/release/bpir-admin channel-test wss://pir2.chenweikeng.com \
+./target/release/bpir-admin channel-test wss://weikeng2.bitcoinpir.org \
     --expect-ark-fingerprint 1f084161a44bb6d93778a904877d4819cafa5d05ef4193b2ded9dd9c73dd3f6a
-./target/release/bpir-admin attest wss://pir2.chenweikeng.com
+./target/release/bpir-admin attest wss://weikeng2.bitcoinpir.org
 ```
 
 ### Recovery — Tier 3 UKI bricks the box
@@ -303,10 +303,10 @@ to start. Drop sshd entirely.
   - (c) Forward via a journal-remote sidecar to Hetzner.
   Recommend (a) for MVP.
 - **DNS resolution**: needed for cloudflared if we keep that on VPSBG
-  (which we do — pir2.chenweikeng.com routes through it). cloudflared
+  (which we do — weikeng2.bitcoinpir.org routes through it). cloudflared
   resolves AMD's KDS endpoint and Cloudflare's edge. Bake systemd-resolved
   + /etc/resolv.conf pointing at 1.1.1.1 in the initramfs.
-- **cloudflared in the UKI?**: yes, otherwise pir2.chenweikeng.com goes
+- **cloudflared in the UKI?**: yes, otherwise weikeng2.bitcoinpir.org goes
   dark. Add cloudflared binary + token + supervisor (s6-overlay or
   similar) into initramfs.
 - **Admin key rotation**: the admin pubkey lives in the UKI cmdline.
@@ -328,14 +328,14 @@ to start. Drop sshd entirely.
 ### Acceptance criteria
 
 1. After UKI upload and reboot, `bpir-admin attest
-   wss://pir2.chenweikeng.com` returns ReportDataMatch with the new
+   wss://weikeng2.bitcoinpir.org` returns ReportDataMatch with the new
    MEASUREMENT (different from Slice 1+2's value because the UKI
    bytes now include the binary).
 2. `ssh vpsbg-pir 'echo hi'` fails (no sshd).
 3. The VPSBG VNC console shows `unified_server` and `cloudflared`
    running supervised.
 4. `bpir-admin upload <name> <dir> --target-path … --server
-   wss://pir2.chenweikeng.com` still works.
+   wss://weikeng2.bitcoinpir.org` still works.
 
 ### Estimate
 
@@ -432,18 +432,18 @@ reverted to Slice 2 first (see PHASE3_SLICE3_RECOVERY.md).
 # === Tier 3 (current production state) — works without SSH ===
 
 # Attest VPSBG (verifies SEV-SNP report + binds X25519 channel pubkey)
-./target/release/bpir-admin attest wss://pir2.chenweikeng.com \
+./target/release/bpir-admin attest wss://weikeng2.bitcoinpir.org \
     --expect-binary 324c3883510c56a344221ec379a6466c3089099f51e566e7ad9b1356156eee7e
 
 # End-to-end channel test with ARK-rooted chain validation
-./target/release/bpir-admin channel-test wss://pir2.chenweikeng.com \
+./target/release/bpir-admin channel-test wss://weikeng2.bitcoinpir.org \
     --expect-ark-fingerprint 1f084161a44bb6d93778a904877d4819cafa5d05ef4193b2ded9dd9c73dd3f6a
 
 # Upload a new DB (admin auth + chunked upload + activate). The
 # --activate flag triggers an in-process hot reload — no restart.
 ./target/release/bpir-admin upload main_944321 ./build/output/main_944321 \
     --target-path checkpoints/944321 \
-    --server wss://pir2.chenweikeng.com
+    --server wss://weikeng2.bitcoinpir.org
 
 # === Slice 2 (after reverting via portal — restores SSH) ===
 

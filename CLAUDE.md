@@ -185,7 +185,7 @@ and [build/src/gen_4_build_merkle.rs:236-239](build/src/gen_4_build_merkle.rs:23
 so any candidate group can serve the query. No server changes were
 required.
 
-**Empirical witnesses (against `wss://pir1.chenweikeng.com`):**
+**Empirical witnesses (against `wss://weikeng1.bitcoinpir.org`):**
 - `dpf_simulator_property_multi_query_collision`: A=B=C=19 rounds,
   IndexMerkleSiblings A=B=C=12. Pre-closure: A=33 / C=21.
 - `harmony_simulator_property_multi_query_collision`: A=B=C=20 rounds,
@@ -247,7 +247,7 @@ for OnionPIR `[0, total_packed)`. The synthetic prefix `0..M-1`
 exists in any production DB (M = 16 ≪ millions of entries).
 No server changes were required.
 
-**Empirical witnesses (against `wss://pir1.chenweikeng.com`):**
+**Empirical witnesses (against `wss://weikeng1.bitcoinpir.org`):**
 - `dpf_found_vs_not_found_have_byte_identical_profiles`:
   `total rounds = 23, ChunkMerkleSiblings = 6` (= 1 pass × 2 servers × 3 levels).
   Pre-closure: found 23 / not-found 17, ChunkMerkleSiblings 6 vs 0.
@@ -383,7 +383,7 @@ cargo test -p pir-sdk-wasm --lib
 - **SSH**: `ssh vpsbg-pir` (root@87.120.8.198, key `~/.ssh/id_ed25519_vpsbg`). Only works in Slice 2.
 - **Boot modes**: Slice 2 (rootfs, sshd, udev) ↔ Tier 3 (UKI, no sshd). Toggle in VPSBG portal → Measured Boot → UKI.
 - **Restart service (Slice 2)**: `ssh vpsbg-pir 'sudo systemctl restart pir-vpsbg'`
-- **Capture pins**: `./target/release/bpir-admin attest wss://pir2.chenweikeng.com`
+- **Capture pins**: `./target/release/bpir-admin attest wss://weikeng2.bitcoinpir.org`
 - **Update web pins**: `web/src/attest-pin.ts` → `PIR2_TIER3_PIN.measurementHex` / `binarySha256Hex`
 - **Recovery**: Portal → UKI → "None" → Save & Reboot → boots rootfs with sshd
 

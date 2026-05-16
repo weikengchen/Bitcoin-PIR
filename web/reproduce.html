@@ -222,7 +222,7 @@
     <main>
         <h1>Reproducing the SEV-SNP MEASUREMENT</h1>
         <p class="lede">
-            Independently verify that <code>pir2.chenweikeng.com</code>'s
+            Independently verify that <code>weikeng2.bitcoinpir.org</code>'s
             attestation report — signed by the AMD chip — actually corresponds
             to the source code published in this repo. No need to trust the
             operator's claimed MEASUREMENT.
@@ -233,8 +233,8 @@
             <p>
                 The two-server PIR security model needs two
                 <em>non-colluding</em> servers to keep query content
-                private. <code>pir1.chenweikeng.com</code> and
-                <code>pir2.chenweikeng.com</code> run on different
+                private. <code>weikeng1.bitcoinpir.org</code> and
+                <code>weikeng2.bitcoinpir.org</code> run on different
                 physical machines — Hetzner i7-8700 and VPSBG AMD EPYC
                 respectively — but they share <em>one operator</em>.
                 So the deployment doesn't literally satisfy
@@ -451,7 +451,7 @@
                         what you computed in step 3:
                     </p>
 	<pre><code>cargo build --release --bin bpir-admin -p bpir-admin
-	./target/release/bpir-admin attest wss://pir2.chenweikeng.com \
+	./target/release/bpir-admin attest wss://weikeng2.bitcoinpir.org \
 	    --expect-measurement 0662adca3ef25ead88ae763684b6a7261e6d71e75e0a197f26c2439a3b6511c86019968bbd4a44c049ea8e6eb636c346 \
 	    --expect-binary      f9daecb103104c58c40440738557785febdfe2c9724de5b3506bca22a5265c9c</code></pre>
                     <p>
@@ -467,7 +467,7 @@
         <section>
             <h2>pir1 verification (Hetzner, no SEV)</h2>
             <p>
-                <code>pir1.chenweikeng.com</code> runs the <strong>same</strong>
+                <code>weikeng1.bitcoinpir.org</code> runs the <strong>same</strong>
                 <code>unified_server</code> binary as pir2, on a Hetzner i7-8700
                 (Intel, no SEV-SNP). Without a hardware root of trust, the
                 client verifies the server's self-reported <code>binary_sha256</code>
@@ -490,7 +490,7 @@
                 Verify with:
             </p>
 	<pre><code>cargo build --release --bin bpir-admin -p bpir-admin
-	./target/release/bpir-admin attest wss://pir1.chenweikeng.com \
+	./target/release/bpir-admin attest wss://weikeng1.bitcoinpir.org \
 	    --expect-binary f9daecb103104c58c40440738557785febdfe2c9724de5b3506bca22a5265c9c</code></pre>
             <p>
                 Or directly: <code>sha256sum /home/pir/BitcoinPIR/target/release/unified_server</code>

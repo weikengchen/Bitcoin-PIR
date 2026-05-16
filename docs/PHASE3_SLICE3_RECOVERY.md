@@ -50,7 +50,7 @@ shape. PIR is back online within ~2 minutes.
    but sshd hasn't started yet — wait another 30s.
 6. **Verify the encrypted channel works end-to-end**:
    ```bash
-   bpir-admin channel-test wss://pir2.chenweikeng.com \
+   bpir-admin channel-test wss://weikeng2.bitcoinpir.org \
        --expect-ark-fingerprint 1f084161a44bb6d93778a904877d4819cafa5d05ef4193b2ded9dd9c73dd3f6a
    ```
    Expect all green: ReportDataMatch, vcek chain verified, encrypted

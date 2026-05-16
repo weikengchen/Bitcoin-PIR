@@ -43,7 +43,7 @@ use pir_sdk_client::WsConnection;
 
 #[derive(Args, Debug)]
 pub struct ChannelTestArgs {
-    /// Server WebSocket URL (e.g. `wss://pir2.chenweikeng.com`).
+    /// Server WebSocket URL (e.g. `wss://weikeng2.bitcoinpir.org`).
     pub server_url: String,
     /// Operator-pinned 64-hex-char SHA-256 fingerprint of the AMD ARK
     /// (Root Key) certificate. When set + the server bundles a VCEK

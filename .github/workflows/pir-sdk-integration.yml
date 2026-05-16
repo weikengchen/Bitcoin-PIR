@@ -1,9 +1,9 @@
 name: PIR SDK Integration Tests
 
 # Runs the `pir-sdk-client` integration suite against the public PIR
-# deployment (wss://pir1.chenweikeng.com / wss://pir2.chenweikeng.com).
+# deployment (wss://weikeng1.bitcoinpir.org / wss://weikeng2.bitcoinpir.org).
 # These are the same servers the web client at
-# https://chenweikeng.com/bitcoin-pir uses, so a failure here would
+# https://www.bitcoinpir.org uses, so a failure here would
 # typically also break the web client — the workflow is our early-warning
 # signal for SDK vs. production-server protocol drift.
 #
@@ -48,8 +48,8 @@ jobs:
       # Pin the default URLs explicitly so the CI log shows what we
       # tested against. Override via repository variables or a fork's
       # env block to hit a different deployment.
-      PIR_DPF_SERVER0_URL: wss://pir1.chenweikeng.com
-      PIR_DPF_SERVER1_URL: wss://pir2.chenweikeng.com
+      PIR_DPF_SERVER0_URL: wss://weikeng1.bitcoinpir.org
+      PIR_DPF_SERVER1_URL: wss://weikeng2.bitcoinpir.org
       # Production topology (per CLAUDE.md /
       # project_pir1_hint_pir2_query_split.md):
       #   pir1 = Hetzner, no-SEV   → HINT server  (--serve-hints + --pool-size)
@@ -57,8 +57,8 @@ jobs:
       # The HINT_URL and QUERY_URL env vars were reversed in this
       # workflow before 2026-05-13 — fixed here so the CI
       # integration tests hit the correct role on each endpoint.
-      PIR_HARMONY_HINT_URL: wss://pir1.chenweikeng.com
-      PIR_HARMONY_QUERY_URL: wss://pir2.chenweikeng.com
+      PIR_HARMONY_HINT_URL: wss://weikeng1.bitcoinpir.org
+      PIR_HARMONY_QUERY_URL: wss://weikeng2.bitcoinpir.org
 
     steps:
       - name: Checkout
@@ -116,7 +116,7 @@ jobs:
     timeout-minutes: 45
     env:
       CARGO_TERM_COLOR: always
-      PIR_ONION_URL: wss://pir1.chenweikeng.com
+      PIR_ONION_URL: wss://weikeng1.bitcoinpir.org
       # The SEAL submodule is declared with an SSH URL
       # (git@github.com:…) in the `OnionPIRv2-fork` repo. Cargo's
       # libgit2-based fetcher won't authenticate as us on GitHub, so

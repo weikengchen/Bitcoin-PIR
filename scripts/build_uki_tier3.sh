@@ -308,13 +308,13 @@ echo "  2. VPSBG dashboard → Confidentiality & Protection →"
 echo "     Advanced: Measured Boot → UKI → Upload → Save & Reboot."
 echo
 echo "  3. Phase 3.2 acceptance — channel-test should now succeed end-to-end:"
-echo "       bpir-admin channel-test wss://pir2.chenweikeng.com \\"
+echo "       bpir-admin channel-test wss://weikeng2.bitcoinpir.org \\"
 echo "           --expect-ark-fingerprint 1f084161a44bb6d93778a904877d4819cafa5d05ef4193b2ded9dd9c73dd3f6a"
 echo "     The reported MEASUREMENT will be NEW (Tier 3 UKI ≠ Slice 2 UKI)."
 echo "     Capture it and publish it as the new pinned MEASUREMENT."
 echo
 echo "  4. Verify the binary hash baked in matches what attest reports:"
-echo "       bpir-admin attest wss://pir2.chenweikeng.com \\"
+echo "       bpir-admin attest wss://weikeng2.bitcoinpir.org \\"
 echo "           --expect-binary $BIN_HASH"
 echo
 echo "  Recovery if Tier 3 bricks the box: VPSBG portal → Measured Boot →"

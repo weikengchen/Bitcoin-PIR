@@ -40,7 +40,7 @@ End-to-end encrypted channel + AMD VCEK chain validation are LIVE on
 both servers. Slice 3 must preserve all of these properties:
 
 ```
-pir2.chenweikeng.com:
+weikeng2.bitcoinpir.org:
   binary_sha256:    324c3883510c56a344221ec379a6466c3089099f51e566e7ad9b1356156eee7e
   MEASUREMENT:      e522983f… (will change once Slice 3 UKI ships)
   channel pubkey:   8f8e48dbd14e4ff0619e21dbacb70b1b1912388748b401774c61f2a7c9c1f437
@@ -48,14 +48,14 @@ pir2.chenweikeng.com:
                     (Turin family root — pinned in web/src/attest-pin.ts)
   vcek chain:       bundled (operator-fetched via snpguest, in /home/pir/data/vcek/)
 
-pir1.chenweikeng.com:
+weikeng1.bitcoinpir.org:
   binary_sha256:    8fec274b9089a5defaec5825920e662af771a3cbd542968c6fdba93ab3f7d0f6
   No SEV — V2 binding only, no chain validation.
 ```
 
 End-to-end smoke (must keep passing post-Slice-3):
 ```bash
-bpir-admin channel-test wss://pir2.chenweikeng.com \
+bpir-admin channel-test wss://weikeng2.bitcoinpir.org \
     --expect-ark-fingerprint 1f084161a44bb6d93778a904877d4819cafa5d05ef4193b2ded9dd9c73dd3f6a
 # Expected: ✓ vcek chain verified + handshake + encrypted ping/pong + get_info
 ```
@@ -229,7 +229,7 @@ on production issues; defer until needed.
 - Token rotation = UKI re-bake. Acceptable since cert/binary
   updates already require re-bakes.
 
-**Recommended**: yes, bake it in. Otherwise pir2.chenweikeng.com
+**Recommended**: yes, bake it in. Otherwise weikeng2.bitcoinpir.org
 goes dark on every Slice 3 boot.
 
 ### 5. Process supervisor
@@ -328,7 +328,7 @@ connected from the new boot.
   it'll now return SHA-256 of `/proc/self/exe` which is the binary
   loaded from initramfs. The hash should match what's in the UKI.
 
-Acceptance: `bpir-admin attest wss://pir2.chenweikeng.com` returns
+Acceptance: `bpir-admin attest wss://weikeng2.bitcoinpir.org` returns
 a fresh MEASUREMENT (different from current `e522983f…`) and the
 self-reported `binary_sha256` matches the new initramfs binary.
 
@@ -385,7 +385,7 @@ All five phases shipped in one session via four iterative UKI builds.
 | 3.5 | ✅ | new MEASUREMENT `2ad9490a64a48d7ab9af1045c5a5abe2b8308edcb13f966a9c95eea3709c4018faf161f52eb3c6063c1e241f19fd6fe5` published in PHASE3_ROADMAP.md; UKI sha256 `afbc07f8ea8df7f24e0d92980184bcc61e8762dbe3bbf0e161ef08bdf8b8fe90` |
 
 Browser `verified-vcek` smoke test: deferred to operator (one click in
-the live web client at `https://pir.chenweikeng.com` against pir2 →
+the live web client at `https://www.bitcoinpir.org` against pir2 →
 the badge should auto-flip to `verified-vcek`).
 
 ---
@@ -470,15 +470,15 @@ scp vpsbg-pir:/tmp/bpir-tier3.efi ./bpir.efi
 # Upload via VPSBG portal → Measured Boot → UKI → Save & Reboot.
 
 # After reboot, verify everything still works
-bpir-admin attest wss://pir2.chenweikeng.com
-bpir-admin channel-test wss://pir2.chenweikeng.com \
+bpir-admin attest wss://weikeng2.bitcoinpir.org
+bpir-admin channel-test wss://weikeng2.bitcoinpir.org \
     --expect-ark-fingerprint 1f084161a44bb6d93778a904877d4819cafa5d05ef4193b2ded9dd9c73dd3f6a
 # Note: NO SSH after Slice 3 deploys — `ssh vpsbg-pir` is dead.
 
 # DB upload (unchanged from Slice 2)
 bpir-admin upload main_944321 ./build/output/main_944321 \
     --target-path checkpoints/944321 \
-    --server wss://pir2.chenweikeng.com
+    --server wss://weikeng2.bitcoinpir.org
 # Then to activate the new DB: rebuild + reupload UKI? Or
 # implement an in-supervisor reload signal? Decide during Phase 3.2.
 

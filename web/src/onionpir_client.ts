@@ -1971,7 +1971,7 @@ function hexToBytes(hex: string): Uint8Array {
 }
 
 export function createOnionPirWebClient(
-  serverUrl: string = 'wss://pir1.chenweikeng.com',
+  serverUrl: string = 'wss://weikeng1.bitcoinpir.org',
 ): OnionPirWebClient {
   return new OnionPirWebClient({ serverUrl });
 }

@@ -138,7 +138,7 @@ ssh pir-hetzner "systemctl restart pir-primary pir-secondary"
 ssh pir-hetzner 'journalctl -u pir-primary -n 50 --no-pager | grep -E "Loaded|height"'
 ```
 
-After verifying live queries against `wss://pir1.chenweikeng.com`, you
+After verifying live queries against `wss://weikeng1.bitcoinpir.org`, you
 can clean up the previous checkpoint dir on the host
 (`/home/pir/data/checkpoints/<A>/`) and the local intermediate dir
 (`/Volumes/Bitcoin/data/intermediate/full_<B>/`).

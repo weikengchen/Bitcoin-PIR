@@ -49,7 +49,7 @@ pub struct UploadArgs {
     #[arg(long)]
     pub target_path: String,
 
-    /// WebSocket URL of the server, e.g. `wss://pir2.chenweikeng.com`.
+    /// WebSocket URL of the server, e.g. `wss://weikeng2.bitcoinpir.org`.
     #[arg(long)]
     pub server: String,
 

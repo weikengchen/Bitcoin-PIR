@@ -242,7 +242,7 @@ naming convention).
    - `pub async fn full_scan<K>(&self, request: FullScanRequest<K>, stop_gap: u32) -> Result<FullScanResponse<K>>`
    - `pub async fn sync<I>(&self, request: SyncRequest<I>) -> Result<SyncResponse>`
 2. `cargo run -p pir-bdk-wallet --bin scan -- --descriptor "<descriptor>" --backend harmony` binary that:
-   - Connects to the live PIR server (`wss://pir1.chenweikeng.com`)
+   - Connects to the live PIR server (`wss://weikeng1.bitcoinpir.org`)
    - Runs `wallet.full_scan()` with stop_gap=20
    - Prints discovered UTXOs as a table (txid, vout, value, script, height)
    - Optionally writes a JSON dump for downstream consumption

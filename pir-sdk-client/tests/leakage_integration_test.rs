@@ -54,16 +54,16 @@ use pir_sdk_client::OnionClient;
 
 // ─── Server URL helpers (mirror integration_test.rs) ────────────────────────
 
-const DEFAULT_DPF_SERVER0: &str = "wss://pir1.chenweikeng.com";
-const DEFAULT_DPF_SERVER1: &str = "wss://pir2.chenweikeng.com";
+const DEFAULT_DPF_SERVER0: &str = "wss://weikeng1.bitcoinpir.org";
+const DEFAULT_DPF_SERVER1: &str = "wss://weikeng2.bitcoinpir.org";
 // Production topology (memory: project_pir1_hint_pir2_query_split.md):
 //   pir1 = Hetzner, no-SEV   → HINT server  (--serve-hints + --pool-size)
 //   pir2 = VPSBG,   SEV-SNP  → QUERY server (--serve-queries)
 // Defaults were reversed pre-2026-05-13.
-const DEFAULT_HARMONY_HINT: &str = "wss://pir1.chenweikeng.com";
-const DEFAULT_HARMONY_QUERY: &str = "wss://pir2.chenweikeng.com";
+const DEFAULT_HARMONY_HINT: &str = "wss://weikeng1.bitcoinpir.org";
+const DEFAULT_HARMONY_QUERY: &str = "wss://weikeng2.bitcoinpir.org";
 #[cfg(feature = "onion")]
-const DEFAULT_ONION_URL: &str = "wss://pir1.chenweikeng.com";
+const DEFAULT_ONION_URL: &str = "wss://weikeng1.bitcoinpir.org";
 
 fn dpf_server0_url() -> String {
     std::env::var("PIR_DPF_SERVER0_URL").unwrap_or_else(|_| DEFAULT_DPF_SERVER0.into())
@@ -602,7 +602,7 @@ fn curated_scripthashes_match_collision_pattern() {
 /// that re-introduces `derive_groups_3[0]` coupling (or breaks the PBC
 /// plan) will flip these assertions.
 ///
-/// Empirical against `wss://pir1.chenweikeng.com` (post-closure):
+/// Empirical against `wss://weikeng1.bitcoinpir.org` (post-closure):
 ///   `total rounds A=B=C=19; IndexMerkleSiblings A=B=C=12`
 ///   = 2 max_items_per_group × 2 servers × 3 Merkle levels.
 #[tokio::test]

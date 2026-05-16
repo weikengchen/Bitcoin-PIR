@@ -6,7 +6,7 @@ Today's light wallets leak every address you own to their server, enabling full 
 
 ## Try It
 
-A live demo runs at **[https://pir.chenweikeng.com/](https://pir.chenweikeng.com/)**. You can paste any Bitcoin address in the browser and watch it resolve to UTXOs privately. The servers run on a home machine and load data on demand, so the first query may be slow — please be patient.
+A live demo runs at **[https://www.bitcoinpir.org/](https://www.bitcoinpir.org/)**. You can paste any Bitcoin address in the browser and watch it resolve to UTXOs privately. The servers run on a home machine and load data on demand, so the first query may be slow — please be patient.
 
 ## What It Does
 

@@ -80,7 +80,7 @@ Pre-port preserved at `/Volumes/Bitcoin/data/preport_backup_2026-05-14/`
    batch, so future client-side `SessionEvicted("…all-empty
    batch…")` reports can be triaged from server logs alone.
 
-**Known gap: Cloudflare idle-timeout on `wss://pir1.chenweikeng.com`.**
+**Known gap: Cloudflare idle-timeout on `wss://weikeng1.bitcoinpir.org`.**
 
 The same test against the public CF-fronted URL fails after ~127 s
 with `ConnectionClosed("Connection reset without closing handshake")`.
@@ -103,7 +103,7 @@ Two independent fixes will close this gap:
     ~30 s while a `PirCommand::AnswerBatch` is outstanding. CF
     sees activity, keeps the tunnel open. No client change.
 
-Either fix unblocks `wss://pir1.chenweikeng.com`. (a) is the
+Either fix unblocks `wss://weikeng1.bitcoinpir.org`. (a) is the
 better one — wall-time improvement benefits every client, not just
 CF-fronted ones. Tracked as a separate follow-up so it doesn't
 blow up the migration commit.
@@ -432,7 +432,7 @@ Production rollout (what to do once this branch merges):
   3. `rsync` the new tree to pir1; edit
      `/home/pir/data/databases.toml` to point at the new checkpoint.
   4. `systemctl restart pir-primary pir-secondary`.
-  5. Smoke a known-good scripthash via pir.chenweikeng.com against
+  5. Smoke a known-good scripthash via www.bitcoinpir.org against
      the post-port WASM (already deployed by commit 7).
 
 Original design notes below:
@@ -667,7 +667,7 @@ After the rev bump lands on `main`:
 5. `systemctl restart pir-primary pir-secondary`. Verify
    `journalctl -u pir-primary --since now | grep "Loaded"` shows the
    new DBs and that V2 hint pool initialises against them.
-6. Verify the web client at `pir.chenweikeng.com` decodes correctly
+6. Verify the web client at `www.bitcoinpir.org` decodes correctly
    — pick a known-good scripthash (one whose UTXO set is independently
    verifiable via mempool.space).
 

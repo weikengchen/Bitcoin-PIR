@@ -21,7 +21,7 @@ use pir_sdk_client::WsConnection;
 
 #[derive(Args, Debug)]
 pub struct ShowVcekUrlArgs {
-    /// Server WebSocket URL (e.g. `wss://pir2.chenweikeng.com`).
+    /// Server WebSocket URL (e.g. `wss://weikeng2.bitcoinpir.org`).
     pub server_url: String,
     /// AMD SoC family for KDS URL construction. Auto-detect by chip
     /// hint isn't done — the operator usually knows. Common values:

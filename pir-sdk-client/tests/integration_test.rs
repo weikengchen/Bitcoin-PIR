@@ -1,7 +1,7 @@
 //! Integration tests for PIR SDK Client.
 //!
 //! These tests require running PIR servers. By default they hit the public
-//! deployment at `wss://pir1.chenweikeng.com` / `wss://pir2.chenweikeng.com`
+//! deployment at `wss://weikeng1.bitcoinpir.org` / `wss://weikeng2.bitcoinpir.org`
 //! (the same servers the production web client uses) — that's what CI runs
 //! against and what a contributor gets out-of-the-box.
 //!
@@ -28,9 +28,9 @@ use pir_sdk_client::{DpfClient, HarmonyClient, PirClient, ScriptHash};
 /// Default to the public deployment so CI — and contributors who haven't
 /// stood up a fixture server — can exercise the full stack against
 /// real data. The public servers are the same ones the web client at
-/// https://chenweikeng.com/bitcoin-pir uses.
-const DEFAULT_DPF_SERVER0: &str = "wss://pir1.chenweikeng.com";
-const DEFAULT_DPF_SERVER1: &str = "wss://pir2.chenweikeng.com";
+/// https://www.bitcoinpir.org uses.
+const DEFAULT_DPF_SERVER0: &str = "wss://weikeng1.bitcoinpir.org";
+const DEFAULT_DPF_SERVER1: &str = "wss://weikeng2.bitcoinpir.org";
 // Production topology (memory: project_pir1_hint_pir2_query_split.md):
 //   pir1 = Hetzner, no-SEV   → HINT server  (--serve-hints + --pool-size)
 //   pir2 = VPSBG,   SEV-SNP  → QUERY server (--serve-queries)
@@ -39,10 +39,10 @@ const DEFAULT_DPF_SERVER1: &str = "wss://pir2.chenweikeng.com";
 // (commit fb8b8a64) pir2 rejects hint requests with a clear
 // wire-level error ("server not configured to serve hints — start
 // with --serve-hints"), which surfaced the reversal in CI.
-const DEFAULT_HARMONY_HINT: &str = "wss://pir1.chenweikeng.com";
-const DEFAULT_HARMONY_QUERY: &str = "wss://pir2.chenweikeng.com";
+const DEFAULT_HARMONY_HINT: &str = "wss://weikeng1.bitcoinpir.org";
+const DEFAULT_HARMONY_QUERY: &str = "wss://weikeng2.bitcoinpir.org";
 #[cfg(feature = "onion")]
-const DEFAULT_ONION_URL: &str = "wss://pir1.chenweikeng.com";
+const DEFAULT_ONION_URL: &str = "wss://weikeng1.bitcoinpir.org";
 
 fn dpf_server0_url() -> String {
     std::env::var("PIR_DPF_SERVER0_URL").unwrap_or_else(|_| DEFAULT_DPF_SERVER0.into())

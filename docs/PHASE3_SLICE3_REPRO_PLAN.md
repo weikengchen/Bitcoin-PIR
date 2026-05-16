@@ -491,7 +491,7 @@ sev-snp-measure --mode snp --vcpus 2 --vcpu-sig 0x00B10F10 \
     --kernel /tmp/bpir-tier3.efi \
     --guest-features 0x1
 # Should match the published MEASUREMENT, which should match the chip-
-# reported MEASUREMENT from `bpir-admin attest wss://pir2.chenweikeng.com`.
+# reported MEASUREMENT from `bpir-admin attest wss://weikeng2.bitcoinpir.org`.
 ```
 
 **Pre-deploy operator checklist** (one-time, before booting a new

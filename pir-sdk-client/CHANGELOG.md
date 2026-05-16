@@ -113,8 +113,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     installed (zero overhead — and zero `performance.now()`
     JS↔WASM boundary calls — when none is).
 - **Integration test suite against live public PIR servers**:
-  - Defaults to `wss://pir1.chenweikeng.com` /
-    `wss://pir2.chenweikeng.com` with per-URL env var overrides.
+  - Defaults to `wss://weikeng1.bitcoinpir.org` /
+    `wss://weikeng2.bitcoinpir.org` with per-URL env var overrides.
   - Surfaced three protocol fixes: DPF batch wire format
     (spurious leading `level` byte + wrong `db_id` position +
     per-group `num_keys` → single top-level `keys_per_group`),

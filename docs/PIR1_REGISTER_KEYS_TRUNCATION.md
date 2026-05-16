@@ -18,7 +18,7 @@ OnionPIR key registration sends a **single ~3.1 MB WebSocket message**
 - **survives a raw TCP / SSH-tunnel transport intact** → server
   registers keys in ~1 ms, full query smoke test passes in 79 s;
 - **is corrupted when proxied through Cloudflare**
-  (`wss://pir1.chenweikeng.com`) → the server's
+  (`wss://weikeng1.bitcoinpir.org`) → the server's
   `deserialize_bv_galois_keys` reads a garbage length and burns
   ~55–60 s, then every `answer_query` returns empty → client sees
   `SessionEvicted`.
@@ -27,7 +27,7 @@ Proven by elimination: the **same** clean-built test binary
 (`integration_test-3399053ae28c1fbd`, verified clean by a 994 µs
 registration over the SSH tunnel) fails with a 55.9 s registration
 when the only thing changed is `PIR_ONION_URL` from
-`ws://127.0.0.1:18091` to `wss://pir1.chenweikeng.com`.
+`ws://127.0.0.1:18091` to `wss://weikeng1.bitcoinpir.org`.
 
 ## Three distinct issues were found (don't conflate them)
 
@@ -66,7 +66,7 @@ on a single large *message*, not idle time.
 | transport | client binary | registration | result |
 |---|---|---|---|
 | `ws://127.0.0.1:18091` (SSH tunnel) | 3399053a (clean) | **0.99 ms** | full smoke PASS, 79 s |
-| `wss://pir1.chenweikeng.com` (CF) | 3399053a (clean, *same binary*) | **55.9 s / 58.1 s** | SessionEvicted |
+| `wss://weikeng1.bitcoinpir.org` (CF) | 3399053a (clean, *same binary*) | **55.9 s / 58.1 s** | SessionEvicted |
 
 Server-side instrumentation on the SSH-tunnel path showed the
 message arriving intact (`ws_bin=3145873B`, galois_len=2,621,564,
@@ -115,7 +115,7 @@ a corrupt blob throws instantly instead of looping 60 s.
 `pir1` (Hetzner) runs `2402b16 + rayon-parallel` (commit
 `37957a86`), serving 2 databases (`main` + `delta_940611_948454`).
 OnionPIR works end-to-end **directly** (SSH tunnel: 79 s full smoke
-PASS). OnionPIR over **`wss://pir1.chenweikeng.com`** is broken at
+PASS). OnionPIR over **`wss://weikeng1.bitcoinpir.org`** is broken at
 the key-registration step until the chunked upload lands. DPF and
 HarmonyPIR over CF are unaffected (their messages are small / already
 chunked).

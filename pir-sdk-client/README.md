@@ -18,7 +18,7 @@ Three interchangeable backends are provided:
 
 All three implement the shared `PirClient` async trait from `pir-sdk`, so
 switching backends is a one-line change at the call site. A reference deployment
-of compatible servers runs at <https://pir.chenweikeng.com/>.
+of compatible servers runs at <https://www.bitcoinpir.org/>.
 
 ## Features at a glance
 
@@ -68,8 +68,8 @@ use pir_sdk_client::{DpfClient, PirClient};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = DpfClient::new(
-        "wss://pir1.chenweikeng.com",
-        "wss://pir2.chenweikeng.com",
+        "wss://weikeng1.bitcoinpir.org",
+        "wss://weikeng2.bitcoinpir.org",
     );
     client.connect().await?;
 
@@ -96,8 +96,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 use pir_sdk_client::{HarmonyClient, PirClient, PRP_HMR12};
 
 let mut client = HarmonyClient::new(
-    "wss://pir1.chenweikeng.com", // query server
-    "wss://pir2.chenweikeng.com", // hint server
+    "wss://weikeng1.bitcoinpir.org", // query server
+    "wss://weikeng2.bitcoinpir.org", // hint server
 );
 client.set_prp_backend(PRP_HMR12);
 client.set_master_key(&[0u8; 16]); // 128-bit session key
@@ -120,7 +120,7 @@ pir-sdk-client = { version = "0.1", features = ["fastprp"] }
 # // requires `pir-sdk-client = { features = ["onion"] }`
 use pir_sdk_client::{OnionClient, PirClient};
 
-let mut client = OnionClient::new("wss://pir1.chenweikeng.com");
+let mut client = OnionClient::new("wss://weikeng1.bitcoinpir.org");
 client.connect().await?;                    // registers Galois + GSW keys
 let result = client.sync(&hashes, None).await?;
 ```
