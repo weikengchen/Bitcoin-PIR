@@ -361,7 +361,7 @@ fn run_narrative(
         for j in 0..count {
             let idx = u32::from_le_bytes(req_bytes[j*4..(j+1)*4].try_into().unwrap());
             if idx as usize >= n {
-                response.extend(std::iter::repeat(0u8).take(w));
+                response.extend(std::iter::repeat_n(0u8, w));
             } else {
                 let s = table_offset + idx as usize * w;
                 response.extend_from_slice(&table_mmap[s..s + w]);

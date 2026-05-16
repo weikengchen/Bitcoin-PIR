@@ -269,7 +269,7 @@ fn median(data: &[f64]) -> f64 {
     let mut sorted = data.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = sorted.len();
-    if n % 2 == 0 {
+    if n.is_multiple_of(2) {
         (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
     } else {
         sorted[n / 2]
@@ -314,13 +314,13 @@ fn print_stats(prefix: &str, data: &[f64], divisor: f64, unit: &str) {
 fn print_histogram(data: &[f64], buckets: &[(f64, f64, &str)]) {
     let n = data.len();
     println!(
-        "  {:<12} {:>6} {:>7}  {}",
-        "Bucket", "Count", "Pct", "Bar"
+        "  {:<12} {:>6} {:>7}  Bar",
+        "Bucket", "Count", "Pct"
     );
     for &(lo, hi, label) in buckets {
         let count = data.iter().filter(|&&v| v >= lo && v < hi).count();
         let pct = 100.0 * count as f64 / n as f64;
-        let bar: String = std::iter::repeat('#').take((pct / 2.0) as usize).collect();
+        let bar: String = std::iter::repeat_n('#', (pct / 2.0) as usize).collect();
         println!("  {:<12} {:>6} {:>6.1}%  {}", label, count, pct, bar);
     }
 }

@@ -37,13 +37,11 @@ fn hex_short(bytes: &[u8]) -> String {
 }
 
 fn choose_backend() -> (u8, &'static str) {
-    { (PRP_HMR12, "HMR12") }
+    (PRP_HMR12, "HMR12")
 }
 
 fn build_prp_box(backend: u8, key: &[u8; 16], domain: usize, rounds: usize) -> Box<dyn Prp> {
-    match backend {
-        _ => Box::new(HoangPrp::new(domain, rounds, key)),
-    }
+    Box::new(HoangPrp::new(domain, rounds, key))
 }
 
 fn generate_group(
@@ -102,10 +100,10 @@ fn server_process_batch(
                     if end <= table_bytes.len() {
                         data.extend_from_slice(&table_bytes[off..end]);
                     } else {
-                        data.extend(std::iter::repeat(0u8).take(entry_size));
+                        data.extend(std::iter::repeat_n(0u8, entry_size));
                     }
                 } else {
-                    data.extend(std::iter::repeat(0u8).take(entry_size));
+                    data.extend(std::iter::repeat_n(0u8, entry_size));
                 }
             }
             data

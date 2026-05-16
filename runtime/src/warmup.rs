@@ -39,7 +39,7 @@ pub fn page_residency(region: &MmapRegion) -> io::Result<(usize, usize)> {
         return Ok((0, 0));
     }
     let ps = page_size();
-    let total_pages = (region.len + ps - 1) / ps;
+    let total_pages = region.len.div_ceil(ps);
     // libc::mincore takes *mut c_char on macOS, *mut c_uchar on Linux; cast lets one body fit both.
     let mut vec: Vec<u8> = vec![0; total_pages];
 
@@ -99,7 +99,7 @@ pub fn warmup_regions(regions: &mut [MmapRegion]) {
 
     let ps = page_size();
     let total_bytes: usize = regions.iter().map(|r| r.len).sum();
-    let total_pages = (total_bytes + ps - 1) / ps;
+    let total_pages = total_bytes.div_ceil(ps);
     let mut pages_touched = 0usize;
 
     println!("[warmup] Warming {:.2} GB across {} regions...",
@@ -110,7 +110,7 @@ pub fn warmup_regions(regions: &mut [MmapRegion]) {
     let progress_interval = 65536usize;
 
     for region in regions.iter() {
-        let pages = (region.len + ps - 1) / ps;
+        let pages = region.len.div_ceil(ps);
         let region_start = Instant::now();
 
         for i in 0..pages {
@@ -119,7 +119,7 @@ pub fn warmup_regions(regions: &mut [MmapRegion]) {
             }
             pages_touched += 1;
 
-            if pages_touched % progress_interval == 0 {
+            if pages_touched.is_multiple_of(progress_interval) {
                 let elapsed = global_start.elapsed().as_secs_f64();
                 let touched_gb = pages_touched as f64 * ps as f64 / 1e9;
                 let total_gb = total_bytes as f64 / 1e9;

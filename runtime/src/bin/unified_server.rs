@@ -369,7 +369,7 @@ fn compute_hints_for_group(
         (&db.index, db.index.params.bin_size(), 0u32)
     } else if level == 1 {
         (&db.chunk, db.chunk.params.bin_size(), db.index.params.k as u32)
-    } else if level >= 10 && level < 20 {
+    } else if (10..20).contains(&level) {
         let sib_level = (level - 10) as usize;
         if sib_level >= db.bucket_merkle_index_siblings.len() {
             panic!("invalid bucket merkle index sibling level {}", sib_level);
@@ -378,7 +378,7 @@ fn compute_hints_for_group(
         // k_offset: after INDEX (75) + CHUNK (80) = 155, plus level offset
         let offset = (db.index.params.k + db.chunk.params.k) as u32 + sib_level as u32 * db.index.params.k as u32;
         (sib, sib.params.bin_size(), offset)
-    } else if level >= 20 && level < 30 {
+    } else if (20..30).contains(&level) {
         let sib_level = (level - 20) as usize;
         if sib_level >= db.bucket_merkle_chunk_siblings.len() {
             panic!("invalid bucket merkle chunk sibling level {}", sib_level);
@@ -434,7 +434,7 @@ fn compute_hints_for_group(
     }
 
     let flat: Vec<u8> = hints.into_iter().flat_map(|h| h.into_iter()).collect();
-    (group_id, padded_n, t_val as u32, m as u32, flat)
+    (group_id, padded_n, t_val, m as u32, flat)
 }
 
 // ─── Server state ───────────────────────────────────────────────────────────
@@ -618,7 +618,7 @@ impl UnifiedServerData {
             json.push_str(&format!(r#"{{"k":{},"bins_per_table":{},"num_groups":{}}}"#,
                 lv.k, lv.bins_per_table, lv.num_groups));
         }
-        json.push_str("]");
+        json.push(']');
         json.push_str(&format!(r#","root":"{}""#, it.root_hex));
         let top_hash = pir_core::merkle::sha256(&it.tree_top);
         json.push_str(&format!(r#","tree_top_hash":"{}""#,
@@ -633,7 +633,7 @@ impl UnifiedServerData {
             json.push_str(&format!(r#"{{"k":{},"bins_per_table":{},"num_groups":{}}}"#,
                 lv.k, lv.bins_per_table, lv.num_groups));
         }
-        json.push_str("]");
+        json.push(']');
         json.push_str(&format!(r#","root":"{}""#, dt.root_hex));
         let top_hash = pir_core::merkle::sha256(&dt.tree_top);
         json.push_str(&format!(r#","tree_top_hash":"{}""#,
@@ -672,7 +672,7 @@ impl UnifiedServerData {
             match self.role { ServerRole::Primary => "primary", ServerRole::Secondary => "secondary" },
         );
 
-        if let Some(Some(ref opi)) = self.onionpir_infos.get(0) {
+        if let Some(Some(ref opi)) = self.onionpir_infos.first() {
             json.push_str(&format!(
                 r#","onionpir":{{"total_packed_entries":{},"index_bins_per_table":{},"chunk_bins_per_table":{},"tag_seed":"0x{:016x}","index_k":{},"chunk_k":{},"index_slots_per_bin":{},"index_slot_size":{},"chunk_slots_per_bin":1,"chunk_slot_size":{}}}"#,
                 opi.total_packed_entries, opi.index_bins_per_table, opi.chunk_bins_per_table,
@@ -685,7 +685,7 @@ impl UnifiedServerData {
         // Top-level `onionpir_merkle` reflects the main DB (db_id=0) for
         // backward compatibility with clients that only look at the main
         // entry. Per-DB Merkle is also emitted under `databases[]` below.
-        if let Some(ref om) = self.onionpir_merkle_for(0) {
+        if let Some(om) = self.onionpir_merkle_for(0) {
             Self::append_onionpir_merkle_json(&mut json, ",\"onionpir_merkle\":", om);
         }
 
@@ -707,7 +707,7 @@ impl UnifiedServerData {
                     sib.bins_per_table,
                 ));
             }
-            json.push_str("]");
+            json.push(']');
             // Root hash as hex
             if let Some(ref root) = self.main_db().merkle_root {
                 json.push_str(&format!(r#","root":"{}""#,
@@ -891,7 +891,7 @@ impl UnifiedServerData {
                 }
 
                 // Per-DB OnionPIR per-bin Merkle, when this DB has it
-                if let Some(ref om) = self.onionpir_merkle_for(i as u8) {
+                if let Some(om) = self.onionpir_merkle_for(i as u8) {
                     Self::append_onionpir_merkle_json(&mut json, ",\"onionpir_merkle\":", om);
                 }
 
@@ -954,7 +954,7 @@ impl UnifiedServerData {
                 let key_refs: Vec<&DpfKey> = dpf_keys.iter().collect();
                 let table_bytes = db.index.group_bytes(b);
                 let (r0, r1, timing) = eval::process_index_group(
-                    &key_refs[0], &key_refs[1],
+                    key_refs[0], key_refs[1],
                     table_bytes,
                     db.index.bins_per_table,
                 );
@@ -1156,7 +1156,7 @@ impl UnifiedServerData {
                             let off = idx_usize * entry_size;
                             data.extend_from_slice(&table_bytes[off..off + entry_size]);
                         } else {
-                            data.extend(std::iter::repeat(0u8).take(entry_size));
+                            data.extend(std::iter::repeat_n(0u8, entry_size));
                         }
                     }
                     data
@@ -1278,7 +1278,7 @@ where
         }
         None => payload,
     };
-    sink.send(Message::Binary(to_send.into())).await
+    sink.send(Message::Binary(to_send)).await
 }
 
 /// Feed-only variant of [`send_resp`] — push the payload into the WS sink
@@ -1323,7 +1323,7 @@ where
         }
         None => payload,
     };
-    sink.feed(Message::Binary(to_send.into())).await
+    sink.feed(Message::Binary(to_send)).await
 }
 
 // ─── Transport-level message chunking (Cloudflare large-message workaround) ──
@@ -1379,7 +1379,7 @@ where
         None => payload,
     };
     if !allow_chunk || to_send.len() <= CHUNK_SIZE {
-        return sink.send(Message::Binary(to_send.into())).await;
+        return sink.send(Message::Binary(to_send)).await;
     }
     let total = to_send.len().div_ceil(CHUNK_SIZE);
     if total > u16::MAX as usize {
@@ -1398,7 +1398,7 @@ where
         frame.extend_from_slice(&(seq as u16).to_le_bytes());
         frame.extend_from_slice(&(total as u16).to_le_bytes());
         frame.extend_from_slice(piece);
-        sink.send(Message::Binary(frame.into())).await?;
+        sink.send(Message::Binary(frame)).await?;
     }
     Ok(())
 }
@@ -1880,7 +1880,7 @@ async fn main() {
             // Spawn PIR worker thread (one per DB)
             std::thread::spawn(move || {
                 // OnionPIRv2 port: KeyStore::new() takes no args now.
-                let mut key_store = Box::new(KeyStore::new());
+                let key_store = Box::new(KeyStore::new());
 
                 // Set up chunk servers.
                 //
@@ -1920,7 +1920,7 @@ async fn main() {
                     onionpir::params_info(0).coeff_val_cnt as usize;
                 assert!(
                     coeff_val_cnt > 0
-                        && (ntt_u64_slice.len() % coeff_val_cnt) == 0,
+                        && ntt_u64_slice.len().is_multiple_of(coeff_val_cnt),
                     "chunk NTT store len ({} u64s) not divisible by \
                      coeff_val_cnt ({}); file is the wrong shape",
                     ntt_u64_slice.len(),
@@ -2024,7 +2024,7 @@ async fn main() {
                     // same reason as the chunk path above.
                     assert!(
                         coeff_val_cnt > 0
-                            && (sib_ntt_slice.len() % coeff_val_cnt) == 0,
+                            && sib_ntt_slice.len().is_multiple_of(coeff_val_cnt),
                         "sibling L{} NTT store len ({} u64s) not divisible \
                          by coeff_val_cnt ({}); file is the wrong shape",
                         li,

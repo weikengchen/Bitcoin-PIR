@@ -21,7 +21,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use harmonypir::params::Params;
 use harmonypir::prp::hoang::HoangPrp;
-use harmonypir_wasm; // for find_best_t, pad_n_for_t, compute_rounds
+ // for find_best_t, pad_n_for_t, compute_rounds
 use rand::RngCore;
 
 // ─── Server data ────────────────────────────────────────────────────────────
@@ -124,7 +124,7 @@ impl HintServerData {
         // Flatten hints.
         let flat: Vec<u8> = hints.into_iter().flat_map(|h| h.into_iter()).collect();
 
-        (group_id, padded_n, t_val as u32, m as u32, flat)
+        (group_id, padded_n, t_val, m as u32, flat)
     }
 }
 
@@ -222,14 +222,14 @@ async fn main() {
                     Err(e) => {
                         eprintln!("[{}] Bad request: {}", peer, e);
                         let resp = Response::Error(format!("decode error: {}", e));
-                        let _ = sink.send(Message::Binary(resp.encode().into())).await;
+                        let _ = sink.send(Message::Binary(resp.encode())).await;
                         continue;
                     }
                 };
 
                 match request {
                     Request::Ping => {
-                        let _ = sink.send(Message::Binary(Response::Pong.encode().into())).await;
+                        let _ = sink.send(Message::Binary(Response::Pong.encode())).await;
                     }
                     Request::HarmonyGetInfo | Request::GetInfo => {
                         let resp = Response::HarmonyInfo(ServerInfo {
@@ -239,7 +239,7 @@ async fn main() {
                             chunk_k: K_CHUNK as u8,
                             tag_seed: data.tables.tag_seed,
                         });
-                        let _ = sink.send(Message::Binary(resp.encode().into())).await;
+                        let _ = sink.send(Message::Binary(resp.encode())).await;
                     }
                     Request::HarmonyHints(hint_req) => {
                         let t_start = Instant::now();
@@ -283,7 +283,7 @@ async fn main() {
                             resp.extend_from_slice(&m.to_le_bytes());
                             resp.extend_from_slice(&flat_hints);
 
-                            if let Err(e) = sink.send(Message::Binary(resp.into())).await {
+                            if let Err(e) = sink.send(Message::Binary(resp)).await {
                                 eprintln!("[{}] Send error: {}", peer, e);
                                 break;
                             }
@@ -317,7 +317,7 @@ async fn main() {
                         preamble.push(total_groups);
                         preamble.extend_from_slice(&prp_key);
 
-                        if let Err(e) = sink.send(Message::Binary(preamble.into())).await {
+                        if let Err(e) = sink.send(Message::Binary(preamble)).await {
                             eprintln!("[{}] V2 preamble send error: {}", peer, e);
                             break;
                         }
@@ -358,7 +358,7 @@ async fn main() {
                             resp.extend_from_slice(&m.to_le_bytes());
                             resp.extend_from_slice(&flat_hints);
 
-                            if let Err(e) = sink.send(Message::Binary(resp.into())).await {
+                            if let Err(e) = sink.send(Message::Binary(resp)).await {
                                 eprintln!("[{}] V2 hint send error: {}", peer, e);
                                 break;
                             }
@@ -370,7 +370,7 @@ async fn main() {
                     }
                     _ => {
                         let resp = Response::Error("unsupported request on hint server".into());
-                        let _ = sink.send(Message::Binary(resp.encode().into())).await;
+                        let _ = sink.send(Message::Binary(resp.encode())).await;
                     }
                 }
             }

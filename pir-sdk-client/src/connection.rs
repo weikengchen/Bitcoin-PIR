@@ -479,7 +479,7 @@ impl WsConnection {
         if data.len() <= CHUNK_SIZE {
             return self
                 .sink
-                .send(Message::Binary(data.to_vec().into()))
+                .send(Message::Binary(data.to_vec()))
                 .await
                 .map_err(|e| PirError::ConnectionClosed(format!("send: {}", e)));
         }
@@ -501,7 +501,7 @@ impl WsConnection {
             frame.extend_from_slice(&(total as u16).to_le_bytes());
             frame.extend_from_slice(piece);
             self.sink
-                .send(Message::Binary(frame.into()))
+                .send(Message::Binary(frame))
                 .await
                 .map_err(|e| {
                     PirError::ConnectionClosed(format!(
@@ -555,7 +555,7 @@ impl WsConnection {
 
             match msg {
                 Message::Binary(b) => {
-                    let b: Vec<u8> = b.into();
+                    let b: Vec<u8> = b;
                     // Chunk frame: [4B len][CHUNK_MAGIC][seq:u16][total:u16][piece].
                     // A normal message never has CHUNK_MAGIC at offset 4
                     // (it is not a valid variant byte / channel magic).

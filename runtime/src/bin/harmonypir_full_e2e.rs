@@ -49,7 +49,7 @@ fn decode_chunk_slot(slot: &[u8]) -> (u32, &[u8]) {
 }
 
 fn choose_backend() -> (u8, &'static str) {
-    { (PRP_HMR12, "HMR12") }
+    (PRP_HMR12, "HMR12")
 }
 
 /// Generate hints for one group (single-threaded, for outer rayon).
@@ -72,20 +72,18 @@ fn generate_hints_for_bucket(
 
     // Build PRP and compute cell assignments (single-threaded).
     // ALF arm removed 2026-05-12 — see harmonypir-wasm/src/lib.rs:36.
-    let cell_of: Vec<usize> = match backend {
-        _ => {
-            let prp = HoangPrp::new(domain, rounds, &derived_key);
-            let mut result = vec![0usize; padded_n];
-            let mut i = 0;
-            while i + 4 <= padded_n {
-                let ys = prp.forward_4([i, i+1, i+2, i+3]);
-                result[i] = ys[0]; result[i+1] = ys[1];
-                result[i+2] = ys[2]; result[i+3] = ys[3];
-                i += 4;
-            }
-            while i < padded_n { result[i] = prp.forward(i); i += 1; }
-            result
+    let cell_of: Vec<usize> = {
+        let prp = HoangPrp::new(domain, rounds, &derived_key);
+        let mut result = vec![0usize; padded_n];
+        let mut i = 0;
+        while i + 4 <= padded_n {
+            let ys = prp.forward_4([i, i+1, i+2, i+3]);
+            result[i] = ys[0]; result[i+1] = ys[1];
+            result[i+2] = ys[2]; result[i+3] = ys[3];
+            i += 4;
         }
+        while i < padded_n { result[i] = prp.forward(i); i += 1; }
+        result
     };
 
     // Scatter-XOR into hints.
@@ -118,7 +116,7 @@ fn simulate_query_server(
     for j in 0..count {
         let idx = u32::from_le_bytes(req_bytes[j*4..(j+1)*4].try_into().unwrap());
         if idx as usize >= n {
-            response.extend(std::iter::repeat(0u8).take(w));
+            response.extend(std::iter::repeat_n(0u8, w));
         } else {
             let s = table_offset + idx as usize * w;
             response.extend_from_slice(&table_mmap[s..s + w]);
@@ -292,7 +290,7 @@ fn main() {
     let mut index_groups: Vec<HarmonyGroup> = (0..K)
         .map(|b| {
             let mut group = HarmonyGroup::new_with_backend(
-                index_bins as u32, index_w as u32, idx_t as u32,
+                index_bins as u32, index_w as u32, idx_t,
                 &MASTER_KEY, b as u32, backend,
             ).unwrap();
             group.load_hints(&index_hints[b]).unwrap();
@@ -303,7 +301,7 @@ fn main() {
     let mut chunk_groups: Vec<HarmonyGroup> = (0..K_CHUNK)
         .map(|b| {
             let mut group = HarmonyGroup::new_with_backend(
-                chunk_bins as u32, chunk_w as u32, chk_t as u32,
+                chunk_bins as u32, chunk_w as u32, chk_t,
                 &MASTER_KEY, K as u32 + b as u32, backend,
             ).unwrap();
             group.load_hints(&chunk_hints[b]).unwrap();
@@ -327,7 +325,7 @@ fn main() {
     let mut total_chunk_resp_bytes = 0usize;
     let mut total_index_dummy = 0usize;
     let mut total_chunk_dummy = 0usize;
-    let mut chunk_groups_touched = vec![false; K_CHUNK];
+    let mut chunk_groups_touched = [false; K_CHUNK];
     let mut all_pass = true;
 
     for ib in 0..K {

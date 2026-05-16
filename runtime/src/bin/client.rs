@@ -105,7 +105,7 @@ async fn ws_roundtrip(
     req: &Request,
 ) -> Response {
     let encoded = req.encode();
-    sink.send(Message::Binary(encoded.into())).await.expect("send");
+    sink.send(Message::Binary(encoded)).await.expect("send");
 
     loop {
         let msg = stream.next().await.expect("no response").expect("read error");
@@ -283,8 +283,8 @@ async fn main() {
     let enc0 = req0.encode();
     let enc1 = req1.encode();
 
-    sink0.send(Message::Binary(enc0.into())).await.expect("send s0");
-    sink1.send(Message::Binary(enc1.into())).await.expect("send s1");
+    sink0.send(Message::Binary(enc0)).await.expect("send s0");
+    sink1.send(Message::Binary(enc1)).await.expect("send s1");
 
     // Receive from both
     let resp0 = recv_response(&mut stream0, &mut sink0).await;
@@ -321,7 +321,7 @@ async fn main() {
             std::process::exit(1);
         });
 
-    let num_units = (num_chunks as usize + CHUNKS_PER_UNIT - 1) / CHUNKS_PER_UNIT;
+    let num_units = (num_chunks as usize).div_ceil(CHUNKS_PER_UNIT);
 
     println!("  Found: start_chunk={}, num_chunks={}", start_chunk, num_chunks);
     println!("  Units to fetch: {} (CHUNKS_PER_UNIT={})", num_units, CHUNKS_PER_UNIT);
@@ -402,8 +402,8 @@ async fn main() {
         let enc0 = req0.encode();
         let enc1 = req1.encode();
 
-        sink0.send(Message::Binary(enc0.into())).await.expect("send s0");
-        sink1.send(Message::Binary(enc1.into())).await.expect("send s1");
+        sink0.send(Message::Binary(enc0)).await.expect("send s0");
+        sink1.send(Message::Binary(enc1)).await.expect("send s1");
 
         let resp0 = recv_response(&mut stream0, &mut sink0).await;
         let resp1 = recv_response(&mut stream1, &mut sink1).await;
@@ -448,7 +448,7 @@ async fn main() {
     println!();
 
     // Build raw data for Merkle data_hash computation (ordered chunk bytes)
-    let full_data_for_merkle: Vec<u8> = {
+    let _full_data_for_merkle: Vec<u8> = {
         let mut data = Vec::new();
         for &cid in &chunk_ids {
             if let Some(d) = recovered_chunks.get(&cid) {
@@ -490,7 +490,7 @@ async fn main() {
             m.extend_from_slice(&top_req);
             m
         };
-        sink0.send(Message::Binary(top_msg.into())).await.expect("send tree-top req");
+        sink0.send(Message::Binary(top_msg)).await.expect("send tree-top req");
         let top_resp = recv_raw(&mut stream0).await;
         // Response: [4B len][1B variant=0x34][tree_tops_bytes...]
         let tree_tops_data = if top_resp.len() >= 6 && top_resp[4] == 0x34 {
@@ -544,7 +544,7 @@ async fn main() {
                 let mut sib_level_groups = Vec::new();
                 let mut nodes = index_bins;
                 for _ in 0..cache_from {
-                    let groups = (nodes + merkle_arity - 1) / merkle_arity;
+                    let groups = nodes.div_ceil(merkle_arity);
                     sib_level_groups.push(groups);
                     nodes = groups;
                 }
@@ -579,8 +579,8 @@ async fn main() {
                         level: 2, round_id, db_id, keys: s1_keys,
                     });
 
-                    sink0.send(Message::Binary(req0.encode().into())).await.expect("send s0 sib");
-                    sink1.send(Message::Binary(req1.encode().into())).await.expect("send s1 sib");
+                    sink0.send(Message::Binary(req0.encode())).await.expect("send s0 sib");
+                    sink1.send(Message::Binary(req1.encode())).await.expect("send s1 sib");
 
                     let resp0 = recv_response(&mut stream0, &mut sink0).await;
                     let resp1 = recv_response(&mut stream1, &mut sink1).await;
@@ -687,7 +687,7 @@ async fn main() {
         } else {
             missing += 1;
             // Pad with zeros for missing chunks
-            full_data.extend_from_slice(&vec![0u8; UNIT_DATA_SIZE]);
+            full_data.extend_from_slice(&[0u8; UNIT_DATA_SIZE]);
         }
     }
 

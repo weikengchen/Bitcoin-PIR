@@ -54,13 +54,11 @@ fn decode_chunk_slot(slot: &[u8]) -> (u32, &[u8]) {
 
 /// Pick the PRP backend: ALF if available, else HMR12.
 fn choose_backend() -> (u8, &'static str) {
-    { (PRP_HMR12, "HMR12") }
+    (PRP_HMR12, "HMR12")
 }
 
 fn build_prp_box(backend: u8, key: &[u8; 16], domain: usize, rounds: usize) -> Box<dyn Prp> {
-    match backend {
-        _ => Box::new(HoangPrp::new(domain, rounds, key)),
-    }
+    Box::new(HoangPrp::new(domain, rounds, key))
 }
 
 /// Generate hints for one group and return a HarmonyGroup ready for queries.
@@ -102,12 +100,10 @@ fn generate_hints_for_bucket(
     let cell_of: Vec<usize> = {
         use harmonypir::prp::BatchPrp;
         // ALF arm removed 2026-05-12 — see harmonypir-wasm/src/lib.rs:36.
-        match backend {
-            _ => {
-                let hp = prp.as_ref() as *const dyn Prp;
-                let full = unsafe { &*(hp as *const HoangPrp) }.batch_forward();
-                full[..pn].to_vec()
-            }
+        {
+            let hp = prp.as_ref() as *const dyn Prp;
+            let full = unsafe { &*(hp as *const HoangPrp) }.batch_forward();
+            full[..pn].to_vec()
         }
     };
 
@@ -155,7 +151,7 @@ fn simulate_query_server(
     for j in 0..count {
         let idx = u32::from_le_bytes(req_bytes[j*4..(j+1)*4].try_into().unwrap());
         if idx as usize >= n {
-            response.extend(std::iter::repeat(0u8).take(w));
+            response.extend(std::iter::repeat_n(0u8, w));
         } else {
             let s = table_offset + idx as usize * w;
             response.extend_from_slice(&table_mmap[s..s + w]);

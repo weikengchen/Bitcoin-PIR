@@ -181,8 +181,8 @@ fn hash_to_curve_cashu(secret: &[u8]) -> ProjectivePoint {
 
     for counter in 0u32.. {
         let mut h = Sha256::new();
-        h.update(&msg_hash);
-        h.update(&counter.to_le_bytes());
+        h.update(msg_hash);
+        h.update(counter.to_le_bytes());
         let digest: [u8; 32] = h.finalize().into();
 
         // Try to lift x = digest as an x-coordinate with even y (0x02 prefix).

@@ -593,7 +593,7 @@ async fn main() {
         let mut req = Vec::with_capacity(5);
         req.extend_from_slice(&1u32.to_le_bytes());
         req.push(0x03); // REQ_GET_INFO_JSON
-        sink.send(Message::Binary(req.into())).await.expect("send");
+        sink.send(Message::Binary(req)).await.expect("send");
     }
     let info_bytes = recv_binary(&mut stream, &mut sink).await;
     // Response: [4B len LE][1B variant=0x03][JSON bytes...]
@@ -613,7 +613,7 @@ async fn main() {
     // for query generation and decryption.
     println!("[3] Creating PIR client...");
     let key_start = Instant::now();
-    let mut keygen_client = PirClient::new(index_bins as u64);
+    let keygen_client = PirClient::new(index_bins as u64);
     let client_id = keygen_client.id();
     let galois = keygen_client.galois_keys();
     let gsw = keygen_client.gsw_key();
@@ -623,11 +623,11 @@ async fn main() {
     // Create per-level clients sharing the same secret key.
     // OnionPIRv2 port: rename `new_from_secret_key` → `from_secret_key`,
     // returns `Option<Self>` now.
-    let mut index_client = PirClient::from_secret_key(
+    let index_client = PirClient::from_secret_key(
         index_bins as u64, client_id, &secret_key,
     )
     .expect("freshly-generated secret key must round-trip (index)");
-    let mut chunk_client = PirClient::from_secret_key(
+    let chunk_client = PirClient::from_secret_key(
         chunk_bins as u64, client_id, &secret_key,
     )
     .expect("freshly-generated secret key must round-trip (chunk)");
@@ -638,7 +638,7 @@ async fn main() {
         gsw_keys: gsw,
         db_id: 0,
     };
-    sink.send(Message::Binary(reg_msg.encode().into())).await.expect("send keys");
+    sink.send(Message::Binary(reg_msg.encode())).await.expect("send keys");
     let ack = recv_binary(&mut stream, &mut sink).await;
     assert_eq!(ack[4], RESP_KEYS_ACK);
     println!("  Keys registered (single registration, shared secret key).\n");
@@ -701,7 +701,7 @@ async fn main() {
         }
 
         let batch = OnionPirBatchQuery { round_id: total_index_rounds, queries, db_id: 0 };
-        sink.send(Message::Binary(batch.encode(REQ_ONIONPIR_INDEX_QUERY).into())).await.expect("send");
+        sink.send(Message::Binary(batch.encode(REQ_ONIONPIR_INDEX_QUERY))).await.expect("send");
         total_index_rounds += 1;
 
         let resp_bytes = recv_binary(&mut stream, &mut sink).await;
@@ -774,19 +774,17 @@ async fn main() {
     let mut unique_entry_ids: Vec<u32> = Vec::new();
     let mut entry_id_set: HashMap<u32, usize> = HashMap::new();
 
-    for ir in &index_results {
-        if let Some(ir) = ir {
-            if ir.num_entries == 0 {
-                println!("  (whale address excluded)");
-                continue;
-            }
-            for i in 0..ir.num_entries as u32 {
-                let eid = ir.entry_id + i;
-                if !entry_id_set.contains_key(&eid) {
-                    let idx = unique_entry_ids.len();
-                    entry_id_set.insert(eid, idx);
-                    unique_entry_ids.push(eid);
-                }
+    for ir in index_results.iter().flatten() {
+        if ir.num_entries == 0 {
+            println!("  (whale address excluded)");
+            continue;
+        }
+        for i in 0..ir.num_entries as u32 {
+            let eid = ir.entry_id + i;
+            if let std::collections::hash_map::Entry::Vacant(e) = entry_id_set.entry(eid) {
+                let idx = unique_entry_ids.len();
+                e.insert(idx);
+                unique_entry_ids.push(eid);
             }
         }
     }
@@ -832,9 +830,9 @@ async fn main() {
         for &(ei, group) in round {
             let eid = unique_entry_ids[ei];
 
-            if !cuckoo_cache.contains_key(&group) {
+            if let std::collections::hash_map::Entry::Vacant(e) = cuckoo_cache.entry(group) {
                 let table = build_chunk_cuckoo_for_group(group, &reverse_index, chunk_bins);
-                cuckoo_cache.insert(group, table);
+                e.insert(table);
                 tables_built += 1;
             }
 
@@ -869,7 +867,7 @@ async fn main() {
         }
 
         let batch = OnionPirBatchQuery { round_id: ri as u16, queries, db_id: 0 };
-        sink.send(Message::Binary(batch.encode(REQ_ONIONPIR_CHUNK_QUERY).into())).await.expect("send");
+        sink.send(Message::Binary(batch.encode(REQ_ONIONPIR_CHUNK_QUERY))).await.expect("send");
 
         let resp_bytes = recv_binary(&mut stream, &mut sink).await;
         let resp_payload = &resp_bytes[4..];
@@ -1040,7 +1038,7 @@ async fn main() {
                 let mut req = Vec::with_capacity(5);
                 req.extend_from_slice(&1u32.to_le_bytes());
                 req.push(*req_top);
-                sink.send(Message::Binary(req.into())).await.expect("send");
+                sink.send(Message::Binary(req)).await.expect("send");
             }
             let top_bytes = recv_binary(&mut stream, &mut sink).await;
             let tree_top = &top_bytes[5..];
@@ -1109,7 +1107,7 @@ async fn main() {
                     }
 
                     // OnionPIRv2 port: rename + Option<Self> return.
-                    let mut sib_client = PirClient::from_secret_key(
+                    let sib_client = PirClient::from_secret_key(
                         li.bins_per_table as u64, client_id, &secret_key,
                     )
                     .expect("freshly-generated secret key must round-trip (sibling)");
@@ -1124,7 +1122,7 @@ async fn main() {
                     }
 
                     let batch = OnionPirBatchQuery { round_id: (level * 100 + ri) as u16, queries: sib_queries, db_id: 0 };
-                    sink.send(Message::Binary(batch.encode(*req_sib).into())).await.expect("send");
+                    sink.send(Message::Binary(batch.encode(*req_sib))).await.expect("send");
 
                     let resp_bytes = recv_binary(&mut stream, &mut sink).await;
                     let resp_payload = &resp_bytes[4..];

@@ -118,7 +118,7 @@ fn bench_config(label: &str, num_entries: u64, save_path: &str) -> (Vec<u8>, Vec
 
     // ── 4. Client keys ──────────────────────────────────────────────────────
     println!("\n[4] Generating client keys...");
-    let mut client = PirClient::new(num_entries);
+    let client = PirClient::new(num_entries);
     let client_id = client.id();
 
     let t_gk = Instant::now();
@@ -295,7 +295,7 @@ fn main() {
         Ok(()) => {
             println!("  set_galois_key + set_gsw_key: OK (no panic)");
             // Try actually answering a query with cross keys
-            let mut cross_client = PirClient::new(INDEX_NUM_ENTRIES);
+            let cross_client = PirClient::new(INDEX_NUM_ENTRIES);
             let query = cross_client.generate_query(0);
             let answer_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 cross_server.answer_query(cross_client_id, &query)
@@ -320,7 +320,7 @@ fn main() {
     control_server.gen_data(&[]);
     control_server.set_galois_keys(cross_client_id, &chunk_gk);
     control_server.set_gsw_key(cross_client_id, &chunk_gsw);
-    let mut control_client = PirClient::new(CHUNK_NUM_ENTRIES);
+    let control_client = PirClient::new(CHUNK_NUM_ENTRIES);
     let control_query = control_client.generate_query(0);
     let _ = control_server.answer_query(cross_client_id, &control_query);
     println!("  Control: OK");

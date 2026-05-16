@@ -1895,7 +1895,7 @@ impl DpfClient {
 
         let db_info = catalog
             .get(db_id)
-            .ok_or_else(|| PirError::DatabaseNotFound(db_id))?
+            .ok_or(PirError::DatabaseNotFound(db_id))?
             .clone();
 
         let mut results: Vec<Option<QueryResult>> = Vec::with_capacity(script_hashes.len());
@@ -1978,7 +1978,7 @@ impl DpfClient {
 
         let db_info = catalog
             .get(db_id)
-            .ok_or_else(|| PirError::DatabaseNotFound(db_id))?
+            .ok_or(PirError::DatabaseNotFound(db_id))?
             .clone();
 
         // If the database doesn't publish bucket Merkle, "verify" is a
@@ -2072,7 +2072,7 @@ impl DpfClient {
 
                 let db_info = catalog
                     .get(step.db_id)
-                    .ok_or_else(|| PirError::DatabaseNotFound(step.db_id))?
+                    .ok_or(PirError::DatabaseNotFound(step.db_id))?
                     .clone();
 
                 let step_results = self.execute_step(script_hashes, step, &db_info).await?;
@@ -2321,7 +2321,7 @@ impl PirClient for DpfClient {
 
             let db_info = catalog
                 .get(step.db_id)
-                .ok_or_else(|| PirError::DatabaseNotFound(step.db_id))?
+                .ok_or(PirError::DatabaseNotFound(step.db_id))?
                 .clone();
 
             let step_results = self.execute_step(script_hashes, step, &db_info).await?;
@@ -2361,7 +2361,7 @@ impl PirClient for DpfClient {
 
         let db_info = catalog
             .get(db_id)
-            .ok_or_else(|| PirError::DatabaseNotFound(db_id))?
+            .ok_or(PirError::DatabaseNotFound(db_id))?
             .clone();
 
         // Fire `on_query_start` before the step kicks off and

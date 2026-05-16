@@ -1604,7 +1604,7 @@ impl HarmonyClient {
         // ── 4. Receive per-group INDEX frames ───────────────────────────
         let mut done: u32 = 0;
         let mut total_response_bytes: u64 = 0;
-        for g in 0..k_index {
+        for _g in 0..k_index {
             let msg = conn.recv().await?;
             total_response_bytes = total_response_bytes.saturating_add(msg.len() as u64);
             if msg.len() < 5 {
@@ -1644,7 +1644,7 @@ impl HarmonyClient {
         }
 
         // ── 5. Receive per-group CHUNK frames ───────────────────────────
-        for g in 0..k_chunk {
+        for _g in 0..k_chunk {
             let msg = conn.recv().await?;
             total_response_bytes = total_response_bytes.saturating_add(msg.len() as u64);
             if msg.len() < 5 {
@@ -2500,7 +2500,7 @@ impl HarmonyClient {
         for (i, ((_found_info, index_bins, matched_idx), (chunk_data, chunk_bins))) in
             outcomes.into_iter().zip(chunk_results.into_iter()).enumerate()
         {
-            let mut q_traces = QueryTraces {
+            let q_traces = QueryTraces {
                 index_bins,
                 matched_index_idx: matched_idx,
                 chunk_bins,
@@ -6324,7 +6324,7 @@ impl BucketMerkleSiblingQuerier for HarmonySiblingQuerier<'_> {
             rec.record_round(
                 "harmony",
                 RoundProfile {
-                    kind: kind.clone(),
+                    kind: kind,
                     server_id: 0,
                     db_id: Some(db_id),
                     request_bytes: request_h0_bytes,

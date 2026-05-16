@@ -453,8 +453,8 @@ fn compute_and_serialize_hint_frame(
     frame.extend_from_slice(&frame_payload_len.to_le_bytes());
     frame.push(RESP_HARMONY_HINTS);
     frame.push(group_id as u8);
-    frame.extend_from_slice(&(padded_n as u32).to_le_bytes());
-    frame.extend_from_slice(&(t_val as u32).to_le_bytes());
+    frame.extend_from_slice(&padded_n.to_le_bytes());
+    frame.extend_from_slice(&t_val.to_le_bytes());
     frame.extend_from_slice(&(m as u32).to_le_bytes());
     frame.extend_from_slice(&flat);
     frame

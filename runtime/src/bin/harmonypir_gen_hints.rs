@@ -83,7 +83,7 @@ fn main() {
     // Write state file.
     let all_entries: Vec<GroupEntry> = index_entries
         .into_iter()
-        .chain(chunk_entries.into_iter())
+        .chain(chunk_entries)
         .collect();
 
     println!("\n[5] Writing state file ({} groups)...", all_entries.len());
@@ -154,7 +154,7 @@ fn compute_group_hints(
     group.load_hints(&flat).expect("load hints");
 
     GroupEntry {
-        group_id: group_id,
+        group_id,
         level,
         data: group.serialize(),
     }

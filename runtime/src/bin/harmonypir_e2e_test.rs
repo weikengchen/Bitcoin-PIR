@@ -38,7 +38,7 @@ fn main() {
 
     let n: u32 = 256;
     let w: u32 = 42;
-    let num_buckets: u32 = 2;
+    let _num_buckets: u32 = 2;
     let key = [0x42u8; 16];
     let backend_name = "HMR12 PRP";
 
@@ -262,7 +262,7 @@ fn main() {
         for j in 0..count {
             let idx = u32::from_le_bytes(req_bytes[j*4..(j+1)*4].try_into().unwrap());
             if idx as usize >= n_usize {
-                response.extend(std::iter::repeat(0u8).take(w_usize));
+                response.extend(std::iter::repeat_n(0u8, w_usize));
             } else {
                 response.extend_from_slice(&db[idx as usize]);
             }
@@ -387,7 +387,7 @@ fn do_query(group: &mut HarmonyGroup, q: u32, db: &[Vec<u8>]) -> Vec<u8> {
     for j in 0..count {
         let idx = u32::from_le_bytes(req_bytes[j*4..(j+1)*4].try_into().unwrap());
         if idx as usize >= n {
-            response.extend(std::iter::repeat(0u8).take(w));
+            response.extend(std::iter::repeat_n(0u8, w));
         } else {
             response.extend_from_slice(&db[idx as usize]);
         }

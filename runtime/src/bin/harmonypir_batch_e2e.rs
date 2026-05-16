@@ -38,13 +38,11 @@ fn hex_short(bytes: &[u8]) -> String {
 }
 
 fn choose_backend() -> (u8, &'static str) {
-    { (PRP_HMR12, "HMR12") }
+    (PRP_HMR12, "HMR12")
 }
 
 fn build_prp_box(backend: u8, key: &[u8; 16], domain: usize, rounds: usize) -> Box<dyn Prp> {
-    match backend {
-        _ => Box::new(HoangPrp::new(domain, rounds, key)),
-    }
+    Box::new(HoangPrp::new(domain, rounds, key))
 }
 
 /// Generate hints for one group. Returns a ready-to-query HarmonyGroup.
@@ -121,11 +119,11 @@ fn server_process_batch(
                         data.extend_from_slice(&table_bytes[off..end]);
                     } else {
                         // Shouldn't happen, but pad with zeros.
-                        data.extend(std::iter::repeat(0u8).take(entry_size));
+                        data.extend(std::iter::repeat_n(0u8, entry_size));
                     }
                 } else {
                     // Virtual padded row — return zeros (client expects entry_size bytes per index).
-                    data.extend(std::iter::repeat(0u8).take(entry_size));
+                    data.extend(std::iter::repeat_n(0u8, entry_size));
                 }
             }
             data
@@ -391,14 +389,14 @@ fn main() {
             let target_group = groups[0] as u32;
             chunk_group_map.insert(target_group, (ci, cid));
 
-            if !chunk_group_instances.contains_key(&target_group) {
+            chunk_group_instances.entry(target_group).or_insert_with(|| {
                 let chunk_bid = K as u32 + target_group;
                 let group = generate_group(
                     backend, &MASTER_KEY, chunk_bid,
                     &chunk_mmap, CHUNK_HEADER_SIZE, chunk_bins, chunk_w,
                 );
-                chunk_group_instances.insert(target_group, group);
-            }
+                group
+            });
         }
 
         // Build chunk batches — one batch per hash function.
@@ -549,12 +547,11 @@ fn main() {
         // Hint slot accounting.
         // Real queries in round 0: all real groups (chunk_group_map.len())
         // Real queries in round 1: only unfound after round 0
-        let found_at_h0 = chunk_pass.min(all_chunk_ids.len()); // approximate
+        let _found_at_h0 = chunk_pass.min(all_chunk_ids.len()); // approximate
         let real_round_0 = chunk_group_map.len();
         // Can't easily count found_at_h0 vs found_at_h1 from here, but the
         // print above already shows which chunks were found at which h.
-        let total_hint_slots = real_round_0 * CHUNK_CUCKOO_NUM_HASHES
-            - /* saved by dummies in later rounds — TODO: track exactly */ 0;
+        let _total_hint_slots = real_round_0 * CHUNK_CUCKOO_NUM_HASHES;
         println!("\n  Hint slot cost: {} real groups × {} rounds (worst case = {} slots, avg ≈ {:.1})",
             real_round_0, CHUNK_CUCKOO_NUM_HASHES,
             real_round_0 * CHUNK_CUCKOO_NUM_HASHES,

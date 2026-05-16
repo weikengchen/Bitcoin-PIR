@@ -13,10 +13,8 @@ use runtime::protocol::{DatabaseCatalog, DatabaseCatalogEntry};
 use build::common::*;
 use futures_util::{SinkExt, StreamExt};
 use libdpf::DpfKey;
-use pir_core::params::{INDEX_PARAMS, CHUNK_PARAMS};
 use rayon::prelude::*;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -25,7 +23,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 // ─── Server data ────────────────────────────────────────────────────────────
 
-use runtime::table::{CuckooTablePair, MappedDatabase, DatabaseDescriptor, ServerState};
+use runtime::table::{CuckooTablePair, ServerState};
 
 struct ServerData {
     tables: CuckooTablePair,
@@ -100,7 +98,7 @@ impl ServerData {
                 let table_offset = HEADER_SIZE + b * self.tables.index_table_byte_size;
                 let table_bytes = &self.tables.index_cuckoo[table_offset..table_offset + self.tables.index_table_byte_size];
                 let (r0, r1, timing) = eval::process_index_group(
-                    &key_refs[0], &key_refs[1],
+                    key_refs[0], key_refs[1],
                     table_bytes,
                     self.tables.index_bins_per_table,
                 );
@@ -197,11 +195,11 @@ impl ServerData {
                                 if end <= table_bytes.len() {
                                     data.extend_from_slice(&table_bytes[off..end]);
                                 } else {
-                                    data.extend(std::iter::repeat(0u8).take(entry_size));
+                                    data.extend(std::iter::repeat_n(0u8, entry_size));
                                 }
                             } else {
                                 // Virtual padded row — return zeros.
-                                data.extend(std::iter::repeat(0u8).take(entry_size));
+                                data.extend(std::iter::repeat_n(0u8, entry_size));
                             }
                         }
                         data
@@ -359,7 +357,7 @@ async fn main() {
                     Err(e) => {
                         eprintln!("[{}] Bad request: {}", peer, e);
                         let resp = Response::Error(format!("decode error: {}", e));
-                        let _ = sink.send(Message::Binary(resp.encode().into())).await;
+                        let _ = sink.send(Message::Binary(resp.encode())).await;
                         continue;
                     }
                 };
@@ -485,7 +483,7 @@ async fn main() {
                 }).await.unwrap();
 
                 let encoded = response.encode();
-                if let Err(e) = sink.send(Message::Binary(encoded.into())).await {
+                if let Err(e) = sink.send(Message::Binary(encoded)).await {
                     eprintln!("[{}] Send error: {}", peer, e);
                     break;
                 }
