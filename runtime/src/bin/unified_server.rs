@@ -567,27 +567,27 @@ impl UnifiedServerData {
     }
 }
 
-#[derive(Clone)]
-struct OnionPirMerkleLevelInfo {
-    k: usize,
-    bins_per_table: usize,
-    num_groups: usize,
-}
-
-/// Per-bin Merkle sub-tree info (INDEX or DATA).
-#[derive(Clone)]
-struct OnionPirMerkleSubTree {
-    levels: Vec<OnionPirMerkleLevelInfo>,
-    root_hex: String,
-    tree_top: Vec<u8>,
-}
-
-/// Two per-bin Merkle trees: INDEX-MERKLE and DATA-MERKLE.
+/// Per-group OnionPIR Merkle metadata for one DB (Phase 3 per-group
+/// redesign). The 155-tree tree-top blob `merkle_onion_tree_tops.bin`
+/// is served whole to clients on either TREE_TOP request; the per-group
+/// sibling FHE-PIR DBs (one OnionPIR `Server` per group) live in the
+/// OnionPIR worker thread.
 #[derive(Clone)]
 struct OnionPirMerkleInfo {
     arity: usize,
-    index_tree: OnionPirMerkleSubTree,
-    data_tree: OnionPirMerkleSubTree,
+    /// SHA256 of the concatenated 155 per-group roots — the §2f trust anchor.
+    super_root_hex: String,
+    /// `merkle_onion_tree_tops.bin` verbatim (75 INDEX + 80 DATA per-group
+    /// tree-tops); served whole on either INDEX/DATA TREE_TOP request.
+    tree_tops: Vec<u8>,
+    /// Number of INDEX per-group sibling trees (= INDEX PBC group count).
+    index_k: usize,
+    /// Plaintexts in each INDEX per-group sibling DB.
+    index_num_pt: usize,
+    /// Number of DATA per-group sibling trees (= CHUNK PBC group count).
+    data_k: usize,
+    /// Plaintexts in each DATA per-group sibling DB.
+    data_num_pt: usize,
 }
 
 #[derive(Clone)]
@@ -603,44 +603,24 @@ struct OnionPirInfo {
 }
 
 impl UnifiedServerData {
-    /// Append a single `OnionPirMerkleInfo` object to `json` preceded by `prefix`.
-    /// Emits the same schema as the old main-only top-level `onionpir_merkle`
-    /// field (arity + index sub-tree + data sub-tree).
+    /// Append a single `OnionPirMerkleInfo` object to `json` preceded by
+    /// `prefix`. Per-group schema (Phase 3): `arity`, `super_root`, the
+    /// shared 155-tree tree-top blob's hash/size, and per-kind `{k,num_pt}`
+    /// for the INDEX and DATA per-group sibling DBs.
     fn append_onionpir_merkle_json(json: &mut String, prefix: &str, om: &OnionPirMerkleInfo) {
         json.push_str(prefix);
-        json.push_str(&format!(r#"{{"arity":{}"#, om.arity));
-
-        // INDEX sub-tree
-        let it = &om.index_tree;
-        json.push_str(&format!(r#","index":{{"sibling_levels":{},"levels":["#, it.levels.len()));
-        for (i, lv) in it.levels.iter().enumerate() {
-            if i > 0 { json.push(','); }
-            json.push_str(&format!(r#"{{"k":{},"bins_per_table":{},"num_groups":{}}}"#,
-                lv.k, lv.bins_per_table, lv.num_groups));
-        }
-        json.push(']');
-        json.push_str(&format!(r#","root":"{}""#, it.root_hex));
-        let top_hash = pir_core::merkle::sha256(&it.tree_top);
-        json.push_str(&format!(r#","tree_top_hash":"{}""#,
-            top_hash.iter().map(|b| format!("{:02x}", b)).collect::<String>()));
-        json.push_str(&format!(r#","tree_top_size":{}}}"#, it.tree_top.len()));
-
-        // DATA sub-tree
-        let dt = &om.data_tree;
-        json.push_str(&format!(r#","data":{{"sibling_levels":{},"levels":["#, dt.levels.len()));
-        for (i, lv) in dt.levels.iter().enumerate() {
-            if i > 0 { json.push(','); }
-            json.push_str(&format!(r#"{{"k":{},"bins_per_table":{},"num_groups":{}}}"#,
-                lv.k, lv.bins_per_table, lv.num_groups));
-        }
-        json.push(']');
-        json.push_str(&format!(r#","root":"{}""#, dt.root_hex));
-        let top_hash = pir_core::merkle::sha256(&dt.tree_top);
-        json.push_str(&format!(r#","tree_top_hash":"{}""#,
-            top_hash.iter().map(|b| format!("{:02x}", b)).collect::<String>()));
-        json.push_str(&format!(r#","tree_top_size":{}}}"#, dt.tree_top.len()));
-
-        json.push('}');
+        let top_hash = pir_core::merkle::sha256(&om.tree_tops);
+        json.push_str(&format!(
+            r#"{{"arity":{},"super_root":"{}","tree_tops_hash":"{}","tree_tops_size":{}"#,
+            om.arity,
+            om.super_root_hex,
+            top_hash.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+            om.tree_tops.len(),
+        ));
+        json.push_str(&format!(
+            r#","index":{{"k":{},"num_pt":{}}},"data":{{"k":{},"num_pt":{}}}}}"#,
+            om.index_k, om.index_num_pt, om.data_k, om.data_num_pt,
+        ));
     }
 
     fn server_info(&self) -> ServerInfo {
@@ -1600,60 +1580,70 @@ async fn main() {
     let mut onionpir_merkle_per_db: Vec<Option<OnionPirMerkleInfo>> =
         (0..num_total_dbs).map(|_| None).collect();
 
-    // Per-bin Merkle: loaded per-DB alongside the OnionPIR worker setup.
-    struct SiblingLevelData {
+    // Per-group OnionPIR Merkle (Phase 3): one consolidated sibling file
+    // per kind, loaded per-DB alongside the OnionPIR worker setup.
+    struct OnionSibFile {
+        /// Number of per-group sibling DBs (= PBC group count).
         k: usize,
-        bins_per_table: usize,
-        num_groups: usize,
-        cuckoo_tables: Vec<Vec<u32>>,
-        ntt_mmap: Mmap,
+        /// Plaintexts per per-group sibling DB.
+        num_pt: usize,
+        /// Byte length of one per-group `save_db` blob.
+        blob_len: usize,
+        /// `merkle_onion_sib_{index,data}.bin` mmap: `[24B header][K blobs]`.
+        mmap: Mmap,
     }
 
-    fn load_merkle_sib_levels(
+    /// Load one consolidated per-group sibling file (Phase 3). Returns
+    /// `None` if the file is absent (DB has no per-group OnionPIR Merkle).
+    fn load_onion_sib_file(
         data_dir: &std::path::Path,
         db_label: &str,
-        prefix: &str,
+        tree_kind: &str,
         mmap_regions: &mut Vec<MmapRegion>,
-    ) -> Vec<SiblingLevelData> {
-        let mut levels: Vec<SiblingLevelData> = Vec::new();
-        for level in 0..10 {
-            let ntt_path = data_dir.join(format!("merkle_onion_{}_sib_L{}_ntt.bin", prefix, level));
-            let cuckoo_path = data_dir.join(format!("merkle_onion_{}_sib_L{}_cuckoo.bin", prefix, level));
-            if !ntt_path.exists() || !cuckoo_path.exists() { break; }
-
-            let cuckoo_data = std::fs::read(&cuckoo_path).expect("read sibling cuckoo");
-            let k = u32::from_le_bytes(cuckoo_data[8..12].try_into().unwrap()) as usize;
-            let bins_per_table = u32::from_le_bytes(cuckoo_data[16..20].try_into().unwrap()) as usize;
-            let num_groups = u32::from_le_bytes(cuckoo_data[28..32].try_into().unwrap()) as usize;
-
-            let header_size = 36;
-            let mut tables: Vec<Vec<u32>> = Vec::with_capacity(k);
-            for g in 0..k {
-                let offset = header_size + g * bins_per_table * 4;
-                let mut table = Vec::with_capacity(bins_per_table);
-                for b in 0..bins_per_table {
-                    let pos = offset + b * 4;
-                    let eid = u32::from_le_bytes(cuckoo_data[pos..pos + 4].try_into().unwrap());
-                    table.push(eid);
-                }
-                tables.push(table);
-            }
-
-            let ntt_file = std::fs::File::open(&ntt_path).expect("open sibling NTT");
-            let ntt_mm = unsafe { Mmap::map(&ntt_file) }.expect("mmap sibling NTT");
-
-            println!("  [{}] {} Sibling L{}: K={}, bins={}, groups={}, NTT={:.2} GB",
-                db_label, prefix, level, k, bins_per_table, num_groups, ntt_mm.len() as f64 / 1e9);
-            mmap_regions.push(MmapRegion {
-                name: format!("{}/merkle_onion_{}_sib_L{}_ntt.bin", db_label, prefix, level),
-                ptr: ntt_mm.as_ptr(),
-                len: ntt_mm.len(),
-                priority: 2,
-            });
-
-            levels.push(SiblingLevelData { k, bins_per_table, num_groups, cuckoo_tables: tables, ntt_mmap: ntt_mm });
+    ) -> Option<OnionSibFile> {
+        let path = data_dir.join(format!("merkle_onion_sib_{}.bin", tree_kind));
+        if !path.exists() {
+            return None;
         }
-        levels
+        let file = std::fs::File::open(&path).expect("open onion sibling file");
+        let mmap = unsafe { Mmap::map(&file) }.expect("mmap onion sibling file");
+        assert!(
+            mmap.len() >= 24,
+            "{}: too small ({} B) for the 24-byte header",
+            path.display(),
+            mmap.len(),
+        );
+        // Header: [8B magic][4B K][4B arity][4B num_pt][4B blob_len].
+        let k = u32::from_le_bytes(mmap[8..12].try_into().unwrap()) as usize;
+        let num_pt = u32::from_le_bytes(mmap[16..20].try_into().unwrap()) as usize;
+        let blob_len = u32::from_le_bytes(mmap[20..24].try_into().unwrap()) as usize;
+        let expected = 24 + k * blob_len;
+        assert_eq!(
+            mmap.len(),
+            expected,
+            "{}: size mismatch (header K={} blob_len={} → {} B, file is {} B)",
+            path.display(),
+            k,
+            blob_len,
+            expected,
+            mmap.len(),
+        );
+        println!(
+            "  [{}] onion sibling '{}': K={}, num_pt={}, blob={:.2} MB, total={:.2} MB",
+            db_label,
+            tree_kind,
+            k,
+            num_pt,
+            blob_len as f64 / 1e6,
+            mmap.len() as f64 / 1e6,
+        );
+        mmap_regions.push(MmapRegion {
+            name: format!("{}/merkle_onion_sib_{}.bin", db_label, tree_kind),
+            ptr: mmap.as_ptr(),
+            len: mmap.len(),
+            priority: 2,
+        });
+        Some(OnionSibFile { k, num_pt, blob_len, mmap })
     }
 
     if args.role == ServerRole::Primary && !args.disable_onion {
@@ -1772,100 +1762,54 @@ async fn main() {
             let index_all_per_group =
                 u64::from_le_bytes(index_all_mmap[16..24].try_into().unwrap()) as usize;
 
-            // Load per-DB Merkle sibling levels (if present on disk). Every
-            // DB that ships `merkle_onion_*` sidecars gets its own per-bin
-            // Merkle trees — previously this was gated on db_id == 0.
-            let index_sibling_levels =
-                load_merkle_sib_levels(db_dir, db_label, "index", &mut mmap_regions);
-            let data_sibling_levels =
-                load_merkle_sib_levels(db_dir, db_label, "data", &mut mmap_regions);
+            // Load the per-group OnionPIR Merkle sidecars (Phase 3
+            // per-group redesign). A DB ships these only if
+            // `gen_4_build_merkle_onion` has been run for it.
+            let index_sib_file =
+                load_onion_sib_file(db_dir, db_label, "index", &mut mmap_regions);
+            let data_sib_file =
+                load_onion_sib_file(db_dir, db_label, "data", &mut mmap_regions);
 
-            // Load Merkle roots and tree-top caches for this DB.
-            let index_merkle_root: Option<Vec<u8>> = {
-                let root_path = db_dir.join("merkle_onion_index_root.bin");
-                if root_path.exists() {
-                    Some(std::fs::read(&root_path).expect("read index merkle root"))
+            let merkle_tree_tops: Option<Vec<u8>> = {
+                let p = db_dir.join("merkle_onion_tree_tops.bin");
+                if p.exists() {
+                    Some(std::fs::read(&p).expect("read merkle_onion_tree_tops.bin"))
                 } else {
                     None
                 }
             };
-            let data_merkle_root: Option<Vec<u8>> = {
-                let root_path = db_dir.join("merkle_onion_data_root.bin");
-                if root_path.exists() {
-                    Some(std::fs::read(&root_path).expect("read data merkle root"))
-                } else {
-                    None
-                }
-            };
-            let index_merkle_tree_top: Option<Vec<u8>> = {
-                let top_path = db_dir.join("merkle_onion_index_tree_top.bin");
-                if top_path.exists() {
-                    Some(std::fs::read(&top_path).expect("read index merkle tree-top"))
-                } else {
-                    None
-                }
-            };
-            let data_merkle_tree_top: Option<Vec<u8>> = {
-                let top_path = db_dir.join("merkle_onion_data_tree_top.bin");
-                if top_path.exists() {
-                    Some(std::fs::read(&top_path).expect("read data merkle tree-top"))
+            let merkle_super_root: Option<Vec<u8>> = {
+                let p = db_dir.join("merkle_onion_root.bin");
+                if p.exists() {
+                    Some(std::fs::read(&p).expect("read merkle_onion_root.bin"))
                 } else {
                     None
                 }
             };
 
-            let index_merkle_sib_infos: Vec<OnionPirMerkleLevelInfo> = index_sibling_levels
-                .iter()
-                .map(|s| OnionPirMerkleLevelInfo {
-                    k: s.k,
-                    bins_per_table: s.bins_per_table,
-                    num_groups: s.num_groups,
-                })
-                .collect();
-            let data_merkle_sib_infos: Vec<OnionPirMerkleLevelInfo> = data_sibling_levels
-                .iter()
-                .map(|s| OnionPirMerkleLevelInfo {
-                    k: s.k,
-                    bins_per_table: s.bins_per_table,
-                    num_groups: s.num_groups,
-                })
-                .collect();
-
-            // Assemble the per-DB Merkle info if any of its pieces are on disk.
-            let has_merkle_data = !index_sibling_levels.is_empty()
-                || !data_sibling_levels.is_empty()
-                || index_merkle_root.is_some()
-                || data_merkle_root.is_some();
-
+            // A DB has OnionPIR Merkle iff the full per-group set is on
+            // disk: both consolidated sibling files plus the tree-top blob.
+            let has_merkle_data = index_sib_file.is_some()
+                && data_sib_file.is_some()
+                && merkle_tree_tops.is_some();
             if has_merkle_data {
-                let index_root_hex = index_merkle_root
-                    .as_ref()
-                    .map(|r| r.iter().map(|b| format!("{:02x}", b)).collect::<String>())
-                    .unwrap_or_default();
-                let data_root_hex = data_merkle_root
+                let idx = index_sib_file.as_ref().unwrap();
+                let dat = data_sib_file.as_ref().unwrap();
+                let arity = onionpir::params_info(0).entry_size as usize / 32;
+                let super_root_hex = merkle_super_root
                     .as_ref()
                     .map(|r| r.iter().map(|b| format!("{:02x}", b)).collect::<String>())
                     .unwrap_or_default();
                 onionpir_merkle_per_db[*db_id as usize] = Some(OnionPirMerkleInfo {
-                    arity: 120,
-                    index_tree: OnionPirMerkleSubTree {
-                        levels: index_merkle_sib_infos,
-                        root_hex: index_root_hex,
-                        tree_top: index_merkle_tree_top.unwrap_or_default(),
-                    },
-                    data_tree: OnionPirMerkleSubTree {
-                        levels: data_merkle_sib_infos,
-                        root_hex: data_root_hex,
-                        tree_top: data_merkle_tree_top.unwrap_or_default(),
-                    },
+                    arity,
+                    super_root_hex,
+                    tree_tops: merkle_tree_tops.unwrap_or_default(),
+                    index_k: idx.k,
+                    index_num_pt: idx.num_pt,
+                    data_k: dat.k,
+                    data_num_pt: dat.num_pt,
                 });
             }
-
-            // Combine sibling levels for the PIR worker:
-            // levels 10..10+N_index = index sibling, levels 20..20+N_data = data sibling
-            let mut sibling_levels: Vec<SiblingLevelData> = Vec::new();
-            sibling_levels.extend(index_sibling_levels);
-            sibling_levels.extend(data_sibling_levels);
 
             let k_index = im.k;
             let k_chunk = ch.k_chunk;
@@ -2005,77 +1949,42 @@ async fn main() {
                 }
                 println!("  [OnionPIR:{}] {} index servers ready (via onion_index_all.bin mmap)", worker_label, k_index);
 
-                // Set up sibling servers (per level, per PBC group) — main DB only
-                let mut sibling_all_index_tables: Vec<Vec<Vec<u32>>> = Vec::new();
-                let mut sibling_all_servers: Vec<Vec<PirServer>> = Vec::new();
-
-                for (li, sib) in sibling_levels.iter().enumerate() {
-                    let p_sib = onionpir::params_info(sib.bins_per_table as u64);
-                    let padded = p_sib.num_entries as usize;
-                    // OnionPIRv2 port: see comment on chunk-server slice above.
-                    let sib_ntt_slice: &[u64] = unsafe {
-                        std::slice::from_raw_parts(
-                            sib.ntt_mmap.as_ptr() as *const u64,
-                            sib.ntt_mmap.len() / 8,
-                        )
-                    };
-                    // Per-level shared store's num_pt (= what gen_4's
-                    // builder saved with). Derived from file size for the
-                    // same reason as the chunk path above.
-                    assert!(
-                        coeff_val_cnt > 0
-                            && sib_ntt_slice.len().is_multiple_of(coeff_val_cnt),
-                        "sibling L{} NTT store len ({} u64s) not divisible \
-                         by coeff_val_cnt ({}); file is the wrong shape",
-                        li,
-                        sib_ntt_slice.len(),
-                        coeff_val_cnt,
-                    );
-                    let sib_shared_num_entries =
-                        (sib_ntt_slice.len() / coeff_val_cnt) as u64;
-
-                    let mut level_index_tables: Vec<Vec<u32>> = Vec::with_capacity(sib.k);
-                    let mut level_servers: Vec<PirServer> = Vec::with_capacity(sib.k);
-
+                // Set up per-group OnionPIR Merkle sibling servers — one
+                // PirServer per group, each zero-copy aliasing its
+                // 24-byte-header sub-slice of merkle_onion_sib_*.bin.
+                // Mirrors the index_servers block above.
+                let build_sib_servers = |sib: &OnionSibFile, kind: &str| -> Vec<PirServer> {
+                    let mut servers = Vec::with_capacity(sib.k);
                     for g in 0..sib.k {
-                        let mut server = PirServer::new(sib.bins_per_table as u64);
-                        let mut index_table = vec![0u32; padded];
-                        for bin in 0..sib.bins_per_table {
-                            let eid = sib.cuckoo_tables[g][bin];
-                            if eid != u32::MAX {
-                                index_table[bin] = eid;
-                            }
-                        }
-                        unsafe {
-                            // OnionPIRv2 port: see chunk-server block above.
-                            // OnionPIRv2 port (commit 3a): see chunk
-                            // block above. sibling NTT store is also
-                            // sized for num_plaintexts (the
-                            // compile-time DB shape).
-                            assert!(
-                                server.set_shared_database(
-                                    sib_ntt_slice,
-                                    sib_shared_num_entries,
-                                    &index_table,
-                                ),
-                                "set_shared_database failed (sibling L{} \
-                                 group {}; sib_shared_num_entries={}, \
-                                 index_table.len={}, local_num_pt={})",
-                                li,
-                                g,
-                                sib_shared_num_entries,
-                                index_table.len(),
-                                p_sib.num_plaintexts,
-                            );
-                            server.set_key_store(Some(&key_store));
-                        }
-                        level_index_tables.push(index_table);
-                        level_servers.push(server);
+                        let off = 24 + g * sib.blob_len;
+                        let slice = &sib.mmap[off..off + sib.blob_len];
+                        let mut server = PirServer::new(sib.num_pt as u64);
+                        // SAFETY: `sib.mmap` is owned by this worker thread
+                        // (moved into the closure) and outlives `server`.
+                        assert!(
+                            unsafe { server.load_db_from_borrowed(slice) },
+                            "[OnionPIR:{}] load_db_from_borrowed failed for {} \
+                             sibling group {} (offset {}, len {})",
+                            worker_label, kind, g, off, slice.len(),
+                        );
+                        // OnionPIRv2 port: `set_key_store` takes Option now.
+                        unsafe { server.set_key_store(Some(&key_store)); }
+                        servers.push(server);
                     }
-                    println!("  [OnionPIR:{}] sibling L{}: {} servers ready (bins={})", worker_label, li, sib.k, sib.bins_per_table);
-                    sibling_all_index_tables.push(level_index_tables);
-                    sibling_all_servers.push(level_servers);
-                }
+                    println!(
+                        "  [OnionPIR:{}] {} sibling servers ready ({} groups, num_pt={})",
+                        worker_label, kind, sib.k, sib.num_pt,
+                    );
+                    servers
+                };
+                let mut index_sib_servers: Vec<PirServer> = match &index_sib_file {
+                    Some(sib) => build_sib_servers(sib, "index"),
+                    None => Vec::new(),
+                };
+                let mut data_sib_servers: Vec<PirServer> = match &data_sib_file {
+                    Some(sib) => build_sib_servers(sib, "data"),
+                    None => Vec::new(),
+                };
 
                 // Event loop
                 while let Some(cmd) = pir_rx.blocking_recv() {
@@ -2148,9 +2057,14 @@ async fn main() {
                                     })
                                     .collect();
                                 ("chunk", results)
-                            } else if level >= 10 && (level as usize - 10) < sibling_all_servers.len() {
-                                let sib_level = level as usize - 10;
-                                let servers = &mut sibling_all_servers[sib_level];
+                            } else if level == 10 || level == 11 {
+                                // Per-group OnionPIR Merkle siblings:
+                                // level 10 = INDEX trees, level 11 = DATA trees.
+                                let (servers, kind): (&mut Vec<PirServer>, &str) = if level == 10 {
+                                    (&mut index_sib_servers, "index-sibling")
+                                } else {
+                                    (&mut data_sib_servers, "data-sibling")
+                                };
                                 let results: Vec<Vec<u8>> = servers
                                     .par_iter_mut()
                                     .enumerate()
@@ -2159,11 +2073,11 @@ async fn main() {
                                             std::panic::AssertUnwindSafe(|| server.answer_query(client_id, &queries_ref[b])),
                                         ) {
                                             Ok(r) => r,
-                                            Err(e) => { eprintln!("[OnionPIR:{}] panic in sibling L{} group {}: {:?}", worker_label, sib_level, b, e); Vec::new() }
+                                            Err(e) => { eprintln!("[OnionPIR:{}] panic in {} group {}: {:?}", worker_label, kind, b, e); Vec::new() }
                                         }
                                     })
                                     .collect();
-                                ("sibling", results)
+                                (kind, results)
                             } else {
                                 eprintln!("[OnionPIR:{}] unknown level {}", worker_label, level);
                                 ("unknown", Vec::new())
@@ -3532,14 +3446,16 @@ async fn main() {
                                 continue;
                             }
                         };
-                        let top = &om.index_tree.tree_top;
+                        // Per-group redesign: one consolidated 155-tree
+                        // tree-top blob, served whole on either request.
+                        let top = &om.tree_tops;
                         let payload_len = 1 + top.len();
                         let mut msg = Vec::with_capacity(4 + payload_len);
                         msg.extend_from_slice(&(payload_len as u32).to_le_bytes());
                         msg.push(RESP_ONIONPIR_MERKLE_INDEX_TREE_TOP);
                         msg.extend_from_slice(top);
                         let _ = send_resp_chunked(&mut sink, channel_session.as_mut(), msg, client_supports_chunks).await;
-                        println!("[onion-merkle-index-top] db={} sent {} bytes", db_id, top.len());
+                        println!("[onion-merkle-tree-tops] db={} (index req) sent {} bytes", db_id, top.len());
                     }
                     REQ_ONIONPIR_MERKLE_DATA_TREE_TOP if server.has_any_onionpir_merkle() => {
                         // Optional db_id byte: payload[1] if present, else 0.
@@ -3552,14 +3468,16 @@ async fn main() {
                                 continue;
                             }
                         };
-                        let top = &om.data_tree.tree_top;
+                        // Per-group redesign: one consolidated 155-tree
+                        // tree-top blob, served whole on either request.
+                        let top = &om.tree_tops;
                         let payload_len = 1 + top.len();
                         let mut msg = Vec::with_capacity(4 + payload_len);
                         msg.extend_from_slice(&(payload_len as u32).to_le_bytes());
                         msg.push(RESP_ONIONPIR_MERKLE_DATA_TREE_TOP);
                         msg.extend_from_slice(top);
                         let _ = send_resp_chunked(&mut sink, channel_session.as_mut(), msg, client_supports_chunks).await;
-                        println!("[onion-merkle-data-top] db={} sent {} bytes", db_id, top.len());
+                        println!("[onion-merkle-tree-tops] db={} (data req) sent {} bytes", db_id, top.len());
                     }
                     REQ_ONIONPIR_MERKLE_INDEX_SIBLING if server.has_any_onionpir() => {
                         // round_id encoding: sibling_level * 100 + pbc_round_index
@@ -3574,7 +3492,6 @@ async fn main() {
                                 let _ = send_resp(&mut sink, channel_session.as_mut(), resp.encode()).await;
                                 continue;
                             }
-                            let sibling_level = (batch.round_id / 100) as u8;
                             let tx = match server.onionpir_tx_for(batch.db_id) {
                                 Some(t) => t.clone(),
                                 None => continue,
@@ -3582,7 +3499,7 @@ async fn main() {
                             let (reply_tx, reply_rx) = oneshot::channel();
                             let _ = tx.send(PirCommand::AnswerBatch {
                                 client_id,
-                                level: 10 + sibling_level, // worker: 10..10+N_index = index siblings
+                                level: 10, // worker: INDEX per-group siblings
                                 round_id: batch.round_id,
                                 queries: batch.queries, reply: reply_tx,
                             }).await;
@@ -3595,19 +3512,14 @@ async fn main() {
                         // round_id encoding: sibling_level * 100 + pbc_round_index
                         // Data siblings start after index siblings in the worker's server array.
                         if let Ok(batch) = OnionPirBatchQuery::decode(body) {
-                            let om = match server.onionpir_merkle_for(batch.db_id) {
-                                Some(om) => om,
-                                None => {
-                                    let resp = Response::Error(format!(
-                                        "OnionPIR Merkle not available for db_id={}",
-                                        batch.db_id
-                                    ));
-                                    let _ = send_resp(&mut sink, channel_session.as_mut(), resp.encode()).await;
-                                    continue;
-                                }
-                            };
-                            let sibling_level = (batch.round_id / 100) as u8;
-                            let index_sib_count = om.index_tree.levels.len() as u8;
+                            if server.onionpir_merkle_for(batch.db_id).is_none() {
+                                let resp = Response::Error(format!(
+                                    "OnionPIR Merkle not available for db_id={}",
+                                    batch.db_id
+                                ));
+                                let _ = send_resp(&mut sink, channel_session.as_mut(), resp.encode()).await;
+                                continue;
+                            }
                             let tx = match server.onionpir_tx_for(batch.db_id) {
                                 Some(t) => t.clone(),
                                 None => continue,
@@ -3615,7 +3527,7 @@ async fn main() {
                             let (reply_tx, reply_rx) = oneshot::channel();
                             let _ = tx.send(PirCommand::AnswerBatch {
                                 client_id,
-                                level: 10 + index_sib_count + sibling_level, // worker: offset past index siblings
+                                level: 11, // worker: DATA per-group siblings
                                 round_id: batch.round_id,
                                 queries: batch.queries, reply: reply_tx,
                             }).await;
