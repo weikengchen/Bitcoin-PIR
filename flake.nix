@@ -240,6 +240,18 @@
           # propagation. Fully hermetic: HEXL is the Nix derivation above.
           sed -i 's|\.define("ONIONPIR_BUILD_FFI", "ON")|&\n        .define("CMAKE_PREFIX_PATH", "${hexl};${pkgs.cpu_features.dev}")|' \
               "$NIX_BUILD_TOP/cargo-vendor-dir/onionpir-0.2.0/build.rs"
+
+          # onionpir's build.rs emits only `-l static=onionpir`. With HEXL
+          # active (ONIONPIR_USE_HEXL) the engine no longer compiles in the
+          # cpp/hexl_shim.cpp fallback, so libonionpir.a carries unresolved
+          # intel::hexl + cpu_features symbols — a static lib does not
+          # bundle its link deps. Append the transitive link directives so
+          # the final unified_server link resolves (order: onionpir -> hexl
+          # -> cpu_features). TODO: upstream this into onionpir's build.rs
+          # (it should emit HEXL link flags whenever CMake reports HEXL
+          # active) and drop this sed.
+          sed -i 's|    println!("cargo:rustc-link-lib=static=onionpir");|&\n    println!("cargo:rustc-link-search=native=${hexl}/lib");\n    println!("cargo:rustc-link-lib=static=hexl");\n    println!("cargo:rustc-link-search=native=${pkgs.cpu_features}/lib");\n    println!("cargo:rustc-link-lib=dylib=cpu_features");|' \
+              "$NIX_BUILD_TOP/cargo-vendor-dir/onionpir-0.2.0/build.rs"
         '';
         # Skip cargo test inside the build (live-server integration tests
         # require network + a running pir2; not appropriate for sandbox).
