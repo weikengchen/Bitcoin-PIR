@@ -21,20 +21,20 @@ rustflags = ["-C", "target-feature=+aes,+ssse3,+sse4.1,+pclmulqdq"]
 [source.crates-io]
 replace-with = "vendored-sources"
 
-# OnionPIRv2-fork is NOT vendored. Its build.rs runs the fork's CMake
-# project, which lives at the repo ROOT — but `cargo vendor` flattens a
-# git dep to just the consumed subcrate (`rust/onionpir/`), so the
-# vendored crate loses the repo-root CMakeLists.txt + C++ engine and the
-# build can't run. Cargo fetches onionpir from github at build time
-# instead; the rev pin in Cargo.lock keeps the source bytes
-# deterministic. The durable fix is the upstream OnionPIRv2-fork
-# "self-contained crate" restructure (move CMakeLists.txt + the C++
-# `src/` into `rust/onionpir/`, the shape of its commit c669da0) —
-# tracked separately; until it lands `nix build .#unified-server`
-# cannot build onionpir hermetically.
+# OnionPIRv2-fork — vendored as of 2026-05-19. The fork's "self-contained
+# crate" restructure (rev c7ed905) moved its CMake project + C++ engine
+# inside `rust/onionpir/`, so `cargo vendor` now ships a buildable copy.
+# (It had to be skipped before: cargo flattens a git dep to just the
+# consumed subcrate, which used to drop the repo-root CMakeLists.txt +
+# engine — onionpir's build.rs CMake invocation then found nothing.)
 #
 # (The stale ALF git-source replacement was removed 2026-05-18 — the
 # ALF crate is no longer a dependency.)
+
+[source."git+https://github.com/Bitcoin-PIR/OnionPIRv2-fork.git?rev=c7ed905aacd747cb01249a72b35a7c171d677345"]
+git = "https://github.com/Bitcoin-PIR/OnionPIRv2-fork.git"
+rev = "c7ed905aacd747cb01249a72b35a7c171d677345"
+replace-with = "vendored-sources"
 
 [source."git+https://github.com/Bitcoin-PIR/fastprp.git?rev=eaf1ee787c051c1250329cbe645c157e085af6e2"]
 git = "https://github.com/Bitcoin-PIR/fastprp.git"
