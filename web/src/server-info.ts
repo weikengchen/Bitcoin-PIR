@@ -94,26 +94,40 @@ export interface BucketMerkleInfoJson {
   tree_tops_size: number;
 }
 
-export interface OnionPirMerkleLevelInfo {
+/**
+ * Per-kind sibling-DB parameters for the per-group OnionPIR Merkle
+ * (Phase 3 per-group redesign). One independent arity-`arity` Merkle
+ * tree per PBC group; `k` = number of PBC groups = number of per-group
+ * trees = FHE queries in one sibling pass; `num_pt` = plaintexts in
+ * each per-group sibling DB. Mirrors the Rust `OnionMerkleKindInfo`.
+ */
+export interface OnionPirMerkleKindInfo {
   k: number;
-  bins_per_table: number;
-  num_groups: number;
+  num_pt: number;
 }
 
-/** Per-bin Merkle sub-tree info (INDEX or DATA). */
-export interface OnionPirMerkleSubTreeInfo {
-  sibling_levels: number;
-  levels: OnionPirMerkleLevelInfo[];
-  root: string;             // hex (32 bytes)
-  tree_top_hash: string;   // SHA256 of tree-top cache blob (hex, 32 bytes)
-  tree_top_size: number;   // byte size of tree-top cache
-}
-
-/** Two per-bin Merkle trees: INDEX-MERKLE and DATA-MERKLE. */
+/**
+ * Per-group OnionPIR Merkle metadata for one DB (Phase 3 redesign).
+ *
+ * Replaces the old flat per-table trees: there is now one independent
+ * Merkle tree per PBC group (75 INDEX + 80 DATA), anchored by a single
+ * `super_root` = SHA256 of the 155 concatenated per-group roots. Mirrors
+ * the server's `append_onionpir_merkle_json` output and the Rust
+ * `OnionMerkleInfo`.
+ */
 export interface OnionPirMerkleInfoJson {
+  /** Merkle arity (children per internal node) — same for every tree. */
   arity: number;
-  index: OnionPirMerkleSubTreeInfo;
-  data: OnionPirMerkleSubTreeInfo;
+  /** SHA256 of the 155 concatenated per-group roots — the pinned anchor. */
+  super_root: string;
+  /** SHA256 of the whole 155-tree tree-top blob (belt-and-suspenders). */
+  tree_tops_hash: string;
+  /** Byte length of the tree-top blob, as declared in the JSON. */
+  tree_tops_size: number;
+  /** INDEX per-group sibling-DB parameters. */
+  index: OnionPirMerkleKindInfo;
+  /** DATA per-group sibling-DB parameters. */
+  data: OnionPirMerkleKindInfo;
 }
 
 // ─── JSON request message ────────────────────────────────────────────────────
@@ -177,17 +191,17 @@ export function parseServerInfoJson(jsonStr: string): ServerInfoJson {
   }
 
   const parseOnionPirMerkle = (om: any): OnionPirMerkleInfoJson => {
-    const parseSubTree = (st: any): OnionPirMerkleSubTreeInfo => ({
-      sibling_levels: st.sibling_levels ?? 0,
-      levels: st.levels ?? [],
-      root: st.root ?? '',
-      tree_top_hash: st.tree_top_hash ?? '',
-      tree_top_size: st.tree_top_size ?? 0,
+    const parseKind = (st: any): OnionPirMerkleKindInfo => ({
+      k: st.k ?? 0,
+      num_pt: st.num_pt ?? 0,
     });
     return {
-      arity: om.arity,
-      index: parseSubTree(om.index ?? {}),
-      data: parseSubTree(om.data ?? {}),
+      arity: om.arity ?? 0,
+      super_root: om.super_root ?? '',
+      tree_tops_hash: om.tree_tops_hash ?? '',
+      tree_tops_size: om.tree_tops_size ?? 0,
+      index: parseKind(om.index ?? {}),
+      data: parseKind(om.data ?? {}),
     };
   };
 

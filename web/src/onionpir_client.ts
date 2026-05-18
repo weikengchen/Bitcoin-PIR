@@ -13,14 +13,12 @@ import {
   REQ_ONIONPIR_MERKLE_INDEX_TREE_TOP, RESP_ONIONPIR_MERKLE_INDEX_TREE_TOP,
   REQ_ONIONPIR_MERKLE_DATA_SIBLING, RESP_ONIONPIR_MERKLE_DATA_SIBLING,
   REQ_ONIONPIR_MERKLE_DATA_TREE_TOP, RESP_ONIONPIR_MERKLE_DATA_TREE_TOP,
-  ONIONPIR_MERKLE_SIBLING_CUCKOO_NUM_HASHES,
 } from './constants.js';
 
 import {
   deriveGroups, deriveCuckooKey, cuckooHash,
   deriveChunkGroups,
   splitmix64, computeTag,
-  deriveIntGroups3, deriveCuckooKeyGeneric, cuckooHashInt,
   sha256,
 } from './hash.js';
 
@@ -30,16 +28,12 @@ import { unpackOnionPlaintext } from './onion-unpack.js';
 import { findEntryInOnionPirIndexResult } from './scan.js';
 import { ManagedWebSocket } from './ws.js';
 import { fetchServerInfoJson } from './server-info.js';
-import {
-  computeParentN, parseTreeTopCache, ZERO_HASH,
-  type TreeTopCache,
-} from './merkle.js';
+import { computeParentN, ZERO_HASH } from './merkle.js';
 
 import type { UtxoEntry, QueryResult, ConnectionState } from './types.js';
 import type {
   DatabaseCatalog,
   OnionPirMerkleInfoJson,
-  OnionPirMerkleSubTreeInfo,
   ServerInfoJson,
 } from './server-info.js';
 import { fetchDatabaseCatalog } from './server-info.js';
@@ -368,6 +362,238 @@ function decodeBatchResult(data: Uint8Array, pos: number): { roundId: number; re
   return { roundId, results, pos };
 }
 
+// ─── Per-group OnionPIR Merkle: tree-top blob + trust anchor ──────────────
+//
+// SOUNDNESS-CRITICAL module section — the standalone-TS mirror of the Rust
+// verifier `pir-sdk-client/src/onion_merkle.rs` (Phase 3d, commit 79e422b4).
+//
+// Since the Phase-3 per-group redesign (PLAN_MERKLE_CODING.md /
+// MERKLE_COLOCATION_REVIEW.md §2-§6) OnionPIR has one independent
+// arity-`arity` Merkle tree per PBC group — 75 INDEX trees + 80 DATA trees
+// — anchored by a single `super_root` = SHA256 of the 155 concatenated
+// per-group roots. The old flat per-table trees, and the gid-cuckoo +
+// `planRounds`-over-gids sibling machinery they needed, are gone.
+//
+// The 155 per-group roots ride in the *untrusted*, server-supplied tree-top
+// blob; `super_root` (from the trusted server-info JSON) is the pinned
+// anchor. `checkTreeTopAnchor` binds the blob to that anchor — this is the
+// load-bearing check. Skip or weaken it and a malicious server can
+// fabricate a self-consistent blob + sibling responses, and every leaf
+// "verifies" against forged roots.
+
+/**
+ * One parsed per-group Merkle tree-top. `levels[0]` is the first cached
+ * level (the level-1 nodes — the leaf level is the single PIR sibling
+ * level and is never cached); `levels[last]` is `[root]`. Mirrors the
+ * Rust `OnionTreeTopCache`.
+ */
+interface OnionTreeTopCache {
+  cacheFromLevel: number;
+  arity: number;
+  levels: Uint8Array[][];
+}
+
+/** The per-group root = the single hash in the last cached level. */
+function onionTreeTopRoot(top: OnionTreeTopCache): Uint8Array | null {
+  const last = top.levels[top.levels.length - 1];
+  return last && last.length > 0 ? last[0] : null;
+}
+
+/** Constant-length byte-array equality. */
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+/**
+ * Parse the consolidated 155-tree tree-top blob `merkle_onion_tree_tops.bin`.
+ * Mirrors the Rust `parse_onion_tree_top_cache`.
+ *
+ * The whole blob is served on either TREE_TOP opcode (0x54 / 0x56); the
+ * caller parses all 155 trees — 75 INDEX trees first, then 80 DATA trees
+ * (the order `gen_4_build_merkle_onion` writes them).
+ *
+ * Wire format:
+ * ```text
+ * [4B num_trees LE]
+ * per tree:
+ *   [1B cache_from_level][4B total_nodes LE][2B arity LE][1B num_cached_levels]
+ *   per cached level: [4B num_nodes LE][num_nodes × 32B hashes]
+ * ```
+ *
+ * Throws on truncation / arity=0 — SOUNDNESS-CRITICAL: a malformed blob
+ * must abort verification, never silently parse as garbage.
+ */
+function parseOnionTreeTopCache(data: Uint8Array): OnionTreeTopCache[] {
+  if (data.length < 4) {
+    throw new Error('onionpir tree-tops blob too short (need 4B num_trees)');
+  }
+  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const numTrees = dv.getUint32(0, true);
+  let off = 4;
+  const out: OnionTreeTopCache[] = [];
+
+  for (let t = 0; t < numTrees; t++) {
+    if (off + 8 > data.length) {
+      throw new Error(`onionpir tree-tops: truncated header for tree ${t}`);
+    }
+    const cacheFromLevel = data[off]; off += 1;
+    off += 4; // total_nodes — informational, ignored
+    const arity = dv.getUint16(off, true); off += 2;
+    const numLevels = data[off]; off += 1;
+    if (arity === 0) {
+      throw new Error(`onionpir tree-tops: tree ${t} has arity=0`);
+    }
+
+    const levels: Uint8Array[][] = [];
+    for (let l = 0; l < numLevels; l++) {
+      if (off + 4 > data.length) {
+        throw new Error(
+          `onionpir tree-tops: truncated level-${l} count for tree ${t}`,
+        );
+      }
+      const n = dv.getUint32(off, true); off += 4;
+      if (off + n * 32 > data.length) {
+        throw new Error(
+          `onionpir tree-tops: truncated hashes for tree ${t} level ${l}`,
+        );
+      }
+      const nodes: Uint8Array[] = [];
+      for (let i = 0; i < n; i++) {
+        nodes.push(data.slice(off, off + 32));
+        off += 32;
+      }
+      levels.push(nodes);
+    }
+    out.push({ cacheFromLevel, arity, levels });
+  }
+  return out;
+}
+
+/**
+ * Bind the fetched 155-tree tree-top blob to the pinned `super_root`.
+ *
+ * **SOUNDNESS-CRITICAL** — mirrors the Rust `check_tree_top_anchor`. The
+ * 155 per-group roots ride in the (untrusted, server-supplied) blob;
+ * `info.super_root` is the pinned anchor. If this check is skipped or
+ * weakened, a malicious server can fabricate a self-consistent tree-top
+ * blob + sibling responses and every leaf "verifies" against forged roots.
+ *
+ * Returns true iff all four checks pass:
+ *  1. the blob has exactly `index.k + data.k` trees;
+ *  2. the blob length + SHA256 match the JSON-declared `tree_tops_size` /
+ *     `tree_tops_hash` (integrity — clearer diagnostic on corruption);
+ *  3. every per-tree arity matches the JSON `arity` (build/JSON drift);
+ *  4. **SHA256(concat of the 155 per-group roots) == super_root** — the
+ *     load-bearing cryptographic anchor check.
+ */
+function checkTreeTopAnchor(
+  info: OnionPirMerkleInfoJson,
+  blob: Uint8Array,
+  allTops: OnionTreeTopCache[],
+  logErr: (msg: string) => void,
+): boolean {
+  const expectedTrees = info.index.k + info.data.k;
+  if (allTops.length !== expectedTrees) {
+    logErr(
+      `[PIR-AUDIT] OnionPIR Merkle: tree-top blob has ${allTops.length} ` +
+      `trees, expected ${expectedTrees} (index_k=${info.index.k} + ` +
+      `data_k=${info.data.k}) — REJECTING ALL LEAVES`,
+    );
+    return false;
+  }
+
+  // Integrity: blob size + hash vs the JSON-declared values.
+  if (blob.length !== info.tree_tops_size) {
+    logErr(
+      `[PIR-AUDIT] OnionPIR Merkle: tree-top blob is ${blob.length} B, ` +
+      `JSON declared tree_tops_size=${info.tree_tops_size} — ` +
+      `REJECTING ALL LEAVES`,
+    );
+    return false;
+  }
+  if (!bytesEqual(sha256(blob), hexToBytes(info.tree_tops_hash))) {
+    logErr(
+      '[PIR-AUDIT] OnionPIR Merkle: tree-top blob hash != JSON ' +
+      'tree_tops_hash — REJECTING ALL LEAVES (blob corrupt or server lied)',
+    );
+    return false;
+  }
+
+  // Per-tree arity must match the JSON arity (build/JSON drift guard).
+  for (let t = 0; t < allTops.length; t++) {
+    if (allTops[t].arity !== info.arity) {
+      logErr(
+        `[PIR-AUDIT] OnionPIR Merkle: tree ${t} arity ${allTops[t].arity} ` +
+        `!= JSON arity ${info.arity} — REJECTING ALL LEAVES`,
+      );
+      return false;
+    }
+  }
+
+  // SOUNDNESS-CRITICAL: the 155 per-group roots must hash to super_root.
+  const preimage = new Uint8Array(allTops.length * 32);
+  for (let t = 0; t < allTops.length; t++) {
+    const r = onionTreeTopRoot(allTops[t]);
+    if (!r) {
+      logErr(
+        `[PIR-AUDIT] OnionPIR Merkle: tree-top ${t} has no root level — ` +
+        'REJECTING ALL LEAVES',
+      );
+      return false;
+    }
+    preimage.set(r, t * 32);
+  }
+  if (!bytesEqual(sha256(preimage), hexToBytes(info.super_root))) {
+    logErr(
+      `[PIR-AUDIT] OnionPIR Merkle: SUPER-ROOT MISMATCH — computed from ` +
+      `${allTops.length} per-group roots != pinned anchor — ` +
+      'REJECTING ALL LEAVES (blob corrupt or server lied)',
+    );
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Walk a per-group tree-top from a reconstructed level-1 node up to the
+ * group root. Mirrors the Rust `walk_tree_top_to_root`.
+ *
+ * `startHash` is the hash of the level-1 node the FHE sibling pass
+ * reconstructed; `startIdx` is its index within that level. At each step
+ * the running hash replaces the child at `idx % arity` of its parent (the
+ * rest read from the cached level), the parent is recomputed, and `idx`
+ * advances. Returns the reconstructed root.
+ */
+function walkTreeTopToRoot(
+  startHash: Uint8Array,
+  startIdx: number,
+  top: OnionTreeTopCache,
+  arity: number,
+): Uint8Array {
+  let hash = startHash;
+  let idx = startIdx;
+  // Walk every cached level except the last (which IS the root).
+  for (let ci = 0; ci < top.levels.length - 1; ci++) {
+    const levelNodes = top.levels[ci];
+    const parentStart = Math.floor(idx / arity) * arity;
+    const childPos = idx % arity;
+    const children: Uint8Array[] = [];
+    for (let c = 0; c < arity; c++) {
+      const nodeI = parentStart + c;
+      if (c === childPos) children.push(hash);
+      else if (nodeI < levelNodes.length) children.push(levelNodes[nodeI]);
+      else children.push(ZERO_HASH);
+    }
+    hash = computeParentN(children);
+    idx = Math.floor(idx / arity);
+  }
+  return hash;
+}
+
 // ─── Client config ────────────────────────────────────────────────────────
 
 export interface OnionPirClientConfig {
@@ -496,196 +722,6 @@ export function selectChunkUniqueFetches(
   return { unique, dummiesAdded };
 }
 
-/**
- * Number of CHUNK Merkle items every query contributes to the per-bin
- * Merkle verification, regardless of UTXO count or
- * found/not-found classification. Closure for the
- * `chunk_max_items_per_group_per_level` axis from
- * `proofs/easycrypt/Leakage.ec`. Must match the Rust constant
- * `pir-core::params::CHUNK_MERKLE_ITEMS_PER_QUERY = 16`; the
- * cross-language diff test (`onion_leakage_diff.test.ts`) catches
- * any drift between this TS port and the Rust reference.
- *
- * With `K_CHUNK = 80` the wire-observable
- * `max_items_per_group_per_level = ceil(M / K_CHUNK) = 1`, constant
- * across all query classifications. The same closure also collapses
- * the long-standing FOUND-vs-NOT-FOUND ChunkMerkleSiblings asymmetry
- * (pre-closure not-found emitted 0 chunk-Merkle leaves while found
- * emitted ≥1); after closure every query contributes exactly M.
- */
-export const CHUNK_MERKLE_ITEMS_PER_QUERY = 16;
-
-/**
- * Derive a per-query 32-byte seed for scripthash-derived synthetic
- * CHUNK padding. Mirrors the Rust helper
- * `crate::dpf::derive_chunk_pad_seed`:
- *
- *   seed = SHA-256("BPIR-CHUNK-PAD" || scripthash || query_index_le)
- *
- * The literal `"BPIR-CHUNK-PAD"` domain-separates this from every
- * other SHA-256 site in the protocol. `query_index_le` (little-endian
- * u32) keeps the synthetic IDs distinct across queries that share a
- * scripthash within a batch.
- *
- * Pure: same inputs → same output, no I/O.
- */
-export function deriveChunkPadSeed(scripthash: Uint8Array, queryIndex: number): Uint8Array {
-  const labelStr = 'BPIR-CHUNK-PAD';
-  const label = new Uint8Array(labelStr.length);
-  for (let i = 0; i < labelStr.length; i++) label[i] = labelStr.charCodeAt(i);
-  const idxLe = new Uint8Array(4);
-  idxLe[0] = queryIndex & 0xff;
-  idxLe[1] = (queryIndex >>> 8) & 0xff;
-  idxLe[2] = (queryIndex >>> 16) & 0xff;
-  idxLe[3] = (queryIndex >>> 24) & 0xff;
-  const input = new Uint8Array(label.length + scripthash.length + 4);
-  input.set(label, 0);
-  input.set(scripthash, label.length);
-  input.set(idxLe, label.length + scripthash.length);
-  return sha256(input);
-}
-
-/**
- * Derive up to `m` synthetic chunk IDs from a per-query seed.
- * Mirrors the Rust helper `crate::dpf::derive_synthetic_chunk_ids`.
- *
- * Returns a number[] of length `min(m, num_chunks - real_chunks.length)`
- * whose entries are pairwise distinct, disjoint from `realChunks`, and
- * in `[0, numChunks)`. Output is determined entirely by the four
- * inputs.
- *
- * Algorithm: counter-mode SHA-256. Each invocation
- * `SHA-256(seed || counter_le)` yields 8 candidate u32 values (32B /
- * 4B each); each candidate is taken modulo `numChunks` and accepted
- * iff disjoint from `realChunks` AND from already-collected
- * synthetics. The counter increments until `m` synthetics are
- * collected (or the candidate space is exhausted — pathological
- * inputs only; defensive `counter > 1_000_000` cap).
- *
- * Production parameters (`m = CHUNK_MERKLE_ITEMS_PER_QUERY = 16`,
- * `numChunks` in the millions): expected SHA-256 invocations ≤ 1.
- */
-export function deriveSyntheticChunkIds(
-  seed: Uint8Array,
-  m: number,
-  numChunks: number,
-  realChunks: readonly number[],
-): number[] {
-  if (m === 0 || numChunks === 0) return [];
-
-  const available = Math.max(0, numChunks - realChunks.length);
-  const target = Math.min(m, available);
-  if (target === 0) return [];
-
-  const result: number[] = [];
-  let counter = 0;
-  // counter is a u64 in Rust; in production it never exceeds a tiny
-  // value, so a JS number (safe to ~2^53) is more than enough.
-
-  while (result.length < target) {
-    const counterLe = new Uint8Array(8);
-    let c = counter;
-    for (let i = 0; i < 8; i++) {
-      counterLe[i] = c & 0xff;
-      c = Math.floor(c / 256);
-    }
-    const input = new Uint8Array(seed.length + 8);
-    input.set(seed, 0);
-    input.set(counterLe, seed.length);
-    const h = sha256(input);
-
-    for (let i = 0; i < 8; i++) {
-      // Read 4 bytes little-endian as a u32, then reduce mod numChunks.
-      // Use BigInt-free arithmetic: build the 32-bit value, then JS `%`
-      // is exact for unsigned 32-bit values.
-      const u32 =
-        (h[i * 4] |
-          (h[i * 4 + 1] << 8) |
-          (h[i * 4 + 2] << 16) |
-          (h[i * 4 + 3] << 24)) >>> 0;
-      const candidate = u32 % numChunks;
-
-      let clash = false;
-      for (const r of realChunks) {
-        if (r === candidate) { clash = true; break; }
-      }
-      if (clash) continue;
-
-      let dup = false;
-      for (const s of result) {
-        if (s === candidate) { dup = true; break; }
-      }
-      if (dup) continue;
-
-      result.push(candidate);
-      if (result.length >= target) break;
-    }
-
-    counter += 1;
-    if (counter > 1_000_000) break;
-  }
-
-  return result;
-}
-
-/**
- * Pad a real-chunk list to length `m` by appending scripthash-derived
- * synthetic chunk_ids. Mirrors the Rust helper
- * `crate::dpf::pad_chunk_ids_to_m` (Kani-verified, 4 harnesses):
- *
- *   - `result.length === m` when `m > realChunks.length` (for
- *     production parameters where `numChunks >> m`).
- *   - `result.slice(0, realChunks.length)` deep-equals `realChunks`.
- *   - Synthetic ids are pairwise distinct, disjoint from `realChunks`,
- *     and in `[0, numChunks)`.
- *   - Identity when `m <= realChunks.length` (`m == 0` no-op or
- *     defensive shrink).
- *
- * `seed` is per-query (typically `deriveChunkPadSeed(scripthash,
- * queryIndex)`). Distinct seeds across queries → distinct synthetic
- * chunk sets → PBC planner can pack the batched CHUNK round densely
- * (matching the Rust closure that restores PBC efficiency for
- * not-found-heavy batches).
- *
- * `numChunks` is an upper bound for synthetic IDs (modulo). For
- * OnionPIR pass `totalPacked`.
- */
-export function padChunkIdsToM(
-  realChunks: readonly number[],
-  m: number,
-  seed: Uint8Array,
-  numChunks: number,
-): number[] {
-  if (m <= realChunks.length) {
-    return [...realChunks];
-  }
-  const padded: number[] = [...realChunks];
-
-  const needed = m - realChunks.length;
-  const synthetics = deriveSyntheticChunkIds(seed, needed, numChunks, realChunks);
-  for (const s of synthetics) padded.push(s);
-
-  // Fallback for pathological `numChunks` (smaller than `m - N`):
-  // top up with the legacy `0..`-skipping behaviour so the length
-  // post-condition still holds. Production never hits this branch.
-  if (padded.length < m) {
-    let next = 0;
-    while (padded.length < m) {
-      let conflict = false;
-      for (const r of padded) {
-        if (r === next) { conflict = true; break; }
-      }
-      if (!conflict) {
-        padded.push(next);
-      }
-      if (next === 0xffffffff) break;
-      next++;
-    }
-  }
-
-  return padded;
-}
-
 // ─── Client class ─────────────────────────────────────────────────────────
 
 export class OnionPirWebClient {
@@ -777,9 +813,6 @@ export class OnionPirWebClient {
     if (newDbId === this.dbId) return;
     const oldDbId = this.dbId;
     this.dbId = newDbId;
-    // Invalidate Merkle tree-top caches (each DB has its own tree tops).
-    this.indexTreeTopCache = null;
-    this.dataTreeTopCache = null;
     // Re-sync BFV params from the per-DB info, if available. Keeps the
     // existing values if this DB's params aren't exposed (e.g. if the
     // server is older and doesn't emit per-DB `onionpir` info).
@@ -821,17 +854,29 @@ export class OnionPirWebClient {
   }
 
   /**
-   * Whether this database has OnionPIR per-bin Merkle data available.
+   * Whether this database has per-group OnionPIR Merkle data available.
    * Works for both the main DB (dbId=0) and delta DBs.
+   *
+   * Fail-safe: a missing / non-64-hex `super_root` (the pinned anchor)
+   * makes this return `false` ⇒ no verification, rather than verifying
+   * against a zero anchor. Mirrors the Rust `parse_onionpir_merkle`
+   * "skip on bad super_root" contract.
    */
   hasMerkleForDb(dbId: number): boolean {
     const info = this.getOnionPirMerkleForDb(dbId);
-    return !!(info && (info.index?.root || info.data?.root));
+    return !!(
+      info &&
+      info.arity > 0 &&
+      /^[0-9a-f]{64}$/.test(info.super_root) &&
+      info.index?.k > 0 &&
+      info.data?.k > 0
+    );
   }
 
-  /** Merkle super-root hex for a specific DB — returns the INDEX root. */
+  /** Merkle super-root hex for a specific DB (the pinned trust anchor). */
   getMerkleRootHexForDb(dbId: number): string | undefined {
-    return this.getOnionPirMerkleForDb(dbId)?.index?.root;
+    const info = this.getOnionPirMerkleForDb(dbId);
+    return info && info.super_root ? info.super_root : undefined;
   }
 
   private log(message: string, level: 'info' | 'success' | 'error' = 'info'): void {
@@ -1073,11 +1118,18 @@ export class OnionPirWebClient {
         numEntries: number;
       }
       const indexResults: (IndexResult | null)[] = new Array(N).fill(null);
-      // Per-bin Merkle: store index bin hash + leaf position per address
+      // Per-group OnionPIR Merkle: SHA256 of the first probed INDEX bin
+      // per address. Retained only as the UI's "this result is
+      // Merkle-verifiable" marker (index.html filters on
+      // `indexBinHash !== undefined`); the verifier itself walks
+      // `allBinsChecked`, keyed by (pbcGroup, bin).
       const indexBinHashes: (Uint8Array | null)[] = new Array(N).fill(null);
-      const indexLeafPos: (number | null)[] = new Array(N).fill(null);
-      // Track ALL bins checked per address for "not found" verification
-      const allBinsChecked: Map<number, { hash: Uint8Array; leafPos: number }[]> = new Map();
+      // Every probed INDEX cuckoo bin as a per-group Merkle leaf —
+      // always INDEX_CUCKOO_NUM_HASHES per address (found / not-found /
+      // whale alike, per the INDEX item-count symmetry invariant).
+      // `pbcGroup` selects the per-group INDEX tree; `bin` is the leaf
+      // index within that group's tree.
+      const allBinsChecked: Map<number, { hash: Uint8Array; pbcGroup: number; bin: number }[]> = new Map();
       let totalIndexRounds = 0;
 
       // PBC place all addresses into groups (same logic as DPF-PIR)
@@ -1152,8 +1204,8 @@ export class OnionPirWebClient {
         let decrypted = 0;
         const totalDecrypts = round.length * INDEX_CUCKOO_NUM_HASHES;
         for (const [addrIdx, group] of round) {
-          // Track ALL bins probed for this address.
-          const binsForAddr: { hash: Uint8Array; leafPos: number }[] = [];
+          // Track ALL bins probed for this address as per-group leaves.
+          const binsForAddr: { hash: Uint8Array; pbcGroup: number; bin: number }[] = [];
           let foundMatch = false;
           // Post-port (commit 7): query `paramsInfo()` once per
           // round; we need polyDegree + entrySize to unpack the
@@ -1182,8 +1234,9 @@ export class OnionPirWebClient {
             // slice by the actual unpack length.
             const hashLen = Math.min(entryBytes.length, PACKED_ENTRY_SIZE);
             const binHash = sha256(entryBytes.slice(0, hashLen));
-            const leafPos = group * this.indexBins + bin;
-            binsForAddr.push({ hash: binHash, leafPos });
+            // Per-group OnionPIR Merkle leaf key: `group` selects the
+            // per-group INDEX tree, `bin` is the leaf index within it.
+            binsForAddr.push({ hash: binHash, pbcGroup: group, bin });
 
             // Only capture the first match; later iterations still decrypt
             // and track their bin but don't overwrite the matched-bin record.
@@ -1192,7 +1245,6 @@ export class OnionPirWebClient {
               if (found) {
                 indexResults[addrIdx] = found;
                 indexBinHashes[addrIdx] = binHash;
-                indexLeafPos[addrIdx] = leafPos;
                 foundMatch = true;
               }
             }
@@ -1203,12 +1255,12 @@ export class OnionPirWebClient {
 
           allBinsChecked.set(addrIdx, binsForAddr);
           if (!foundMatch) {
-            // Fall back to the first probed bin for the legacy hashes/leafPos
-            // fields (unused for Merkle now — item builder reads allIndexBinHashes).
+            // Not found: set the `indexBinHash` marker from the first
+            // probed bin so the UI still treats this result as
+            // Merkle-verifiable (the verifier walks `allBinsChecked`).
             const firstBin = binsForAddr[0];
             if (firstBin) {
               indexBinHashes[addrIdx] = firstBin.hash;
-              indexLeafPos[addrIdx] = firstBin.leafPos;
             }
             this.log(`[PIR-AUDIT] Query ${addrIdx}: NOT FOUND (checked ${binsForAddr.length} bins)`);
           } else {
@@ -1225,28 +1277,22 @@ export class OnionPirWebClient {
       // LEVEL 2: Chunk PIR
       // ════════════════════════════════════════════════════════════════
 
-      // Collect per-query owned entry_ids for the
-      // `chunk_max_items_per_group_per_level` axis closure (mirror of
-      // the Rust `OnionClient::query_chunk_level` body — see
-      // commit `f915a65`). Every query (found / not-found / whale)
-      // owns exactly `CHUNK_MERKLE_ITEMS_PER_QUERY = M` entry_ids:
-      //   - Found with N real entries: N reals + (M - N) synthetic.
-      //   - Not-found / whale: M synthetic.
+      // Collect each query's *real* chunk entry_ids. Phase 3 / WS-A
+      // removed the M=16 chunk-Merkle padding (PLAN_MERKLE_CODING.md):
+      // a query now fetches its real chunk count — found-with-N → N
+      // reals, not-found / whale → 0. The newly-admitted leak (per-query
+      // real chunk count is observable) is intended and tracked in the
+      // leakage spec; ~99% of addresses have exactly 1 chunk. This
+      // mirrors the Rust `OnionClient::query_chunk_level` (commit
+      // `79e422b4`, which dropped `pad_chunk_ids_to_m`).
       //
-      // Synthetic entry_ids are derived from a per-query SHA-256 seed
-      // (`scripthash || query_index`), via `padChunkIdsToM` — the same
-      // Kani-verified pattern the Rust `pad_chunk_ids_to_m` helper
-      // uses (commit `08d4725a` switched both Rust and TS away from
-      // the legacy `0..M`-skipping pad to scripthash-derived seeds so
-      // the PBC planner can pack not-found-heavy batches densely).
-      // Reals & synthetics are valid `entry_id`s in `[0, totalPacked)`
-      // for any production OnionPIR DB.
-      //
-      // The closure subsumes the previous CHUNK Round-Presence
-      // Symmetry random-dummy injection (1 dummy per not-found /
-      // whale): M-padding closes both the chunk_max axis AND the
-      // FOUND-vs-NOT-FOUND wire-shape asymmetry where DATA Merkle
-      // traffic was emitted only for found queries.
+      // Round-presence is preserved *separately* from M-padding:
+      //   - CHUNK PIR round-presence — every non-empty batch issues ≥1
+      //     K_CHUNK CHUNK PIR round even when all-not-found (the
+      //     `chunkRounds` empty-round fallback below).
+      //   - CHUNK-Merkle round-presence — the per-group verifier always
+      //     issues ≥1 all-dummy DATA sibling pass (`verifySubTree`).
+      // Together they keep found-vs-not-found hidden without M=16.
       const whaleQueries = new Set<number>();
       const chunkOwnedPerQuery: number[][] = new Array(N);
       const uniqueEntryIds: number[] = [];
@@ -1263,24 +1309,13 @@ export class OnionPirWebClient {
             realChunks.push(ir.entryId + j);
           }
         }
-        // Per-query seed: SHA-256("BPIR-CHUNK-PAD" || scripthash ||
-        // query_index_le). Distinct seeds across queries → distinct
-        // synthetic chunk sets → PBC planner can pack the batched
-        // CHUNK round densely (matching the Rust fix).
-        const padSeed = deriveChunkPadSeed(scriptHashes[i], i);
-        const owned = padChunkIdsToM(
-          realChunks,
-          CHUNK_MERKLE_ITEMS_PER_QUERY,
-          padSeed,
-          this.totalPacked,
-        );
-        for (const eid of owned) {
+        for (const eid of realChunks) {
           if (eid < this.totalPacked && !seen.has(eid)) {
             seen.add(eid);
             uniqueEntryIds.push(eid);
           }
         }
-        chunkOwnedPerQuery[i] = owned;
+        chunkOwnedPerQuery[i] = realChunks;
       }
 
       if (whaleQueries.size > 0) {
@@ -1288,23 +1323,24 @@ export class OnionPirWebClient {
       }
 
       this.log(
-        `[PIR-AUDIT] CHUNK chunk_max closure: ${N} queries × M=${CHUNK_MERKLE_ITEMS_PER_QUERY} owned each = ${uniqueEntryIds.length} unique fetched`,
+        `[PIR-AUDIT] CHUNK: ${N} queries, ${uniqueEntryIds.length} unique real chunk entry_ids`,
       );
 
-      if (uniqueEntryIds.length === 0) {
-        // Only reachable on empty-batch calls (no scripthashes queried),
-        // which is a no-op. Real batches always emit ≥1 entry per query
-        // due to the padding above.
-        this.log('Empty batch — skipping chunk phase');
-      }
-
       const decryptedEntries = new Map<number, Uint8Array>();
-      // Per-bin Merkle: store data bin hash + leaf position per entry_id
-      const dataBinHashes = new Map<number, Uint8Array>();
-      const dataLeafPositions = new Map<number, number>();
+      // entry_id → per-group OnionPIR Merkle DATA leaf. `pbcGroup`
+      // selects the per-group DATA tree; `bin` is the leaf index within
+      // it. Mirrors the Rust `data_merkle: HashMap<u32,(Hash256,usize,u32)>`.
+      const dataMerkle = new Map<number, { hash: Uint8Array; pbcGroup: number; bin: number }>();
       let chunkRoundsCount = 0;
 
-      if (uniqueEntryIds.length > 0) {
+      // 🔒 CHUNK Round-Presence Symmetry (CLAUDE.md / PLAN_MERKLE_CODING.md
+      // cross-cutting invariant C.1). A genuinely empty batch (no
+      // scripthashes, N === 0) has nothing to hide → no CHUNK round. But
+      // a batch whose scripthashes are *all* not-found / whale
+      // (`uniqueEntryIds` empty) MUST still issue exactly one all-dummy
+      // K_CHUNK CHUNK PIR round — skipping it would leak found-vs-not-found
+      // via CHUNK round absence. Mirrors the Rust `query_chunk_level`.
+      if (N > 0) {
         // Create chunk client from same secret key (no extra registration needed).
         // Post-port (commit 7): no `numEntries` arg; null check on stale-key.
         progress('Level 2', 'Setting up chunk phase...');
@@ -1317,17 +1353,26 @@ export class OnionPirWebClient {
           );
         }
 
-        // Build reverse index once: group → entry_ids (single pass over 815K entries)
-        // This is 80× faster than scanning per-group.
-        const reverseIndex = await ensureChunkReverseIndex(
-          this.totalPacked,
-          (msg) => progress('Level 2', msg),
-        );
-
-        const entryPbcGroups = uniqueEntryIds.map(eid => deriveChunkGroups(eid));
-        const chunkRounds = planPbcRounds(entryPbcGroups, this.chunkK);
+        // Plan PBC rounds over the real chunk entry_ids. An all-not-found
+        // batch has `uniqueEntryIds` empty → substitute a single empty
+        // round so exactly one all-dummy K_CHUNK CHUNK PIR round still
+        // goes out (round-presence, above). The round body handles an
+        // empty `round` natively — every group falls through to a random
+        // dummy and no real cuckoo lookup runs.
+        const chunkRounds: [number, number][][] = uniqueEntryIds.length === 0
+          ? [[]]
+          : planPbcRounds(uniqueEntryIds.map(eid => deriveChunkGroups(eid)), this.chunkK);
         chunkRoundsCount = chunkRounds.length;
         this.log(`Level 2: ${uniqueEntryIds.length} entries → ${chunkRounds.length} round(s)`);
+
+        // The reverse index only locates *real* entries; an all-not-found
+        // batch never indexes it, so skip the (total-entries-scale) build.
+        const reverseIndex = uniqueEntryIds.length === 0
+          ? null
+          : await ensureChunkReverseIndex(
+              this.totalPacked,
+              (msg) => progress('Level 2', msg),
+            );
 
         const cuckooCache = new Map<number, Uint32Array>();
 
@@ -1342,7 +1387,9 @@ export class OnionPirWebClient {
           for (const [ei, group] of round) {
             const eid = uniqueEntryIds[ei];
             if (!cuckooCache.has(group)) {
-              cuckooCache.set(group, buildChunkCuckooForGroup(this.wasmModule!, group, reverseIndex, this.chunkBins));
+              // A non-empty `round` implies `uniqueEntryIds.length > 0`,
+              // so `reverseIndex` was built (non-null) above.
+              cuckooCache.set(group, buildChunkCuckooForGroup(this.wasmModule!, group, reverseIndex!, this.chunkBins));
               tablesBuilt++;
               progress('Level 2', `Chunk round ${ri + 1}/${chunkRounds.length}: built ${tablesBuilt} cuckoo tables...`);
               await yieldToMain();
@@ -1412,9 +1459,14 @@ export class OnionPirWebClient {
             }
             const hashLen = Math.min(entryBytes.length, PACKED_ENTRY_SIZE);
             decryptedEntries.set(qi.entryId, entryBytes.slice(0, hashLen));
-            // Per-bin Merkle: hash the full decrypted data bin
-            dataBinHashes.set(qi.entryId, sha256(entryBytes.slice(0, hashLen)));
-            dataLeafPositions.set(qi.entryId, qi.group * this.chunkBins + qi.bin);
+            // Per-group OnionPIR Merkle DATA leaf — `qi.group` selects
+            // the per-group DATA tree, `qi.bin` is the leaf index. The
+            // leaf hash is OnionPIR's no-prefix SHA256(decrypted_bin).
+            dataMerkle.set(qi.entryId, {
+              hash: sha256(entryBytes.slice(0, hashLen)),
+              pbcGroup: qi.group,
+              bin: qi.bin,
+            });
             chunkDecrypted++;
             progress('Level 2', `Chunk round ${ri + 1}/${chunkRounds.length}: decrypted ${chunkDecrypted}/${queryInfos.length}...`);
             await yieldToMain();
@@ -1431,39 +1483,36 @@ export class OnionPirWebClient {
 
       const results: (QueryResult | null)[] = new Array(N).fill(null);
 
-      // Helper: assemble the M data leaves owned by query qi from the
-      // per-query owned entry_id list. Closure invariant: every query
-      // (found / not-found / whale) owns exactly
-      // `CHUNK_MERKLE_ITEMS_PER_QUERY` data leaves so the wire shape
-      // is constant. Synthetic entry_ids contribute valid Merkle
-      // proofs (the server commits to them in the published DATA
-      // Merkle root); the closure simply ensures every query attaches
-      // them as DATA leaves the verifier owns.
-      const collectOwnedDataLeaves = (qi: number): {
-        hashes: Uint8Array[];
-        positions: number[];
-      } => {
-        const owned = chunkOwnedPerQuery[qi];
-        const hashes: Uint8Array[] = [];
-        const positions: number[] = [];
-        for (const eid of owned) {
-          const h = dataBinHashes.get(eid);
-          const lp = dataLeafPositions.get(eid);
-          if (h && lp !== undefined) {
-            hashes.push(h);
-            positions.push(lp);
-          }
+      // OnionPIR Merkle info for this DB — `super_root` (the pinned
+      // anchor) is surfaced on each result for display.
+      const merkleInfo = this.getOnionPirMerkleForDb(this.dbId);
+
+      // Helper: collect the per-group DATA Merkle leaves owned by query
+      // `qi` — one per real chunk entry_id (so 0 for not-found / whale).
+      // Phase 3 / WS-A removed the M=16 pad, so the leaf count now varies
+      // with UTXO count (an admitted, documented leak); CHUNK-Merkle
+      // round-presence is kept by `verifySubTree`'s ≥1 all-dummy DATA
+      // sibling pass, not by padding.
+      const collectOwnedDataLeaves = (
+        qi: number,
+      ): { hash: Uint8Array; pbcGroup: number; bin: number }[] => {
+        const leaves: { hash: Uint8Array; pbcGroup: number; bin: number }[] = [];
+        for (const eid of chunkOwnedPerQuery[qi]) {
+          const leaf = dataMerkle.get(eid);
+          if (leaf) leaves.push(leaf);
         }
-        return { hashes, positions };
+        return leaves;
       };
 
       for (let qi = 0; qi < N; qi++) {
         const ownedLeaves = collectOwnedDataLeaves(qi);
 
         if (whaleQueries.has(qi)) {
-          // Whale: matched INDEX entry but `numEntries == 0`. Post
-          // chunk_max closure, whales also own M synthetic data
-          // leaves — the verifier walks them just like found queries.
+          // Whale: matched INDEX entry but `numEntries == 0` → 0 DATA
+          // leaves. The whale's INDEX entry is committed to the per-group
+          // INDEX Merkle root, so its probed INDEX bins still verify
+          // (whale-exclusion is a verifiable property). DATA round-
+          // presence is handled by `verifySubTree`'s all-dummy pass.
           results[qi] = {
             entries: [],
             totalSats: 0n,
@@ -1471,13 +1520,10 @@ export class OnionPirWebClient {
             numChunks: 0,
             numRounds: chunkRoundsCount,
             isWhale: true,
-            merkleIndexRoot: this.getOnionPirMerkleForDb(this.dbId)?.index?.root,
-            merkleDataRoot: this.getOnionPirMerkleForDb(this.dbId)?.data?.root,
+            merkleSuperRoot: merkleInfo?.super_root,
             indexBinHash: indexBinHashes[qi] ?? undefined,
-            indexLeafPos: indexLeafPos[qi] ?? undefined,
-            allIndexBinHashes: allBinsChecked.get(qi),
-            dataBinHashes: ownedLeaves.hashes,
-            dataLeafPositions: ownedLeaves.positions,
+            indexBinLeaves: allBinsChecked.get(qi),
+            dataBinLeaves: ownedLeaves,
             scriptHash: scriptHashes[qi],
             rawChunkData: new Uint8Array(0),
           };
@@ -1486,20 +1532,14 @@ export class OnionPirWebClient {
 
         const ir = indexResults[qi];
         if (!ir) {
-          // Not-found in INDEX — every probed cuckoo bin is committed
-          // for the absence proof; chunk_max closure attaches the M
-          // owned synthetic data leaves so found-vs-not-found is
-          // wire-shape-identical at the Merkle level.
+          // Not-found in INDEX — every probed cuckoo bin is committed for
+          // the absence proof. Post-M=16-removal a not-found query owns
+          // 0 DATA leaves; found-vs-not-found stays hidden because
+          // `verifySubTree` always issues ≥1 all-dummy DATA sibling pass
+          // (CHUNK-Merkle round-presence).
           const binHash = indexBinHashes[qi];
-          const leafPos = indexLeafPos[qi];
           const allBins = allBinsChecked.get(qi);
-          // `indexLeafPos: (number | null)[]` (line 854): unfilled slots
-          // are `null`, not `undefined`. The earlier `leafPos !== undefined`
-          // check was a no-op against a `number | null` value — the
-          // post-closure compiler now catches that the assignment to
-          // `indexLeafPos: number | undefined` (QueryResult field) drops
-          // the null option implicitly. Narrow against `null` instead.
-          if (binHash && leafPos !== null) {
+          if (binHash) {
             results[qi] = {
               entries: [],
               totalSats: 0n,
@@ -1507,13 +1547,10 @@ export class OnionPirWebClient {
               numChunks: 0,
               numRounds: chunkRoundsCount,
               isWhale: false,
-              merkleIndexRoot: this.getOnionPirMerkleForDb(this.dbId)?.index?.root,
-              merkleDataRoot: this.getOnionPirMerkleForDb(this.dbId)?.data?.root,
+              merkleSuperRoot: merkleInfo?.super_root,
               indexBinHash: binHash,
-              indexLeafPos: leafPos,
-              allIndexBinHashes: allBins,
-              dataBinHashes: ownedLeaves.hashes,
-              dataLeafPositions: ownedLeaves.positions,
+              indexBinLeaves: allBins,
+              dataBinLeaves: ownedLeaves,
               scriptHash: scriptHashes[qi],
               rawChunkData: new Uint8Array(0),
             };
@@ -1521,10 +1558,7 @@ export class OnionPirWebClient {
           continue;
         }
 
-        // Found path — assemble UTXO data from REAL entries only.
-        // Synthetic-slot payloads belong to other scripthashes and
-        // are not surfaced in `entries` / `rawChunkData`; they only
-        // contribute to Merkle leaf coverage.
+        // Found path — assemble UTXO data from this query's real entries.
         const parts: Uint8Array[] = [];
         for (let j = 0; j < ir.numEntries; j++) {
           const eid = ir.entryId + j;
@@ -1549,20 +1583,14 @@ export class OnionPirWebClient {
           numChunks: ir.numEntries,
           numRounds: chunkRoundsCount,
           isWhale: false,
-          merkleIndexRoot: this.getOnionPirMerkleForDb(this.dbId)?.index?.root,
-          merkleDataRoot: this.getOnionPirMerkleForDb(this.dbId)?.data?.root,
+          merkleSuperRoot: merkleInfo?.super_root,
           indexBinHash: indexBinHashes[qi] ?? undefined,
-          indexLeafPos: indexLeafPos[qi] ?? undefined,
           // ALL probed cuckoo positions (always INDEX_CUCKOO_NUM_HASHES bins —
-          // see CLAUDE.md "Merkle INDEX Item-Count Symmetry"). Used by the
-          // Merkle item builder to emit one INDEX leaf per probed bin.
-          allIndexBinHashes: allBinsChecked.get(qi),
-          // Post-closure: M data leaves per query (real + synthetic).
-          // Synthetic-slot leaves are valid Merkle commitments; the
-          // verifier requires ALL M leaves to verify for the query
-          // to pass.
-          dataBinHashes: ownedLeaves.hashes,
-          dataLeafPositions: ownedLeaves.positions,
+          // see CLAUDE.md "Merkle INDEX Item-Count Symmetry"); one per-group
+          // INDEX Merkle leaf each.
+          indexBinLeaves: allBinsChecked.get(qi),
+          // One per-group DATA Merkle leaf per real chunk entry_id.
+          dataBinLeaves: ownedLeaves,
           scriptHash: scriptHashes[qi],
           // Preserve raw bytes so delta-DB queries can be re-decoded via
           // decodeDeltaData in the sync-merge flow. For main DB this is just
@@ -1597,10 +1625,22 @@ export class OnionPirWebClient {
   }
 
   /**
-   * Batch-verify per-bin Merkle proofs for multiple OnionPIR query results.
+   * Batch-verify per-group OnionPIR Merkle proofs for multiple query
+   * results. SOUNDNESS-CRITICAL — the standalone-TS mirror of the Rust
+   * `onion_merkle::verify_onion_merkle_batch` (Phase 3d).
    *
-   * Two separate trees: INDEX-MERKLE (per INDEX bin) and DATA-MERKLE (per DATA bin).
-   * The client already has bin hashes from queryBatch() — just walk each tree.
+   * Two per-group forests: 75 INDEX trees + 80 DATA trees, anchored by
+   * one pinned `super_root`. Each leaf carried on a `QueryResult`
+   * (`indexBinLeaves` / `dataBinLeaves`) is keyed by `(pbcGroup, bin)`.
+   * The verifier fetches + anchor-checks the 155-tree tree-top blob,
+   * runs one FHE sibling pass per kind, and walks each per-group
+   * tree-top to its group root.
+   *
+   * **Both** sub-trees are always verified, even when one has no leaves
+   * — `verifySubTree` issues one all-dummy K-padded sibling pass for an
+   * empty sub-tree so a not-found / whale batch (0 DATA leaves) is
+   * wire-indistinguishable from a found batch (CHUNK-Merkle
+   * round-presence).
    *
    * Call after queryBatch() — requires FHE keys to still be registered.
    */
@@ -1620,69 +1660,74 @@ export class OnionPirWebClient {
     const progress = onProgress || (() => {});
     const out: boolean[] = new Array(results.length).fill(false);
 
-    // Collect all unique leaf verifications: { hash, leafPos } for each tree
-    interface LeafItem { hash: Uint8Array; leafPos: number; resultIdx: number; tree: 'index' | 'data' }
-    const allLeaves: LeafItem[] = [];
-
+    // One per-group Merkle leaf per probed bin. `tree` selects the
+    // INDEX vs DATA per-group forest; `pbcGroup` selects the tree.
+    interface LeafItem {
+      tree: 'index' | 'data';
+      pbcGroup: number;
+      bin: number;
+      hash: Uint8Array;
+      resultIdx: number;
+    }
+    const leaves: LeafItem[] = [];
     for (let i = 0; i < results.length; i++) {
       const r = results[i];
-
-      // Always push one INDEX leaf per probed cuckoo bin (uniform count across
-      // found / not-found / whale — closes the side channel where pass count
-      // leaks presence). Whales verify on INDEX only (their bin with
-      // numEntries=0 is committed to the INDEX Merkle root).
-      // See CLAUDE.md "Merkle INDEX item-count symmetry".
-      if (r.allIndexBinHashes && r.allIndexBinHashes.length > 0) {
-        for (const bin of r.allIndexBinHashes) {
-          allLeaves.push({ hash: bin.hash, leafPos: bin.leafPos, resultIdx: i, tree: 'index' });
+      // INDEX leaves — always INDEX_CUCKOO_NUM_HASHES per query (found /
+      // not-found / whale alike: the INDEX item-count symmetry invariant).
+      if (r.indexBinLeaves) {
+        for (const lf of r.indexBinLeaves) {
+          leaves.push({ tree: 'index', pbcGroup: lf.pbcGroup, bin: lf.bin, hash: lf.hash, resultIdx: i });
         }
       }
-
-      // Data bins (only for "found" results — CHUNK-round-presence asymmetry
-      // is the documented trade-off, out of scope for this fix).
-      if (r.dataBinHashes && r.dataLeafPositions) {
-        for (let j = 0; j < r.dataBinHashes.length; j++) {
-          allLeaves.push({ hash: r.dataBinHashes[j], leafPos: r.dataLeafPositions[j], resultIdx: i, tree: 'data' });
+      // DATA leaves — one per real chunk entry_id (0 for not-found /
+      // whale). The variable count is the admitted UTXO-count leak;
+      // found-vs-not-found stays hidden via DATA round-presence below.
+      if (r.dataBinLeaves) {
+        for (const lf of r.dataBinLeaves) {
+          leaves.push({ tree: 'data', pbcGroup: lf.pbcGroup, bin: lf.bin, hash: lf.hash, resultIdx: i });
         }
       }
     }
 
-    if (allLeaves.length === 0) return out;
+    // Genuinely empty input — nothing to verify, no Merkle traffic.
+    // Mirrors the Rust `run_merkle_verification` empty-leaves guard.
+    if (leaves.length === 0) return out;
 
-    // Verify each tree separately
-    const indexLeaves = allLeaves.filter(l => l.tree === 'index');
-    const dataLeaves = allLeaves.filter(l => l.tree === 'data');
+    // Verify BOTH sub-trees — ALWAYS, even when one has no leaves. An
+    // all-not-found / whale batch contributes 0 DATA leaves, but
+    // `verifySubTree` still issues one all-dummy K_CHUNK sibling pass,
+    // so found-vs-not-found cannot be inferred from CHUNK-Merkle traffic
+    // (CLAUDE.md "CHUNK Round-Presence Symmetry"). Mirrors the Rust
+    // `verify_onion_merkle_batch`, which always verifies both sub-trees.
+    const indexLeaves = leaves.filter(l => l.tree === 'index');
+    const dataLeaves = leaves.filter(l => l.tree === 'data');
 
-    const indexOk = indexLeaves.length > 0
-      ? await this.verifySubTree('index', merkle.index, merkle.arity, indexLeaves, progress)
-      : new Map<number, boolean>();
-    const dataOk = dataLeaves.length > 0
-      ? await this.verifySubTree('data', merkle.data, merkle.arity, dataLeaves, progress)
-      : new Map<number, boolean>();
+    const indexVerdicts = await this.verifySubTree('index', merkle, indexLeaves, progress);
+    const dataVerdicts = await this.verifySubTree('data', merkle, dataLeaves, progress);
 
-    // Map results: an address passes if ALL its index + data leaves verified
-    const perResult = new Map<number, boolean>();
-    for (const leaf of indexLeaves) {
-      const ok = indexOk.get(leaf.leafPos) ?? false;
-      if (!ok) perResult.set(leaf.resultIdx, false);
-      else if (!perResult.has(leaf.resultIdx)) perResult.set(leaf.resultIdx, true);
-    }
-    for (const leaf of dataLeaves) {
-      const ok = dataOk.get(leaf.leafPos) ?? false;
-      if (!ok) perResult.set(leaf.resultIdx, false);
-      // don't override a false with true
+    // Aggregate: a result passes iff ALL of its leaves verified. A
+    // failure on any leaf can never be overridden back to `true`.
+    const perResultOk = new Map<number, boolean>();
+    for (const lf of leaves) {
+      const verdicts = lf.tree === 'index' ? indexVerdicts : dataVerdicts;
+      const ok = verdicts.get(`${lf.pbcGroup}:${lf.bin}`) ?? false;
+      if (!ok) {
+        perResultOk.set(lf.resultIdx, false);
+      } else if (!perResultOk.has(lf.resultIdx)) {
+        perResultOk.set(lf.resultIdx, true);
+      }
     }
 
     let verified = 0;
-    for (const [ri, ok] of perResult) {
+    for (const [ri, ok] of perResultOk) {
       out[ri] = ok;
       results[ri].merkleVerified = ok;
       if (ok) verified++;
     }
 
-    const total = perResult.size;
+    const total = perResultOk.size;
     if (verified === total && total > 0) {
-      this.log(`Merkle VERIFIED: all ${total} results valid (index+data trees)`, 'success');
+      this.log(`Merkle VERIFIED: all ${total} results valid (per-group index+data trees)`, 'success');
     } else if (total > 0) {
       this.log(`Merkle: ${verified}/${total} verified, ${total - verified} failed`, verified > 0 ? 'info' : 'error');
     }
@@ -1691,272 +1736,283 @@ export class OnionPirWebClient {
   }
 
   /**
-   * Verify a set of leaves against one sub-tree (INDEX or DATA).
-   * Returns map: leafPos → verified boolean.
+   * Verify a set of per-group OnionPIR Merkle leaves against one
+   * sub-tree (INDEX or DATA). Mirrors the Rust
+   * `onion_merkle::verify_sub_tree`.
+   *
+   * Per-group walk: fetch + anchor-check the consolidated 155-tree
+   * tree-top blob, then for each "pass" issue one K-padded FHE sibling
+   * round (one query per PBC group — real row for a group with a leaf,
+   * random-row dummy for the rest), fold the decrypted sibling row into
+   * the leaf's running hash, and walk the cached per-group tree-top to
+   * the group root.
+   *
+   * `max(1, maxItemsPerGroup)` passes run: ≥1 even for an empty
+   * sub-tree (CHUNK-Merkle round-presence) and one extra per
+   * within-group collision (e.g. the two INDEX cuckoo positions of a
+   * not-found query landing in the same group).
+   *
+   * Returns map: `"<pbcGroup>:<bin>"` → verified boolean.
+   *
+   * On a protocol / parse error this throws (the verdict is "could not
+   * verify"); on a super-root mismatch every probed leaf is recorded
+   * `false` and the sibling rounds are skipped (they would prove
+   * nothing against forged roots).
    */
   private async verifySubTree(
     treeName: 'index' | 'data',
-    treeInfo: import('./server-info.js').OnionPirMerkleSubTreeInfo,
-    arity: number,
-    leaves: { hash: Uint8Array; leafPos: number }[],
+    info: OnionPirMerkleInfoJson,
+    leaves: { pbcGroup: number; bin: number; hash: Uint8Array }[],
     progress: (step: string, detail: string) => void,
-  ): Promise<Map<number, boolean>> {
-    const result = new Map<number, boolean>();
-    if (!treeInfo.root) return result;
+  ): Promise<Map<string, boolean>> {
+    const out = new Map<string, boolean>();
+    const arity = info.arity;
+    const kind = treeName === 'index' ? info.index : info.data;
+    const k = kind.k;
+    const numPt = kind.num_pt;
 
-    // Fetch tree-top cache
-    progress('Merkle', `Fetching ${treeName} tree-top cache...`);
-    const treeTopData = await this.fetchTreeTopCache(treeName);
-    const expectedRoot = hexToBytes(treeInfo.root);
+    const treeTopReq = treeName === 'index'
+      ? REQ_ONIONPIR_MERKLE_INDEX_TREE_TOP : REQ_ONIONPIR_MERKLE_DATA_TREE_TOP;
+    const treeTopResp = treeName === 'index'
+      ? RESP_ONIONPIR_MERKLE_INDEX_TREE_TOP : RESP_ONIONPIR_MERKLE_DATA_TREE_TOP;
+    const sibReq = treeName === 'index'
+      ? REQ_ONIONPIR_MERKLE_INDEX_SIBLING : REQ_ONIONPIR_MERKLE_DATA_SIBLING;
+    const sibResp = treeName === 'index'
+      ? RESP_ONIONPIR_MERKLE_INDEX_SIBLING : RESP_ONIONPIR_MERKLE_DATA_SIBLING;
 
-    const treeTopHash = sha256(treeTopData.rawBytes);
-    const expectedTopHash = hexToBytes(treeInfo.tree_top_hash);
-    if (!treeTopHash.every((b, i) => b === expectedTopHash[i])) {
-      this.log(`${treeName} tree-top cache integrity FAILED`, 'error');
-      return result;
-    }
-
-    // Deduplicate by leafPos
-    const uniqueLeaves = new Map<number, Uint8Array>();
-    for (const leaf of leaves) {
-      uniqueLeaves.set(leaf.leafPos, leaf.hash);
-    }
-
-    // Initialize per-leaf state
-    const leafPosArr = [...uniqueLeaves.keys()];
-    const N = leafPosArr.length;
-    const currentHash: Uint8Array[] = leafPosArr.map(lp => uniqueLeaves.get(lp)!);
-    const nodeIdx: number[] = [...leafPosArr];
-    const failed: boolean[] = new Array(N).fill(false);
-
-    // Sibling seed offset: index=0x100, data=0x200
-    const seedBase = treeName === 'index' ? 0xBA7C51B1FEED0100n : 0xBA7C51B1FEED0200n;
-
-    // Sibling PIR rounds
-    for (let level = 0; level < treeInfo.sibling_levels; level++) {
-      const levelInfo = treeInfo.levels[level];
-      const levelSeed = seedBase + BigInt(level);
-      const reqCode = treeName === 'index' ? REQ_ONIONPIR_MERKLE_INDEX_SIBLING : REQ_ONIONPIR_MERKLE_DATA_SIBLING;
-      const respCode = treeName === 'index' ? RESP_ONIONPIR_MERKLE_INDEX_SIBLING : RESP_ONIONPIR_MERKLE_DATA_SIBLING;
-
-      // Compute groupId per leaf, deduplicate
-      const groupToItems = new Map<number, number[]>();
-      for (let i = 0; i < N; i++) {
-        if (failed[i]) continue;
-        const gid = Math.floor(nodeIdx[i] / arity);
-        const arr = groupToItems.get(gid);
-        if (arr) arr.push(i);
-        else groupToItems.set(gid, [i]);
-      }
-      const uniqueGroupIds = [...groupToItems.keys()];
-      if (uniqueGroupIds.length === 0) break;
-
-      progress('Merkle', `${treeName} L${level + 1}/${treeInfo.sibling_levels}: ${uniqueGroupIds.length} groups...`);
-
-      // PBC-place unique groupIds
-      const candidateGroups = uniqueGroupIds.map(gid => deriveIntGroups3(gid, levelInfo.k));
-      const pbcRounds = planRounds(candidateGroups, levelInfo.k, 3);
-      const siblingData = new Map<number, Uint8Array>();
-
-      for (let ri = 0; ri < pbcRounds.length; ri++) {
-        const round = pbcRounds[ri];
-
-        const groupInfo = new Map<number, { gid: number; targetBin: number }>();
-        for (const [ugi, pbcGroup] of round) {
-          const gid = uniqueGroupIds[ugi];
-
-          const groupEntries: number[] = [];
-          for (let g = 0; g < levelInfo.num_groups; g++) {
-            const bs = deriveIntGroups3(g, levelInfo.k);
-            if (bs[0] === pbcGroup || bs[1] === pbcGroup || bs[2] === pbcGroup) {
-              groupEntries.push(g);
-            }
-          }
-
-          const sibKeys: bigint[] = [];
-          for (let h = 0; h < ONIONPIR_MERKLE_SIBLING_CUCKOO_NUM_HASHES; h++) {
-            sibKeys.push(deriveCuckooKeyGeneric(levelSeed, pbcGroup, h));
-          }
-          // 2402b16 buildCuckooBs1 ABI: Uint32Array of (lo32,hi32) key pairs.
-          const cuckooTable = this.wasmModule!.buildCuckooBs1(
-            new Uint32Array(groupEntries),
-            packCuckooKeysU32(sibKeys),
-            levelInfo.bins_per_table,
-          );
-
-          let targetBin: number | null = null;
-          for (let h = 0; h < ONIONPIR_MERKLE_SIBLING_CUCKOO_NUM_HASHES; h++) {
-            const bin = cuckooHashInt(gid, sibKeys[h], levelInfo.bins_per_table);
-            if (cuckooTable[bin] === gid) { targetBin = bin; break; }
-          }
-          if (targetBin === null) {
-            for (const ai of groupToItems.get(gid)!) failed[ai] = true;
-          } else {
-            groupInfo.set(pbcGroup, { gid, targetBin });
-          }
-          await yieldToMain();
-        }
-
-        // Generate K FHE queries. The sibling client is sized to this
-        // Merkle level's database (`bins_per_table`) — every OnionPIR client
-        // must match the database it queries; see the keygen block above.
-        const sibClient = this.wasmModule!.createClientFromSecretKey(
-          levelInfo.bins_per_table, this.fheClientId, this.fheSecretKey!,
-        );
-        if (!sibClient) {
-          throw new Error(
-            `OnionPIR sib createClientFromSecretKey returned null ` +
-            `(clientId=${this.fheClientId}, sk.len=${this.fheSecretKey!.length})`
-          );
-        }
-        try {
-          const queries: Uint8Array[] = [];
-          for (let b = 0; b < levelInfo.k; b++) {
-            const info = groupInfo.get(b);
-            const bin = info ? info.targetBin : Number(this.rng.nextU64() % BigInt(levelInfo.bins_per_table));
-            queries.push(sibClient.generateQuery(bin));
-            if (b % 5 === 4) await yieldToMain();
-          }
-
-          const batchMsg = encodeBatchQuery(reqCode, level * 100 + ri, queries, this.dbId);
-          const respRaw = await this.sendRaw(batchMsg);
-          // OnionPIR sibling round: K (or K_CHUNK) FHE queries, one per
-          // PBC group. The Rust `verify_sub_tree` records `items[g] = 1`
-          // and tags `index` trees as `IndexMerkleSiblings { level }`,
-          // `data` trees as `ChunkMerkleSiblings { level }`.
-          this.recordRound({
-            kind: treeName === 'index' ? 'index_merkle_siblings' : 'chunk_merkle_siblings',
-            level,
-            server_id: 0,
-            db_id: this.dbId,
-            request_bytes: batchMsg.length,
-            response_bytes: respRaw.length,
-            items: new Array(levelInfo.k).fill(1),
-          });
-          const respPayload = respRaw.slice(4);
-          if (respPayload[0] !== respCode) {
-            throw new Error(`Unexpected ${treeName} sibling response: 0x${respPayload[0].toString(16)}`);
-          }
-          const { results: sibResults } = decodeBatchResult(respPayload, 1);
-
-          // Post-port (commit 7): unpack raw plaintext to bytes.
-          const sibWasmParams = this.wasmModule!.paramsInfo(levelInfo.bins_per_table);
-          for (const [pbcGroup, info] of groupInfo) {
-            const rawPt = sibClient.decryptResponse(sibResults[pbcGroup]);
-            const decrypted = unpackOnionPlaintext(
-              rawPt, sibWasmParams.polyDegree, sibWasmParams.entrySize,
-            );
-            if (!decrypted) {
-              throw new Error(
-                `onion_unpack rejected sibling plaintext ` +
-                `(raw.len=${rawPt.length} N=${sibWasmParams.polyDegree} ` +
-                `es=${sibWasmParams.entrySize})`
-              );
-            }
-            siblingData.set(info.gid, decrypted);
-          }
-        } finally {
-          sibClient.delete();
-        }
-      }
-
-      // Update each leaf's state
-      for (const [gid, itemIndices] of groupToItems) {
-        const decrypted = siblingData.get(gid);
-        if (!decrypted) continue;
-
-        for (const ai of itemIndices) {
-          if (failed[ai]) continue;
-          const childPos = nodeIdx[ai] % arity;
-          const children: Uint8Array[] = [];
-          for (let c = 0; c < arity; c++) {
-            if (c === childPos) {
-              children.push(currentHash[ai]);
-            } else {
-              const off = c * 32;
-              children.push(off + 32 <= decrypted.length ? decrypted.slice(off, off + 32) : ZERO_HASH);
-            }
-          }
-          currentHash[ai] = computeParentN(children);
-          nodeIdx[ai] = gid;
-        }
-      }
-    }
-
-    // Walk tree-top cache to root
-    const cache = treeTopData.parsed;
-    for (let i = 0; i < N; i++) {
-      if (failed[i]) continue;
-      let hash = currentHash[i];
-      let idx = nodeIdx[i];
-      for (let ci = 0; ci < cache.levels.length - 1; ci++) {
-        const levelNodes = cache.levels[ci];
-        const parentStart = Math.floor(idx / cache.arity) * cache.arity;
-        const childHashes: Uint8Array[] = [];
-        for (let c = 0; c < cache.arity; c++) {
-          const childIdx = parentStart + c;
-          childHashes.push(childIdx < levelNodes.length ? levelNodes[childIdx] : ZERO_HASH);
-        }
-        hash = computeParentN(childHashes);
-        idx = Math.floor(idx / cache.arity);
-      }
-      const ok = hash.length === expectedRoot.length && hash.every((b, j) => b === expectedRoot[j]);
-      result.set(leafPosArr[i], ok);
-    }
-
-    const verified = [...result.values()].filter(Boolean).length;
-    this.log(`${treeName}-merkle: ${verified}/${N} leaves verified`);
-    return result;
-  }
-
-  // ─── Tree-top cache fetch (per sub-tree) ───────────────────────────
-
-  // Tree-top caches are per-DB: each DB has its own INDEX and DATA sub-tree
-  // tops. Invalidated on setDbId() and wrapped to include the dbId in the
-  // cache key so a stale switch never returns the wrong tops.
-  private indexTreeTopCache: { rawBytes: Uint8Array; parsed: TreeTopCache; dbId: number } | null = null;
-  private dataTreeTopCache: { rawBytes: Uint8Array; parsed: TreeTopCache; dbId: number } | null = null;
-
-  private async fetchTreeTopCache(treeName: 'index' | 'data'): Promise<{ rawBytes: Uint8Array; parsed: TreeTopCache }> {
-    const cached = treeName === 'index' ? this.indexTreeTopCache : this.dataTreeTopCache;
-    if (cached && cached.dbId === this.dbId) return cached;
-
-    const reqCode = treeName === 'index' ? REQ_ONIONPIR_MERKLE_INDEX_TREE_TOP : REQ_ONIONPIR_MERKLE_DATA_TREE_TOP;
-    const respCode = treeName === 'index' ? RESP_ONIONPIR_MERKLE_INDEX_TREE_TOP : RESP_ONIONPIR_MERKLE_DATA_TREE_TOP;
-
+    // ── 1. Fetch the consolidated 155-tree tree-top blob ───────────────
+    // The whole blob is served on either TREE_TOP opcode; fetching once
+    // per sub-tree mirrors the Rust `verify_sub_tree` (and keeps the
+    // `merkle_tree_tops` round count = 2 — one INDEX, one DATA).
+    progress('Merkle', `Fetching ${treeName} tree-top blob...`);
     // Wire: [4B len][1B req]([1B db_id] if non-zero, backward compatible).
-    const payloadLen = this.dbId !== 0 ? 2 : 1;
-    const req = new Uint8Array(4 + payloadLen);
-    new DataView(req.buffer).setUint32(0, payloadLen, true);
-    req[4] = reqCode;
-    if (this.dbId !== 0) req[5] = this.dbId;
-    const raw = await this.sendRaw(req);
-    // Tree-top fetch is admitted to leak (public Merkle tops). Both
-    // INDEX and DATA tree-top fetches are tagged `merkle_tree_tops` —
-    // matches the Rust `RoundKind::MerkleTreeTops` (no per-tree split
-    // there either).
+    const ttPayloadLen = this.dbId !== 0 ? 2 : 1;
+    const ttReq = new Uint8Array(4 + ttPayloadLen);
+    new DataView(ttReq.buffer).setUint32(0, ttPayloadLen, true);
+    ttReq[4] = treeTopReq;
+    if (this.dbId !== 0) ttReq[5] = this.dbId;
+    const ttRaw = await this.sendRaw(ttReq);
+    // Tree-top fetch is admitted to leak (public Merkle tops). Tagged
+    // `merkle_tree_tops` — matches the Rust `RoundKind::MerkleTreeTops`.
     this.recordRound({
       kind: 'merkle_tree_tops',
       server_id: 0,
       db_id: this.dbId,
-      request_bytes: req.length,
-      response_bytes: raw.length,
+      request_bytes: ttReq.length,
+      response_bytes: ttRaw.length,
       items: [],
     });
-
-    const variant = raw[4];
-    if (variant !== respCode) {
-      throw new Error(`Unexpected ${treeName} tree-top response: 0x${variant.toString(16)}`);
+    if (ttRaw.length < 5 || ttRaw[4] !== treeTopResp) {
+      throw new Error(
+        `Unexpected ${treeName} tree-top response: 0x${(ttRaw[4] ?? 0).toString(16)}`,
+      );
     }
-    const treeTopBytes = raw.slice(5);
-    const parsed = parseTreeTopCache(treeTopBytes);
+    const blob = ttRaw.slice(5);
+    const allTops = parseOnionTreeTopCache(blob);
+    this.log(
+      `[PIR-AUDIT] OnionPIR Merkle ${treeName} tree-top: ${allTops.length} ` +
+      `trees parsed (arity=${arity})`,
+    );
 
-    const result = { rawBytes: treeTopBytes, parsed, dbId: this.dbId };
-    if (treeName === 'index') this.indexTreeTopCache = result;
-    else this.dataTreeTopCache = result;
+    // ── 2. Bind the blob to the pinned super-root (SOUNDNESS-CRITICAL) ──
+    // A super-root mismatch means the server's whole Merkle commitment
+    // is untrusted (malicious server, or a DB-version skew). Every
+    // probed leaf fails; the sibling rounds would prove nothing against
+    // forged roots, so skip them.
+    if (!checkTreeTopAnchor(info, blob, allTops, (m) => this.log(m, 'error'))) {
+      for (const lf of leaves) out.set(`${lf.pbcGroup}:${lf.bin}`, false);
+      return out;
+    }
 
-    this.log(`Fetched ${treeName} tree-top (db=${this.dbId}): ${treeTopBytes.length} bytes, ${parsed.levels.length} levels`);
-    return result;
+    // ── 3. Deduplicate leaves by (pbcGroup, bin) ───────────────────────
+    const uniqueMap = new Map<string, { pbcGroup: number; bin: number; hash: Uint8Array }>();
+    for (const lf of leaves) {
+      const key = `${lf.pbcGroup}:${lf.bin}`;
+      if (!uniqueMap.has(key)) uniqueMap.set(key, lf);
+    }
+    const keys = [...uniqueMap.keys()];
+    const n = keys.length;
+    // Per-leaf running state.
+    const currentHash: Uint8Array[] = keys.map(key => uniqueMap.get(key)!.hash);
+    const nodeIdx: number[] = keys.map(key => uniqueMap.get(key)!.bin);
+    const failed: boolean[] = new Array(n).fill(false);
+
+    this.log(
+      `[PIR-AUDIT] OnionPIR Merkle ${treeName}: verifying ${n} unique ` +
+      `leaves (k=${k})`,
+    );
+
+    // ── 4. Group leaves by PBC group ───────────────────────────────────
+    // Multiple leaves share a group only for the INDEX-not-found case
+    // (both cuckoo positions) or batch collisions; each surplus leaf
+    // becomes one extra pass, each pass itself fully K-padded.
+    const itemsByGroup = new Map<number, number[]>();
+    for (let i = 0; i < n; i++) {
+      const g = uniqueMap.get(keys[i])!.pbcGroup;
+      const arr = itemsByGroup.get(g);
+      if (arr) arr.push(i);
+      else itemsByGroup.set(g, [i]);
+    }
+    // ≥1: an empty sub-tree still issues one all-dummy pass (round-presence).
+    let maxItemsPerGroup = 1;
+    for (const arr of itemsByGroup.values()) {
+      if (arr.length > maxItemsPerGroup) maxItemsPerGroup = arr.length;
+    }
+
+    // ── 5. FHE sibling client (one per sub-tree — fixed num_pt) ────────
+    const sibClient = this.wasmModule!.createClientFromSecretKey(
+      numPt, this.fheClientId, this.fheSecretKey!,
+    );
+    if (!sibClient) {
+      throw new Error(
+        `OnionPIR Merkle ${treeName}: sib createClientFromSecretKey ` +
+        `returned null (clientId=${this.fheClientId}, num_pt=${numPt}, ` +
+        `sk.len=${this.fheSecretKey!.length})`,
+      );
+    }
+    try {
+      const pinfo = this.wasmModule!.paramsInfo(numPt);
+      if (pinfo.entrySize !== arity * 32) {
+        throw new Error(
+          `OnionPIR Merkle ${treeName}: sibling DB entry_size ` +
+          `${pinfo.entrySize} != arity*32 (${arity * 32}) — onionpir ` +
+          `rev / build-shape drift`,
+        );
+      }
+
+      // ── 6. Sibling passes: one K-padded FHE round per pass ───────────
+      // There is exactly ONE PIR sibling level (leaf → level-1). Each
+      // pass handles at most one leaf per group, and every leaf is in
+      // exactly one pass, so per-pass updates of nodeIdx / currentHash
+      // never interfere.
+      for (let pass = 0; pass < maxItemsPerGroup; pass++) {
+        progress('Merkle', `${treeName} sibling pass ${pass + 1}/${maxItemsPerGroup}...`);
+
+        // Which leaf (if any) each group contributes at this pass.
+        const passGroupToItem = new Map<number, number>();
+        for (const [g, arr] of itemsByGroup) {
+          if (pass < arr.length) passGroupToItem.set(g, arr[pass]);
+        }
+
+        // K FHE queries — real row for a group with a pass-`pass` leaf,
+        // random-row dummy for the rest. K-padding: the server sees K
+        // indistinguishable FHE queries every pass, regardless of how
+        // many leaves are real (CLAUDE.md "Query Padding").
+        const queries: Uint8Array[] = [];
+        for (let g = 0; g < k; g++) {
+          const item = passGroupToItem.get(g);
+          const row = item !== undefined
+            ? Math.floor(nodeIdx[item] / arity)
+            : Number(this.rng.nextU64() % BigInt(numPt));
+          queries.push(sibClient.generateQuery(row));
+          if (g % 5 === 4) await yieldToMain();
+        }
+
+        // round_id is vestigial under the per-group design — send 0.
+        const batchMsg = encodeBatchQuery(sibReq, 0, queries, this.dbId);
+        const respRaw = await this.sendRaw(batchMsg);
+        // One PIR sibling level ⇒ level is always 0. K FHE queries, one
+        // per PBC group — items[g] = 1 each. Matches the Rust
+        // `verify_sub_tree`'s `Index/ChunkMerkleSiblings { level: 0 }`.
+        this.recordRound({
+          kind: treeName === 'index' ? 'index_merkle_siblings' : 'chunk_merkle_siblings',
+          level: 0,
+          server_id: 0,
+          db_id: this.dbId,
+          request_bytes: batchMsg.length,
+          response_bytes: respRaw.length,
+          items: new Array(k).fill(1),
+        });
+        const respPayload = respRaw.slice(4);
+        if (respPayload[0] !== sibResp) {
+          throw new Error(
+            `Unexpected ${treeName} sibling response: 0x${respPayload[0].toString(16)}`,
+          );
+        }
+        const { results: batch } = decodeBatchResult(respPayload, 1);
+
+        // Fold each real group's decrypted sibling row into its leaf.
+        for (const [g, item] of passGroupToItem) {
+          if (failed[item]) continue;
+          if (g >= batch.length) {
+            this.log(
+              `[PIR-AUDIT] OnionPIR Merkle ${treeName} pass ${pass}: result ` +
+              `batch truncated at group ${g} (len ${batch.length})`,
+              'error',
+            );
+            failed[item] = true;
+            continue;
+          }
+          const rawPt = sibClient.decryptResponse(batch[g]);
+          const row = unpackOnionPlaintext(rawPt, pinfo.polyDegree, pinfo.entrySize);
+          if (!row) {
+            throw new Error(
+              `onion_unpack rejected ${treeName} sibling plaintext ` +
+              `(raw.len=${rawPt.length} N=${pinfo.polyDegree} ` +
+              `es=${pinfo.entrySize})`,
+            );
+          }
+          // Recompute the level-1 parent of bin `nodeIdx[item]`: the
+          // decrypted row holds that parent's `arity` leaf children;
+          // replace the child at `bin % arity` with the leaf's own
+          // committed hash, then hash the `arity` children. If the
+          // server lied about any sibling, the parent — and hence the
+          // root — will not match.
+          const childPos = nodeIdx[item] % arity;
+          const children: Uint8Array[] = [];
+          for (let c = 0; c < arity; c++) {
+            if (c === childPos) {
+              children.push(currentHash[item]);
+            } else {
+              const off = c * 32;
+              children.push(off + 32 <= row.length ? row.slice(off, off + 32) : ZERO_HASH);
+            }
+          }
+          currentHash[item] = computeParentN(children);
+          nodeIdx[item] = Math.floor(nodeIdx[item] / arity);
+        }
+      }
+    } finally {
+      sibClient.delete();
+    }
+
+    // ── 7. Walk each leaf's cached tree-top to its per-group root ──────
+    for (let i = 0; i < n; i++) {
+      const { pbcGroup, bin } = uniqueMap.get(keys[i])!;
+      if (failed[i]) {
+        out.set(keys[i], false);
+        continue;
+      }
+      // 75 INDEX trees first, then 80 DATA trees.
+      const topIdx = treeName === 'index' ? pbcGroup : info.index.k + pbcGroup;
+      const top = allTops[topIdx];
+      if (!top) {
+        this.log(
+          `[PIR-AUDIT] OnionPIR Merkle ${treeName}: no tree-top for group ` +
+          `${pbcGroup} (leaf bin ${bin})`,
+          'error',
+        );
+        out.set(keys[i], false);
+        continue;
+      }
+      const walked = walkTreeTopToRoot(currentHash[i], nodeIdx[i], top, arity);
+      // `onionTreeTopRoot` is non-null — `checkTreeTopAnchor` already
+      // rejected any tree-top without a root level.
+      const expected = onionTreeTopRoot(top);
+      const ok = expected !== null && bytesEqual(walked, expected);
+      if (!ok) {
+        this.log(
+          `[PIR-AUDIT] OnionPIR Merkle ${treeName} group ${pbcGroup} bin ` +
+          `${bin}: root MISMATCH`,
+          'error',
+        );
+      }
+      out.set(keys[i], ok);
+    }
+
+    const verified = [...out.values()].filter(Boolean).length;
+    this.log(`[PIR-AUDIT] OnionPIR Merkle ${treeName}: ${verified}/${n} leaves verified`);
+    return out;
   }
 }
 

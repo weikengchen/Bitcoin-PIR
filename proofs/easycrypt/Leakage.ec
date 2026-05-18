@@ -73,43 +73,56 @@
  *          (structural triviality).
  *
  *   2. chunk_max_items_per_group_per_level : int
- *      Pre-closure: a found query producing N total chunk Merkle
- *      items revealed the per-level pass count = max items in any
- *      chunk-PBC group, varying with N and the chunk-id distribution.
- *      The closure target was a constant function of (M, K_CHUNK).
+ *      A found query producing N total chunk Merkle items reveals the
+ *      per-level pass count = the maximum real chunk count across any
+ *      chunk-PBC group. The wire-observable value therefore tracks the
+ *      per-query UTXO-count distribution.
  *
- *      Post-closure (commits `565ea47` DPF, `08ec736` Harmony,
- *      follow-up OnionPIR): every query (found / not-found / whale)
- *      contributes exactly `CHUNK_MERKLE_ITEMS_PER_QUERY = M = 16`
- *      chunk Merkle items via the pure helper
- *      `crate::dpf::pad_chunk_ids_to_m`. Real chunks fill the prefix
- *      of the per-query owned-list; synthetic chunk_ids `0..` (skipping
- *      reals) fill the suffix. The wire-observable
- *      `max_items_per_group_per_level = ceil(M / K_CHUNK) = 1` for
- *      production parameters (`M = 16, K_CHUNK = 80`), constant
- *      across all query classifications and content.
+ *      Closure history — closed, then deliberately RE-OPENED:
  *
- *      The same closure incidentally also closes a separate residual
- *      leak — the pre-closure ChunkMerkleSiblings round count was 0
- *      for not-found / whale queries but ≥1 for found, letting the
- *      wire reveal UTXO existence even when the per-message K-padding
- *      was preserved. After M-padding, every query emits identical
- *      ChunkMerkleSiblings + DATA tree-tops traffic.
+ *        - Closed (commits `565ea47` DPF, `08ec736` Harmony, follow-up
+ *          OnionPIR): an M=16 pad (`crate::dpf::pad_chunk_ids_to_m`)
+ *          made every query — found / not-found / whale — contribute
+ *          exactly `CHUNK_MERKLE_ITEMS_PER_QUERY = M = 16` chunk Merkle
+ *          items, so the wire-observable
+ *          `max_items_per_group_per_level = ceil(M / K_CHUNK) = 1` was
+ *          constant for production parameters (`M = 16, K_CHUNK = 80`).
+ *        - Re-opened (PLAN_MERKLE_CODING.md Phase 4 / WS-A,
+ *          [HUMAN decision, 2026-05-17]): the M=16 pad was removed. It
+ *          forced every query — incl. a 1-UTXO address — to fetch and
+ *          verify 16 chunk entries (~16x chunk-layer cost) to hide a
+ *          count that is 1 for ~99 % of mainnet addresses. The
+ *          decision: accept the leak. `pad_chunk_ids_to_m`,
+ *          `derive_chunk_pad_seed`, `derive_synthetic_chunk_ids` and
+ *          the `CHUNK_MERKLE_ITEMS_PER_QUERY` constant were deleted.
  *
- *      Empirical witnesses (Hetzner, single-query, post-closure):
+ *      So this axis is once again a genuine admitted leak: a function
+ *      of the per-query real chunk count. The leakage record `L`
+ *      carries it (the field was always present, modelling an admitted
+ *      axis); the simulator reproduces the transcript's
+ *      `chunk_merkle_segment` from it. `Protocol.ec` / `Simulator.ec`
+ *      were always parameterised by an abstract `chunk_max : int`,
+ *      never by the literal 16, so no proof obligation changed —
+ *      `make check` is unaffected by the re-opening. What changed is
+ *      the *protocol*: `chunk_max` is no longer empirically constant,
+ *      so strictly more query pairs are now distinguishable under
+ *      `L_eq` — a weaker, but honestly documented, privacy claim.
  *
- *        - `dpf_found_vs_not_found_have_byte_identical_profiles` —
- *          `total rounds = 23, ChunkMerkleSiblings = 6`
- *          (= 1 pass × 2 servers × 3 levels). Pre-closure not-found
- *          was 17 rounds with 0 ChunkMerkleSiblings.
- *        - `harmony_found_vs_not_found_have_byte_identical_profiles` —
- *          `total rounds = 23, ChunkMerkleSiblings = 3` (1 server × 3 levels).
- *        - `onion_found_vs_not_found_have_byte_identical_profiles` —
- *          `total rounds = 9, ChunkMerkleSiblings = 1` (single-server,
- *          single-level Onion Merkle).
+ *      Found-vs-not-found is NOT leaked by the now-variable item
+ *      count: it stays closed by a SEPARATE mechanism, CHUNK
+ *      Round-Presence Symmetry (see the closed-axis list below). Every
+ *      query — incl. not-found / whale, which contribute 0 chunk
+ *      Merkle items — still emits >=1 all-dummy ChunkMerkleSiblings
+ *      pass + DATA tree-tops, because the Merkle verifier
+ *      (`verify_bucket_merkle_batch_generic` for DPF / Harmony;
+ *      `verify_sub_tree` / `verifySubTree` for OnionPIR) verifies the
+ *      DATA sub-tree unconditionally. Witnessed by the
+ *      `*_found_vs_not_found_have_byte_identical_profiles` leakage
+ *      integration tests.
  *
- *      The axis is retained in `L` for spec stability; the field is
- *      empirically constant for fixed M and DB parameters.
+ *      Closure path (not taken): re-introduce a fixed-M pad. Rejected
+ *      for the ~16x chunk-layer cost; removing it raised the leak-free
+ *      batch ceiling from ~`K_CHUNK / 16 ~= 5` to ~`K_CHUNK ~= 80`.
  *
  *   3. session_query_index : int
  *      Position of `q` within a session of queries from the same

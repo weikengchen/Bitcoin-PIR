@@ -162,22 +162,13 @@ pub const CHUNK_CUCKOO_NUM_HASHES: usize = CHUNK_PARAMS.cuckoo_num_hashes;
 pub const CHUNK_MAGIC: u64 = CHUNK_PARAMS.magic;
 pub const CHUNK_HEADER_SIZE: usize = CHUNK_PARAMS.header_size;
 
-/// Number of CHUNK Merkle items every query contributes to the
-/// per-bucket Merkle verification, regardless of UTXO count or
-/// found/not-found classification. The closure for the
-/// `chunk_max_items_per_group_per_level` axis (from
-/// `proofs/easycrypt/Leakage.ec`) pads each query's chunk-Merkle
-/// contribution to this constant by drawing `M − N` synthetic
-/// chunk_ids when the query has `N < M` real chunks.
-///
-/// `M = 16` covers ~99 % of mainnet scripthashes by UTXO count
-/// (whales — `num_chunks == 0` — are handled by the existing
-/// whale-exclusion path, not by this constant). With `K_CHUNK = 80`
-/// the wire-observable `max_items_per_group_per_level = ceil(M /
-/// K_CHUNK) = 1`, so the closure pins chunk-Merkle pass count to a
-/// constant function of `M` and `K_CHUNK` — no longer leaking the
-/// per-query UTXO-count distribution.
-pub const CHUNK_MERKLE_ITEMS_PER_QUERY: usize = 16;
+// NOTE: `CHUNK_MERKLE_ITEMS_PER_QUERY` (the M=16 chunk-Merkle item-count
+// pad) was removed in PLAN_MERKLE_CODING.md Phase 4 / WS-A. A query now
+// contributes its *real* chunk count of chunk-Merkle items; the
+// `chunk_max_items_per_group_per_level` axis in
+// `proofs/easycrypt/Leakage.ec` is a documented, admitted leak again.
+// Found-vs-not-found stays closed via CHUNK Round-Presence Symmetry,
+// which is a separate mechanism and does not depend on M-padding.
 
 #[cfg(test)]
 mod tests {

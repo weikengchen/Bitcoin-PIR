@@ -375,7 +375,8 @@ order as the input scripthashes, plus `synced_height: u32`. Internally
 this already does:
 
 - K-padded INDEX rounds (correct privacy budget — no per-script fan-out).
-- CHUNK queries with `pad_chunk_ids_to_m`.
+- K_CHUNK-padded CHUNK rounds (with CHUNK Round-Presence Symmetry —
+  every query, found or not, still issues ≥1 CHUNK round).
 - Delta vs full-snapshot planning (via `compute_sync_plan`).
 - Merkle verification (per-bucket bin Merkle).
 

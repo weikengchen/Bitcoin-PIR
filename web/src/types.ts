@@ -85,24 +85,33 @@ export interface QueryResult {
   chunkBinIndices?: number[];
   /** Raw CHUNK bin contents */
   chunkBinContents?: Uint8Array[];
-  // ── Per-bin Merkle (OnionPIR) ─────────────────────────────────────
-  /** INDEX-MERKLE root hex (OnionPIR per-bin) */
-  merkleIndexRoot?: string;
-  /** DATA-MERKLE root hex (OnionPIR per-bin) */
-  merkleDataRoot?: string;
-  /** SHA256 of the decrypted INDEX bin (per-bin Merkle leaf) */
-  indexBinHash?: Uint8Array;
-  /** Leaf position in INDEX-MERKLE tree */
-  indexLeafPos?: number;
+  // ── Per-group OnionPIR Merkle (Phase 3 redesign) ──────────────────
   /**
-   * All INDEX bins checked for "not found" verification (OnionPIR).
-   * Each entry has the bin hash and leaf position.
+   * Pinned super-root hex (SHA256 of the 155 per-group roots). The
+   * Phase-3 per-group redesign replaced the two flat per-table roots
+   * (`merkleIndexRoot` / `merkleDataRoot`) with a single anchor.
    */
-  allIndexBinHashes?: { hash: Uint8Array; leafPos: number }[];
-  /** SHA256 of each decrypted DATA bin (per-bin Merkle leaves) */
-  dataBinHashes?: Uint8Array[];
-  /** Leaf positions in DATA-MERKLE tree */
-  dataLeafPositions?: number[];
+  merkleSuperRoot?: string;
+  /**
+   * SHA256 of the first probed INDEX bin. Retained purely as the UI's
+   * "this result is Merkle-verifiable" marker (index.html filters on
+   * `indexBinHash !== undefined`); the per-group verifier itself walks
+   * `indexBinLeaves`.
+   */
+  indexBinHash?: Uint8Array;
+  /**
+   * Every probed INDEX cuckoo bin as a per-group Merkle leaf — always
+   * `INDEX_CUCKOO_NUM_HASHES` entries (found / not-found / whale alike,
+   * per the INDEX item-count symmetry invariant). `pbcGroup` selects
+   * the per-group INDEX tree; `bin` is the leaf index within it.
+   */
+  indexBinLeaves?: { hash: Uint8Array; pbcGroup: number; bin: number }[];
+  /**
+   * Each fetched DATA bin as a per-group Merkle leaf — one per real
+   * chunk entry_id (so 0 for not-found / whale). `pbcGroup` selects the
+   * per-group DATA tree; `bin` is the leaf index within it.
+   */
+  dataBinLeaves?: { hash: Uint8Array; pbcGroup: number; bin: number }[];
 }
 
 // ─── Connection state ───────────────────────────────────────────────────────

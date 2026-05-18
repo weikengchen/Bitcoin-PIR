@@ -24,18 +24,23 @@ A determined adversary observing the wire learns at most:
 - `index_max_items_per_group_per_level` — empirically constant `= 2`
   after the [INDEX Merkle Group-Symmetry](#invariant-3-index-merkle-group-symmetry-index_max)
   closure.
-- `chunk_max_items_per_group_per_level` — empirically constant `= 1`
-  (with `M = 16, K_CHUNK = 80`) after the [CHUNK Merkle
-  Item-Count Symmetry](#invariant-4-chunk-merkle-item-count-symmetry-chunk_max)
-  closure.
+- `chunk_max_items_per_group_per_level` — the approximate per-query
+  UTXO count. An admitted, documented leak: the M=16 pad that pinned
+  it to `1` was removed in Phase 4 / WS-A (see *CHUNK Merkle
+  Item-Count — a documented trade-off* below). Mild — ~99 % of
+  addresses have exactly 1 chunk.
 
 In particular, the wire **does not reveal**:
 - Which scripthash was queried.
 - Whether the scripthash was found, not-found, or whale.
-- The number of UTXOs (for found queries).
 - The cuckoo position the lookup matched at.
 - The collision pattern of `derive_groups_3[0]` across a multi-query
   batch.
+
+It **does** admit (Phase 4 / WS-A trade-off) the approximate per-query
+UTXO count — the `chunk_max` axis above. Found-vs-not-found itself
+stays hidden via CHUNK Round-Presence Symmetry, but a found query's
+chunk-Merkle item count tracks its UTXO count.
 
 ## What's mechanized vs cited-by-hypothesis
 
@@ -53,13 +58,15 @@ write-up.
    `Real_batch.query_batch` + list induction.
 
 2. **Pure-helper correctness via Kani** (`pir-sdk-client/src/{dpf,harmony,onion}.rs`,
-   `#[cfg(kani)] mod kani_harnesses`). 18+ harnesses verifying:
-   - `pad_chunk_ids_to_m` shape, real-prefix preservation,
-     synthetic disjointness, identity at `m=0`.
+   `#[cfg(kani)] mod kani_harnesses`). 14+ harnesses verifying:
    - `build_index_alphas` / `build_index_alphas_batched` K-padding
      invariants.
    - `items_from_trace` per-query item-count symmetry.
    - `classify_chunk_slots` round-presence symmetry (P1/P2).
+
+   (The 4 `pad_chunk_ids_to_m` harnesses were deleted in Phase 4 /
+   WS-A together with the M=16 pad they covered — see the CHUNK
+   Merkle Item-Count trade-off below.)
    Each harness verifies in seconds; run one at a time per
    `feedback_kani_style.md`.
 
@@ -121,10 +128,15 @@ skipped CHUNK rounds, exposing presence.
 - Doc: `CLAUDE.md` § "CHUNK Round-Presence Symmetry".
 - Code: `pir-sdk-client/src/{dpf,harmony}.rs::query_chunk_level`
   (forces a dummy round when `chunk_ids` is empty);
-  `pir-sdk-client/src/onion.rs::query_chunk_level` (synthetic
-  entry_id per slot via `classify_chunk_slots`).
-- Subsumed by Invariant 4 post-closure: every query now emits an
-  M-padded CHUNK round, which always has ≥1 round.
+  `pir-sdk-client/src/onion.rs::query_chunk_level` and
+  `web/src/onionpir_client.ts::queryBatch` (an all-not-found batch
+  substitutes a single empty round, so one all-dummy K_CHUNK CHUNK
+  round still goes out).
+- After the Phase 4 M=16 removal this is a fully **independent**
+  invariant — no longer "subsumed" by the (now-deleted) CHUNK Merkle
+  Item-Count pad. CHUNK-Merkle round-presence is supplied by the
+  Merkle verifier's ≥1 all-dummy DATA pass; CHUNK *PIR* round-presence
+  by the empty-round fallback above.
 
 ### Invariant 3: INDEX Merkle Group-Symmetry (`index_max`)
 
@@ -142,24 +154,35 @@ them so `max_items_per_group = 2` regardless of input.
   was structurally trivial pre-closure (its INDEX layer already
   used `pbc_plan_rounds`).
 
-### Invariant 4: CHUNK Merkle Item-Count Symmetry (`chunk_max`)
+### CHUNK Merkle Item-Count — a documented trade-off (`chunk_max`)
 
-Every query contributes exactly `CHUNK_MERKLE_ITEMS_PER_QUERY = M = 16`
-chunk Merkle items, regardless of UTXO count or classification. Real
-chunks fill the prefix; synthetic chunk_ids `0..` (skipping reals)
-fill the suffix. With `K_CHUNK = 80`, the wire-observable
-`max_items_per_group_per_level = ceil(M / K_CHUNK) = 1` is constant.
+**Not a closed invariant.** An M=16 chunk-Merkle item-count pad once
+made every query contribute exactly 16 chunk Merkle items, pinning the
+wire-observable `max_items_per_group_per_level` to `1`. Phase 4 / WS-A
+(PLAN_MERKLE_CODING.md, `[HUMAN decision, 2026-05-17]`) **removed that
+pad**: it forced even a 1-UTXO address to fetch and verify 16 chunk
+entries (~16× chunk-layer cost) to hide a count that is `1` for ~99 %
+of mainnet addresses.
 
-- Spec: `proofs/easycrypt/Leakage.ec` axis 2.
-- Doc: `CLAUDE.md` § "CHUNK Merkle Item-Count Symmetry".
-- Helper: `pir-sdk-client/src/dpf.rs::pad_chunk_ids_to_m` + 4 Kani
-  harnesses (TS port: `web/src/onionpir_client.ts::padChunkIdsToM` +
-  11 vitest unit tests).
-- Closure commits: `565ea47` (DPF), `08ec736` (Harmony), `f915a65`
-  (OnionPIR), `eb5128c` (standalone TS).
-- Side-effect closure: the previous "ChunkMerkleSiblings round count
-  = 0 for not-found vs ≥1 for found" leak is gone — every query now
-  emits the same number of ChunkMerkleSiblings rounds.
+A query now contributes its *real* chunk count of chunk Merkle items,
+so the server learns the approximate per-query UTXO count — the
+`chunk_max` axis is an admitted, documented leak again.
+
+**Found-vs-not-found stays closed** by a *separate* mechanism — CHUNK
+Round-Presence Symmetry — which does not depend on M-padding: the
+Merkle verifier (`verify_bucket_merkle_batch_generic` for DPF /
+Harmony; `verify_sub_tree` / `verifySubTree` for OnionPIR) issues ≥1
+all-dummy CHUNK-Merkle pass even for a 0-chunk query, so a not-found
+query emits the same ChunkMerkleSiblings + DATA tree-top traffic as a
+found query.
+
+- Spec: `proofs/easycrypt/Leakage.ec` axis 2 (re-opened, admitted).
+- Doc: `CLAUDE.md` § "CHUNK Merkle Item-Count — Documented Trade-off".
+- History: closed by `565ea47` (DPF), `08ec736` (Harmony), `f915a65`
+  (OnionPIR), `eb5128c` (standalone TS); re-opened in Phase 4 — the
+  `pad_chunk_ids_to_m` / `CHUNK_MERKLE_ITEMS_PER_QUERY` /
+  `padChunkIdsToM` code, the 4 Kani harnesses, and the
+  `onion_pad_chunk_ids` vitest suite were deleted.
 
 ## Verification layers — the test pyramid
 

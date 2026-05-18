@@ -132,11 +132,12 @@ describe('OnionPIR cross-language leakage diff (Phase 2.3 step D)', () => {
         // profile shape matches the Rust corpus.
         //
         // `queryBatch` returns `(QueryResult | null)[]` for the legacy
-        // null-=-not-found contract. Post-`chunk_max` closure every
-        // query resolves to a non-null result (not-found queries fill
-        // M synthetic data leaves), but the type signature is preserved
-        // for backward compatibility. Filter nulls before
-        // `verifyMerkleBatch`, which expects `QueryResult[]`.
+        // null-=-not-found contract. In practice every query resolves
+        // to a non-null result — a not-found query still builds a
+        // QueryResult carrying its probed INDEX Merkle leaves — but the
+        // nullable type signature is preserved for backward
+        // compatibility. Filter nulls before `verifyMerkleBatch`, which
+        // expects `QueryResult[]`.
         const nonNull = results.filter(
           (r): r is NonNullable<typeof r> => r !== null,
         );

@@ -184,16 +184,27 @@ to no longer leak it):
 5. Update [PLAN_LEAKAGE_VERIFICATION.md](../../PLAN_LEAKAGE_VERIFICATION.md)
    and [CLAUDE.md](../../CLAUDE.md) "What the Server Learns" sections.
 
-## Engineering closures pending
+## Closure status
 
-The two highest-priority engineering closures (which would narrow
-`L`):
+- `index_max_items_per_group_per_level` — **closed.** The INDEX Merkle
+  Group-Symmetry work (DPF / Harmony route each scripthash to its
+  `pbc_plan_rounds`-assigned group) pins this at 2 per query for
+  typical batches, independent of the input collision pattern. See
+  axis 1 in [Leakage.ec](Leakage.ec).
+- `chunk_max_items_per_group_per_level` — **closed, then deliberately
+  re-opened.** An M=16 chunk-Merkle pad closed it; Phase 4 / WS-A
+  (PLAN_MERKLE_CODING.md, `[HUMAN decision]`) removed the pad — it cost
+  ~16× chunk-layer work to hide a count that is `1` for ~99 % of
+  addresses. This axis is now an accepted, documented leak (a function
+  of the per-query real chunk count). See axis 2 in [Leakage.ec](Leakage.ec).
+- `session_query_index`, `query_db_id` — intentional public protocol
+  metadata, not closable (axes 3-4).
 
-- `chunk_max_items_per_group_per_level` — see [PLAN_CHUNK_MAX_CLOSURE.md](../../PLAN_CHUNK_MAX_CLOSURE.md). 4-5 weeks across 3 backends. Highest privacy impact.
-- `index_max_items_per_group_per_level` — analogous, ~1 week. Easier because per-query items are fixed.
-
-Once both land, `L` shrinks to `{ session_query_index; query_db_id }`,
-and the simulator-property proof tightens correspondingly.
+`L` therefore stays at its current four axes; the simulator-property
+proof in [Theorem.ec](Theorem.ec) is over exactly this `L`. Note that
+found-vs-not-found stays **closed** independently of the `chunk_max`
+re-opening — via CHUNK Round-Presence Symmetry, a separate mechanism
+(see the closed-axis list in [Leakage.ec](Leakage.ec)).
 
 ## Provenance
 
