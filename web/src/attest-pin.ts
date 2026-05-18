@@ -75,10 +75,14 @@ export const PIR2_TIER3_PIN: ServerAttestPin = {
   // WebSocket chunking fix (commit 49db31da) so OnionPIR's large
   // RegisterKeys upload survives Cloudflare. pir2 runs `--serve-queries`
   // only — no hint pool. The embedded binary (`f63b3535…`) comes from
-  // the deterministic wrapper `scripts/build_unified_server.sh` and is
-  // byte-identical to the one running on Hetzner pir-primary /
-  // pir-secondary, so PIR1_PIN and PIR2_TIER3_PIN share the same
-  // `binarySha256Hex`. MEASUREMENT captured from the v16 deploy via
+  // the deterministic wrapper `scripts/build_unified_server.sh`.
+  // NOTE (2026-05-18): pir2 is now one version BEHIND pir1 — pir1 was
+  // redeployed to the Phase-3b per-group OnionPIR Merkle server
+  // (`0cc87a8c…`, commit 121ea5c3) while pir2 still runs this pre-3b
+  // `f63b3535…` build, so PIR1_PIN and PIR2_TIER3_PIN no longer share
+  // a `binarySha256Hex`. A pir2 UKI v17 rebuild will realign them
+  // (pir2 does not serve OnionPIR, so this is a hygiene gap, not a
+  // functional one). MEASUREMENT captured from the v16 deploy via
   // `bpir-admin attest wss://weikeng2.bitcoinpir.org`.
   measurementHex:
     '59e276f34881fec46f68f07582b863d46944868206db14402e32000e49ab568e3d41a9df9155991345ed578c31a7ab4a',
@@ -96,11 +100,15 @@ export const PIR2_TIER3_PIN: ServerAttestPin = {
  */
 export const PIR1_PIN: ServerAttestPin = {
   // No measurementHex — Hetzner has no SEV.
-  // Bumped 2026-05-16: rebuilt with the deterministic wrapper
-  // `scripts/build_unified_server.sh` from commit 49db31da (the
-  // transport-level WS chunking fix). The binary (`f63b3535…`) is
-  // byte-identical to the one baked into the pir2 Tier 3 UKI v16.
+  // Bumped 2026-05-18: pir1 was redeployed to the Phase-3b per-group
+  // OnionPIR Merkle server (commit 121ea5c3). The binary below was
+  // verified on Hetzner against BOTH the on-disk artifact
+  // (`target/release/unified_server`) AND the live pir-primary /
+  // pir-secondary process images (`/proc/<pid>/exe`) — all three
+  // agree. pir2 is NOT on this binary yet (it still runs the pre-3b
+  // `f63b3535…` build), so PIR1_PIN and PIR2_TIER3_PIN no longer
+  // share a `binarySha256Hex`.
   binarySha256Hex:
-    'f63b35354c3f02037d5063a25696c3a919d14cccbcf4946f98cf6c5e75117ecd',
+    '0cc87a8c8530a7830e78ed172af2c5c666c62ccde5d00dbca36321c577dcdeba',
   description: 'weikeng1.bitcoinpir.org (Hetzner i7-8700, no SEV)',
 };
