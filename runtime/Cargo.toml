@@ -75,7 +75,7 @@ pir-core = { path = "../pir-core" }
 pir-runtime-core = { path = "../pir-runtime-core" }
 build = { path = "../build" }
 libdpf = { git = "https://github.com/weikengchen/libdpf.git" }
-onionpir = { git = "https://github.com/Bitcoin-PIR/OnionPIRv2-fork.git", rev = "c7ed905aacd747cb01249a72b35a7c171d677345" }
+onionpir = { git = "https://github.com/Bitcoin-PIR/OnionPIRv2-fork.git", rev = "7ea020a7bd2cb87a508d14d86af554ee247e5cf0" }
 harmonypir = { git = "https://github.com/Bitcoin-PIR/harmonypir.git", rev = "60635d8e526629b2ba99ec5020a55d078a299660", default-features = false }
 harmonypir-wasm = { path = "../harmonypir-wasm" }
 libc = "0.2"

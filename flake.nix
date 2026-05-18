@@ -24,15 +24,39 @@
     # Both operators end up with byte-identical rustc binaries.
     rustToolchain = pkgs.rust-bin.stable."1.94.1".default;
 
-    # OnionPIR (the `onionpir` git dep) builds a C++ engine through its
-    # crate-local CMake project. That engine has an optional Intel-HEXL
-    # fast path (x86_64 NTT) plus an in-crate scalar fallback shim. The
-    # Nix build forces the scalar shim: postPatch (below) injects
-    # `-DUSE_HEXL=OFF` into the vendored onionpir build.rs. That keeps the
-    # build fully hermetic — no HEXL fetch, no cpu_features, no CMake
-    # FetchContent network access — at the cost of x86 NTT speed. (The
-    # OnionPIRv2-fork has been SEAL-free since its BV-keyswitch rewrite,
-    # so there is also no SEAL submodule to vendor.)
+    # Intel HEXL — x86_64 NTT/eltwise acceleration for the onionpir C++
+    # engine (linked when ONIONPIR_USE_HEXL is defined, i.e. USE_HEXL=ON —
+    # the crate's x86_64 default since rev 7ea020a). nixpkgs has no `hexl`
+    # package, so build it here. HEXL 1.2.6 does `find_package(CpuFeatures
+    # CONFIG)` and only FetchContent-downloads google/cpu_features if that
+    # misses — passing nixpkgs' cpu_features makes the HEXL build fully
+    # hermetic (no network). HEXL_BENCHMARK/HEXL_TESTING OFF likewise skip
+    # the google-benchmark / gtest FetchContent. The result ships
+    # lib/cmake/hexl-1.2.6/HEXLConfig.cmake, so the onionpir build's
+    # `find_package(HEXL CONFIG)` resolves it (see buildInputs + postPatch).
+    hexl = pkgs.stdenv.mkDerivation {
+      pname = "hexl";
+      version = "1.2.6";
+      src = pkgs.fetchFromGitHub {
+        owner = "intel";
+        repo = "hexl";
+        rev = "v1.2.6";
+        # Fake hash — the first `nix build` reports the real one.
+        hash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+      };
+      nativeBuildInputs = [ pkgs.cmake ];
+      # cpu_features ships its CMake config package in the `dev` output;
+      # buildInputs propagation puts it on CMAKE_PREFIX_PATH so HEXL's
+      # `find_package(CpuFeatures CONFIG)` resolves it instead of fetching.
+      buildInputs = [ pkgs.cpu_features ];
+      cmakeFlags = [
+        "-DHEXL_BENCHMARK=OFF"
+        "-DHEXL_TESTING=OFF"
+        "-DHEXL_SHARED_LIB=OFF"
+        "-DCMAKE_BUILD_TYPE=Release"
+        "-DCMAKE_POSITION_INDEPENDENT_CODE=ON"
+      ];
+    };
 
   in {
     # ─── packages.unified-server ───────────────────────────────────────
@@ -172,16 +196,15 @@
           # 2026-05-18 re-sync: dropped `alf-nt` (HarmonyPIR's PRP
           # backend no longer depends on the ALF crate); added `arc`
           # (new git dep); `onionpir-0.1.0` → `onionpir-0.2.0`.
-          # 2026-05-19 re-pin: onionpir aa7710d → c7ed905 — the
-          # OnionPIRv2-fork "self-contained crate" restructure moved the
-          # CMake project + cpp/ engine inside rust/onionpir/. New rev →
-          # new content hash (refreshed below via the fake-hash cycle).
+          # 2026-05-19 re-pin: onionpir aa7710d → c7ed905 → 7ea020a — the
+          # self-contained-crate restructure, then the HEXL / -march
+          # detection fix. New rev → new content hash (fake-hash cycle).
           outputHashes = {
             "arc-0.1.0"        = "sha256-tUyvnyJoNTlrXpudIZ3Er6Mqj8zmltBtY06kF9P6hp0=";
             "fastprp-0.1.0"    = "sha256-GVTeA1yBdpOj0GHcKTqQZz+1+AvV+tBkvUewTnNSlAo=";
             "harmonypir-0.1.0" = "sha256-E7moHaQUhR4NUIdKsOluOGHFOkZE6bJrj26tc0f3IGQ=";
             "libdpf-0.1.0"     = "sha256-Hu4yEsxiNugk0dZe02Fz70DzOGKf9v52fhRgXtV8Vnw=";
-            "onionpir-0.2.0"   = "sha256-MbCbG1rmT/ORYyBHzfOuqdChDhUMq/f41ht3hktCGVQ=";
+            "onionpir-0.2.0"   = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
           };
         };
 
@@ -207,16 +230,16 @@
           # entries, and cargo errors on duplicate source definitions.
           sed -i '/^\[source\.crates-io\]/,$d' .cargo/config.toml
 
-          # Build OnionPIR's C++ engine with the in-crate scalar shim
-          # instead of Intel HEXL. The onionpir crate's CMakeLists
-          # defaults USE_HEXL=ON on x86_64, then resolves HEXL through a
-          # hardcoded HEXL_DIR (an upstream author's absolute path) that
-          # does not exist in the sandbox — find_package(HEXL REQUIRED)
-          # would FATAL_ERROR. USE_HEXL=OFF selects cpp/hexl_compat/ +
-          # cpp/hexl_shim.cpp, bundled inside the crate, so the build
-          # needs no external HEXL. Inject the define into the vendored
-          # build.rs's cmake::Config chain.
-          sed -i 's|\.define("ONIONPIR_BUILD_FFI", "ON")|&\n        .define("USE_HEXL", "OFF")|' \
+          # Point the onionpir C++ build's CMake at the HEXL + cpu_features
+          # CMake-config packages. Since rev 7ea020a the onionpir CMakeLists
+          # defaults USE_HEXL=ON on x86_64 and does `find_package(HEXL
+          # CONFIG)`; HEXL's own config in turn does `find_package(
+          # CpuFeatures CONFIG)`. nixpkgs' cmake hook already exports both
+          # on CMAKE_PREFIX_PATH via buildInputs, but the `cmake` crate
+          # (cmake-rs) spawns its own cmake — inject the prefixes into its
+          # Config chain explicitly so resolution can't depend on env
+          # propagation. Fully hermetic: HEXL is the Nix derivation above.
+          sed -i 's|\.define("ONIONPIR_BUILD_FFI", "ON")|&\n        .define("CMAKE_PREFIX_PATH", "${hexl};${pkgs.cpu_features.dev}")|' \
               "$NIX_BUILD_TOP/cargo-vendor-dir/onionpir-0.2.0/build.rs"
         '';
         # Skip cargo test inside the build (live-server integration tests
@@ -235,18 +258,22 @@
           git
         ];
 
-        # No extra buildInputs: the onionpir C++ engine links only the
-        # C++ runtime (libstdc++, from gcc) — no HEXL, no SEAL, no OpenMP.
-        buildInputs = [ ];
+        # Intel HEXL (Nix-built, above) + its cpu_features dependency —
+        # for the onionpir C++ engine's find_package(HEXL CONFIG) /
+        # find_package(CpuFeatures CONFIG) and the final link. cpu_features
+        # is a shared lib, so it stays a runtime dep of unified_server in
+        # the Nix closure.
+        buildInputs = [ hexl pkgs.cpu_features ];
 
         # Strip debug info reproducibly. cargo's release default already
         # omits debug; this is defense-in-depth.
         dontStrip = false;
 
-        # Strict sandbox (no __noChroot): the build needs no network.
-        # USE_HEXL=OFF removes the only step that ever wanted it (HEXL's
-        # CMake FetchContent); every git dep is pre-fetched by Nix via
-        # cargoLock. The only gcc visible is the Nix-provided one.
+        # Strict sandbox (no __noChroot): the build needs no network. HEXL
+        # is the Nix-built derivation above and the onionpir C++ build
+        # resolves it via find_package(CONFIG) — no FetchContent; every
+        # git dep is pre-fetched by Nix via cargoLock. The only gcc
+        # visible is the Nix-provided one.
       };
     };
 

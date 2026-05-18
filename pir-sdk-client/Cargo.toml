@@ -66,10 +66,10 @@ harmonypir-wasm = { path = "../harmonypir-wasm" }
 # OnionPIR v2 FFI bindings — C++ BV-keyswitch FHE (SEAL-free). Pulled in only
 # under the `onion` feature because it requires a native toolchain (cmake +
 # a C++20 compiler). Pinned to the same rev used by the `runtime` crate.
-# rev c7ed905 makes rust/onionpir/ a self-contained crate (CMake project +
-# C++ engine bundled under the crate dir) so `cargo vendor` ships a buildable
-# copy — see the OnionPIRv2-fork restructure commit.
-onionpir = { git = "https://github.com/Bitcoin-PIR/OnionPIRv2-fork.git", rev = "c7ed905aacd747cb01249a72b35a7c171d677345", optional = true }
+# rev 7ea020a — self-contained, vendorable crate (CMake project + C++ engine
+# bundled under the crate dir); USE_HEXL/-march detection fixed, Intel HEXL
+# acceleration enabled by default on x86_64.
+onionpir = { git = "https://github.com/Bitcoin-PIR/OnionPIRv2-fork.git", rev = "7ea020a7bd2cb87a508d14d86af554ee247e5cf0", optional = true }
 rand = { version = "0.8", optional = true }
 
 # `async_trait` is pure-Rust and works on any target — both the native
