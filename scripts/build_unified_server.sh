@@ -27,6 +27,16 @@
 #     pins the rustc selected via rustup; the rustup harness itself
 #     can vary)
 #
+# Note (2026-05): the hermetic Nix flake `nix build .#unified-server`
+# is now the canonical, content-addressed build — it is what is
+# deployed to pir1/pir2 and pinned in web/src/attest-pin.ts, and it
+# links Intel HEXL into OnionPIR's C++ engine. This convention recipe
+# instead builds that engine with the in-crate scalar/SIMD shim:
+# onionpir's build.rs emits no HEXL link flags, so a system-installed
+# HEXL would fail the link (which is why /usr/local HEXL is not kept
+# on the build host). Prefer the flake where Nix is available; keep
+# this script as the non-Nix fallback.
+#
 # Operator usage:
 #   ./scripts/build_unified_server.sh
 # Output: target/release/unified_server  +  printed sha256.
