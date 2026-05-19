@@ -4116,6 +4116,17 @@ impl HarmonyClient {
         let mut index_sib_groups = std::mem::take(&mut self.index_sib_groups);
         let mut chunk_sib_groups = std::mem::take(&mut self.chunk_sib_groups);
 
+        // Merkle leakage rounds are BUFFERED, not recorded inline:
+        // `verify_bucket_merkle_batch_parallel` drives two queriers
+        // concurrently on separate sockets, and recording inline would
+        // interleave INDEX- and CHUNK-Merkle rounds in wall-clock order.
+        // That interleaving varies run-to-run and correlates with
+        // found-vs-not-found, making a found query wire-distinguishable
+        // from a not-found one by Merkle-round ORDER alone. The buffers
+        // are drained below in a fixed INDEX-then-CHUNK sequence.
+        let mut merkle_rounds_first: Vec<RoundProfile> = Vec::new();
+        let mut merkle_rounds_second: Vec<RoundProfile> = Vec::new();
+
         let per_item = if self.query_conn_secondary.is_some() {
             // ── Parallel path: split INDEX and CHUNK sib trees across
             // the two sockets. Each querier holds the full map for
@@ -4133,17 +4144,20 @@ impl HarmonyClient {
                 .as_mut()
                 .expect("checked is_some above");
 
+            // `q_index` buffers INDEX-Merkle rounds, `q_chunk` buffers
+            // CHUNK-Merkle rounds — into disjoint Vecs, so the two
+            // concurrent sockets never interleave each other's rounds.
             let mut q_index = HarmonySiblingQuerier {
                 query_conn: conn0,
                 index_sib_groups: &mut index_sib_groups,
                 chunk_sib_groups: &mut empty_chunk_placeholder,
-                leakage_recorder: leakage.clone(),
+                recorded: &mut merkle_rounds_first,
             };
             let mut q_chunk = HarmonySiblingQuerier {
                 query_conn: conn1,
                 index_sib_groups: &mut empty_index_placeholder,
                 chunk_sib_groups: &mut chunk_sib_groups,
-                leakage_recorder: leakage.clone(),
+                recorded: &mut merkle_rounds_second,
             };
 
             verify_bucket_merkle_batch_parallel(
@@ -4159,7 +4173,9 @@ impl HarmonyClient {
             )
             .await
         } else {
-            // ── Single-socket fallback: original code path, unchanged.
+            // ── Single-socket fallback: one querier verifies INDEX then
+            // CHUNK sequentially, so `merkle_rounds_first` already ends
+            // up in canonical INDEX-then-CHUNK order on its own.
             let query_conn = self
                 .query_conn
                 .as_mut()
@@ -4168,7 +4184,7 @@ impl HarmonyClient {
                 query_conn,
                 index_sib_groups: &mut index_sib_groups,
                 chunk_sib_groups: &mut chunk_sib_groups,
-                leakage_recorder: leakage.clone(),
+                recorded: &mut merkle_rounds_first,
             };
             verify_bucket_merkle_batch_generic(
                 &mut querier,
@@ -4186,6 +4202,21 @@ impl HarmonyClient {
         // Restore sibling state regardless of success.
         self.index_sib_groups = index_sib_groups;
         self.chunk_sib_groups = chunk_sib_groups;
+
+        // Emit the buffered Merkle leakage rounds in a fixed order — ALL
+        // INDEX-Merkle rounds, then ALL CHUNK-Merkle rounds — regardless
+        // of which socket's response landed first. This is the same
+        // order the sequential DPF verifier produces, and it is what
+        // keeps a found query's profile byte-identical to a not-found
+        // query's (CLAUDE.md "found-vs-not-found"). Done here, after the
+        // queriers drop and the sib maps are restored, because
+        // `record_round` borrows `self`.
+        for round in merkle_rounds_first {
+            self.record_round(round);
+        }
+        for round in merkle_rounds_second {
+            self.record_round(round);
+        }
 
         let per_item = per_item?;
 
@@ -5923,11 +5954,25 @@ struct HarmonySiblingQuerier<'a> {
     index_sib_groups: &'a mut HashMap<(usize, u8), HarmonyGroup>,
     /// CHUNK sibling groups keyed by `(merkle_level, group_id)`.
     chunk_sib_groups: &'a mut HashMap<(usize, u8), HarmonyGroup>,
-    /// Optional leakage recorder forwarded from `HarmonyClient`. Each
-    /// pass emits one `IndexMerkleSiblings` / `ChunkMerkleSiblings`
-    /// round on the query server (`server_id = 0`) — there is no
-    /// per-server fan-out for HarmonyPIR Merkle.
-    leakage_recorder: Option<Arc<dyn LeakageRecorder>>,
+    /// Merkle leakage rounds, buffered in this querier's own issue
+    /// order — level 0 → N, and pass h0 → h1 within a level. Each pass
+    /// appends one `IndexMerkleSiblings` / `ChunkMerkleSiblings` round
+    /// tagged `server_id = 0` (HarmonyPIR Merkle has no per-server
+    /// fan-out).
+    ///
+    /// Rounds are BUFFERED here, not recorded inline, because
+    /// `verify_bucket_merkle_batch_parallel` drives two queriers
+    /// concurrently on separate sockets. Recording inline would
+    /// interleave INDEX- and CHUNK-Merkle rounds in wall-clock order —
+    /// a timing artifact that varies run-to-run and, worse, correlates
+    /// with found-vs-not-found (the CHUNK querier spends a hair more
+    /// CPU building a real slot than a dummy). That makes a found
+    /// query wire-distinguishable from a not-found one purely by
+    /// Merkle-round order. `verify_merkle_items` drains the buffer(s)
+    /// into the real recorder in a fixed INDEX-then-CHUNK sequence —
+    /// matching the sequential DPF verifier — so the leakage profile
+    /// stays deterministic and content-independent.
+    recorded: &'a mut Vec<RoundProfile>,
 }
 
 #[async_trait]
@@ -6020,23 +6065,22 @@ impl BucketMerkleSiblingQuerier for HarmonySiblingQuerier<'_> {
                 table_type, level, dt_wire, request_bytes, response.len() + 4,
             );
         }
-        if let Some(rec) = &self.leakage_recorder {
-            let kind = match table_type {
-                1 => RoundKind::ChunkMerkleSiblings { level: level as u8 },
-                _ => RoundKind::IndexMerkleSiblings { level: level as u8 },
-            };
-            rec.record_round(
-                "harmony",
-                RoundProfile {
-                    kind,
-                    server_id: 0,
-                    db_id: Some(db_id),
-                    request_bytes,
-                    response_bytes: (response.len() as u64).saturating_add(4),
-                    items: items_per_group,
-                },
-            );
-        }
+        // Buffer this pass's leakage round; `verify_merkle_items` drains
+        // the buffer in a fixed INDEX-then-CHUNK order once both Merkle
+        // trees finish — see `HarmonySiblingQuerier.recorded` for why
+        // inline recording would leak found-vs-not-found via round order.
+        let kind = match table_type {
+            1 => RoundKind::ChunkMerkleSiblings { level: level as u8 },
+            _ => RoundKind::IndexMerkleSiblings { level: level as u8 },
+        };
+        self.recorded.push(RoundProfile {
+            kind,
+            server_id: 0,
+            db_id: Some(db_id),
+            request_bytes,
+            response_bytes: (response.len() as u64).saturating_add(4),
+            items: items_per_group,
+        });
         let raw_results = decode_batch_response(&response)?;
 
         let mut out: Vec<Option<Vec<u8>>> = vec![None; table_k];
@@ -6301,35 +6345,29 @@ impl BucketMerkleSiblingQuerier for HarmonySiblingQuerier<'_> {
             ));
         }
 
-        // Record per-pass leakage profile.
-        if let Some(rec) = &self.leakage_recorder {
-            let kind = match table_type {
-                1 => RoundKind::ChunkMerkleSiblings { level: level as u8 },
-                _ => RoundKind::IndexMerkleSiblings { level: level as u8 },
-            };
-            rec.record_round(
-                "harmony",
-                RoundProfile {
-                    kind: kind,
-                    server_id: 0,
-                    db_id: Some(db_id),
-                    request_bytes: request_h0_bytes,
-                    response_bytes: resp_h0_raw.len() as u64,
-                    items: items_per_group_h0,
-                },
-            );
-            rec.record_round(
-                "harmony",
-                RoundProfile {
-                    kind,
-                    server_id: 0,
-                    db_id: Some(db_id),
-                    request_bytes: request_h1_bytes,
-                    response_bytes: resp_h1_raw.len() as u64,
-                    items: items_per_group_h1,
-                },
-            );
-        }
+        // Buffer both passes' leakage rounds in pass order (h0 then h1);
+        // `verify_merkle_items` drains the buffer in a fixed
+        // INDEX-then-CHUNK order — see `HarmonySiblingQuerier.recorded`.
+        let kind = match table_type {
+            1 => RoundKind::ChunkMerkleSiblings { level: level as u8 },
+            _ => RoundKind::IndexMerkleSiblings { level: level as u8 },
+        };
+        self.recorded.push(RoundProfile {
+            kind,
+            server_id: 0,
+            db_id: Some(db_id),
+            request_bytes: request_h0_bytes,
+            response_bytes: resp_h0_raw.len() as u64,
+            items: items_per_group_h0,
+        });
+        self.recorded.push(RoundProfile {
+            kind,
+            server_id: 0,
+            db_id: Some(db_id),
+            request_bytes: request_h1_bytes,
+            response_bytes: resp_h1_raw.len() as u64,
+            items: items_per_group_h1,
+        });
 
         let raw_results_h0 = decode_batch_response(&resp_h0_raw[4..])?;
         let raw_results_h1 = decode_batch_response(&resp_h1_raw[4..])?;
