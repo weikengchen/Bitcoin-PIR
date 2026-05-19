@@ -76,11 +76,11 @@ export const PIR2_TIER3_PIN: ServerAttestPin = {
   // RegisterKeys upload survives Cloudflare. pir2 runs `--serve-queries`
   // only — no hint pool. The embedded binary (`f63b3535…`) comes from
   // the deterministic wrapper `scripts/build_unified_server.sh`.
-  // NOTE (2026-05-18): pir2 is now one version BEHIND pir1 — pir1 was
-  // redeployed to the Phase-3b per-group OnionPIR Merkle server
-  // (`0cc87a8c…`, commit 121ea5c3) while pir2 still runs this pre-3b
-  // `f63b3535…` build, so PIR1_PIN and PIR2_TIER3_PIN no longer share
-  // a `binarySha256Hex`. A pir2 UKI v17 rebuild will realign them
+  // NOTE (2026-05-19): pir2 is behind pir1 — pir1 was redeployed to
+  // the HEXL-accelerated server (`3925cc4d…`, commit 0845b060) while
+  // pir2 still runs this pre-3b `f63b3535…` build, so PIR1_PIN and
+  // PIR2_TIER3_PIN no longer share a `binarySha256Hex`. A pir2 UKI
+  // v17 rebuild will realign them
   // (pir2 does not serve OnionPIR, so this is a hygiene gap, not a
   // functional one). MEASUREMENT captured from the v16 deploy via
   // `bpir-admin attest wss://weikeng2.bitcoinpir.org`.
@@ -100,15 +100,15 @@ export const PIR2_TIER3_PIN: ServerAttestPin = {
  */
 export const PIR1_PIN: ServerAttestPin = {
   // No measurementHex — Hetzner has no SEV.
-  // Bumped 2026-05-18: pir1 was redeployed to the Phase-3b per-group
-  // OnionPIR Merkle server (commit 121ea5c3). The binary below was
-  // verified on Hetzner against BOTH the on-disk artifact
-  // (`target/release/unified_server`) AND the live pir-primary /
-  // pir-secondary process images (`/proc/<pid>/exe`) — all three
-  // agree. pir2 is NOT on this binary yet (it still runs the pre-3b
-  // `f63b3535…` build), so PIR1_PIN and PIR2_TIER3_PIN no longer
-  // share a `binarySha256Hex`.
+  // Bumped 2026-05-19: pir1 redeployed to the HEXL-accelerated server
+  // (commit 0845b060) — the reproducible Nix build `nix build
+  // .#unified-server`, with Intel HEXL linked into OnionPIR's C++
+  // engine. Verified on Hetzner against the on-disk artifact
+  // (`target/release/unified_server`) and the live pir-primary process
+  // image (`/proc/<pid>/exe`). pir2 is not on this binary yet (still
+  // the pre-3b `f63b3535…` Tier-3 v16 build), so PIR1_PIN and
+  // PIR2_TIER3_PIN do not share a `binarySha256Hex`.
   binarySha256Hex:
-    '0cc87a8c8530a7830e78ed172af2c5c666c62ccde5d00dbca36321c577dcdeba',
+    '3925cc4d5c4e45d8d3c8d798afb471905f909751d5c15ad5cccb22eb2631d2d5',
   description: 'weikeng1.bitcoinpir.org (Hetzner i7-8700, no SEV)',
 };
