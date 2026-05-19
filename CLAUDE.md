@@ -402,4 +402,4 @@ Never use `echo "$var" | grep -q` under `set -o pipefail`. `grep -q` exits on fi
 ### Attestation pins (current as of 2026-05-19)
 `web/src/attest-pin.ts` is the authoritative source — values below are a quick reference.
 - **pir1 (Hetzner)**: binary `3925cc4d...` (HEXL-accelerated server, commit `0845b060`, reproducible `nix build .#unified-server`) — no SEV, no measurement
-- **pir2 (VPSBG) Tier 3 v16**: binary `f63b3535...`, measurement `59e276f3...` — behind pir1 (pre-3b `49db31da` build; pir2 does not serve OnionPIR, UKI v17 realignment pending)
+- **pir2 (VPSBG) Tier 3 v17**: binary `3925cc4d...` (same as pir1 — flake-built UKI `nix build --impure .#tier3-uki`, PR #3), measurement `6dcbfa45...` — fleet realigned; pir2 serves `--serve-queries` only, no OnionPIR

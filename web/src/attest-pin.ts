@@ -65,30 +65,26 @@ export interface ServerAttestPin {
 }
 
 /**
- * weikeng2.bitcoinpir.org — VPSBG Tier 3 UKI v16, pinned 2026-05-16.
- * Deterministic build (scripts/build_unified_server.sh +
- * build_uki_tier3.sh) on the Hetzner build host with VPSBG kernel
- * 7.0.0-15 + dracut 110.
+ * weikeng2.bitcoinpir.org — VPSBG Tier 3 UKI v17, pinned 2026-05-19.
+ * Built by the `packages.tier3-uki` flake derivation
+ * (`nix build --impure .#tier3-uki`) on the Hetzner build host: VPSBG
+ * kernel 7.0.0-15 + the reproducible `nix build .#unified-server`
+ * binary, embedded via the full Nix closure.
  */
 export const PIR2_TIER3_PIN: ServerAttestPin = {
-  // Tier 3 UKI v16 — 2026-05-16. Rebuilt to ship the transport-level
-  // WebSocket chunking fix (commit 49db31da) so OnionPIR's large
-  // RegisterKeys upload survives Cloudflare. pir2 runs `--serve-queries`
-  // only — no hint pool. The embedded binary (`f63b3535…`) comes from
-  // the deterministic wrapper `scripts/build_unified_server.sh`.
-  // NOTE (2026-05-19): pir2 is behind pir1 — pir1 was redeployed to
-  // the HEXL-accelerated server (`3925cc4d…`, commit 0845b060) while
-  // pir2 still runs this pre-3b `f63b3535…` build, so PIR1_PIN and
-  // PIR2_TIER3_PIN no longer share a `binarySha256Hex`. A pir2 UKI
-  // v17 rebuild will realign them
-  // (pir2 does not serve OnionPIR, so this is a hygiene gap, not a
-  // functional one). MEASUREMENT captured from the v16 deploy via
-  // `bpir-admin attest wss://weikeng2.bitcoinpir.org`.
+  // Tier 3 UKI v17 — 2026-05-19. The flake-built UKI (PR #3) embeds the
+  // reproducible Nix `unified_server` (`3925cc4d…`), so pir2 now runs
+  // the BYTE-IDENTICAL binary to pir1 — PIR1_PIN and PIR2_TIER3_PIN
+  // share `binarySha256Hex` again (the v16 `f63b3535…` drift is closed).
+  // pir2 runs `--serve-queries` only (no hint pool) and does not serve
+  // OnionPIR. MEASUREMENT captured from the v17 deploy via
+  // `bpir-admin attest wss://weikeng2.bitcoinpir.org` (SEV-SNP report
+  // Status: ReportDataMatch — attestation verified on real hardware).
   measurementHex:
-    '59e276f34881fec46f68f07582b863d46944868206db14402e32000e49ab568e3d41a9df9155991345ed578c31a7ab4a',
+    '6dcbfa45baa345ce5fabdddbc7386d43c31b3dbf1fd75402a112d303299c2428b2c0d0bf6a01325da87292ae69f2aa2a',
   binarySha256Hex:
-    'f63b35354c3f02037d5063a25696c3a919d14cccbcf4946f98cf6c5e75117ecd',
-  description: 'weikeng2.bitcoinpir.org (VPSBG, SEV-SNP, Tier 3 UKI v16)',
+    '3925cc4d5c4e45d8d3c8d798afb471905f909751d5c15ad5cccb22eb2631d2d5',
+  description: 'weikeng2.bitcoinpir.org (VPSBG, SEV-SNP, Tier 3 UKI v17)',
 };
 
 /**
@@ -105,9 +101,9 @@ export const PIR1_PIN: ServerAttestPin = {
   // .#unified-server`, with Intel HEXL linked into OnionPIR's C++
   // engine. Verified on Hetzner against the on-disk artifact
   // (`target/release/unified_server`) and the live pir-primary process
-  // image (`/proc/<pid>/exe`). pir2 is not on this binary yet (still
-  // the pre-3b `f63b3535…` Tier-3 v16 build), so PIR1_PIN and
-  // PIR2_TIER3_PIN do not share a `binarySha256Hex`.
+  // image (`/proc/<pid>/exe`). As of the 2026-05-19 Tier-3 v17 deploy
+  // (flake-built UKI, PR #3) pir2 runs this same binary, so PIR1_PIN
+  // and PIR2_TIER3_PIN now share `binarySha256Hex`.
   binarySha256Hex:
     '3925cc4d5c4e45d8d3c8d798afb471905f909751d5c15ad5cccb22eb2631d2d5',
   description: 'weikeng1.bitcoinpir.org (Hetzner i7-8700, no SEV)',
