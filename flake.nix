@@ -77,105 +77,320 @@
     # Use: `nix build .#unified-server` → ./result/bin/unified_server
     packages.${system} = {
       # ─── packages.tier3-uki ────────────────────────────────────────
-      # Phase 2 extension: produce the Tier 3 UKI inside Nix's sandbox.
-      # Replaces dracut entirely with NixOS's `makeInitrdNG` (which
-      # natively handles /nix/store paths — copies whole derivations
-      # into the initramfs at their store path, sets up symlinks at
-      # target paths). The bpir-* dracut modules' install() functions
-      # are translated into a `contents` list below.
+      # Production Tier 3 UKI for pir2 (weikeng2 — VPSBG, SEV-SNP).
       #
-      # The kernel image baked here is Nix's, NOT the Ubuntu kernel
-      # production runs. Different kernel → different UKI sha →
-      # different MEASUREMENT. A v5+ production deploy via this flake
-      # would update web/src/attest-pin.ts after re-deriving the
-      # MEASUREMENT.
+      # Assembles the whole UKI inside Nix — VPSBG kernel + initramfs +
+      # cmdline objcopy'd into systemd's EFI stub — embedding the exact
+      # reproducible `unified_server` from packages.unified-server. This
+      # is the flake counterpart of scripts/build_uki_tier3.sh: that
+      # recipe bakes a *system-linked* binary via dracut; this one
+      # bundles the full /nix/store closure via makeInitrdNG, so the
+      # baked-in binary is bit-identical to `nix build .#unified-server`
+      # (hence byte-identical to what pir1 runs).
       #
-      # WIP CAVEATS — initial spike. Things still needing attention to
-      # produce a fully bootable Tier 3 v5 UKI:
-      #   - bpir-tier3-init.sh hardcodes /usr/bin/runsvdir, /sbin/udhcpc,
-      #     etc. With Nix paths these don't exist. Either patch the script
-      #     in the contents list or set up symlinks via PATH-bind.
-      #   - Kernel modules: makeInitrdNG doesn't auto-include /lib/modules.
-      #     For SEV-SNP guest we need virtio_*, ccp, sev-guest, tsm_report
-      #     — production currently expects to modprobe these. Either
-      #     ensure they're built INTO the kernel (=y instead of =m) or
-      #     bundle the modules tree into contents.
-      #   - tunnel.env loaded at runtime from rootfs (per sub-task 3b),
-      #     no change needed here.
+      #   nix build --impure .#tier3-uki    # on pir-hetzner, as root
+      #   → ./result/bpir-tier3.efi
+      #
+      # ── IMPURITY: the VPSBG kernel ─────────────────────────────────
+      # pir2's measured-boot + SEV-SNP chain is validated ONLY for the
+      # Ubuntu-25.04-plucky-backport kernel 7.0.0-15-generic. A Nix
+      # kernel would change the launch MEASUREMENT and is not validated
+      # for VPSBG SEV-SNP. So the kernel image + its module tree are
+      # sourced from the BUILD HOST's filesystem (/boot, /lib/modules)
+      # via `builtins.path` — a deliberate, controlled break of flake
+      # hermeticity. Consequences:
+      #   - `nix build` MUST be passed `--impure` (else eval fails:
+      #     "access to absolute path '/boot/...' is forbidden").
+      #   - the build MUST run on the Hetzner UKI build host — the only
+      #     machine with this kernel installed (CLAUDE.md "Hetzner — UKI
+      #     build host"), as root (/boot/vmlinuz-* is mode 0600).
+      # The impurity is confined to *where the kernel comes from*; the
+      # result stays content-addressed and reproducible given the same
+      # kernel + module tree + flake revision.
       tier3-uki = let
-        kernel = pkgs.linuxPackages_6_12.kernel;
+        # Kernel version. Keep in sync with the path literals below
+        # (Nix path literals are not cleanly string-interpolatable).
+        kver = "7.0.0-15-generic";
+
+        # VPSBG-validated kernel image + module tree, content-addressed
+        # from the build host's filesystem. See the IMPURITY note above.
+        vpsbgKernelImage = builtins.path {
+          path = /boot/vmlinuz-7.0.0-15-generic;
+          name = "vmlinuz-7.0.0-15-generic";
+        };
+        vpsbgModulesSrc = builtins.path {
+          path = /lib/modules/7.0.0-15-generic;
+          name = "vpsbg-modules-7.0.0-15-generic";
+        };
+
         unifiedServer = self.packages.${system}.unified-server;
 
-        # Scripts from scripts/dracut/97bpir-tier3-init/, copied verbatim
-        # into the initramfs at the paths the boot flow expects.
-        bpirInitScript      = ./scripts/dracut/97bpir-tier3-init/bpir-tier3-init.sh;
-        cloudflaredRun      = ./scripts/dracut/97bpir-tier3-init/cloudflared-run.sh;
-        unifiedServerRun    = ./scripts/dracut/97bpir-tier3-init/unified-server-run.sh;
-        udhcpcDefaultScript = ./scripts/dracut/97bpir-tier3-init/udhcpc-default.script;
+        # cloudflared — the official statically-linked release binary.
+        # nixpkgs' cloudflared is a *dynamically* linked Go build with
+        # no RUNPATH: it resolves libc against a system /lib the Tier 3
+        # initramfs does not have, and patchelf'ing a RUNPATH onto a Go
+        # binary corrupts it (verified: segfault, exit 139). The
+        # official cloudflared-linux-amd64 asset is fully static (no ELF
+        # interpreter) — zero library resolution, nothing to bundle —
+        # which is exactly what the proven dracut v16 recipe ships.
+        # Pinned by content hash, so `fetchurl` stays a hermetic
+        # fixed-output derivation (this part needs no `--impure`).
+        cloudflaredStatic = pkgs.fetchurl {
+          url = "https://github.com/cloudflare/cloudflared/releases/download/2026.3.0/cloudflared-linux-amd64";
+          hash = "sha256-Sp5Q5tbXmOkPzQGTMVGpC/ft2ZoKVcKK0Y8uFiY6XDA=";
+        };
 
-        initrd = pkgs.makeInitrdNG {
-          name = "bpir-tier3-initrd";
-          # Each `source` is copied into the initramfs at its /nix/store
-          # path. Where target is given, a symlink at that path resolves
-          # back to the in-initramfs Nix-store path. Closures (library
-          # deps) get pulled in automatically by makeInitrdNG's reference
-          # walk.
-          contents = [
-            # Binaries (whole derivations → all of /bin is reachable)
-            { source = pkgs.cloudflared;  target = "/bin/cloudflared"; }
-            { source = unifiedServer;     target = "/bin/unified_server"; }
-            { source = pkgs.runit;        target = "/bin/runit"; }
-            { source = pkgs.busybox;      target = "/bin/busybox"; }
-            { source = pkgs.iproute2;     target = "/bin/ip"; }
-            { source = pkgs.kmod;         target = "/bin/modprobe"; }
-            { source = pkgs.util-linux;   target = "/bin/mount"; }
+        # Boot scripts — copied verbatim from scripts/dracut/97bpir-tier3-init/.
+        # NOT patched: the same files drive the proven dracut recipe
+        # (build_uki_tier3.sh). Instead, every binary the scripts invoke
+        # is placed below at the absolute path the script expects, so
+        # the scripts stay byte-identical across both recipes.
+        bpirInitScript   = ./scripts/dracut/97bpir-tier3-init/bpir-tier3-init.sh;
+        cloudflaredRun   = ./scripts/dracut/97bpir-tier3-init/cloudflared-run.sh;
+        unifiedServerRun = ./scripts/dracut/97bpir-tier3-init/unified-server-run.sh;
 
-            # Static scripts (no symlink needed — placed at target directly)
-            { source = bpirInitScript;      target = "/sbin/bpir-tier3-init"; }
-            { source = cloudflaredRun;      target = "/etc/sv/cloudflared/run"; }
-            { source = unifiedServerRun;    target = "/etc/sv/unified_server/run"; }
-            { source = udhcpcDefaultScript; target = "/etc/udhcpc/default.script"; }
+        # ── Minimal SEV-SNP kernel-module subset ─────────────────────
+        # The 7.0.0-15 kernel has virtio_net / virtio_pci / virtio_blk
+        # and ext4 built IN (confirmed in modules.builtin), so the only
+        # loadable modules a Tier 3 boot needs are the SEV-SNP guest
+        # stack: ccp, sev-guest, tsm_report. Their dependency closure is
+        # exactly those three (modules.dep: ccp→∅, sev-guest→tsm_report,
+        # tsm_report→∅). This mirrors the --add-drivers set + two-gate
+        # SEV validation of build_uki_tier3.sh.
+        #
+        # The host module tree nests the real .ko files one level deep
+        # (its modules.dep entries are prefixed "7.0.0-15-generic/..."),
+        # so each module is resolved by name with `find`, normalised
+        # into a standard kernel/... layout, and depmod regenerates
+        # clean metadata.
+        modulesSubset = pkgs.runCommand "bpir-tier3-modules-${kver}" {
+          nativeBuildInputs = [ pkgs.kmod ];
+        } ''
+          set -euo pipefail
+          dst="$out/lib/modules/${kver}"
+          mkdir -p "$dst/kernel/drivers/crypto/ccp" \
+                   "$dst/kernel/drivers/virt/coco/sev-guest" \
+                   "$dst/kernel/drivers/virt/coco/guest"
+
+          copy_mod() {
+            # $1 = module basename, $2 = destination kernel/ subdir.
+            local ko
+            ko=$(find ${vpsbgModulesSrc} -name "$1.ko.zst" -print -quit)
+            [ -n "$ko" ] || { echo "FATAL: $1.ko.zst not in module tree" >&2; exit 1; }
+            cp "$ko" "$dst/$2/"
+            echo "bundled module: $1  <-  $ko"
+          }
+          copy_mod ccp        kernel/drivers/crypto/ccp
+          copy_mod sev-guest  kernel/drivers/virt/coco/sev-guest
+          copy_mod tsm_report kernel/drivers/virt/coco/guest
+
+          # depmod inputs: the built-in module list + ordering hints, so
+          # a runtime `modprobe ext4` / `modprobe virtio_net` resolves
+          # as builtin (exit 0) rather than "not found".
+          for f in modules.builtin modules.builtin.modinfo modules.order; do
+            if [ -e "${vpsbgModulesSrc}/$f" ]; then
+              cp "${vpsbgModulesSrc}/$f" "$dst/"
+            fi
+          done
+
+          depmod -b "$out" "${kver}"
+
+          # ── SEV validation gate (mirrors build_uki_tier3.sh) ──
+          for mod in ccp sev-guest tsm_report; do
+            grep -qF "/$mod.ko" "$dst/modules.dep" \
+              || { echo "FATAL: $mod absent from generated modules.dep" >&2; exit 1; }
+          done
+          echo "SEV-SNP modules confirmed in modules.dep: ccp sev-guest tsm_report"
+        '';
+
+        # ── Initramfs ────────────────────────────────────────────────
+        # makeInitrdNG is deliberately NOT used. Its make-initrd-ng tool
+        # resolves a binary's shared libraries via that binary's own
+        # RUNPATH only — it does NOT walk the Nix store closure (the
+        # tool's own source notes glibc is unreachable that way). Go's
+        # cloudflared and glibc's own libs carry no usable RUNPATH, so
+        # makeInitrdNG silently drops them ("Couldn't satisfy dependency
+        # libc.so.6 …") and the initramfs comes out unrunnable (~17 MB).
+        #
+        # Instead: take the FULL runtime closure via closureInfo, copy
+        # every store path in verbatim, lay out the FHS-ish symlink tree
+        # the (dracut-shared, unmodified) boot scripts expect, and roll a
+        # reproducible newc cpio. Every bundled binary resolves its
+        # interpreter + libraries through absolute /nix/store paths, all
+        # of which are present.
+        initrdClosure = pkgs.closureInfo {
+          rootPaths = [
+            pkgs.busybox pkgs.iproute2 pkgs.util-linux pkgs.kmod pkgs.runit
+            unifiedServer modulesSubset
           ];
         };
 
+        initrd = pkgs.runCommand "bpir-tier3-initrd" {
+          nativeBuildInputs = [ pkgs.cpio pkgs.gzip ];
+        } ''
+          set -euo pipefail
+          root=root
+          mkdir -p "$root"
+
+          # 1. The complete runtime closure → /nix/store/<hash>.
+          mkdir -p "$root/nix/store"
+          cp -a $(cat ${initrdClosure}/store-paths) "$root/nix/store/"
+
+          # 2. Kernel pseudo-fs mount points — bpir-tier3-init.sh mounts
+          #    proc/sysfs/devtmpfs onto these without mkdir'ing them.
+          #    (CONFIG_DEVTMPFS_MOUNT=y → kernel populates /dev itself.)
+          mkdir -p "$root/proc" "$root/sys" "$root/dev" "$root/run" "$root/tmp"
+
+          # 3. /bin → busybox applet dir: /bin/{sh,mount,ip,sleep,mkdir,
+          #    ln,cat,grep,ls,reboot,nc,...}. /bin/sh backs every
+          #    #!/bin/sh (the rdinit takeover + the runit `run` scripts).
+          ln -s ${pkgs.busybox}/bin "$root/bin"
+
+          # 4. Tools where the busybox applet is not good enough, in
+          #    /usr/bin so PATH (/usr/local/bin:/usr/bin:/usr/sbin:/sbin:
+          #    /bin) finds them first: kmod modprobe/lsmod (loads the
+          #    .ko.zst SEV modules), iproute2 ip (route ... onlink),
+          #    util-linux mount/blkid (rootfs LABEL= / ext4 / --bind).
+          mkdir -p "$root/usr/bin" "$root/usr/local/bin" "$root/sbin" \
+                   "$root/etc/sv/cloudflared" "$root/etc/sv/unified_server" \
+                   "$root/lib"
+          ln -s ${pkgs.kmod}/bin/modprobe           "$root/usr/bin/modprobe"
+          ln -s ${pkgs.kmod}/bin/lsmod              "$root/usr/bin/lsmod"
+          ln -s ${pkgs.iproute2}/bin/ip             "$root/usr/bin/ip"
+          ln -s ${pkgs.util-linux}/bin/mount        "$root/usr/bin/mount"
+          ln -s ${pkgs.util-linux}/bin/blkid        "$root/usr/bin/blkid"
+          ln -s ${pkgs.runit}/bin/runsvdir          "$root/usr/bin/runsvdir"
+          ln -s ${pkgs.runit}/bin/runsv             "$root/usr/bin/runsv"
+          ln -s ${pkgs.runit}/bin/sv                "$root/usr/bin/sv"
+          ln -s ${pkgs.runit}/bin/chpst             "$root/usr/bin/chpst"
+
+          # 5. The two long-lived services + rdinit takeover + runit
+          #    `run` scripts, at the absolute paths the scripts use.
+          #    unified_server is the reproducible Nix build (== pir1).
+          # cloudflared: the static release binary, copied in directly
+          # (no closure, no interpreter). unified_server: the Nix build
+          # — symlinked so makeInitrdNG-style closure copying applies.
+          install -m0755 ${cloudflaredStatic}      "$root/usr/local/bin/cloudflared"
+          ln -s ${unifiedServer}/bin/unified_server "$root/usr/local/bin/unified_server"
+          # The three scripts are COPIED with an explicit +x mode (not
+          # symlinked into the store): the repo files' executable bits
+          # are inconsistent — unified-server-run.sh is not +x, and a
+          # 0444 store symlink target makes runsv fail the service with
+          # "unable to start ./run: access denied" (caught in QEMU). The
+          # dracut recipe masks this by chmod'ing its module dir.
+          install -m0755 ${bpirInitScript}   "$root/sbin/bpir-tier3-init"
+          install -m0755 ${cloudflaredRun}   "$root/etc/sv/cloudflared/run"
+          install -m0755 ${unifiedServerRun} "$root/etc/sv/unified_server/run"
+
+          # 6. SEV-SNP module subset → /lib/modules/<kver>/ for modprobe.
+          ln -s ${modulesSubset}/lib/modules "$root/lib/modules"
+
+          # 7. Reproducible newc cpio + gzip (kernel: CONFIG_RD_GZIP=y).
+          mkdir -p "$out"
+          find "$root" -exec touch -h -d @1 {} +
+          ( cd "$root" && find . -print0 | sort -z \
+              | cpio --quiet -o -H newc -R +0:+0 --reproducible --null \
+              | gzip -9 -n ) > "$out/initrd"
+          echo "initrd size: $(du -h "$out/initrd" | cut -f1)" \
+               "($(wc -l < ${initrdClosure}/store-paths) store paths)"
+        '';
+
       in pkgs.runCommand "bpir-tier3-uki" {
-        # ukify isn't reliably available in nixpkgs (`systemdUkify`
-        # build is broken on current nixos-unstable). Bypass ukify and
-        # use objcopy directly — that's all ukify does fundamentally
-        # (assemble PE/EFI sections via the linuxx64.efi.stub, which IS
-        # in pkgs.systemd at /lib/systemd/boot/efi/).
+        # objcopy assembles the UKI: it appends .osrel / .cmdline /
+        # .linux / .initrd PE sections to systemd's linuxx64.efi.stub.
+        # (ukify would do the same, but nixpkgs at this pin has no
+        # `ukify` attr and `systemdUkify` is unreliable — objcopy is
+        # the documented pre-ukify recipe and needs no Python.)
         nativeBuildInputs = with pkgs; [ binutils ];
-        passthru = { inherit initrd kernel; };
+        passthru = { inherit initrd modulesSubset; kernel = vpsbgKernelImage; };
       } ''
-        mkdir -p $out
+        set -euo pipefail
         STUB=${pkgs.systemd}/lib/systemd/boot/efi/linuxx64.efi.stub
-        [ -f "$STUB" ] || { echo "ERROR: $STUB not found"; exit 1; }
+        [ -f "$STUB" ] || { echo "ERROR: EFI stub not found at $STUB" >&2; exit 1; }
 
-        # Write cmdline + os-release as small section payloads.
+        KERNEL=${vpsbgKernelImage}
+        INITRD=${initrd}/initrd
+
+        # cmdline — byte-identical to build_uki_tier3.sh's proven v16
+        # cmdline. rdinit= makes the kernel exec our PID 1 takeover
+        # straight from the initramfs (no rootfs pivot).
         printf '%s' \
-            "rdinit=/sbin/bpir-tier3-init console=ttyS0,115200 console=tty1 loglevel=7" \
-            > cmdline
-        printf 'NAME="bpir"\nVERSION_ID="tier3-v5-nix"\n' > os-release
+          "rdinit=/sbin/bpir-tier3-init console=ttyS0,115200 console=tty1 quiet loglevel=3" \
+          > cmdline
+        printf 'NAME="bpir"\nID=bpir\nVERSION_ID="tier3-v17"\nPRETTY_NAME="BitcoinPIR Tier 3 (v17)"\n' \
+          > os-release
 
-        # objcopy adds PE sections to the stub. VMAs must be page-
-        # aligned (4 KiB) and non-overlapping. Addresses below are the
-        # canonical layout systemd's ukify uses (sufficient gaps for
-        # multi-MiB initrd payloads).
+        # ── PE section VMAs ────────────────────────────────────────
+        # objcopy-appended sections must sit ABOVE the stub's own PE
+        # image: VMA ≥ ImageBase, past SizeOfImage. Otherwise BFD
+        # truncates the 32-bit RVA ("section below image base") and the
+        # UKI is unbootable. The nixpkgs systemd stub's ImageBase is NOT
+        # a round number (and shifts with systemd bumps), so read
+        # ImageBase + SizeOfImage off the stub and compute from there.
+        # awk has no `exit` (reads all of objdump's output) so the pipe
+        # never SIGPIPEs the producer under `set -o pipefail`.
+        imagebase=$(( 0x$(objdump -p "$STUB" | awk '/^ImageBase/    {v=$2} END {print v}') ))
+        sizeofimage=$(( 0x$(objdump -p "$STUB" | awk '/^SizeOfImage/ {v=$2} END {print v}') ))
+        mib=$(( 1024 * 1024 ))
+        stub_end=$(( imagebase + sizeofimage ))
+        # First MiB-aligned VMA above the stub image, then 1 MiB gaps
+        # (.osrel/.cmdline are tiny) and a 64 MiB gap for the kernel.
+        osrel_vma=$(( ( stub_end + mib - 1 ) / mib * mib ))
+        cmdline_vma=$(( osrel_vma   + mib ))
+        linux_vma=$((   cmdline_vma + mib ))
+        initrd_vma=$((  linux_vma + 64 * mib ))
+
+        linux_sz=$(stat -c %s "$KERNEL")
+        if [ "$linux_sz" -ge $(( 64 * mib )) ]; then
+          echo "ERROR: kernel ($linux_sz bytes) exceeds the 64 MiB .linux gap" >&2
+          exit 1
+        fi
+        echo "stub: ImageBase=$(printf '0x%x' "$imagebase") SizeOfImage=$(printf '0x%x' "$sizeofimage")"
+        echo "VMAs: osrel=$(printf '0x%x' "$osrel_vma") cmdline=$(printf '0x%x' "$cmdline_vma") linux=$(printf '0x%x' "$linux_vma") initrd=$(printf '0x%x' "$initrd_vma")"
+
+        mkdir -p "$out"
         objcopy \
-            --add-section .osrel=os-release    --change-section-vma .osrel=0x20000 \
-            --add-section .cmdline=cmdline     --change-section-vma .cmdline=0x30000 \
-            --add-section .linux=${kernel}/bzImage \
-            --change-section-vma .linux=0x2000000 \
-            --add-section .initrd=${initrd}/initrd \
-            --change-section-vma .initrd=0x3000000 \
-            $STUB \
-            $out/bpir-tier3.efi
+          --add-section .osrel=os-release  --change-section-vma .osrel="$osrel_vma" \
+          --add-section .cmdline=cmdline   --change-section-vma .cmdline="$cmdline_vma" \
+          --add-section .linux="$KERNEL"   --change-section-vma .linux="$linux_vma" \
+          --add-section .initrd="$INITRD"  --change-section-vma .initrd="$initrd_vma" \
+          "$STUB" "$out/bpir-tier3.efi" 2> objcopy.err \
+            || { cat objcopy.err >&2; echo "ERROR: objcopy failed" >&2; exit 1; }
 
-        sha256sum $out/bpir-tier3.efi | tee $out/bpir-tier3.efi.sha256
+        # ── Post-build validation ──────────────────────────────────
+        # objcopy emits "section below image base" as a WARNING (exit 0
+        # still), so inspect its stderr explicitly.
+        if [ -s objcopy.err ]; then
+          echo "── objcopy warnings ──"; cat objcopy.err
+          if grep -q 'below image base' objcopy.err; then
+            echo "ERROR: objcopy placed a section below the PE image base" >&2
+            exit 1
+          fi
+        fi
+        # (here-string, not a pipe, to avoid SIGPIPE under pipefail.)
+        sections=$(objdump -h "$out/bpir-tier3.efi")
+        echo "── UKI PE sections ──"
+        echo "$sections"
+        for s in .osrel .cmdline .linux .initrd; do
+          grep -q -- "$s" <<< "$sections" \
+            || { echo "ERROR: section $s missing from UKI" >&2; exit 1; }
+        done
+        # SizeOfImage must cover .initrd's RVA end, else the firmware
+        # will not map the initramfs into memory and the boot dies.
+        out_soi=$(( 0x$(objdump -p "$out/bpir-tier3.efi" | awk '/^SizeOfImage/ {v=$2} END {print v}') ))
+        initrd_sz=$(stat -c %s "$INITRD")
+        initrd_end_rva=$(( initrd_vma - imagebase + initrd_sz ))
+        if [ "$out_soi" -lt "$initrd_end_rva" ]; then
+          echo "ERROR: UKI SizeOfImage ($(printf '0x%x' "$out_soi")) does not cover .initrd end ($(printf '0x%x' "$initrd_end_rva"))" >&2
+          exit 1
+        fi
+        echo "SizeOfImage=$(printf '0x%x' "$out_soi") covers .initrd end=$(printf '0x%x' "$initrd_end_rva") — OK"
+
+        sha256sum "$out/bpir-tier3.efi" | tee "$out/bpir-tier3.efi.sha256"
         echo
-        echo "kernel: ${kernel}/bzImage"
-        echo "initrd: ${initrd}/initrd"
-        echo "binary inside initrd: ${unifiedServer}/bin/unified_server"
+        echo "kernel:         $KERNEL ($linux_sz bytes)"
+        echo "initrd:         $INITRD"
+        echo "unified_server: ${unifiedServer}/bin/unified_server"
       '';
 
       unified-server = pkgs.rustPlatform.buildRustPackage {
