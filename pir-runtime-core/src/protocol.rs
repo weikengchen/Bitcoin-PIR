@@ -1273,7 +1273,12 @@ fn decode_harmony_hint_request_v2_half(data: &[u8]) -> io::Result<HarmonyHintReq
 
 // ─── HarmonyPIR batch encoding helpers ─────────────────────────────────────
 
-fn encode_harmony_batch_query(buf: &mut Vec<u8>, q: &HarmonyBatchQuery) {
+/// Encode a `HarmonyBatchQuery` *payload* (no [4B length][1B opcode]
+/// envelope — the envelope is owned by `Request::encode`). Exposed as
+/// `pub` so out-of-crate callers (notably the WASM wire-explorer
+/// decoder in `pir-sdk-wasm`) have a single source-of-truth encoder
+/// to test their mirrored decoder against.
+pub fn encode_harmony_batch_query(buf: &mut Vec<u8>, q: &HarmonyBatchQuery) {
     buf.push(q.level);
     buf.extend_from_slice(&q.round_id.to_le_bytes());
     buf.extend_from_slice(&(q.items.len() as u16).to_le_bytes());
@@ -1293,7 +1298,12 @@ fn encode_harmony_batch_query(buf: &mut Vec<u8>, q: &HarmonyBatchQuery) {
     }
 }
 
-fn decode_harmony_batch_query(data: &[u8]) -> io::Result<HarmonyBatchQuery> {
+/// Decode a `HarmonyBatchQuery` *payload* (no [4B length][1B opcode]
+/// envelope — pass `&data[1..]` from a `[opcode][payload]` frame, or
+/// just `&payload` from a stripped frame). Exposed as `pub` so
+/// out-of-crate callers (the WASM wire-explorer in `pir-sdk-wasm`)
+/// share one parser definition with the server side.
+pub fn decode_harmony_batch_query(data: &[u8]) -> io::Result<HarmonyBatchQuery> {
     if data.len() < 6 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "harmony batch query too short"));
     }

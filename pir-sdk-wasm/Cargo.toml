@@ -80,6 +80,22 @@ send_wrapper = "0.6"
 tracing-wasm = "0.2"
 console_error_panic_hook = "0.1"
 
+# Native-only dev dependency: the wire-explorer decoder in
+# `harmony_wire::harmony_decode_counts` mirrors
+# `pir_runtime_core::protocol::decode_harmony_batch_query` (see that
+# module's source-of-truth note). The mirror exists because
+# pir-runtime-core pulls in libdpf/memmap2/etc. and doesn't compile to
+# `wasm32-unknown-unknown`. To keep the mirror honest, the module's
+# native unit tests round-trip fixtures through pir-runtime-core's
+# canonical encoder and assert byte-level parity.
+#
+# Gated to `cfg(not(target_arch = "wasm32"))` so wasm-pack builds never
+# attempt to pull pir-runtime-core (which would fail). Dev-dependencies
+# don't normally affect `wasm-pack build`, but the target-gate makes
+# the intent explicit and survives any future resolver shifts.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+pir-runtime-core = { version = "0.1.0", path = "../pir-runtime-core" }
+
 # Per-package profile overrides must live at the workspace root; Cargo
 # ignores `[profile.*]` here and emits a warning on every build. For
 # size-optimized WASM builds, use `wasm-pack build --release` which

@@ -327,3 +327,35 @@ export function decodeUtxoData(data: Uint8Array): Array<{
   vout: number;
   amount: number;
 }>;
+
+// ─── Wire Explorer Helpers ──────────────────────────────────────────────────
+
+/**
+ * Decode the per-group sub-query `count` fields from a
+ * `REQ_HARMONY_BATCH_QUERY` (opcode `0x43`) frame, returning one entry
+ * per `(group, sub_query)` slot in declaration order so JS can assert
+ * the **HarmonyPIR Per-Group Request-Count Symmetry** privacy
+ * invariant ("every per-group query slot — INDEX / CHUNK / sibling —
+ * sends exactly `T − 1` sorted distinct `u32` indices") against live
+ * captured traffic.
+ *
+ * Accepts three input shapes (auto-detected, see below) so callers
+ * don't need to know whether they've already peeled the WebSocket
+ * envelope:
+ *   1. Full wire frame: `[4B payload_len LE][1B opcode = 0x43][payload]`
+ *   2. Stripped envelope, opcode kept: `[1B opcode = 0x43][payload]`
+ *   3. Raw payload: just `[payload]`
+ *
+ * Detection priority is (1) → (2) → (3); shape (1) wins when both (1)
+ * and (2) would match — the length-prefix consistency check is the
+ * tie-breaker.
+ *
+ * @param frame - Wire bytes captured from the WebSocket, in any of the
+ *                three shapes above.
+ * @returns A flat `Uint32Array` of length
+ *          `num_groups × sub_queries_per_group`, row-major by group.
+ * @throws If the input is empty, the opcode is wrong, the header is
+ *         truncated, or any per-group `count` declares more bytes than
+ *         remain in the payload.
+ */
+export function harmony_decode_counts(frame: Uint8Array): Uint32Array;

@@ -1794,6 +1794,7 @@ dependencies = [
  "js-sys",
  "pir-attest-verify",
  "pir-core",
+ "pir-runtime-core",
  "pir-sdk",
  "pir-sdk-client",
  "rand_core 0.6.4",

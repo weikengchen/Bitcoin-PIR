@@ -72,6 +72,14 @@ pub use client::{WasmDpfClient, WasmHarmonyClient, WasmSyncResult};
 pub mod metrics;
 pub use metrics::WasmAtomicMetrics;
 
+/// Wire-explorer helpers for HarmonyPIR frames — exposes
+/// [`harmony_decode_counts`] so the public dev-site explorer at
+/// <https://bitcoin-pir.github.io/playground/explorer> can verify the
+/// HarmonyPIR Per-Group Request-Count Symmetry invariant on live
+/// captured traffic.
+pub mod harmony_wire;
+pub use harmony_wire::harmony_decode_counts;
+
 /// Phase 2+ observability tail — wires a `tracing-wasm` subscriber that
 /// routes Phase 1 `#[tracing::instrument]` spans to the browser
 /// DevTools console. Call [`init_tracing_subscriber`] once at app
