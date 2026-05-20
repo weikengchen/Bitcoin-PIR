@@ -1261,49 +1261,74 @@ where
     sink.send(Message::Binary(to_send)).await
 }
 
-/// Feed-only variant of [`send_resp`] — push the payload into the WS sink
-/// without flushing. Lets the caller batch N frames into the kernel send
-/// buffer with one final [`SinkExt::flush`] instead of paying an await
-/// per frame.
+// `feed_resp` (a per-frame `sink.feed()` variant of `send_resp`) was
+// removed when the V2 / V2-half hint paths switched from one
+// `Message::Binary` per group to a coalesced ~768 KB batch — see
+// `HINT_BATCH_BYTES` below. The coalesced path uses `send_resp_batch`,
+// which seals each record individually (preserving per-record framing
+// the client demuxes) and emits the concatenated buffer as one
+// `Sink::send`-flushed Binary message per batch.
+
+/// Send a batch of `[4B len][body]` records as ONE WebSocket Binary
+/// message. Each record retains its own `[4B len][body_or_sealed]`
+/// framing inside the buffer so the client's transport layer can demux
+/// them one-by-one via [`WsConnection::recv`] (which peels one record
+/// per call, buffering any tail).
 ///
-/// Used by the V2 hint pool path to stream ~155 frames (~20 MB) without
-/// stalling on per-frame backpressure. Equivalent to `send_resp` on the
-/// wire — the receiver sees identical bytes; only the
-/// application-layer flushing changes.
+/// When the channel session is active, each record is sealed
+/// individually with a fresh sequence number — the seal pattern is
+/// byte-identical to N back-to-back `send_resp` calls, just emitted as
+/// one WS Binary message instead of N.
 ///
-/// Caller MUST `sink.flush().await` (or call `send_resp` for the final
-/// frame) before considering the batch complete — otherwise the last
-/// few frames may sit unsent in the local sink buffer.
-async fn feed_resp<S>(
+/// Used by the HarmonyPIR hint paths (V1, V2, V2-half) to coalesce the
+/// per-group hint records into ~`HINT_BATCH_BYTES`-sized batches; see
+/// the call sites for the surrounding loops.
+async fn send_resp_batch<S>(
     sink: &mut S,
-    session: Option<&mut pir_runtime_core::channel::Session>,
-    payload: Vec<u8>,
+    mut session: Option<&mut pir_runtime_core::channel::Session>,
+    records: Vec<Vec<u8>>,
 ) -> tokio_tungstenite::tungstenite::Result<()>
 where
     S: futures_util::SinkExt<tokio_tungstenite::tungstenite::Message, Error = tokio_tungstenite::tungstenite::Error>
         + Unpin,
 {
     use tokio_tungstenite::tungstenite::{Error as TungError, Message};
-    let to_send = match session {
-        Some(s) => {
-            if payload.len() < 4 {
-                payload
-            } else {
-                let inner = &payload[4..];
-                let sealed = s
-                    .seal(pir_runtime_core::channel::Direction::ServerToClient, inner)
-                    .map_err(|e| {
-                        TungError::Io(std::io::Error::other(format!("channel seal: {}", e)))
-                    })?;
-                let mut framed = Vec::with_capacity(4 + sealed.len());
-                framed.extend_from_slice(&(sealed.len() as u32).to_le_bytes());
-                framed.extend_from_slice(&sealed);
-                framed
+    if records.is_empty() {
+        return Ok(());
+    }
+    // Pre-size the output buffer. For the no-channel case we know the
+    // exact size; for the channel case each sealed body is
+    // `body.len() + 1 (magic) + 8 (seq) + 16 (tag) = body.len() + 25`,
+    // so a tight upper-bound stays correct without re-allocating.
+    let total_estimate: usize = records
+        .iter()
+        .map(|r| if r.len() < 4 { r.len() } else { 4 + (r.len() - 4) + 25 })
+        .sum();
+    let mut buf: Vec<u8> = Vec::with_capacity(total_estimate);
+    for payload in records {
+        match session.as_deref_mut() {
+            Some(s) => {
+                if payload.len() < 4 {
+                    // Defensive: malformed (no length prefix). Pass
+                    // through — matches `send_resp` behaviour.
+                    buf.extend_from_slice(&payload);
+                } else {
+                    let inner = &payload[4..];
+                    let sealed = s
+                        .seal(pir_runtime_core::channel::Direction::ServerToClient, inner)
+                        .map_err(|e| {
+                            TungError::Io(std::io::Error::other(format!("channel seal: {}", e)))
+                        })?;
+                    buf.extend_from_slice(&(sealed.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(&sealed);
+                }
+            }
+            None => {
+                buf.extend_from_slice(&payload);
             }
         }
-        None => payload,
-    };
-    sink.feed(Message::Binary(to_send)).await
+    }
+    sink.send(Message::Binary(buf)).await
 }
 
 // ─── Transport-level message chunking (Cloudflare large-message workaround) ──
@@ -1319,6 +1344,23 @@ const CHUNK_MAGIC: u8 = 0xc7;
 const CHUNK_SIZE: usize = 256 * 1024;
 const CHUNK_HDR: usize = 1 + 2 + 2; // magic + seq + total
 const MAX_REASSEMBLED: usize = 64 * 1024 * 1024;
+
+/// Target accumulation size before flushing a coalesced HarmonyPIR hint
+/// batch as one WebSocket Binary message. Per-group hint records
+/// (~74 KB each on the public deployment) are concatenated into a buffer
+/// until the threshold is crossed, then flushed.
+///
+/// Wire-format inside the buffer is unchanged — each record is still the
+/// pre-existing `[4B len][RESP_HARMONY_HINTS][group_id][n][t][m][hints]`
+/// frame. Only WS message boundaries are reduced (a HarmonyPIR query that
+/// previously emitted ~622 RX HARMONY_HINTS frames across two sockets now
+/// emits ~32).
+///
+/// Sized below 1 MiB so the message survives the Cloudflare WebSocket
+/// proxy (~1 MB ceiling — see docs/PIR1_REGISTER_KEYS_TRUNCATION.md).
+/// Mirrors `HINT_BATCH_BYTES` in
+/// `runtime/src/bin/harmonypir_hint_server.rs`.
+const HINT_BATCH_BYTES: usize = 768 * 1024;
 
 /// Like [`send_resp`], but when `allow_chunk` is set and the framed
 /// message exceeds `CHUNK_SIZE`, splits it into chunk frames the client
@@ -3034,24 +3076,51 @@ async fn main() {
                                 });
                             });
 
+                            // Coalesce per-group records into ~HINT_BATCH_BYTES
+                            // WS messages so the browser sees ~30 onmessage
+                            // events instead of `num` (~155). Each record
+                            // retains its per-record `[4B len][body]`
+                            // framing inside the buffer (sealed
+                            // individually if the channel is active) so
+                            // the client's existing one-record-per-recv()
+                            // contract holds — see `send_resp_batch` and
+                            // `WsConnection::recv` for the demux.
                             let mut sent = 0;
+                            let mut batches = 0usize;
+                            let mut pending: Vec<Vec<u8>> = Vec::new();
+                            let mut pending_bytes = 0usize;
                             while let Some((group_id, n, t, m, flat_hints)) = rx.recv().await {
                                 let hint_len = 1 + 1 + 4 + 4 + 4 + flat_hints.len();
-                                let mut resp = Vec::with_capacity(4 + hint_len);
-                                resp.extend_from_slice(&(hint_len as u32).to_le_bytes());
-                                resp.push(RESP_HARMONY_HINTS);
-                                resp.push(group_id);
-                                resp.extend_from_slice(&n.to_le_bytes());
-                                resp.extend_from_slice(&t.to_le_bytes());
-                                resp.extend_from_slice(&m.to_le_bytes());
-                                resp.extend_from_slice(&flat_hints);
-                                if let Err(e) = send_resp(&mut sink, channel_session.as_mut(), resp).await {
-                                    eprintln!("[{}] Send error: {}", peer, e);
-                                    break;
+                                let mut record = Vec::with_capacity(4 + hint_len);
+                                record.extend_from_slice(&(hint_len as u32).to_le_bytes());
+                                record.push(RESP_HARMONY_HINTS);
+                                record.push(group_id);
+                                record.extend_from_slice(&n.to_le_bytes());
+                                record.extend_from_slice(&t.to_le_bytes());
+                                record.extend_from_slice(&m.to_le_bytes());
+                                record.extend_from_slice(&flat_hints);
+                                pending_bytes += record.len();
+                                pending.push(record);
+                                if pending_bytes >= HINT_BATCH_BYTES {
+                                    let batch = std::mem::take(&mut pending);
+                                    pending_bytes = 0;
+                                    if let Err(e) = send_resp_batch(&mut sink, channel_session.as_mut(), batch).await {
+                                        eprintln!("[{}] Send error: {}", peer, e);
+                                        break;
+                                    }
+                                    batches += 1;
                                 }
                                 sent += 1;
                             }
-                            println!("[harmony-hint] db={} L{} {}/{} groups in {:.2?}", db_id, level, sent, num, t_start.elapsed());
+                            if !pending.is_empty() {
+                                if let Err(e) = send_resp_batch(&mut sink, channel_session.as_mut(), pending).await {
+                                    eprintln!("[{}] Final-batch send error: {}", peer, e);
+                                } else {
+                                    batches += 1;
+                                }
+                            }
+                            println!("[harmony-hint] db={} L{} {}/{} groups in {:.2?} ({} WS batches)",
+                                db_id, level, sent, num, t_start.elapsed(), batches);
                         }
                     }
                     REQ_HARMONY_HINTS_V2 => {
@@ -3097,45 +3166,58 @@ async fn main() {
                             }
                         };
 
-                        // 1. Feed key preamble frame (no flush — see (4) below).
-                        if let Err(e) = feed_resp(&mut sink, channel_session.as_mut(), entry.key_preamble.clone()).await {
-                            eprintln!("[{}] V2 preamble feed error: {}", peer, e);
+                        // 1. Send key preamble as its own (small) WS Binary
+                        //    message — keeps the existing wire shape for the
+                        //    preamble + makes the client's first recv()
+                        //    return just the preamble. (The client picks the
+                        //    PRP key out of it before building HarmonyGroup
+                        //    instances.)
+                        if let Err(e) = send_resp(&mut sink, channel_session.as_mut(), entry.key_preamble.clone()).await {
+                            eprintln!("[{}] V2 preamble send error: {}", peer, e);
                             continue;
                         }
 
-                        // 2. Feed all INDEX frames. `feed` pushes into the
-                        //    WS sink's local buffer without forcing a flush
-                        //    per frame — so the ~155 frames in a typical
-                        //    pool entry don't pay 155× await + flush
-                        //    backpressure overhead. The kernel TCP buffer
-                        //    sees one large pipelined write loop and
-                        //    schedules segments much more efficiently.
-                        //    Measured: ~2.3 MB/s → ~6 MB/s on the public
-                        //    deployment.
+                        // 2. Coalesce INDEX + CHUNK frames into
+                        //    ~HINT_BATCH_BYTES WS messages. Each record
+                        //    retains its per-record `[4B len][body]`
+                        //    framing (sealed individually if the channel
+                        //    is on) so the client's
+                        //    one-record-per-recv() contract holds — see
+                        //    `send_resp_batch` + `WsConnection::recv`
+                        //    for the demux. A typical pool entry's ~155
+                        //    frames now flush as ~10 WS messages
+                        //    instead of 155.
                         let mut sent = 0usize;
-                        for frame in &entry.index_frames {
-                            if let Err(e) = feed_resp(&mut sink, channel_session.as_mut(), frame.clone()).await {
-                                eprintln!("[{}] V2 index frame feed error: {}", peer, e);
-                                break;
+                        let mut batches = 0usize;
+                        let mut pending: Vec<Vec<u8>> = Vec::new();
+                        let mut pending_bytes = 0usize;
+                        let frame_iter = entry.index_frames.iter().chain(entry.chunk_frames.iter());
+                        for frame in frame_iter {
+                            pending_bytes += frame.len();
+                            pending.push(frame.clone());
+                            if pending_bytes >= HINT_BATCH_BYTES {
+                                let batch = std::mem::take(&mut pending);
+                                pending_bytes = 0;
+                                if let Err(e) = send_resp_batch(&mut sink, channel_session.as_mut(), batch).await {
+                                    eprintln!("[{}] V2 frame batch send error: {}", peer, e);
+                                    break;
+                                }
+                                batches += 1;
                             }
                             sent += 1;
                         }
-
-                        // 3. Feed all CHUNK frames.
-                        for frame in &entry.chunk_frames {
-                            if let Err(e) = feed_resp(&mut sink, channel_session.as_mut(), frame.clone()).await {
-                                eprintln!("[{}] V2 chunk frame feed error: {}", peer, e);
-                                break;
+                        if !pending.is_empty() {
+                            if let Err(e) = send_resp_batch(&mut sink, channel_session.as_mut(), pending).await {
+                                eprintln!("[{}] V2 final-batch send error: {}", peer, e);
+                            } else {
+                                batches += 1;
                             }
-                            sent += 1;
                         }
 
-                        // 4. Terminal sentinel: group_id=0xFF signals
-                        //    end-of-stream. Use `send_resp` here (not
-                        //    `feed_resp`) so the underlying
-                        //    `Sink::send` flushes the entire batched
-                        //    stream — preamble + 155 frames + sentinel
-                        //    all hit the wire in one final flush.
+                        // 3. Terminal sentinel: group_id=0xFF signals
+                        //    end-of-stream. Sent as its own (small) message
+                        //    so the client's last recv() returns just the
+                        //    sentinel, matching the legacy unbatched shape.
                         let terminal_len: u32 = 1 + 1; // variant + group_id
                         let mut terminal = Vec::with_capacity(4 + terminal_len as usize);
                         terminal.extend_from_slice(&terminal_len.to_le_bytes());
@@ -3145,9 +3227,10 @@ async fn main() {
 
                         let elapsed = t_start.elapsed();
                         println!(
-                            "[harmony-hint-v2] db={} {} groups served from pool (prp_key={:02x?}...) in {:.2?}",
+                            "[harmony-hint-v2] db={} {} groups served from pool ({} WS batches, prp_key={:02x?}...) in {:.2?}",
                             db_id,
                             sent,
+                            batches,
                             &entry.prp_key[..4],
                             elapsed,
                         );
@@ -3270,9 +3353,11 @@ async fn main() {
                             }
                         };
 
-                        // 1. Feed key preamble (same for both halves
-                        //    since they share the entry).
-                        if let Err(e) = feed_resp(
+                        // 1. Send key preamble (same for both halves
+                        //    since they share the entry). Kept as its own
+                        //    small WS Binary message so the client's first
+                        //    recv() returns just the preamble.
+                        if let Err(e) = send_resp(
                             &mut sink,
                             channel_session.as_mut(),
                             entry_arc.key_preamble.clone(),
@@ -3280,37 +3365,71 @@ async fn main() {
                         .await
                         {
                             eprintln!(
-                                "[{}] V2-half preamble feed error: {}",
+                                "[{}] V2-half preamble send error: {}",
                                 peer, e
                             );
                             continue;
                         }
 
-                        // 2. Feed the selected half's frames.
+                        // 2. Coalesce the selected half's frames into
+                        //    ~HINT_BATCH_BYTES WS messages. Each record
+                        //    retains its per-record `[4B len][body]`
+                        //    framing (sealed individually if the
+                        //    channel is on) so the client's
+                        //    one-record-per-recv() contract holds. A
+                        //    typical half (~78 INDEX or ~77 CHUNK
+                        //    frames @ ~74 KB) now flushes as ~5 WS
+                        //    messages instead of ~78.
                         let frames: &[Vec<u8>] = if side == 0 {
                             &entry_arc.index_frames
                         } else {
                             &entry_arc.chunk_frames
                         };
                         let mut sent = 0usize;
+                        let mut batches = 0usize;
+                        let mut pending: Vec<Vec<u8>> = Vec::new();
+                        let mut pending_bytes = 0usize;
                         for frame in frames {
-                            if let Err(e) = feed_resp(
+                            pending_bytes += frame.len();
+                            pending.push(frame.clone());
+                            if pending_bytes >= HINT_BATCH_BYTES {
+                                let batch = std::mem::take(&mut pending);
+                                pending_bytes = 0;
+                                if let Err(e) = send_resp_batch(
+                                    &mut sink,
+                                    channel_session.as_mut(),
+                                    batch,
+                                )
+                                .await
+                                {
+                                    eprintln!(
+                                        "[{}] V2-half frame batch send error (side={}, group={}): {}",
+                                        peer, side, sent, e
+                                    );
+                                    break;
+                                }
+                                batches += 1;
+                            }
+                            sent += 1;
+                        }
+                        if !pending.is_empty() {
+                            if let Err(e) = send_resp_batch(
                                 &mut sink,
                                 channel_session.as_mut(),
-                                frame.clone(),
+                                pending,
                             )
                             .await
                             {
                                 eprintln!(
-                                    "[{}] V2-half frame feed error (side={}, group={}): {}",
-                                    peer, side, sent, e
+                                    "[{}] V2-half final-batch send error (side={}): {}",
+                                    peer, side, e
                                 );
-                                break;
+                            } else {
+                                batches += 1;
                             }
-                            sent += 1;
                         }
 
-                        // 3. Send terminal sentinel (flushes the batch).
+                        // 3. Send terminal sentinel.
                         let terminal_len: u32 = 1 + 1;
                         let mut terminal = Vec::with_capacity(4 + terminal_len as usize);
                         terminal.extend_from_slice(&terminal_len.to_le_bytes());
@@ -3326,10 +3445,11 @@ async fn main() {
                         let elapsed = t_start.elapsed();
                         let side_name = if side == 0 { "INDEX" } else { "CHUNK" };
                         println!(
-                            "[harmony-hint-v2-half] db={} side={} {} groups served from pool (prp_key={:02x?}..., token={:02x?}...) in {:.2?}",
+                            "[harmony-hint-v2-half] db={} side={} {} groups served from pool ({} WS batches, prp_key={:02x?}..., token={:02x?}...) in {:.2?}",
                             db_id,
                             side_name,
                             sent,
+                            batches,
                             &entry_arc.prp_key[..4],
                             &token[..4],
                             elapsed,

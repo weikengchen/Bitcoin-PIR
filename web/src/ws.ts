@@ -150,20 +150,65 @@ export class ManagedWebSocket {
     this.ws = null;
   }
 
-  /** Pong-filter, then resolve the next pending request (FIFO). */
+    /**
+   * Pong-filter, then resolve the next pending request (FIFO).
+   *
+   * A single WebSocket message may carry one record (the historical
+   * shape) or several length-prefixed records concatenated back-to-back
+   * — the HarmonyPIR hint coalescing introduced 2026-05-20 (see
+   * `HINT_BATCH_BYTES` in `runtime/src/bin/unified_server.rs`) flushes
+   * ~750 KB of records per WS message. This method peels each
+   * `[4B len LE][payload of len bytes]` record off the head of `data`
+   * and resolves one pending callback per record. For any non-coalesced
+   * message (one record per WS message) the loop runs exactly once,
+   * preserving the historical behaviour.
+   */
   private deliver(data: Uint8Array): void {
-    // Filter pong responses: [4B len LE][1B variant]. Pong: len=1, variant=0x00.
-    if (data.length >= 5) {
-      const len = data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24);
-      if (len === 1 && data[4] === 0x00) {
-        return; // Silently discard pong
+    let off = 0;
+    while (off + 4 <= data.length) {
+      const len =
+        data[off] |
+        (data[off + 1] << 8) |
+        (data[off + 2] << 16) |
+        (data[off + 3] << 24);
+      const recordEnd = off + 4 + len;
+      if (recordEnd > data.length) {
+        // Malformed: length prefix points past the WS message. Drop
+        // the rest — coalescing is strictly within one WS message, so
+        // a record can never span a boundary.
+        this.log(
+          `Truncated record in WS message: len=${len} but only ${data.length - off - 4} bytes available`,
+          'error',
+        );
+        return;
+      }
+      const record = data.subarray(off, recordEnd);
+      off = recordEnd;
+
+      // Filter pong responses: [4B len=1 LE][1B variant=0x00].
+      if (len === 1 && record[4] === 0x00) {
+        continue; // Silently discard pong
+      }
+
+      const cb = this.pending.shift();
+      if (cb) {
+        clearTimeout(cb.timeout);
+        // Copy out of the subarray so callers can hold the buffer past
+        // the next onmessage event without aliasing the WS message's
+        // backing ArrayBuffer.
+        cb.resolve(new Uint8Array(record));
+      } else {
+        this.log(
+          `Received record with no pending caller (len=${len}); dropping`,
+          'error',
+        );
       }
     }
-
-    const cb = this.pending.shift();
-    if (cb) {
-      clearTimeout(cb.timeout);
-      cb.resolve(data);
+    if (off !== data.length) {
+      this.log(
+        `WS message had ${data.length - off} trailing bytes (not a complete record)`,
+        'error',
+      );
     }
   }
 

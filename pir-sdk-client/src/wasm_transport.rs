@@ -136,6 +136,42 @@ enum IncomingFrame {
     Closed(String),
 }
 
+/// Pop one `[4B len][payload of len bytes]` record off the head of `buf`,
+/// leaving any trailing bytes in place. Mirrors
+/// `WsConnection::take_record_from_buf` in
+/// [`crate::connection`](crate::connection) — see that function for the
+/// rationale (HarmonyPIR hint coalescing).
+fn take_record_from_buf(buf: &mut Vec<u8>) -> PirResult<Option<Vec<u8>>> {
+    if buf.len() < 4 {
+        if !buf.is_empty() {
+            let leftover = buf.len();
+            buf.clear();
+            return Err(PirError::Protocol(format!(
+                "recv: WS message ended mid-record (leftover {} bytes)",
+                leftover
+            )));
+        }
+        return Ok(None);
+    }
+    let payload_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    let record_len = 4 + payload_len;
+    if buf.len() < record_len {
+        let leftover = buf.len();
+        buf.clear();
+        return Err(PirError::Protocol(format!(
+            "recv: truncated record (len prefix {} > {} buffered bytes)",
+            payload_len, leftover
+        )));
+    }
+    let record = buf[..record_len].to_vec();
+    if record_len == buf.len() {
+        buf.clear();
+    } else {
+        buf.drain(..record_len);
+    }
+    Ok(Some(record))
+}
+
 /// Owning handles for the four JS-side callbacks.
 ///
 /// `Closure<dyn FnMut(...)>` is the idiomatic `wasm-bindgen` shape for a
@@ -183,6 +219,15 @@ pub struct WasmWebSocketTransport {
     /// Backend label passed to the recorder's callbacks. Defaults to
     /// `""`; owning clients override via `set_metrics_recorder`.
     metrics_backend: &'static str,
+    /// Leftover bytes from the last WS Binary message — populated when
+    /// the message carries multiple length-prefixed records (the
+    /// HarmonyPIR hint coalescing introduced 2026-05-20; see
+    /// `HINT_BATCH_BYTES` in `runtime/src/bin/unified_server.rs`).
+    /// `recv()` peels one record per call before reaching for the next
+    /// WS message. For any server that emits one record per WS message,
+    /// this buffer is always empty between calls, so the path is a
+    /// no-op for non-coalesced traffic.
+    recv_buf: Vec<u8>,
 }
 
 impl WasmWebSocketTransport {
@@ -229,9 +274,8 @@ fn build_transport(
 )> {
     // `WebSocket::new` throws on invalid URLs; convert the JS exception
     // to a PirError.
-    let ws = WebSocket::new(url).map_err(|e| {
-        PirError::ConnectionFailed(format!("WebSocket constructor threw: {:?}", e))
-    })?;
+    let ws = WebSocket::new(url)
+        .map_err(|e| PirError::ConnectionFailed(format!("WebSocket constructor threw: {:?}", e)))?;
     // Messages arrive as `ArrayBuffer`. The alternative (`Blob`) needs an
     // async FileReader step per message — wasted work for our binary-only
     // protocol.
@@ -340,6 +384,7 @@ fn build_transport(
         closed: Wasm32Shim::new(closed),
         metrics_recorder: None,
         metrics_backend: "",
+        recv_buf: Vec::new(),
     };
 
     Ok((open_rx, transport))
@@ -405,18 +450,31 @@ impl PirTransport for WasmWebSocketTransport {
     }
 
     async fn recv(&mut self) -> PirResult<Vec<u8>> {
+        // First try to peel one record off any tail from the previous
+        // WS message (HarmonyPIR hint coalescing — see `recv_buf` doc).
+        if let Some(record) = take_record_from_buf(&mut self.recv_buf)? {
+            return Ok(record);
+        }
+
         // The `next()` future resolves when the next callback-pushed
         // `IncomingFrame` lands on the channel — could be a message,
         // error, or close.
         match self.rx.next().await {
             Some(IncomingFrame::Binary(bytes)) => {
+                // `fire_bytes_received` fires once per WS message
+                // (matching the wire-level observer count), not per
+                // record — so a coalesced batch still reports its full
+                // size on the message that delivered it.
                 self.fire_bytes_received(bytes.len());
-                Ok(bytes)
+                self.recv_buf = bytes;
+                take_record_from_buf(&mut self.recv_buf)?.ok_or_else(|| {
+                    PirError::Protocol(
+                        "recv: WS message shorter than one length-prefixed record".into(),
+                    )
+                })
             }
             Some(IncomingFrame::Error(msg)) => Err(PirError::ConnectionFailed(msg)),
-            Some(IncomingFrame::Closed(reason)) => {
-                Err(PirError::ConnectionClosed(reason))
-            }
+            Some(IncomingFrame::Closed(reason)) => Err(PirError::ConnectionClosed(reason)),
             None => Err(PirError::ConnectionClosed(
                 "WebSocket receiver dropped".into(),
             )),

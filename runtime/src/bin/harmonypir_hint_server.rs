@@ -24,6 +24,23 @@ use harmonypir::prp::hoang::HoangPrp;
  // for find_best_t, pad_n_for_t, compute_rounds
 use rand::RngCore;
 
+/// Target accumulation size before flushing a coalesced hint batch as one
+/// WebSocket Binary message. Per-group hint records (~74 KB each on the
+/// public deployment) are concatenated into this buffer; once the
+/// threshold is crossed the buffer is flushed and a fresh one started.
+///
+/// Wire-format inside the buffer is unchanged — each record is still the
+/// pre-existing `[4B len][RESP_HARMONY_HINTS][group_id][n][t][m][hints]`
+/// frame. Only WS message boundaries are reduced (a HarmonyPIR query that
+/// previously emitted ~622 RX HARMONY_HINTS frames now emits ~32).
+///
+/// Kept below 1 MiB so the message survives the Cloudflare WebSocket
+/// proxy (~1 MB ceiling — see docs/PIR1_REGISTER_KEYS_TRUNCATION.md). The
+/// standalone hint server isn't deployed behind Cloudflare, but a shared
+/// constant keeps the framing identical across the unified-server V2 /
+/// V2-half paths.
+const HINT_BATCH_BYTES: usize = 768 * 1024;
+
 // ─── Server data ────────────────────────────────────────────────────────────
 
 use runtime::table::CuckooTablePair;
@@ -271,27 +288,48 @@ async fn main() {
                         });
 
                         // Receive and stream hints to client as they arrive.
+                        // Coalesce per-group records into ~HINT_BATCH_BYTES
+                        // chunks so the client sees ~32 WS messages
+                        // (one onmessage event each) instead of `num`
+                        // (~155). Each record inside the buffer is the
+                        // same `[4B len][RESP_HARMONY_HINTS][...]` frame
+                        // the client was already parsing — only WS
+                        // message boundaries change.
                         let mut sent = 0;
+                        let mut batches = 0usize;
+                        let mut buf: Vec<u8> = Vec::with_capacity(HINT_BATCH_BYTES + 128 * 1024);
                         while let Some((group_id, n, t, m, flat_hints)) = rx.recv().await {
                             let hint_payload_len = 1 + 1 + 4 + 4 + 4 + flat_hints.len();
-                            let mut resp = Vec::with_capacity(4 + hint_payload_len);
-                            resp.extend_from_slice(&(hint_payload_len as u32).to_le_bytes());
-                            resp.push(RESP_HARMONY_HINTS);
-                            resp.push(group_id);
-                            resp.extend_from_slice(&n.to_le_bytes());
-                            resp.extend_from_slice(&t.to_le_bytes());
-                            resp.extend_from_slice(&m.to_le_bytes());
-                            resp.extend_from_slice(&flat_hints);
+                            buf.extend_from_slice(&(hint_payload_len as u32).to_le_bytes());
+                            buf.push(RESP_HARMONY_HINTS);
+                            buf.push(group_id);
+                            buf.extend_from_slice(&n.to_le_bytes());
+                            buf.extend_from_slice(&t.to_le_bytes());
+                            buf.extend_from_slice(&m.to_le_bytes());
+                            buf.extend_from_slice(&flat_hints);
 
-                            if let Err(e) = sink.send(Message::Binary(resp)).await {
-                                eprintln!("[{}] Send error: {}", peer, e);
-                                break;
+                            if buf.len() >= HINT_BATCH_BYTES {
+                                let batch = std::mem::take(&mut buf);
+                                if let Err(e) = sink.send(Message::Binary(batch)).await {
+                                    eprintln!("[{}] Send error: {}", peer, e);
+                                    break;
+                                }
+                                buf.reserve(HINT_BATCH_BYTES + 128 * 1024);
+                                batches += 1;
                             }
                             sent += 1;
                         }
+                        // Flush the final partial batch.
+                        if !buf.is_empty() {
+                            if let Err(e) = sink.send(Message::Binary(buf)).await {
+                                eprintln!("[{}] Final-batch send error: {}", peer, e);
+                            } else {
+                                batches += 1;
+                            }
+                        }
 
-                        println!("[{}] Hints streamed: level={} {}/{} groups in {:.2?}",
-                            peer, level, sent, num, t_start.elapsed());
+                        println!("[{}] Hints streamed: level={} {}/{} groups in {:.2?} ({} WS batches)",
+                            peer, level, sent, num, t_start.elapsed(), batches);
                     }
                     Request::HarmonyHintsV2(_v2_req) => {
                         // V2: server generates PRP key, sends ALL groups for both
@@ -345,28 +383,45 @@ async fn main() {
                             });
                         });
 
-                        // Stream frames as they arrive.
+                        // Stream frames as they arrive — coalesced into
+                        // ~HINT_BATCH_BYTES-sized WS messages. See the V1
+                        // path above for the rationale; the inner
+                        // length-prefixed record stream is unchanged.
                         let mut sent = 0usize;
+                        let mut batches = 0usize;
+                        let mut buf: Vec<u8> = Vec::with_capacity(HINT_BATCH_BYTES + 128 * 1024);
                         while let Some((group_id, n, t, m, flat_hints)) = rx.recv().await {
                             let hint_payload_len: u32 = 1 + 1 + 4 + 4 + 4 + flat_hints.len() as u32;
-                            let mut resp = Vec::with_capacity(4 + hint_payload_len as usize);
-                            resp.extend_from_slice(&hint_payload_len.to_le_bytes());
-                            resp.push(RESP_HARMONY_HINTS);
-                            resp.push(group_id);
-                            resp.extend_from_slice(&n.to_le_bytes());
-                            resp.extend_from_slice(&t.to_le_bytes());
-                            resp.extend_from_slice(&m.to_le_bytes());
-                            resp.extend_from_slice(&flat_hints);
+                            buf.extend_from_slice(&hint_payload_len.to_le_bytes());
+                            buf.push(RESP_HARMONY_HINTS);
+                            buf.push(group_id);
+                            buf.extend_from_slice(&n.to_le_bytes());
+                            buf.extend_from_slice(&t.to_le_bytes());
+                            buf.extend_from_slice(&m.to_le_bytes());
+                            buf.extend_from_slice(&flat_hints);
 
-                            if let Err(e) = sink.send(Message::Binary(resp)).await {
-                                eprintln!("[{}] V2 hint send error: {}", peer, e);
-                                break;
+                            if buf.len() >= HINT_BATCH_BYTES {
+                                let batch = std::mem::take(&mut buf);
+                                if let Err(e) = sink.send(Message::Binary(batch)).await {
+                                    eprintln!("[{}] V2 hint send error: {}", peer, e);
+                                    break;
+                                }
+                                buf.reserve(HINT_BATCH_BYTES + 128 * 1024);
+                                batches += 1;
                             }
                             sent += 1;
                         }
+                        // Flush the final partial batch.
+                        if !buf.is_empty() {
+                            if let Err(e) = sink.send(Message::Binary(buf)).await {
+                                eprintln!("[{}] V2 final-batch send error: {}", peer, e);
+                            } else {
+                                batches += 1;
+                            }
+                        }
 
-                        println!("[{}] V2 hints streamed: {}/{} groups in {:.2?}",
-                            peer, sent, total_groups, t_start.elapsed());
+                        println!("[{}] V2 hints streamed: {}/{} groups in {:.2?} ({} WS batches)",
+                            peer, sent, total_groups, t_start.elapsed(), batches);
                     }
                     _ => {
                         let resp = Response::Error("unsupported request on hint server".into());

@@ -186,6 +186,18 @@ pub struct WsConnection {
     /// Backend label passed to the recorder's callbacks. Defaults to the
     /// empty string; the owning client overrides via `set_metrics_recorder`.
     metrics_backend: &'static str,
+    /// Leftover bytes from the last WS Binary message — populated when a
+    /// message arrives carrying more than one length-prefixed record.
+    /// `recv()` drains records out of this buffer one at a time before
+    /// reaching for the next WS message.
+    ///
+    /// Used to consume coalesced HarmonyPIR hint batches (a server-side
+    /// optimisation that flushes ~750 KB of length-prefixed hint records
+    /// per WS message — see `HINT_BATCH_BYTES` in
+    /// `runtime/src/bin/unified_server.rs`). For any server that still
+    /// emits one record per WS message, this buffer never holds residual
+    /// bytes, so the path is a no-op for non-coalesced traffic.
+    recv_buf: Vec<u8>,
 }
 
 /// Install the `ring` crypto provider for rustls exactly once per process.
@@ -302,6 +314,7 @@ impl WsConnection {
                         retry_policy: policy,
                         metrics_recorder: None,
                         metrics_backend: "",
+                        recv_buf: Vec::new(),
                     });
                 }
                 Err(err) if err.is_connection_error() => {
@@ -378,6 +391,10 @@ impl WsConnection {
                 Ok((sink, stream)) => {
                     self.sink = sink;
                     self.stream = stream;
+                    // Drop any half-consumed coalesced hint batch from the
+                    // previous connection — its records belonged to a
+                    // request whose response can never complete.
+                    self.recv_buf.clear();
                     return Ok(());
                 }
                 Err(err) if err.is_connection_error() => {
@@ -513,20 +530,40 @@ impl WsConnection {
         Ok(())
     }
 
-    /// Receive a binary message, handling ping/pong automatically,
-    /// subject to the per-request deadline.
+    /// Receive one length-prefixed record, handling ping/pong
+    /// automatically, subject to the per-request deadline.
+    ///
+    /// A single WebSocket Binary message may carry one record (the
+    /// historical shape) or several records concatenated back-to-back
+    /// (the HarmonyPIR hint coalescing introduced 2026-05-20 — see
+    /// `HINT_BATCH_BYTES` on the server side). This method peels one
+    /// `[4B len][payload of len bytes]` record off the head of the
+    /// internal buffer and stashes any tail bytes for the next call,
+    /// reading a fresh WS message only when the buffer is empty.
+    ///
+    /// `fire_bytes_received` is invoked once per WS message read (with
+    /// the message's full size) — not per record — so the metrics
+    /// recorder sees the same byte count a wire observer would see.
     pub async fn recv(&mut self) -> PirResult<Vec<u8>> {
+        if let Some(record) = Self::take_record_from_buf(&mut self.recv_buf)? {
+            return Ok(record);
+        }
+
         let request_timeout = self.request_timeout;
         let url = self.url.clone();
         let recv_fut = self.recv_inner();
         match tokio::time::timeout(request_timeout, recv_fut).await {
-            Ok(Ok(frame)) => {
-                // Report the raw frame length (including any length
-                // prefix the PIR protocol adds on top of the WebSocket
-                // payload — matches what a wire-level observer would
-                // see).
-                self.fire_bytes_received(frame.len());
-                Ok(frame)
+            Ok(Ok(ws_msg)) => {
+                // Report the size of the raw WS message (or reassembled
+                // chunked message) — matches what a wire-level observer
+                // would see.
+                self.fire_bytes_received(ws_msg.len());
+                self.recv_buf = ws_msg;
+                Self::take_record_from_buf(&mut self.recv_buf)?.ok_or_else(|| {
+                    PirError::Protocol(
+                        "recv: WS message shorter than one length-prefixed record".into(),
+                    )
+                })
             }
             Ok(Err(e)) => Err(e),
             Err(_) => Err(PirError::Timeout(format!(
@@ -534,6 +571,54 @@ impl WsConnection {
                 url, request_timeout,
             ))),
         }
+    }
+
+    /// Pop one `[4B len][payload of len bytes]` record off the head of
+    /// `buf`, leaving any trailing bytes in place. Returns:
+    ///  * `Ok(Some(record))` — one full record was drained.
+    ///  * `Ok(None)`         — `buf` is empty (or holds fewer than 4
+    ///    bytes — treated as "no more records yet" so the caller will
+    ///    read another WS message).
+    ///  * `Err(...)`         — `buf` claims more bytes than it has
+    ///    (malformed length prefix), which would otherwise hang the
+    ///    caller waiting for bytes that will never arrive.
+    fn take_record_from_buf(buf: &mut Vec<u8>) -> PirResult<Option<Vec<u8>>> {
+        if buf.len() < 4 {
+            if !buf.is_empty() {
+                // A partial length prefix that never completed across
+                // messages is a protocol violation — coalescing is
+                // strictly within one WS message, so the buffer is
+                // expected to drain to empty between WS reads.
+                let leftover = buf.len();
+                buf.clear();
+                return Err(PirError::Protocol(format!(
+                    "recv: WS message ended mid-record (leftover {} bytes)",
+                    leftover
+                )));
+            }
+            return Ok(None);
+        }
+        let payload_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        let record_len = 4 + payload_len;
+        if buf.len() < record_len {
+            let leftover = buf.len();
+            buf.clear();
+            return Err(PirError::Protocol(format!(
+                "recv: truncated record (len prefix {} > {} buffered bytes)",
+                payload_len, leftover
+            )));
+        }
+        let record = buf[..record_len].to_vec();
+        if record_len == buf.len() {
+            buf.clear();
+        } else {
+            // Compact the tail down. For typical hint batches this
+            // happens ~10 times per WS message; the resulting copies
+            // are still far cheaper than the per-frame WS receive
+            // overhead the coalescing eliminates.
+            buf.drain(..record_len);
+        }
+        Ok(Some(record))
     }
 
     /// Inner recv loop — same behaviour as the old `recv`, no timeout.
@@ -563,9 +648,7 @@ impl WsConnection {
                         let seq = u16::from_le_bytes([b[5], b[6]]);
                         let total = u16::from_le_bytes([b[7], b[8]]);
                         if total == 0 {
-                            return Err(PirError::Protocol(
-                                "chunk frame with total=0".into(),
-                            ));
+                            return Err(PirError::Protocol("chunk frame with total=0".into()));
                         }
                         if seq != chunk_expected {
                             return Err(PirError::Protocol(format!(
@@ -747,6 +830,119 @@ mod tests {
         };
         assert_eq!(policy.backoff_delay(64), policy.max_delay);
         assert_eq!(policy.backoff_delay(1_000), policy.max_delay);
+    }
+
+    /// Build a `[4B len LE][body]` record from `body`.
+    fn make_record(body: &[u8]) -> Vec<u8> {
+        let mut r = Vec::with_capacity(4 + body.len());
+        r.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        r.extend_from_slice(body);
+        r
+    }
+
+    #[test]
+    fn take_record_from_buf_empty_buf_returns_none() {
+        let mut buf: Vec<u8> = Vec::new();
+        let out = WsConnection::take_record_from_buf(&mut buf).expect("ok");
+        assert!(out.is_none());
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn take_record_from_buf_single_record_drains_to_empty() {
+        let mut buf = make_record(&[0x41, 0xaa, 0xbb]);
+        let out = WsConnection::take_record_from_buf(&mut buf)
+            .expect("ok")
+            .expect("some");
+        assert_eq!(out, make_record(&[0x41, 0xaa, 0xbb]));
+        assert!(buf.is_empty());
+        // Next call sees an empty buffer.
+        assert!(WsConnection::take_record_from_buf(&mut buf)
+            .expect("ok")
+            .is_none());
+    }
+
+    #[test]
+    fn take_record_from_buf_demuxes_two_records() {
+        let r1 = make_record(b"first");
+        let r2 = make_record(b"second-payload");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&r1);
+        buf.extend_from_slice(&r2);
+
+        let out1 = WsConnection::take_record_from_buf(&mut buf)
+            .expect("ok")
+            .expect("some");
+        assert_eq!(out1, r1, "first record byte-identical");
+        let out2 = WsConnection::take_record_from_buf(&mut buf)
+            .expect("ok")
+            .expect("some");
+        assert_eq!(out2, r2, "second record byte-identical");
+        assert!(buf.is_empty());
+        assert!(WsConnection::take_record_from_buf(&mut buf)
+            .expect("ok")
+            .is_none());
+    }
+
+    #[test]
+    fn take_record_from_buf_truncated_length_errors() {
+        // Length prefix claims 100 bytes but only 5 trailing bytes
+        // present — must error so the caller doesn't hang waiting for
+        // more buffer.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(100u32).to_le_bytes());
+        buf.extend_from_slice(b"short");
+        let err = WsConnection::take_record_from_buf(&mut buf).expect_err("err");
+        match err {
+            PirError::Protocol(msg) => {
+                assert!(msg.contains("truncated"), "msg = {}", msg);
+            }
+            other => panic!("expected Protocol, got {:?}", other),
+        }
+        assert!(buf.is_empty(), "buf cleared after error");
+    }
+
+    #[test]
+    fn take_record_from_buf_partial_prefix_errors() {
+        // Fewer than 4 bytes of length prefix can only happen if a
+        // previous record ate the first 3 bytes — that's a protocol
+        // violation, so we error rather than silently dropping it.
+        let mut buf: Vec<u8> = vec![1, 2, 3];
+        let err = WsConnection::take_record_from_buf(&mut buf).expect_err("err");
+        match err {
+            PirError::Protocol(msg) => {
+                assert!(msg.contains("ended mid-record"), "msg = {}", msg);
+            }
+            other => panic!("expected Protocol, got {:?}", other),
+        }
+    }
+
+    /// Server-side coalescing-then-client-side demux round-trip check.
+    ///
+    /// Mirrors what `send_resp_batch` produces in
+    /// `runtime/src/bin/unified_server.rs` for the no-channel case: a
+    /// `Vec` of `[4B len][body]` records concatenated back-to-back into
+    /// one buffer. Demuxing must return the exact same records in
+    /// order — this is the strongest argument the coalescing doesn't
+    /// change protocol semantics.
+    #[test]
+    fn batch_round_trip_demuxes_to_original_records() {
+        let originals: Vec<Vec<u8>> = (0u8..7)
+            .map(|i| make_record(&vec![i, 0x41, 0xaa, 0xbb, 0xcc, i.wrapping_add(0x10)]))
+            .collect();
+        // Concat: simulates one WS Binary message carrying all 7 records.
+        let mut batch = Vec::new();
+        for r in &originals {
+            batch.extend_from_slice(r);
+        }
+        // Drain: simulates the client's recv-loop pulling one record
+        // per recv() call.
+        let mut drained = Vec::new();
+        while let Some(r) = WsConnection::take_record_from_buf(&mut batch).expect("ok") {
+            drained.push(r);
+        }
+        assert_eq!(drained, originals, "round-tripped records match");
+        assert!(batch.is_empty());
     }
 
     /// Small helper: run `fut` and panic if it returns `Ok` — `WsConnection`
