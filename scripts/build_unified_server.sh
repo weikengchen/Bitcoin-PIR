@@ -39,19 +39,23 @@
 # outputs), links Intel HEXL into OnionPIR's C++ engine, and is what
 # pir1/pir2 actually run.
 #
-# This script is a no-Nix DEVELOPMENT convenience. It currently builds
+# This script is a no-Nix DEVELOPMENT convenience. By default it builds
 # OnionPIR's C++ engine with the in-crate scalar/SIMD shim
-# (cpp/hexl_shim.cpp), because /usr/local HEXL is not kept on the build
-# host. (Since onionpir rev 3f815ba — re-pin landed 835791e6 — the
-# crate's build.rs DOES emit HEXL link flags when CMake finds HEXL, so
-# adding a sister `scripts/install_hexl.sh` to pin HEXL 1.2.6 on the
-# host would let this script produce a HEXL-accelerated binary too.)
+# (cpp/hexl_shim.cpp). Since onionpir rev 3f815ba (re-pin in 835791e6),
+# the crate's build.rs auto-emits HEXL link flags when CMake finds an
+# HEXL install — so if you've run scripts/install_hexl.sh to pin
+# HEXL 1.2.6 (+ google/cpu_features 0.10.1) on the host, this script
+# switches to the HEXL-accelerated build path automatically. The auto-
+# detection probes $HEXL_PREFIX (default /usr/local) and, on Apple
+# Silicon, falls back to /opt/homebrew. Override either by setting
+# HEXL_PREFIX explicitly, or set HEXL_PREFIX=none to force the shim.
 #
-# Even so, this script is NOT bit-reproducible across hosts: system
-# glibc, linker, and cmake versions are not pinned. Use it to iterate
-# locally; do not pin its sha256 anywhere.
+# Even with HEXL pinned, this script is NOT bit-reproducible across
+# hosts: system gcc/clang, libc, cmake, and linker versions are not
+# pinned. Use it to iterate locally; do not pin its sha256 anywhere.
 #
 # Operator usage:
+#   ./scripts/install_hexl.sh                            # one-time, optional
 #   ./scripts/build_unified_server.sh
 # Output: target/release/unified_server  +  printed sha256.
 
@@ -75,6 +79,48 @@ echo "    rustc:             $(rustc --version 2>&1)"
 echo "    workspace:         $WORKSPACE_ROOT"
 echo "    RUSTFLAGS:         $RUSTFLAGS"
 echo "    SOURCE_DATE_EPOCH: $SOURCE_DATE_EPOCH"
+
+# ─── HEXL preflight (since onionpir 3f815ba) ─────────────────────────────
+# onionpir's build.rs runs `find_package(HEXL CONFIG)` and emits the
+# linker flags when it locates an HEXL install. CMake's default search
+# path includes /usr/local; we additionally probe /opt/homebrew for
+# Apple Silicon and respect $HEXL_PREFIX as an explicit override. If
+# HEXL_PREFIX=none, skip detection entirely (force shim).
+#
+# Version check: we look for the literal directory name `hexl-1.2.6`
+# under <prefix>/lib/cmake/, which is HEXL's CMake-installed config
+# layout. A mismatched version (e.g. hexl-1.2.5/) simply won't match
+# and we fall back to the shim — never link against an unpinned HEXL.
+HEXL_FOUND=""
+if [ "${HEXL_PREFIX:-}" = "none" ]; then
+    echo "    HEXL:              skipped (HEXL_PREFIX=none)"
+else
+    # Build a list of candidate prefixes to probe.
+    HEXL_CANDIDATES=()
+    [ -n "${HEXL_PREFIX:-}" ] && HEXL_CANDIDATES+=("$HEXL_PREFIX")
+    HEXL_CANDIDATES+=("/usr/local")
+    # Apple Silicon Homebrew default. Harmless on other platforms (dir
+    # won't exist).
+    [ -d /opt/homebrew ] && HEXL_CANDIDATES+=("/opt/homebrew")
+
+    for candidate in "${HEXL_CANDIDATES[@]}"; do
+        if [ -f "$candidate/lib/cmake/hexl-1.2.6/HEXLConfig.cmake" ]; then
+            HEXL_FOUND="$candidate"
+            break
+        fi
+    done
+
+    if [ -n "$HEXL_FOUND" ]; then
+        echo "    HEXL:              1.2.6 at $HEXL_FOUND (accelerated build)"
+        # Pass to the onionpir CMake invocation. Defense-in-depth — the
+        # default search path already includes /usr/local; this also
+        # covers /opt/homebrew + $HEXL_PREFIX overrides.
+        export CMAKE_PREFIX_PATH="$HEXL_FOUND${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+    else
+        echo "    HEXL:              not found (building in-crate scalar/SIMD shim)"
+        echo "                       run ./scripts/install_hexl.sh for HEXL acceleration"
+    fi
+fi
 echo
 
 # --locked enforces "Cargo.lock is the truth, never auto-update", which is
