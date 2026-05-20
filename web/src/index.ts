@@ -47,13 +47,6 @@ export {
 } from './protocol.js';
 
 export {
-  genDpfKeys,
-  genChunkDpfKeys,
-  genDpfKeysN,
-  type DpfKeyPair,
-} from './dpf.js';
-
-export {
   splitmix64,
   computeTag,
   deriveGroups,

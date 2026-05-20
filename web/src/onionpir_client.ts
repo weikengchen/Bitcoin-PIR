@@ -160,7 +160,7 @@ async function loadWasmModule(): Promise<OnionPirModule> {
         // (Vite serves the public/ tree verbatim); node tests install
         // a factory via `globalThis.__onionpirWasmFactory`.
         const wasmModuleUrl = '/wasm/onionpir_client.mjs';
-        const mod = await import(/* @vite-ignore */ wasmModuleUrl);
+        const mod = await import(/* @vite-ignore */ /* webpackIgnore: true */ wasmModuleUrl);
         factory = (mod as { default: OnionPirFactory }).default;
       }
       return await factory();

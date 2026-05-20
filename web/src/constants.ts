@@ -113,6 +113,12 @@ export const RESP_HARMONY_HINTS = 0x41;
 export const RESP_HARMONY_QUERY = 0x42;
 export const RESP_HARMONY_BATCH_QUERY = 0x43;
 
+// V2 hint protocol (server-generated PRP key). Source of truth:
+// pir-runtime-core/src/protocol.rs:28,43,181.
+export const REQ_HARMONY_HINTS_V2 = 0x44;
+export const REQ_HARMONY_HINTS_V2_HALF = 0x46;
+export const RESP_HARMONY_HINTS_KEY = 0x44; // same opcode byte, response-direction label
+
 // ─── Legacy global Merkle protocol codes (deprecated, kept for server compat) ─
 
 export const REQ_MERKLE_SIBLING_BATCH = 0x31;
