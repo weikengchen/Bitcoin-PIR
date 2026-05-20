@@ -27,15 +27,29 @@
 #     pins the rustc selected via rustup; the rustup harness itself
 #     can vary)
 #
-# Note (2026-05): the hermetic Nix flake `nix build .#unified-server`
-# is now the canonical, content-addressed build — it is what is
-# deployed to pir1/pir2 and pinned in web/src/attest-pin.ts, and it
-# links Intel HEXL into OnionPIR's C++ engine. This convention recipe
-# instead builds that engine with the in-crate scalar/SIMD shim:
-# onionpir's build.rs emits no HEXL link flags, so a system-installed
-# HEXL would fail the link (which is why /usr/local HEXL is not kept
-# on the build host). Prefer the flake where Nix is available; keep
-# this script as the non-Nix fallback.
+# Note (2026-05-20): for any binary whose sha256 you intend to PUBLISH
+# or PIN — including the one baked into the Tier 3 UKI and the one
+# pinned in web/src/attest-pin.ts — use the hermetic Nix flake:
+#
+#   nix build .#unified-server
+#
+# Empirically bit-reproducible (verified 2026-05-20 via
+# `nix-store --realise --check` on the unified-server, hexl, and onionpir
+# derivations — all three rebuilt byte-identical to existing store
+# outputs), links Intel HEXL into OnionPIR's C++ engine, and is what
+# pir1/pir2 actually run.
+#
+# This script is a no-Nix DEVELOPMENT convenience. It currently builds
+# OnionPIR's C++ engine with the in-crate scalar/SIMD shim
+# (cpp/hexl_shim.cpp), because /usr/local HEXL is not kept on the build
+# host. (Since onionpir rev 3f815ba — re-pin landed 835791e6 — the
+# crate's build.rs DOES emit HEXL link flags when CMake finds HEXL, so
+# adding a sister `scripts/install_hexl.sh` to pin HEXL 1.2.6 on the
+# host would let this script produce a HEXL-accelerated binary too.)
+#
+# Even so, this script is NOT bit-reproducible across hosts: system
+# glibc, linker, and cmake versions are not pinned. Use it to iterate
+# locally; do not pin its sha256 anywhere.
 #
 # Operator usage:
 #   ./scripts/build_unified_server.sh
