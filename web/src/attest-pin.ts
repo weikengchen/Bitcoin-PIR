@@ -96,15 +96,14 @@ export const PIR2_TIER3_PIN: ServerAttestPin = {
  */
 export const PIR1_PIN: ServerAttestPin = {
   // No measurementHex — Hetzner has no SEV.
-  // Bumped 2026-05-19: pir1 redeployed to the HEXL-accelerated server
-  // (commit 0845b060) — the reproducible Nix build `nix build
-  // .#unified-server`, with Intel HEXL linked into OnionPIR's C++
-  // engine. Verified on Hetzner against the on-disk artifact
-  // (`target/release/unified_server`) and the live pir-primary process
-  // image (`/proc/<pid>/exe`). As of the 2026-05-19 Tier-3 v17 deploy
-  // (flake-built UKI, PR #3) pir2 runs this same binary, so PIR1_PIN
-  // and PIR2_TIER3_PIN now share `binarySha256Hex`.
+  // Bumped 2026-05-20: pir1 redeployed from main @ 90bcaef4 to ship
+  // PRs #5/#6/#7 (web vendor cleanup, harmony_decode_counts wasm
+  // binding, Harmony hint coalescing). Binary is the reproducible
+  // `nix build .#unified-server` output (same Nix-built binary
+  // embedded in the v18 Tier-3 UKI for pir2, so once pir2 boots
+  // v18, PIR1_PIN and PIR2_TIER3_PIN share `binarySha256Hex`
+  // again — the shared-binary invariant from v17 is preserved).
   binarySha256Hex:
-    '3925cc4d5c4e45d8d3c8d798afb471905f909751d5c15ad5cccb22eb2631d2d5',
+    '2ba6e79c388f54867988885785512f42864d5ceb3b88d1e1d5b8d24459d2f46c',
   description: 'weikeng1.bitcoinpir.org (Hetzner i7-8700, no SEV)',
 };
