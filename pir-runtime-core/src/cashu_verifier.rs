@@ -228,6 +228,10 @@ fn base64url_decode(input: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Brings the `is_identity` trait method into scope for ProjectivePoint
+    // in tests. Production code in this module uses it through a different
+    // path; only the test path needed the explicit import.
+    use k256::elliptic_curve::Group;
 
     #[test]
     fn test_hash_to_curve_round_trip() {

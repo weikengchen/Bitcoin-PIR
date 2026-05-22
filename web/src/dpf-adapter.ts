@@ -51,6 +51,7 @@ import {
   type WasmDpfClient,
   type WasmQueryResult,
 } from './sdk-bridge.js';
+import { getAmdTurinArkFingerprint } from './attest-pin.js';
 import type { ConnectionState, QueryResult, UtxoEntry } from './types.js';
 import { ManagedWebSocket } from './ws.js';
 
@@ -524,7 +525,41 @@ export class BatchPirClientAdapter {
     const att0 = await attestOne(0);
     const att1 = await attestOne(1);
 
-    const expectedArkFp = this.config.expectedArkFingerprint ?? null;
+    // Default behaviour: source the ARK fingerprint from WASM
+    // (`getAmdTurinArkFingerprint`), which mirrors the Rust constant
+    // `pir-attest-verify::TURIN_ARK_FINGERPRINT_SHA256` and runs a
+    // cross-check against `AMD_TURIN_ARK_FINGERPRINT_HEX` on first
+    // call. Callers can still pass `null` explicitly to skip the
+    // chain check (tests, pre-deploy debugging) or pass a different
+    // fingerprint to override (e.g. for a future Milan migration —
+    // they'd ship a custom Uint8Array).
+    let expectedArkFp: Uint8Array | null;
+    if (this.config.expectedArkFingerprint === null) {
+      expectedArkFp = null;
+    } else if (this.config.expectedArkFingerprint !== undefined) {
+      expectedArkFp = this.config.expectedArkFingerprint;
+    } else {
+      try {
+        expectedArkFp = getAmdTurinArkFingerprint();
+      } catch (e) {
+        // 'info' rather than 'error' because this is a fallback path
+        // (skip chain validation) rather than an outright failure —
+        // the connection still works, just without ARK pinning.
+        this.log(
+          `default ARK fingerprint unavailable (WASM not initialised?): ${(e as Error)?.message ?? e}`,
+          'info',
+        );
+        expectedArkFp = null;
+      }
+    }
+
+    // Strict production policy: VMPL 0, no debug, no migrate-MA, TCB-
+    // monotonic. We deliberately do NOT pin MEASUREMENT here even when
+    // a per-server pin is configured — the manual measurement check
+    // below produces a more granular error message (which pin failed,
+    // for which server) than the single-line WASM diagnostic.
+    const sdk = requireSdkWasm();
+    const policyReqs = new sdk.WasmPolicyRequirements();
 
     const summarise = (
       idx: 0 | 1,
@@ -555,26 +590,35 @@ export class BatchPirClientAdapter {
         launchMeasurementHex: att.launchMeasurementHex,
       };
 
-      // Slice D.3: AMD VCEK chain validation. Only attempt when the
-      // V2 binding already passed (otherwise the report is suspect
-      // anyway), the server bundled a chain, AND we have an
+      // Slice D.3+: AMD VCEK chain + policy validation. Only attempt
+      // when the V2 binding already passed (otherwise the report is
+      // suspect anyway), the server bundled a chain, AND we have an
       // operator-pinned ARK fingerprint to anchor trust.
+      //
+      // `verifyFull` runs:
+      //   1. ARK fingerprint match + ARK→ASK→VCEK chain (RSA-PSS)
+      //   2. SEV-SNP report ECDSA-P384 signature against VCEK
+      //   3. Policy: VMPL ≤ max, no debug, no migrate-MA, TCB
+      //      monotonicity + optional minimum / measurement / id pins
+      // — and throws on the FIRST failure. Error message starts with
+      // "chain:", "report-sig:" or "policy:" so the operator can
+      // tell which step rejected.
       if (state === 'verified' && matched && att.hasVcekChain) {
         if (expectedArkFp) {
           try {
-            att.verifyVcekChain(expectedArkFp);
+            att.verifyFull(expectedArkFp, policyReqs);
             result.state = 'verified-vcek';
             result.vcekChain = 'pass';
           } catch (e) {
             result.vcekChain = 'fail';
             result.vcekChainError = (e as Error)?.message ?? String(e);
             this.log(
-              `verifyVcekChain(server${idx}) failed: ${result.vcekChainError}`,
+              `verifyFull(server${idx}) failed: ${result.vcekChainError}`,
               'error',
             );
-            // Demote to 'mismatch' on chain failure — the operator's
-            // pinning explicitly demanded chain validation, and it
-            // didn't pass. Treat as a strong negative signal.
+            // Demote to 'mismatch' on any failure — the operator's
+            // pinning explicitly demanded chain + policy validation
+            // and it didn't pass. Treat as a strong negative signal.
             result.state = 'mismatch';
           }
         } else {

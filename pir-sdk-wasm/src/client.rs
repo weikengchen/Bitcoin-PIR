@@ -591,6 +591,285 @@ impl WasmAttestVerification {
         .map_err(|e| JsError::new(&format!("{}", e)))?;
         Ok(())
     }
+
+    /// Highest-level SEV-SNP check: runs `verifyVcekChain`'s four
+    /// steps AND the policy assertions described below — in a single
+    /// call. On success, the report is fully trustworthy
+    /// (signature-anchored AND content-acceptable).
+    ///
+    /// `expectedArkFingerprint`: same as `verifyVcekChain`. Pass the
+    /// `AMD_TURIN_ARK_FINGERPRINT` constant from `attest-pin.ts` for
+    /// production.
+    ///
+    /// `policy` is a `WasmPolicyRequirements` (constructed via its
+    /// JS-visible constructor + setters). Defaults to the strictest
+    /// production policy: VMPL 0, no debug, no migration, TCB
+    /// monotonic. Override individual fields for tests / non-strict
+    /// deployments.
+    ///
+    /// Throws a single-line JsError on the FIRST failing step (chain
+    /// → report sig → policy). Use `verifyVcekChain` directly if you
+    /// want to surface the chain / sig failure separately from a
+    /// policy failure.
+    #[wasm_bindgen(js_name = verifyFull)]
+    pub fn verify_full(
+        &self,
+        expected_ark_fingerprint: Option<Box<[u8]>>,
+        policy: &WasmPolicyRequirements,
+    ) -> Result<(), JsError> {
+        if !self.has_vcek_chain() {
+            return Err(JsError::new(
+                "verifyFull: server didn't bundle a VCEK chain (arkPem/askPem/vcekPem empty)",
+            ));
+        }
+        let pin = match expected_ark_fingerprint {
+            None => None,
+            Some(bytes) => {
+                if bytes.len() != 32 {
+                    return Err(JsError::new(&format!(
+                        "expectedArkFingerprint must be exactly 32 bytes, got {}",
+                        bytes.len()
+                    )));
+                }
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                Some(arr)
+            }
+        };
+        pir_attest_verify::verify_full(
+            &self.inner.response.sev_snp_report,
+            &self.inner.response.ark_pem,
+            &self.inner.response.ask_pem,
+            &self.inner.response.vcek_pem,
+            pin,
+            &policy.inner,
+        )
+        .map_err(|e| JsError::new(&format!("{}", e)))?;
+        Ok(())
+    }
+}
+
+/// JS-visible policy requirements for [`WasmAttestVerification::verify_full`].
+/// Constructed with sensible production defaults (strict). Mutate
+/// individual fields via the setters to relax.
+#[wasm_bindgen]
+pub struct WasmPolicyRequirements {
+    inner: pir_attest_verify::policy::PolicyRequirements,
+}
+
+#[wasm_bindgen]
+impl WasmPolicyRequirements {
+    /// Construct the strictest production policy: VMPL 0, no debug,
+    /// no MA migration, TCB-monotonic. No measurement / family /
+    /// image pin (set via the corresponding setters if you want them).
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self {
+            inner: pir_attest_verify::policy::PolicyRequirements::default(),
+        }
+    }
+
+    /// Raise the VMPL ceiling. Production: leave at 0.
+    #[wasm_bindgen(js_name = setMaxVmpl)]
+    pub fn set_max_vmpl(&mut self, v: u32) {
+        self.inner.max_vmpl = v;
+    }
+
+    /// Permit guests with `policy.debug_allowed` set. Production: leave false.
+    #[wasm_bindgen(js_name = setAllowDebug)]
+    pub fn set_allow_debug(&mut self, v: bool) {
+        self.inner.allow_debug = v;
+    }
+
+    /// Permit guests with `policy.migrate_ma_allowed` set. Production: leave false.
+    #[wasm_bindgen(js_name = setAllowMigrateMa)]
+    pub fn set_allow_migrate_ma(&mut self, v: bool) {
+        self.inner.allow_migrate_ma = v;
+    }
+
+    /// Require guests to have `policy.single_socket_required`. Off by default.
+    #[wasm_bindgen(js_name = setRequireSingleSocket)]
+    pub fn set_require_single_socket(&mut self, v: bool) {
+        self.inner.require_single_socket = v;
+    }
+
+    /// Pin the expected MEASUREMENT (48 bytes). Must be exactly 48
+    /// bytes or a JsError is thrown. Set to the operator-published
+    /// value for your Tier 3 UKI.
+    #[wasm_bindgen(js_name = setExpectedMeasurement)]
+    pub fn set_expected_measurement(&mut self, bytes: &[u8]) -> Result<(), JsError> {
+        if bytes.len() != 48 {
+            return Err(JsError::new(&format!(
+                "expectedMeasurement must be exactly 48 bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let mut arr = [0u8; 48];
+        arr.copy_from_slice(bytes);
+        self.inner.expected_measurement = Some(arr);
+        Ok(())
+    }
+
+    /// Pin the expected family_id (16 bytes).
+    #[wasm_bindgen(js_name = setExpectedFamilyId)]
+    pub fn set_expected_family_id(&mut self, bytes: &[u8]) -> Result<(), JsError> {
+        if bytes.len() != 16 {
+            return Err(JsError::new(&format!(
+                "expectedFamilyId must be exactly 16 bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let mut arr = [0u8; 16];
+        arr.copy_from_slice(bytes);
+        self.inner.expected_family_id = Some(arr);
+        Ok(())
+    }
+
+    /// Pin the expected image_id (16 bytes).
+    #[wasm_bindgen(js_name = setExpectedImageId)]
+    pub fn set_expected_image_id(&mut self, bytes: &[u8]) -> Result<(), JsError> {
+        if bytes.len() != 16 {
+            return Err(JsError::new(&format!(
+                "expectedImageId must be exactly 16 bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let mut arr = [0u8; 16];
+        arr.copy_from_slice(bytes);
+        self.inner.expected_image_id = Some(arr);
+        Ok(())
+    }
+}
+
+impl Default for WasmPolicyRequirements {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// JS-visible accessor for the Turin ARK fingerprint pinned in
+/// pir-attest-verify (matches `web/src/attest-pin.ts`). Returns the
+/// 32-byte SHA-256 as a Uint8Array. Pass directly to
+/// [`WasmAttestVerification::verify_full`] /
+/// [`WasmAttestVerification::verify_vcek_chain`] for Turin servers.
+#[wasm_bindgen(js_name = turinArkFingerprint)]
+pub fn turin_ark_fingerprint() -> Uint8Array {
+    Uint8Array::from(&pir_attest_verify::TURIN_ARK_FINGERPRINT_SHA256[..])
+}
+
+// ─── WasmAnnounceVerification ──────────────────────────────────────────────
+
+/// JS-visible result of a `WasmDpfClient.announce()` (or
+/// `WasmHarmonyClient.announce()`) call.
+///
+/// Carries the parsed operator-signed bundle:
+/// - `IdentityCert` (Tier 1): operator's offline Ed25519 key endorses
+///   the server's identity_pubkey for a given server_id + validity
+///   window.
+/// - `ChannelManifest` (Tier 2): server's per-boot Ed25519 key signs
+///   the current channel_pub + build metadata.
+///
+/// `chainVerified` tells you whether the two layers cross-check
+/// (manifest signature + identity_pubkey + server_id agreement).
+/// Pinning the operator pubkey is a separate, caller-driven step:
+/// compare `operatorPubkeyHex` against your pinned value, then call
+/// the IdentityCert's verify yourself if you want defense-in-depth on
+/// top of `chainVerified` — but `chainVerified` already runs the
+/// manifest signature check internally.
+#[wasm_bindgen]
+pub struct WasmAnnounceVerification {
+    inner: pir_sdk_client::announce::AnnounceVerification,
+}
+
+#[wasm_bindgen]
+impl WasmAnnounceVerification {
+    /// Server identifier the cert was endorsed for (e.g. "pir1").
+    #[wasm_bindgen(getter, js_name = serverId)]
+    pub fn server_id(&self) -> String {
+        self.inner.bundle.cert.server_id.clone()
+    }
+
+    /// Hex-encoded operator pubkey (the Tier-1 signer). Compare this
+    /// against the value the operator published out-of-band (e.g. via
+    /// Nostr) before trusting any of the bundle's fields.
+    #[wasm_bindgen(getter, js_name = operatorPubkeyHex)]
+    pub fn operator_pubkey_hex(&self) -> String {
+        hex_encode(&self.inner.bundle.cert.operator_pubkey)
+    }
+
+    /// Hex-encoded identity pubkey the operator endorsed for this
+    /// server. The Tier-2 manifest signature chains back to this key.
+    #[wasm_bindgen(getter, js_name = identityPubkeyHex)]
+    pub fn identity_pubkey_hex(&self) -> String {
+        hex_encode(&self.inner.bundle.cert.identity_pubkey)
+    }
+
+    /// X25519 channel pubkey the manifest endorses. Cross-check
+    /// against the value you'll handshake with (e.g.
+    /// `attestVerification.serverStaticPub`). Returns the raw 32 bytes.
+    #[wasm_bindgen(getter, js_name = channelPub)]
+    pub fn channel_pub(&self) -> Uint8Array {
+        Uint8Array::from(&self.inner.bundle.manifest.channel_pub[..])
+    }
+
+    /// Same data as [`Self::channel_pub`] but hex-encoded for display.
+    #[wasm_bindgen(getter, js_name = channelPubHex)]
+    pub fn channel_pub_hex(&self) -> String {
+        hex_encode(&self.inner.bundle.manifest.channel_pub)
+    }
+
+    /// Hex-encoded binary SHA-256 the manifest claims (self-reported,
+    /// trustworthy iff the chain check passed).
+    #[wasm_bindgen(getter, js_name = binarySha256Hex)]
+    pub fn binary_sha256_hex(&self) -> String {
+        hex_encode(&self.inner.bundle.manifest.binary_sha256)
+    }
+
+    /// Server-self-reported git rev (string).
+    #[wasm_bindgen(getter, js_name = gitRev)]
+    pub fn git_rev(&self) -> String {
+        self.inner.bundle.manifest.git_rev.clone()
+    }
+
+    /// Cert validity lower bound (unix-seconds). 0 = no lower bound.
+    #[wasm_bindgen(getter, js_name = validFrom)]
+    pub fn valid_from(&self) -> i64 {
+        self.inner.bundle.cert.valid_from
+    }
+
+    /// Cert validity upper bound (unix-seconds). 0 = indefinite.
+    #[wasm_bindgen(getter, js_name = validUntil)]
+    pub fn valid_until(&self) -> i64 {
+        self.inner.bundle.cert.valid_until
+    }
+
+    /// Manifest's `issued_at` timestamp (unix-seconds). Use this to
+    /// apply a freshness policy if you want one.
+    #[wasm_bindgen(getter, js_name = issuedAt)]
+    pub fn issued_at(&self) -> i64 {
+        self.inner.bundle.manifest.issued_at
+    }
+
+    /// Whether the in-bundle chain check passed: manifest signature
+    /// valid against `identityPubkey`, and `cert.server_id` ==
+    /// `manifest.server_id`, and `cert.identity_pubkey` ==
+    /// `manifest.identity_pubkey`. Does NOT include cert-vs-pinned-
+    /// operator verification (caller-driven).
+    #[wasm_bindgen(getter, js_name = chainVerified)]
+    pub fn chain_verified(&self) -> bool {
+        self.inner.chain_verified
+    }
+
+    /// Diagnostic string describing why `chainVerified` is false.
+    /// Empty when verified.
+    #[wasm_bindgen(getter, js_name = chainError)]
+    pub fn chain_error(&self) -> String {
+        self.inner
+            .chain_error
+            .as_ref()
+            .map(|e| e.to_string())
+            .unwrap_or_default()
+    }
 }
 
 // ─── WasmDpfClient ──────────────────────────────────────────────────────────
@@ -612,6 +891,12 @@ impl WasmAttestVerification {
 #[wasm_bindgen]
 pub struct WasmDpfClient {
     inner: DpfClient,
+    /// Per-server cache of the handshake-eph seed committed-to in the
+    /// most recent `attest()` call's REPORT_DATA. Threaded into
+    /// `upgradeToSecureChannel` so the chip-signed report binds the
+    /// exact eph_pub used in the handshake. Cleared after a successful
+    /// upgrade. JS callers never see these bytes.
+    attest_eph_seeds: [Option<[u8; 32]>; 2],
 }
 
 #[wasm_bindgen]
@@ -622,6 +907,7 @@ impl WasmDpfClient {
     pub fn new(server0_url: &str, server1_url: &str) -> Self {
         Self {
             inner: DpfClient::new(server0_url, server1_url),
+            attest_eph_seeds: [None, None],
         }
     }
 
@@ -751,31 +1037,81 @@ impl WasmDpfClient {
     /// Send REQ_ATTEST to one of the connected servers and return a
     /// [`WasmAttestVerification`] handle covering the response.
     ///
-    /// `serverIndex` selects 0 (first URL) or 1 (second URL). The 32-byte
-    /// nonce is generated browser-side from `crypto.getRandomValues` (via
-    /// `getrandom`'s "js" feature) — different on every call, so callers
-    /// can correlate parallel attests by re-reading
-    /// [`WasmAttestVerification::nonce_hex`].
+    /// `serverIndex` selects 0 (first URL) or 1 (second URL). Internally
+    /// the 32-byte nonce is *bound* to the X25519 handshake ephemeral
+    /// the client will use in the subsequent `upgradeToSecureChannel`:
     ///
-    /// Use the returned `serverStaticPub` (32 bytes) as input to
-    /// [`Self::upgradeToSecureChannel`]. Verifying the SEV-SNP report's
-    /// AMD VCEK chain is a separate concern (Slice D) — until that
-    /// lands, the V2 binding only proves internal consistency of the
-    /// claimed server-side state, not the chip's signature.
+    /// ```text
+    /// eph_seed       = OsRng()                                  (cached per-server)
+    /// client_eph_pub = X25519(eph_seed)
+    /// random_32      = OsRng()
+    /// nonce          = sha256("BPIR-ATTEST-NONCE-V1" || client_eph_pub || random_32)
+    /// ```
+    ///
+    /// Caching the `eph_seed` here lets `upgradeToSecureChannel` reuse
+    /// the same pubkey the report committed to, so the chip-signed
+    /// REPORT_DATA covers *this* handshake — not a stale or replayed
+    /// one. The `eph_seed` is never exposed to JS.
+    ///
+    /// Calling `attest(serverIndex)` twice for the same server rotates
+    /// the cached seed (the prior eph is dropped). Callers should call
+    /// `attest` for *both* servers before `upgradeToSecureChannel`.
     #[wasm_bindgen(js_name = attest)]
     pub async fn attest(
         &mut self,
         server_index: u8,
     ) -> Result<WasmAttestVerification, JsError> {
-        let mut nonce = [0u8; 32];
-        getrandom::getrandom(&mut nonce)
+        if server_index >= 2 {
+            return Err(JsError::new(&format!(
+                "attest: serverIndex must be 0 or 1, got {}",
+                server_index
+            )));
+        }
+        let mut eph_seed = [0u8; 32];
+        let mut random_32 = [0u8; 32];
+        getrandom::getrandom(&mut eph_seed)
             .map_err(|e| JsError::new(&format!("getrandom: {}", e)))?;
+        getrandom::getrandom(&mut random_32)
+            .map_err(|e| JsError::new(&format!("getrandom: {}", e)))?;
+        let client_eph_pub = pir_channel::eph_pub_from_seed(eph_seed);
+        let nonce = pir_core::attest::derive_attest_nonce(client_eph_pub, random_32);
         let v = self
             .inner
             .attest(server_index, nonce)
             .await
             .map_err(err_to_js)?;
+        // Only cache on a successful attest call so a network failure
+        // doesn't leave a stale seed behind that a subsequent upgrade
+        // would silently use.
+        self.attest_eph_seeds[server_index as usize] = Some(eph_seed);
         Ok(WasmAttestVerification { inner: v })
+    }
+
+    /// Send REQ_ANNOUNCE to one of the connected servers and return a
+    /// [`WasmAnnounceVerification`] with the parsed operator-signed
+    /// identity bundle.
+    ///
+    /// Errors with the server's RESP_ERROR text ("announce not
+    /// configured") if the server doesn't have an identity key + cert
+    /// installed. That's a soft state — attest / handshake / queries
+    /// still work as normal.
+    #[wasm_bindgen(js_name = announce)]
+    pub async fn announce(
+        &mut self,
+        server_index: u8,
+    ) -> Result<WasmAnnounceVerification, JsError> {
+        if server_index >= 2 {
+            return Err(JsError::new(&format!(
+                "announce: serverIndex must be 0 or 1, got {}",
+                server_index
+            )));
+        }
+        let v = self
+            .inner
+            .announce(server_index)
+            .await
+            .map_err(err_to_js)?;
+        Ok(WasmAnnounceVerification { inner: v })
     }
 
     /// Wrap both server connections with the encrypted-channel
@@ -789,9 +1125,15 @@ impl WasmDpfClient {
     /// frame format — cloudflared (or any other transport-layer
     /// intermediary) sees only ciphertext.
     ///
-    /// Errors if either connection isn't established, or if either
-    /// handshake fails. On error, the connections are dropped — call
-    /// [`Self::connect`] to re-establish.
+    /// Uses the eph_seeds cached by [`Self::attest`] so the handshake's
+    /// `client_eph_pub` matches the one the SEV-SNP REPORT_DATA
+    /// committed to. **You MUST call `attest(0)` and `attest(1)` before
+    /// this method**, otherwise it rejects with a JsError. On success
+    /// the cached seeds are cleared (one-shot per attest call).
+    ///
+    /// Errors if either connection isn't established, either cached
+    /// eph_seed is missing, or either handshake fails. On error, the
+    /// connections are dropped — call [`Self::connect`] to re-establish.
     #[wasm_bindgen(js_name = upgradeToSecureChannel)]
     pub async fn upgrade_to_secure_channel(
         &mut self,
@@ -804,10 +1146,32 @@ impl WasmDpfClient {
         let pub1: [u8; 32] = server_static_pub_1
             .try_into()
             .map_err(|_| JsError::new("serverStaticPub1 must be exactly 32 bytes"))?;
+        let eph_seed_0 = self.attest_eph_seeds[0].ok_or_else(|| {
+            JsError::new(
+                "upgradeToSecureChannel: must call attest(0) first (eph_seed binding required)",
+            )
+        })?;
+        let eph_seed_1 = self.attest_eph_seeds[1].ok_or_else(|| {
+            JsError::new(
+                "upgradeToSecureChannel: must call attest(1) first (eph_seed binding required)",
+            )
+        })?;
+        let mut hs_nonce_0 = [0u8; 32];
+        let mut hs_nonce_1 = [0u8; 32];
+        getrandom::getrandom(&mut hs_nonce_0)
+            .map_err(|e| JsError::new(&format!("getrandom: {}", e)))?;
+        getrandom::getrandom(&mut hs_nonce_1)
+            .map_err(|e| JsError::new(&format!("getrandom: {}", e)))?;
         self.inner
-            .upgrade_to_secure_channel(pub0, pub1)
+            .upgrade_to_secure_channel_with_seeds(
+                pub0, eph_seed_0, hs_nonce_0, pub1, eph_seed_1, hs_nonce_1,
+            )
             .await
-            .map_err(err_to_js)
+            .map_err(err_to_js)?;
+        // One-shot: consume the cached seeds so a follow-up reconnect
+        // is forced to re-attest before another upgrade.
+        self.attest_eph_seeds = [None, None];
+        Ok(())
     }
 
     /// Inspector-path batch query — like [`queryBatch`](Self::query_batch)
@@ -1032,6 +1396,11 @@ impl WasmDpfClient {
 #[wasm_bindgen]
 pub struct WasmHarmonyClient {
     inner: HarmonyClient,
+    /// Per-server cache of the handshake-eph seed committed-to in the
+    /// most recent `attest()` call's REPORT_DATA. Index 0 = hint
+    /// server, index 1 = query server. See
+    /// [`WasmDpfClient::attest_eph_seeds`].
+    attest_eph_seeds: [Option<[u8; 32]>; 2],
 }
 
 #[wasm_bindgen]
@@ -1044,6 +1413,7 @@ impl WasmHarmonyClient {
     pub fn new(hint_server_url: &str, query_server_url: &str) -> Self {
         Self {
             inner: HarmonyClient::new(hint_server_url, query_server_url),
+            attest_eph_seeds: [None, None],
         }
     }
 
@@ -1179,26 +1549,63 @@ impl WasmHarmonyClient {
 
     /// Send REQ_ATTEST to the hint (`serverIndex=0`) or query
     /// (`serverIndex=1`) server and return the verification result.
-    /// See [`WasmDpfClient::attest`] for the full semantics.
+    /// See [`WasmDpfClient::attest`] for the full semantics (including
+    /// the bound-nonce derivation that ties this attestation to the
+    /// subsequent handshake).
     #[wasm_bindgen(js_name = attest)]
     pub async fn attest(
         &mut self,
         server_index: u8,
     ) -> Result<WasmAttestVerification, JsError> {
-        let mut nonce = [0u8; 32];
-        getrandom::getrandom(&mut nonce)
+        if server_index >= 2 {
+            return Err(JsError::new(&format!(
+                "attest: serverIndex must be 0 or 1, got {}",
+                server_index
+            )));
+        }
+        let mut eph_seed = [0u8; 32];
+        let mut random_32 = [0u8; 32];
+        getrandom::getrandom(&mut eph_seed)
             .map_err(|e| JsError::new(&format!("getrandom: {}", e)))?;
+        getrandom::getrandom(&mut random_32)
+            .map_err(|e| JsError::new(&format!("getrandom: {}", e)))?;
+        let client_eph_pub = pir_channel::eph_pub_from_seed(eph_seed);
+        let nonce = pir_core::attest::derive_attest_nonce(client_eph_pub, random_32);
         let v = self
             .inner
             .attest(server_index, nonce)
             .await
             .map_err(err_to_js)?;
+        self.attest_eph_seeds[server_index as usize] = Some(eph_seed);
         Ok(WasmAttestVerification { inner: v })
     }
 
+    /// Send REQ_ANNOUNCE to the hint (`serverIndex=0`) or query
+    /// (`serverIndex=1`) server. See [`WasmDpfClient::announce`] for
+    /// full semantics.
+    #[wasm_bindgen(js_name = announce)]
+    pub async fn announce(
+        &mut self,
+        server_index: u8,
+    ) -> Result<WasmAnnounceVerification, JsError> {
+        if server_index >= 2 {
+            return Err(JsError::new(&format!(
+                "announce: serverIndex must be 0 or 1, got {}",
+                server_index
+            )));
+        }
+        let v = self
+            .inner
+            .announce(server_index)
+            .await
+            .map_err(err_to_js)?;
+        Ok(WasmAnnounceVerification { inner: v })
+    }
+
     /// Wrap both server connections (hint + query) with the encrypted
-    /// channel transport. See [`WasmDpfClient::upgrade_to_secure_channel`].
-    /// Argument order matches `serverUrls()` — `(hint, query)`.
+    /// channel transport. See [`WasmDpfClient::upgrade_to_secure_channel`]
+    /// — same eph_seed caching + binding flow. Argument order matches
+    /// `serverUrls()` — `(hint, query)`.
     #[wasm_bindgen(js_name = upgradeToSecureChannel)]
     pub async fn upgrade_to_secure_channel(
         &mut self,
@@ -1211,10 +1618,37 @@ impl WasmHarmonyClient {
         let query_pub: [u8; 32] = query_server_static_pub
             .try_into()
             .map_err(|_| JsError::new("queryServerStaticPub must be exactly 32 bytes"))?;
+        let eph_seed_hint = self.attest_eph_seeds[0].ok_or_else(|| {
+            JsError::new(
+                "upgradeToSecureChannel: must call attest(0) on the hint server first \
+                 (eph_seed binding required)",
+            )
+        })?;
+        let eph_seed_query = self.attest_eph_seeds[1].ok_or_else(|| {
+            JsError::new(
+                "upgradeToSecureChannel: must call attest(1) on the query server first \
+                 (eph_seed binding required)",
+            )
+        })?;
+        let mut hs_nonce_hint = [0u8; 32];
+        let mut hs_nonce_query = [0u8; 32];
+        getrandom::getrandom(&mut hs_nonce_hint)
+            .map_err(|e| JsError::new(&format!("getrandom: {}", e)))?;
+        getrandom::getrandom(&mut hs_nonce_query)
+            .map_err(|e| JsError::new(&format!("getrandom: {}", e)))?;
         self.inner
-            .upgrade_to_secure_channel(hint_pub, query_pub)
+            .upgrade_to_secure_channel_with_seeds(
+                hint_pub,
+                eph_seed_hint,
+                hs_nonce_hint,
+                query_pub,
+                eph_seed_query,
+                hs_nonce_query,
+            )
             .await
-            .map_err(err_to_js)
+            .map_err(err_to_js)?;
+        self.attest_eph_seeds = [None, None];
+        Ok(())
     }
 
     /// Inspector-path batch query — like [`queryBatch`](Self::query_batch)

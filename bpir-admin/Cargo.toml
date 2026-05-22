@@ -16,6 +16,9 @@ path = "src/main.rs"
 pir-core = { path = "../pir-core" }
 pir-sdk = { path = "../pir-sdk" }
 pir-sdk-client = { path = "../pir-sdk-client" }
+# Used by `generate-identity` + `sign-identity` subcommands to build
+# IdentityCert blobs the server consumes.
+pir-identity = { path = "../pir-identity" }
 # Slice D: parse the SNP report locally so `bpir-admin show-vcek-url`
 # can extract chip_id + TCB and print the AMD KDS curl commands.
 pir-attest-verify = { path = "../pir-attest-verify" }

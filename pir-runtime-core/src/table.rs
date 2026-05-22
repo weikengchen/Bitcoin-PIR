@@ -358,6 +358,15 @@ pub struct ServerState {
     pub ark_pem: Vec<u8>,
     pub ask_pem: Vec<u8>,
     pub vcek_pem: Vec<u8>,
+    /// Pre-encoded `pir_identity::AnnouncementBundle` bytes that
+    /// REQ_ANNOUNCE returns verbatim. Populated at startup by
+    /// `crate::identity::build_announcement_bundle` if both the
+    /// `--identity-key-path` and `--identity-cert-path` files are
+    /// present and consistent; left `None` (and a warning is logged)
+    /// when either file is missing or the cert / key disagree. With
+    /// `None`, REQ_ANNOUNCE returns a `Response::Error` and the rest
+    /// of the protocol is unaffected.
+    pub announcement_bundle: Option<Vec<u8>>,
 }
 
 impl ServerState {

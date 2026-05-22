@@ -51,6 +51,35 @@ use sev::firmware::guest::AttestationReport;
 use sev::parser::ByteParser;
 
 pub use sev::firmware::guest::AttestationReport as SnpReport;
+pub use sev::firmware::host::TcbVersion;
+
+/// Operator-pinned SHA-256 fingerprint of the AMD **Turin**-family ARK
+/// (Root Key) certificate, DER-encoded.
+///
+/// Source: AMD's published cert chain at
+/// `https://kdsintf.amd.com/vcek/v1/Turin/cert_chain` (the ARK is the
+/// second PEM block). Same fingerprint applies to every Turin-family
+/// chip — there's one ARK per CPU generation, not per chip.
+///
+/// This is the *trust anchor* for the SEV-SNP chain. Verifiers pass
+/// `Some(TURIN_ARK_FINGERPRINT_SHA256)` to [`verify_chain`] so the
+/// supplied ARK PEM is checked against this value before any RSA
+/// signature work — defends against a malicious server bundling a
+/// self-signed forgery and claiming it's AMD's root.
+///
+/// Mirrored in `web/src/attest-pin.ts` as
+/// `AMD_TURIN_ARK_FINGERPRINT_HEX` — keep both in sync. To rotate
+/// (~25-year cadence; ARK rolls are very rare):
+/// 1. Re-fetch `cert_chain.pem` from AMD KDS.
+/// 2. `csplit -z -f cert_ -b "%d.pem" cert_chain.pem '/-----BEGIN CERT/' '{*}'`
+/// 3. `openssl x509 -in cert_1.pem -outform DER | sha256sum`
+/// 4. Replace both constants + rebuild.
+pub const TURIN_ARK_FINGERPRINT_SHA256: [u8; 32] = [
+    0x1f, 0x08, 0x41, 0x61, 0xa4, 0x4b, 0xb6, 0xd9, 0x37, 0x78, 0xa9, 0x04, 0x87, 0x7d, 0x48, 0x19,
+    0xca, 0xfa, 0x5d, 0x05, 0xef, 0x41, 0x93, 0xb2, 0xde, 0xd9, 0xdd, 0x9c, 0x73, 0xdd, 0x3f, 0x6a,
+];
+
+pub mod policy;
 
 /// Bytes-level offset of the report's MEASUREMENT field.
 ///
@@ -209,6 +238,72 @@ pub fn verify_chain(
         .map_err(|e| VerifyError::ChainBroken(format!("{e}")))?;
     Ok(())
 }
+
+/// One-shot full SEV-SNP attestation verification: chain + report
+/// signature + policy.
+///
+/// This is the recommended entry point for production callers. It runs
+/// the three independent checks in order, short-circuiting on first
+/// failure, and returns the parsed [`SnpReport`] only if everything
+/// passed:
+///
+/// 1. **Chain** ([`verify_chain`]): server-supplied `ark_pem` matches
+///    the operator-pinned fingerprint, ARK self-signed, ARK→ASK,
+///    ASK→VCEK (RSA-PSS-SHA384). Pass
+///    `Some(TURIN_ARK_FINGERPRINT_SHA256)` for the Turin pin.
+/// 2. **Report signature** ([`verify_report_against_vcek`]): the SNP
+///    report's ECDSA-P384-SHA384 signature verifies against the VCEK
+///    pubkey — i.e. the report was minted by the chip whose VCEK was
+///    supplied.
+/// 3. **Policy** ([`policy::verify_policy`]): VMPL, debug, migrate,
+///    TCB monotonicity + minimum, and the optional measurement /
+///    family / image / chip_id pins all hold.
+///
+/// On success, the returned [`SnpReport`] carries every field the
+/// caller might want to inspect (REPORT_DATA, MEASUREMENT, chip_id,
+/// etc.) — and they're all anchored in silicon at this point.
+pub fn verify_full(
+    report_bytes: &[u8],
+    ark_pem: &[u8],
+    ask_pem: &[u8],
+    vcek_pem: &[u8],
+    expected_ark_fingerprint: Option<[u8; 32]>,
+    requirements: &policy::PolicyRequirements,
+) -> Result<SnpReport, FullVerifyError> {
+    verify_chain(ark_pem, ask_pem, vcek_pem, expected_ark_fingerprint)
+        .map_err(FullVerifyError::Chain)?;
+    let report = verify_report_against_vcek(report_bytes, vcek_pem)
+        .map_err(FullVerifyError::ReportSignature)?;
+    policy::verify_policy(&report, requirements).map_err(FullVerifyError::Policy)?;
+    Ok(report)
+}
+
+/// Composite error from [`verify_full`]. Each variant wraps the
+/// step-specific error type so callers can drill in if they need to.
+#[derive(Debug)]
+pub enum FullVerifyError {
+    /// ARK / ASK / VCEK chain validation failed (pre-signature check
+    /// on the report itself).
+    Chain(VerifyError),
+    /// VCEK chain was sound but the report's signature didn't verify
+    /// against the VCEK pubkey.
+    ReportSignature(VerifyError),
+    /// Chain and signature were sound but a policy assertion (VMPL,
+    /// debug bit, TCB, measurement, etc.) failed.
+    Policy(policy::PolicyError),
+}
+
+impl core::fmt::Display for FullVerifyError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Chain(e) => write!(f, "chain: {}", e),
+            Self::ReportSignature(e) => write!(f, "report-sig: {}", e),
+            Self::Policy(e) => write!(f, "policy: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for FullVerifyError {}
 
 /// Compute SHA-256 of the ARK's PEM bytes (after stripping the
 /// PEM armor — i.e. the SHA-256 of the DER-encoded certificate).
@@ -398,5 +493,70 @@ mod tests {
         assert!(s.contains("ARK fingerprint mismatch"));
         assert!(s.contains(&"aa".repeat(32)));
         assert!(s.contains(&"bb".repeat(32)));
+    }
+
+    #[test]
+    fn turin_ark_fingerprint_is_32_bytes_and_nonzero() {
+        // Sanity: caught a copy-paste mistake earlier where I had 31
+        // bytes. Belt-and-suspenders.
+        assert_eq!(TURIN_ARK_FINGERPRINT_SHA256.len(), 32);
+        assert!(TURIN_ARK_FINGERPRINT_SHA256.iter().any(|&b| b != 0));
+        // First byte matches the published value 0x1f (sanity-check
+        // against a single-character typo).
+        assert_eq!(TURIN_ARK_FINGERPRINT_SHA256[0], 0x1f);
+        // Last byte 0x6a.
+        assert_eq!(TURIN_ARK_FINGERPRINT_SHA256[31], 0x6a);
+    }
+
+    #[test]
+    fn verify_full_short_circuits_on_chain_failure() {
+        // Garbage PEM bytes → chain check fails before report-sig or
+        // policy is even attempted.
+        let req = policy::PolicyRequirements::default();
+        let err = verify_full(
+            &[0u8; SNP_REPORT_LEN],
+            b"garbage",
+            b"garbage",
+            b"garbage",
+            None,
+            &req,
+        )
+        .unwrap_err();
+        assert!(matches!(err, FullVerifyError::Chain(_)), "{:?}", err);
+    }
+
+    #[test]
+    fn verify_full_short_circuits_on_pinned_ark_mismatch() {
+        // Even with garbage PEM, the fingerprint check fires first
+        // (per `verify_chain`'s contract). FullVerifyError wraps that
+        // as Chain.
+        let req = policy::PolicyRequirements::default();
+        let err = verify_full(
+            &[0u8; SNP_REPORT_LEN],
+            b"garbage",
+            b"garbage",
+            b"garbage",
+            Some([0xFFu8; 32]),
+            &req,
+        )
+        .unwrap_err();
+        match err {
+            FullVerifyError::Chain(VerifyError::ArkFingerprintMismatch { .. }) => {}
+            other => panic!("expected Chain(ArkFingerprintMismatch), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn full_verify_error_display_includes_step() {
+        // Display should say which step failed — operators reading
+        // logs want to know whether to fix their pin, their VCEK
+        // bundle, or their policy config.
+        let e = FullVerifyError::Chain(VerifyError::ChainBroken("oops".into()));
+        let s = e.to_string();
+        assert!(s.starts_with("chain:"), "got: {}", s);
+
+        let e = FullVerifyError::Policy(policy::PolicyError::DebugNotAllowed);
+        let s = e.to_string();
+        assert!(s.starts_with("policy:"), "got: {}", s);
     }
 }

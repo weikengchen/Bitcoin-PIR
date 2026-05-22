@@ -71,6 +71,7 @@ import {
   type WasmHarmonyClient,
   type WasmQueryResult,
 } from './sdk-bridge.js';
+import { getAmdTurinArkFingerprint } from './attest-pin.js';
 import type { ServerAttestation } from './dpf-adapter.js';
 import type {
   HarmonyQueryResult,
@@ -212,7 +213,26 @@ export class HarmonyPirClientAdapter {
     const hintAtt = await attestOne(0);
     const queryAtt = await attestOne(1);
 
-    const expectedArkFp = this.config.expectedArkFingerprint ?? null;
+    // Same default-to-WASM-export logic as the DPF adapter — see
+    // dpf-adapter.ts::attestAndUpgrade for rationale.
+    let expectedArkFp: Uint8Array | null;
+    if (this.config.expectedArkFingerprint === null) {
+      expectedArkFp = null;
+    } else if (this.config.expectedArkFingerprint !== undefined) {
+      expectedArkFp = this.config.expectedArkFingerprint;
+    } else {
+      try {
+        expectedArkFp = getAmdTurinArkFingerprint();
+      } catch (e) {
+        this.log(
+          `HarmonyPIR default ARK fingerprint unavailable: ${(e as Error)?.message ?? e}`,
+        );
+        expectedArkFp = null;
+      }
+    }
+
+    const sdk = requireSdkWasm();
+    const policyReqs = new sdk.WasmPolicyRequirements();
 
     const summarise = (
       idx: 0 | 1,
@@ -235,19 +255,19 @@ export class HarmonyPirClientAdapter {
         gitRev: att.gitRev,
         launchMeasurementHex: att.launchMeasurementHex,
       };
-      // Slice D.3 chain validation. Same gating logic as the DPF
-      // adapter — see dpf-adapter.ts::attestAndUpgrade for rationale.
+      // Slice D.3+ chain + policy validation. Same gating logic as
+      // the DPF adapter — see dpf-adapter.ts::attestAndUpgrade.
       if (state === 'verified' && matched && att.hasVcekChain) {
         if (expectedArkFp) {
           try {
-            att.verifyVcekChain(expectedArkFp);
+            att.verifyFull(expectedArkFp, policyReqs);
             result.state = 'verified-vcek';
             result.vcekChain = 'pass';
           } catch (e) {
             result.vcekChain = 'fail';
             result.vcekChainError = (e as Error)?.message ?? String(e);
             this.log(
-              `HarmonyPIR verifyVcekChain failed: ${result.vcekChainError}`,
+              `HarmonyPIR verifyFull failed: ${result.vcekChainError}`,
             );
             result.state = 'mismatch';
           }

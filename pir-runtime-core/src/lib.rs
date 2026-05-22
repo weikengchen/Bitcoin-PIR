@@ -9,6 +9,7 @@ pub mod cashu_verifier;
 pub mod channel;
 pub mod eval;
 pub mod handler;
+pub mod identity;
 pub mod manifest;
 pub mod protocol;
 pub mod table;

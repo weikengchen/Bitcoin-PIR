@@ -49,6 +49,27 @@ interface PirSdkWasm {
   WasmAtomicMetrics: {
     new(): WasmAtomicMetrics;
   };
+  /**
+   * Constructor for [`WasmPolicyRequirements`] used by
+   * `WasmAttestVerification.verifyFull`. `new sdk.WasmPolicyRequirements()`
+   * returns the strict production defaults; mutate via setters.
+   */
+  WasmPolicyRequirements: {
+    new(): WasmPolicyRequirements;
+  };
+  /**
+   * Returns the 32-byte SHA-256 fingerprint of the AMD Turin-family
+   * ARK certificate (DER-encoded). Pinned inside `pir-attest-verify`
+   * so the WASM module is the single source of truth — pass directly
+   * to `WasmAttestVerification.verifyFull` /
+   * `WasmAttestVerification.verifyVcekChain` on Turin hardware.
+   *
+   * Mirrors `web/src/attest-pin.ts::AMD_TURIN_ARK_FINGERPRINT_HEX` —
+   * `attest-pin.ts` uses this function as its runtime source and
+   * cross-checks the human-readable hex string against the WASM bytes
+   * at module load (catches drift if the two ever diverge).
+   */
+  turinArkFingerprint(): Uint8Array;
   // ARC (Anonymous Rate-limited Credentials) presentation state. Opaque
   // wrapper over the Rust `arc::PresentationState`; mirrored in TS by
   // `web/src/credential-manager.ts::ArcCredentialManager`. The constructor
@@ -228,6 +249,50 @@ export interface WasmAttestVerification {
    * diagnostic string.
    */
   verifyVcekChain(expectedArkFingerprint: Uint8Array | null): void;
+
+  /**
+   * Highest-level verify: runs `verifyVcekChain`'s four steps PLUS
+   * the policy assertions captured in `policy` — VMPL ceiling,
+   * `debug_allowed` / `migrate_ma_allowed` / `single_socket_required`
+   * bits, TCB monotonicity (`reported_tcb ≤ committed_tcb`) + optional
+   * minimum TCB, optional MEASUREMENT / family_id / image_id pins.
+   *
+   * Throws on the FIRST failing step. Caller can detect which step
+   * failed by inspecting the error message ("chain: …", "report-sig: …",
+   * "policy: …"). Use `verifyVcekChain` directly if you'd rather get a
+   * raw chain-only verdict.
+   */
+  verifyFull(
+    expectedArkFingerprint: Uint8Array | null,
+    policy: WasmPolicyRequirements,
+  ): void;
+}
+
+/**
+ * Policy requirements for [`WasmAttestVerification.verifyFull`].
+ *
+ * Constructed via `new sdk.WasmPolicyRequirements()` for strict
+ * production defaults: VMPL 0, no debug, no MA migration, TCB-
+ * monotonic, no pinned MEASUREMENT/family_id/image_id. Mutate via the
+ * setters to relax (e.g. enabling debug for a local test rig) or to
+ * pin MEASUREMENT.
+ */
+export interface WasmPolicyRequirements {
+  free(): void;
+  /** Raise the VMPL ceiling. Production wants 0. */
+  setMaxVmpl(v: number): void;
+  /** Permit guests with `policy.debug_allowed` set. Production: false. */
+  setAllowDebug(v: boolean): void;
+  /** Permit guests with `policy.migrate_ma_allowed` set. Production: false. */
+  setAllowMigrateMa(v: boolean): void;
+  /** Require `policy.single_socket_required`. Off by default. */
+  setRequireSingleSocket(v: boolean): void;
+  /** Pin the expected MEASUREMENT (must be exactly 48 bytes). */
+  setExpectedMeasurement(bytes: Uint8Array): void;
+  /** Pin the expected family_id (16 bytes). */
+  setExpectedFamilyId(bytes: Uint8Array): void;
+  /** Pin the expected image_id (16 bytes). */
+  setExpectedImageId(bytes: Uint8Array): void;
 }
 
 interface WasmDpfClient {

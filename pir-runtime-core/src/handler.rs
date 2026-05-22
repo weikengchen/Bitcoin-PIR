@@ -32,8 +32,19 @@ impl RequestHandler {
                 ark_pem: Vec::new(),
                 ask_pem: Vec::new(),
                 vcek_pem: Vec::new(),
+                announcement_bundle: None,
             },
         }
+    }
+
+    /// Install the pre-encoded operator-signed announcement bundle —
+    /// the bytes REQ_ANNOUNCE will return verbatim. See
+    /// [`crate::identity::build_announcement_bundle`] for how to
+    /// produce these bytes. Pass `None` to leave the server in
+    /// "unannounced" mode (REQ_ANNOUNCE → RESP_ERROR).
+    pub fn with_announcement_bundle(mut self, bundle: Option<Vec<u8>>) -> Self {
+        self.state.announcement_bundle = bundle;
+        self
     }
 
     /// Bind the long-lived X25519 channel pubkey the server generated
@@ -142,6 +153,13 @@ impl RequestHandler {
             Request::HarmonyQuery(query) => self.handle_harmony_query(query),
             Request::HarmonyBatchQuery(query) => self.handle_harmony_batch_query(query),
             Request::Attest { nonce } => Response::Attest(self.handle_attest(*nonce)),
+            Request::Announce => match &self.state.announcement_bundle {
+                Some(bytes) => Response::Announce(bytes.clone()),
+                None => Response::Error(
+                    "announce not configured: server lacks identity key or operator cert"
+                        .into(),
+                ),
+            },
             // Handshake needs per-connection state to mint a fresh
             // ephemeral keypair, derive the session key, and stash it
             // for subsequent encrypted-frame open/seal. The stateless

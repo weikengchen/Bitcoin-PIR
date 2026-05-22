@@ -135,6 +135,21 @@ struct CliArgs {
     /// `--serve-queries`. See `serve_hints` for the deployment
     /// topology rationale.
     serve_queries: bool,
+    /// Path to the server's long-lived Ed25519 identity key (raw 32-byte
+    /// seed). Combined with `--identity-cert-path` to build the
+    /// REQ_ANNOUNCE bundle. If either is missing or fails to load,
+    /// REQ_ANNOUNCE is disabled but the rest of the protocol runs
+    /// normally. Generate one with `bpir-admin generate-identity`.
+    identity_key_path: Option<PathBuf>,
+    /// Path to the operator-signed IdentityCert (raw bytes produced by
+    /// `bpir-admin sign-identity`, encoded per
+    /// `pir_identity::IdentityCert::encode`).
+    identity_cert_path: Option<PathBuf>,
+    /// Human-readable server identifier (e.g. "pir1", "pir2"). Bound
+    /// into the announcement bundle; cross-checked against the cert
+    /// loaded from `--identity-cert-path`. Required if either of the
+    /// identity flags is set.
+    identity_server_id: Option<String>,
 }
 
 fn parse_args() -> CliArgs {
@@ -156,6 +171,9 @@ fn parse_args() -> CliArgs {
     let mut cashu_keysets: Vec<(String, String)> = Vec::new();
     let mut serve_hints = false;
     let mut serve_queries = false;
+    let mut identity_key_path: Option<PathBuf> = None;
+    let mut identity_cert_path: Option<PathBuf> = None;
+    let mut identity_server_id: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -256,12 +274,30 @@ fn parse_args() -> CliArgs {
             "--serve-queries" => {
                 serve_queries = true;
             }
+            "--identity-key-path" => {
+                if let Some(p) = args.get(i + 1) {
+                    identity_key_path = Some(PathBuf::from(p));
+                }
+                i += 1;
+            }
+            "--identity-cert-path" => {
+                if let Some(p) = args.get(i + 1) {
+                    identity_cert_path = Some(PathBuf::from(p));
+                }
+                i += 1;
+            }
+            "--identity-server-id" => {
+                if let Some(s) = args.get(i + 1) {
+                    identity_server_id = Some(s.clone());
+                }
+                i += 1;
+            }
             _ => {}
         }
         i += 1;
     }
 
-    CliArgs { port, data_dir, role, warmup, config_path, checkpoints, deltas, admin_pubkey_hex, disable_onion, vcek_dir, pool_size, pool_dir, require_arc, require_cashu, cashu_keysets, serve_hints, serve_queries }
+    CliArgs { port, data_dir, role, warmup, config_path, checkpoints, deltas, admin_pubkey_hex, disable_onion, vcek_dir, pool_size, pool_dir, require_arc, require_cashu, cashu_keysets, serve_hints, serve_queries, identity_key_path, identity_cert_path, identity_server_id }
 }
 
 // ─── OnionPIR worker thread ─────────────────────────────────────────────────
@@ -2219,6 +2255,92 @@ async fn main() {
         }
     };
 
+    // ── Build the operator-signed announcement bundle, if configured ─
+    // [HUMAN-decided 2026-05-21] When either file is missing or the
+    // cert / key disagree, log a warning and serve without announce
+    // (REQ_ANNOUNCE returns RESP_ERROR). Existing attest / handshake
+    // / query paths are unaffected.
+    let announcement_bundle: Option<Vec<u8>> = match (
+        args.identity_key_path.as_ref(),
+        args.identity_cert_path.as_ref(),
+        args.identity_server_id.as_deref(),
+    ) {
+        (Some(key_path), Some(cert_path), Some(server_id)) => {
+            match pir_runtime_core::identity::load_identity_key(key_path)
+                .and_then(|sk| {
+                    pir_runtime_core::identity::load_identity_cert(cert_path)
+                        .map(|cert| (sk, cert))
+                })
+            {
+                Ok((sk, cert)) => {
+                    // Manifest roots in db_id order — same as the V2
+                    // attest layout, so the bundle and the SEV report
+                    // commit to the same set.
+                    let manifest_roots: Vec<[u8; 32]> = all_databases
+                        .iter()
+                        .map(|db| db.manifest_root.unwrap_or([0u8; 32]))
+                        .collect();
+                    let binary_sha256 = pir_runtime_core::attest::self_exe_sha256();
+                    let git_rev = pir_runtime_core::attest::GIT_REV;
+                    let issued_at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    match pir_runtime_core::identity::build_announcement_bundle(
+                        &sk,
+                        cert,
+                        server_id,
+                        channel_pubkey,
+                        binary_sha256,
+                        git_rev,
+                        manifest_roots,
+                        issued_at,
+                    ) {
+                        Ok(id) => {
+                            let id_short: String = id
+                                .cert
+                                .identity_pubkey[..8]
+                                .iter()
+                                .map(|b| format!("{:02x}", b))
+                                .collect();
+                            println!(
+                                "  Identity announce: enabled (server_id={}, identity_pub={}…, issued_at={})",
+                                server_id, id_short, issued_at
+                            );
+                            Some(id.encoded_bundle)
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "  Identity announce: DISABLED — failed to build bundle: {}. REQ_ANNOUNCE will return RESP_ERROR; attest/handshake/queries still serve normally.",
+                                e
+                            );
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  Identity announce: DISABLED — {}. REQ_ANNOUNCE will return RESP_ERROR; attest/handshake/queries still serve normally.",
+                        e
+                    );
+                    None
+                }
+            }
+        }
+        (None, None, None) => {
+            println!(
+                "  Identity announce: not configured (--identity-key-path / --identity-cert-path / --identity-server-id unset)"
+            );
+            None
+        }
+        _ => {
+            eprintln!(
+                "  Identity announce: DISABLED — all three of --identity-key-path, --identity-cert-path, --identity-server-id must be set together (or none of them)."
+            );
+            None
+        }
+    };
+
     // ── Assemble ServerState ────────────────────────────────────────────
     let num_databases = all_databases.len();
     let state = ServerState {
@@ -2227,6 +2349,7 @@ async fn main() {
         ark_pem,
         ask_pem,
         vcek_pem,
+        announcement_bundle,
     };
 
     let admin_config = match args.admin_pubkey_hex.as_deref() {

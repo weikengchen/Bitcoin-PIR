@@ -33,7 +33,7 @@
 
 use crate::protocol::encode_request;
 use crate::transport::PirTransport;
-use pir_core::attest::{build_report_data, extract_report_data};
+use pir_core::attest::{build_report_data, derive_attest_nonce, extract_report_data};
 use pir_core::merkle::Hash256;
 use pir_sdk::{PirError, PirResult};
 
@@ -176,6 +176,42 @@ pub async fn attest<T: PirTransport + ?Sized>(
         expected_report_data_hash: expected_low,
         sev_status,
     })
+}
+
+/// Send REQ_ATTEST with the nonce *bound* to the client's handshake
+/// ephemeral pubkey, so the chip-signed REPORT_DATA commits to *this*
+/// handshake — not a stale or replayed attestation.
+///
+/// Concretely: `nonce = derive_attest_nonce(eph_pub_from_seed(eph_seed),
+/// random_32)`. The same `eph_seed` MUST be threaded into the
+/// subsequent [`crate::channel::establish`] call so the eph pubkey
+/// committed-to in REPORT_DATA equals the eph pubkey sent in
+/// REQ_HANDSHAKE.
+///
+/// `random_32` MUST be a fresh CSPRNG draw per call (Os entropy in
+/// production; deterministic in tests for reproducibility).
+///
+/// The returned [`AttestVerification`] is the same shape as
+/// [`attest`]'s — its `expected_report_data_hash` was computed using
+/// the derived nonce, so the existing `sev_status` semantics apply
+/// (e.g. `ReportDataMatch` proves the SEV report covers both the
+/// server's static pubkey AND this handshake's client ephemeral).
+pub async fn attest_with_eph_binding<T: PirTransport + ?Sized>(
+    transport: &mut T,
+    eph_seed: [u8; 32],
+    random_32: [u8; 32],
+) -> PirResult<AttestVerification> {
+    let client_eph_pub = pir_channel::eph_pub_from_seed(eph_seed);
+    let nonce = derive_attest_nonce(client_eph_pub, random_32);
+    attest(transport, nonce).await
+}
+
+/// Recompute the bound attest nonce from an `eph_seed` + `random_32`.
+/// Useful for tests / inspectors that want to compare a captured
+/// `AttestVerification::nonce` against the binding it should encode.
+pub fn bound_nonce_for(eph_seed: [u8; 32], random_32: [u8; 32]) -> [u8; 32] {
+    let client_eph_pub = pir_channel::eph_pub_from_seed(eph_seed);
+    derive_attest_nonce(client_eph_pub, random_32)
 }
 
 /// Mirror of `pir_runtime_core::protocol::decode_attest_result`. Kept
@@ -553,5 +589,139 @@ mod tests {
         };
         let err = attest(&mut mock, [0u8; 32]).await.unwrap_err();
         assert!(matches!(err, PirError::Protocol(_)), "got {:?}", err);
+    }
+
+    #[tokio::test]
+    async fn attest_with_eph_binding_sends_bound_nonce_on_the_wire() {
+        // The function must derive the nonce from (eph_seed, random_32)
+        // and put exactly those bytes into REQ_ATTEST. Recompute the
+        // expected nonce independently and compare to the wire bytes.
+        let eph_seed = [0x77u8; 32];
+        let random_32 = [0x88u8; 32];
+        let expected_nonce = bound_nonce_for(eph_seed, random_32);
+
+        let resp = AttestResponse {
+            sev_snp_report: Vec::new(),
+            manifest_roots: vec![],
+            binary_sha256: [0u8; 32],
+            server_static_pub: [0u8; 32],
+            git_rev: "x".into(),
+            ark_pem: Vec::new(),
+            ask_pem: Vec::new(),
+            vcek_pem: Vec::new(),
+        };
+        let mut mock = MockTransport {
+            reply: build_response_payload(&resp),
+            last_request: Mutex::new(Vec::new()),
+        };
+        let v = attest_with_eph_binding(&mut mock, eph_seed, random_32)
+            .await
+            .unwrap();
+        assert_eq!(v.nonce, expected_nonce);
+
+        let req = mock.last_request.lock().unwrap().clone();
+        assert_eq!(req.len(), 4 + 1 + 32);
+        assert_eq!(req[4], REQ_ATTEST);
+        assert_eq!(&req[5..37], &expected_nonce);
+    }
+
+    #[tokio::test]
+    async fn stale_report_against_different_eph_pub_is_rejected() {
+        // Threat model: an attacker captured a real SEV report from a
+        // prior session bound to eph_seed_A's nonce. They replay it
+        // against a client running eph_seed_B. The client's recomputed
+        // REPORT_DATA preimage uses nonce_B (committing to client_eph_pub_B);
+        // the captured report's REPORT_DATA was computed from nonce_A
+        // (committing to client_eph_pub_A) → mismatch.
+        let eph_seed_a = [0xAAu8; 32];
+        let eph_seed_b = [0xBBu8; 32];
+        let random_32 = [0x99u8; 32]; // same random, different eph_seeds
+        let nonce_a = bound_nonce_for(eph_seed_a, random_32);
+        let nonce_b = bound_nonce_for(eph_seed_b, random_32);
+        assert_ne!(nonce_a, nonce_b);
+
+        let manifest_roots = vec![[0u8; 32]];
+        let binary_sha256 = [0u8; 32];
+        let server_static_pub = [0xEEu8; 32];
+        let git_rev = "v1".to_string();
+
+        // The captured report's REPORT_DATA was computed against nonce_A.
+        let captured_preimage = build_report_data(
+            nonce_a,
+            &manifest_roots,
+            binary_sha256,
+            server_static_pub,
+            &git_rev,
+        );
+        let mut sev_blob = vec![0u8; 1184];
+        sev_blob[SEV_SNP_REPORT_DATA_OFFSET..SEV_SNP_REPORT_DATA_OFFSET + 64]
+            .copy_from_slice(&captured_preimage);
+
+        // Attacker re-serves the captured report verbatim (same SEV
+        // bytes + same self-reported fields) — what changes is which
+        // eph_seed the *current* client is using.
+        let resp = AttestResponse {
+            sev_snp_report: sev_blob,
+            manifest_roots,
+            binary_sha256,
+            server_static_pub,
+            git_rev,
+            ark_pem: Vec::new(),
+            ask_pem: Vec::new(),
+            vcek_pem: Vec::new(),
+        };
+        let mut mock = MockTransport {
+            reply: build_response_payload(&resp),
+            last_request: Mutex::new(Vec::new()),
+        };
+        // Current client runs with eph_seed_B → expects REPORT_DATA
+        // bound to nonce_B; gets one bound to nonce_A → mismatch.
+        let v = attest_with_eph_binding(&mut mock, eph_seed_b, random_32)
+            .await
+            .unwrap();
+        assert_eq!(v.sev_status, SevStatus::ReportDataMismatch);
+    }
+
+    #[tokio::test]
+    async fn bound_nonce_matches_against_honest_server() {
+        // Sanity: honest server signs against the SAME nonce the client
+        // derived → ReportDataMatch.
+        let eph_seed = [0x55u8; 32];
+        let random_32 = [0x66u8; 32];
+        let nonce = bound_nonce_for(eph_seed, random_32);
+
+        let manifest_roots = vec![[0x33u8; 32]];
+        let binary_sha256 = [0x44u8; 32];
+        let server_static_pub = [0xEEu8; 32];
+        let git_rev = "main".to_string();
+        let preimage = build_report_data(
+            nonce,
+            &manifest_roots,
+            binary_sha256,
+            server_static_pub,
+            &git_rev,
+        );
+        let mut sev_blob = vec![0u8; 1184];
+        sev_blob[SEV_SNP_REPORT_DATA_OFFSET..SEV_SNP_REPORT_DATA_OFFSET + 64]
+            .copy_from_slice(&preimage);
+
+        let resp = AttestResponse {
+            sev_snp_report: sev_blob,
+            manifest_roots,
+            binary_sha256,
+            server_static_pub,
+            git_rev,
+            ark_pem: Vec::new(),
+            ask_pem: Vec::new(),
+            vcek_pem: Vec::new(),
+        };
+        let mut mock = MockTransport {
+            reply: build_response_payload(&resp),
+            last_request: Mutex::new(Vec::new()),
+        };
+        let v = attest_with_eph_binding(&mut mock, eph_seed, random_32)
+            .await
+            .unwrap();
+        assert_eq!(v.sev_status, SevStatus::ReportDataMatch);
     }
 }

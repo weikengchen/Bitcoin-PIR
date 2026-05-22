@@ -791,6 +791,29 @@ impl HarmonyClient {
         crate::attest::attest(conn.as_mut(), nonce).await
     }
 
+    /// Send REQ_ANNOUNCE to the chosen server (0 = hint, 1 = query).
+    /// See [`super::DpfClient::announce`] for full semantics.
+    pub async fn announce(
+        &mut self,
+        server_index: u8,
+    ) -> PirResult<crate::announce::AnnounceVerification> {
+        let conn = match server_index {
+            0 => self.hint_conn.as_mut().ok_or_else(|| {
+                PirError::Protocol("announce: hint server not connected".into())
+            })?,
+            1 => self.query_conn.as_mut().ok_or_else(|| {
+                PirError::Protocol("announce: query server not connected".into())
+            })?,
+            _ => {
+                return Err(PirError::Protocol(format!(
+                    "announce: server_index must be 0 (hint) or 1 (query), got {}",
+                    server_index
+                )))
+            }
+        };
+        crate::announce::announce(conn.as_mut()).await
+    }
+
     /// Replace both server connections with secure-channel-wrapped
     /// versions. See [`super::DpfClient::upgrade_to_secure_channel`]
     /// for the full semantics. Argument order matches the
@@ -799,6 +822,45 @@ impl HarmonyClient {
         &mut self,
         hint_server_static_pub: [u8; 32],
         query_server_static_pub: [u8; 32],
+    ) -> PirResult<()> {
+        let mut eph_h = [0u8; 32];
+        let mut nonce_h = [0u8; 32];
+        let mut eph_q = [0u8; 32];
+        let mut nonce_q = [0u8; 32];
+        getrandom::getrandom(&mut eph_h)
+            .map_err(|e| PirError::Protocol(format!("getrandom: {}", e)))?;
+        getrandom::getrandom(&mut nonce_h)
+            .map_err(|e| PirError::Protocol(format!("getrandom: {}", e)))?;
+        getrandom::getrandom(&mut eph_q)
+            .map_err(|e| PirError::Protocol(format!("getrandom: {}", e)))?;
+        getrandom::getrandom(&mut nonce_q)
+            .map_err(|e| PirError::Protocol(format!("getrandom: {}", e)))?;
+
+        self.upgrade_to_secure_channel_with_seeds(
+            hint_server_static_pub,
+            eph_h,
+            nonce_h,
+            query_server_static_pub,
+            eph_q,
+            nonce_q,
+        )
+        .await
+    }
+
+    /// Binding-friendly overload: thread the same `eph_seed_*` you
+    /// passed to [`crate::attest::attest_with_eph_binding`] for the
+    /// corresponding server so the attestation covers this exact
+    /// handshake. See
+    /// [`super::DpfClient::upgrade_to_secure_channel_with_seeds`] for
+    /// rationale. `hs_nonce_*` are HKDF salts (CSPRNG-fresh per call).
+    pub async fn upgrade_to_secure_channel_with_seeds(
+        &mut self,
+        hint_server_static_pub: [u8; 32],
+        eph_seed_hint: [u8; 32],
+        hs_nonce_hint: [u8; 32],
+        query_server_static_pub: [u8; 32],
+        eph_seed_query: [u8; 32],
+        hs_nonce_query: [u8; 32],
     ) -> PirResult<()> {
         let raw_hint = self
             .hint_conn
@@ -814,23 +876,20 @@ impl HarmonyClient {
             }
         };
 
-        let mut eph_h = [0u8; 32];
-        let mut nonce_h = [0u8; 32];
-        let mut eph_q = [0u8; 32];
-        let mut nonce_q = [0u8; 32];
-        getrandom::getrandom(&mut eph_h)
-            .map_err(|e| PirError::Protocol(format!("getrandom: {}", e)))?;
-        getrandom::getrandom(&mut nonce_h)
-            .map_err(|e| PirError::Protocol(format!("getrandom: {}", e)))?;
-        getrandom::getrandom(&mut eph_q)
-            .map_err(|e| PirError::Protocol(format!("getrandom: {}", e)))?;
-        getrandom::getrandom(&mut nonce_q)
-            .map_err(|e| PirError::Protocol(format!("getrandom: {}", e)))?;
-
-        let wrapped_hint =
-            crate::channel::establish(raw_hint, hint_server_static_pub, eph_h, nonce_h).await?;
-        let wrapped_query =
-            crate::channel::establish(raw_query, query_server_static_pub, eph_q, nonce_q).await?;
+        let wrapped_hint = crate::channel::establish(
+            raw_hint,
+            hint_server_static_pub,
+            eph_seed_hint,
+            hs_nonce_hint,
+        )
+        .await?;
+        let wrapped_query = crate::channel::establish(
+            raw_query,
+            query_server_static_pub,
+            eph_seed_query,
+            hs_nonce_query,
+        )
+        .await?;
 
         self.hint_conn = Some(Box::new(wrapped_hint));
         self.query_conn = Some(Box::new(wrapped_query));

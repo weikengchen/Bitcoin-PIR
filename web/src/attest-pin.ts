@@ -1,11 +1,16 @@
+import { requireSdkWasm } from './sdk-bridge.js';
+
 /**
  * Operator-pinned 32-byte SHA-256 fingerprint of the AMD ARK (Root
- * Key) certificate.
+ * Key) certificate, as a human-readable hex string.
  *
- * This is the trust anchor for browser-side AMD VCEK chain validation
- * (Slice D). When the adapter calls `verifyVcekChain`, it computes
- * SHA-256(ARK_DER) and compares to this constant; mismatch = the
- * server's bundled cert chain doesn't actually root at AMD's ARK.
+ * This constant is **documentation** — the live runtime value used by
+ * the verifier comes from the WASM module (`turinArkFingerprint()`,
+ * exported from `pir-attest-verify::TURIN_ARK_FINGERPRINT_SHA256`).
+ * Keeping the hex here gives operators a searchable, auditable copy
+ * of the pinned value AND a build-time cross-check (see
+ * [`getAmdTurinArkFingerprint`] below) that catches drift if anyone
+ * ever rotates one without the other.
  *
  * Pinned 2026-05-03 by the operator from the Turin family ARK at
  * https://kdsintf.amd.com/vcek/v1/Turin/cert_chain (second PEM block).
@@ -16,7 +21,9 @@
  *        # Split, then SHA-256 the ARK DER:
  *        csplit -z -f cert_ -b "%d.pem" cert_chain.pem '/-----BEGIN CERT/' '{*}'
  *        openssl x509 -in cert_1.pem -outform DER | sha256sum
- *   3. Replace the hex below + rebuild + redeploy the web bundle.
+ *   3. Replace the hex below AND the Rust constant
+ *      `pir-attest-verify::TURIN_ARK_FINGERPRINT_SHA256`, then rebuild
+ *      the WASM bundle.
  *
  * Same fingerprint applies to all Turin-family chips. (Genoa, Milan,
  * etc. would have different ARKs and need their own pins; we only
@@ -25,9 +32,11 @@
 export const AMD_TURIN_ARK_FINGERPRINT_HEX =
   '1f084161a44bb6d93778a904877d4819cafa5d05ef4193b2ded9dd9c73dd3f6a';
 
-/** Same as `AMD_TURIN_ARK_FINGERPRINT_HEX` but as Uint8Array — the
- *  shape `WasmAttestVerification.verifyVcekChain` expects. */
-export const AMD_TURIN_ARK_FINGERPRINT: Uint8Array = (() => {
+/** Decode the hex constant once at module load. Used as the
+ *  authoritative *human-readable* source — the runtime value comes
+ *  from WASM and is checked against this at [`getAmdTurinArkFingerprint`]
+ *  call time. */
+const HEX_AS_BYTES: Uint8Array = (() => {
   const hex = AMD_TURIN_ARK_FINGERPRINT_HEX;
   const out = new Uint8Array(32);
   for (let i = 0; i < 32; i++) {
@@ -35,6 +44,57 @@ export const AMD_TURIN_ARK_FINGERPRINT: Uint8Array = (() => {
   }
   return out;
 })();
+
+/**
+ * Return the 32-byte ARK fingerprint sourced from the WASM module
+ * (which mirrors the Rust constant
+ * `pir-attest-verify::TURIN_ARK_FINGERPRINT_SHA256`).
+ *
+ * Throws if [`initSdkWasm`] hasn't resolved yet — the WASM module is
+ * the single source of truth, so this function intentionally has no
+ * pure-TS fallback. Callers that need the value before WASM init can
+ * use [`AMD_TURIN_ARK_FINGERPRINT_HEX`] for display purposes only
+ * (never as the value passed to `verifyVcekChain` / `verifyFull` —
+ * that would defeat the cross-check).
+ *
+ * On first call after WASM init, cross-checks the WASM-exported bytes
+ * against the hex constant and throws on mismatch (build-time drift
+ * between Rust + TS). Subsequent calls return the cached Uint8Array.
+ */
+let cachedArkFingerprint: Uint8Array | null = null;
+export function getAmdTurinArkFingerprint(): Uint8Array {
+  if (cachedArkFingerprint) return cachedArkFingerprint;
+  const sdk = requireSdkWasm();
+  const fromWasm = sdk.turinArkFingerprint();
+  if (fromWasm.length !== 32) {
+    throw new Error(
+      `attest-pin: WASM turinArkFingerprint returned ${fromWasm.length} bytes (expected 32)`,
+    );
+  }
+  for (let i = 0; i < 32; i++) {
+    if (fromWasm[i] !== HEX_AS_BYTES[i]) {
+      throw new Error(
+        `attest-pin: ARK fingerprint mismatch between WASM (${bytesToHex(fromWasm)}) ` +
+          `and AMD_TURIN_ARK_FINGERPRINT_HEX (${AMD_TURIN_ARK_FINGERPRINT_HEX}). ` +
+          `One was rotated without the other — fix and rebuild.`,
+      );
+    }
+  }
+  cachedArkFingerprint = fromWasm;
+  return fromWasm;
+}
+
+/**
+ * @deprecated Use [`getAmdTurinArkFingerprint`] instead. This eager
+ * Uint8Array is kept for back-compat with pre-Slice-D.4 callers; new
+ * code should source from WASM so the cross-check fires. Will be
+ * removed once `dpf-adapter.ts` / `harmonypir-adapter.ts` migrate.
+ */
+export const AMD_TURIN_ARK_FINGERPRINT: Uint8Array = HEX_AS_BYTES;
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
 
 /**
  * Per-server build-time pins for values the SEV-SNP report surfaces.

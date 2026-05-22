@@ -39,6 +39,11 @@ pir-core = { version = "0.1.0", path = "../pir-core" }
 # the native path in `cargo test -p pir-sdk-wasm`, so the tokio pull-in is
 # acceptable.
 pir-sdk-client = { version = "0.1.0", path = "../pir-sdk-client" }
+# Provides `eph_pub_from_seed` for the bound-nonce derivation in
+# `WasmDpfClient::attest` / `WasmHarmonyClient::attest` (so the SEV-SNP
+# REPORT_DATA commits to the *exact* X25519 eph pubkey used in the
+# subsequent `upgradeToSecureChannel` handshake).
+pir-channel = { version = "0.1.0", path = "../pir-channel" }
 arc = { git = "https://github.com/Bitcoin-PIR/arc.git", rev = "de6c1709eee0faa32985d5a452be11904ee95de4" }
 rand_core = { version = "0.6", features = ["getrandom"] }
 # Browser-side AMD VCEK chain verifier (Slice D). Pure-Rust crypto

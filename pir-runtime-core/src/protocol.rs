@@ -98,6 +98,33 @@ pub const RESP_CASHU_BAT_OK: u8 = 0x09;
 // cleartext frame after that is a protocol error.
 pub const REQ_HANDSHAKE: u8 = 0x06;
 
+// ─── Operator-signed identity announce ─────────────────────────────────────
+//
+// One-shot query: client asks "who are you?" and gets a two-tier
+// signed bundle:
+//
+//   client → server:  REQ_ANNOUNCE   (no payload)
+//   server → client:  RESP_ANNOUNCE  { AnnouncementBundle bytes }
+//
+// where the bundle is `pir_identity::AnnouncementBundle::encode()` —
+// `[cert_len:u32 LE][cert][manifest_len:u32 LE][manifest]`.
+//
+// The two layers it carries:
+// * IdentityCert  — operator's offline Ed25519 key signs (server_id,
+//                    identity_pubkey, valid_from, valid_until). Operator
+//                    key is published out-of-band (eventually Nostr).
+// * ChannelManifest — server's on-disk identity key signs the current
+//                    boot's channel_pub (X25519, from
+//                    `ChannelKeypair::generate`) + binary_sha256 +
+//                    git_rev + manifest_roots + issued_at.
+//
+// Servers that lack the identity-key file or operator-cert file at
+// startup serve attest/handshake but reject REQ_ANNOUNCE with
+// RESP_ERROR; existing flows are unaffected. Clients use the bundle to
+// authenticate `server_static_pub` on hosts that lack SEV-SNP (pir1),
+// and as defense-in-depth on hosts that do (pir2).
+pub const REQ_ANNOUNCE: u8 = 0x07;
+
 // ─── Admin auth (Slice 3a) ─────────────────────────────────────────────────
 //
 // Challenge/response with ed25519. The server holds the admin's public
@@ -156,6 +183,7 @@ pub const RESP_INFO: u8 = 0x01;
 pub const RESP_DB_CATALOG: u8 = 0x02;
 pub const RESP_ATTEST: u8 = 0x05;
 pub const RESP_HANDSHAKE: u8 = 0x06;
+pub const RESP_ANNOUNCE: u8 = 0x07;
 pub const RESP_ADMIN_AUTH_CHALLENGE: u8 = 0x80;
 pub const RESP_ADMIN_AUTH_RESPONSE: u8 = 0x81;
 pub const RESP_ADMIN_DB_UPLOAD_BEGIN: u8 = 0x82;
@@ -390,6 +418,11 @@ pub enum Request {
     HarmonyHintsV2Half(HarmonyHintRequestV2Half),
     HarmonyQuery(HarmonyQuery),
     HarmonyBatchQuery(HarmonyBatchQuery),
+    /// Operator-signed identity announce. Body is empty — the server
+    /// returns its cached, pre-encoded `pir_identity::AnnouncementBundle`
+    /// in `Response::Announce`. Servers that lack the on-disk identity
+    /// material reply with `Response::Error`.
+    Announce,
 }
 
 // ─── Response types ─────────────────────────────────────────────────────────
@@ -557,6 +590,11 @@ pub enum Response {
     /// X25519 ephemeral pubkey. After this exchange both sides have the
     /// same session key derived via `pir_channel`'s ECDH+HKDF.
     Handshake(HandshakeResult),
+    /// Server's reply to `Request::Announce`. Body is the raw bytes of
+    /// `pir_identity::AnnouncementBundle::encode()` — the wire format
+    /// is opaque to this enum so a future bundle version bump doesn't
+    /// require touching the protocol layer.
+    Announce(Vec<u8>),
     AdminAuthChallenge(AdminAuthChallenge),
     AdminAuthResponse(AdminAuthResult),
     AdminDbUploadBegin(AdminAck),
@@ -696,6 +734,9 @@ impl Request {
                 payload.push(REQ_HARMONY_BATCH_QUERY);
                 encode_harmony_batch_query(&mut payload, q);
             }
+            Request::Announce => {
+                payload.push(REQ_ANNOUNCE);
+            }
         }
         let mut msg = Vec::with_capacity(4 + payload.len());
         msg.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -830,6 +871,7 @@ impl Request {
                 let q = decode_harmony_batch_query(&data[1..])?;
                 Ok(Request::HarmonyBatchQuery(q))
             }
+            REQ_ANNOUNCE => Ok(Request::Announce),
             v => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown request variant: 0x{:02x}", v),
@@ -864,6 +906,11 @@ impl Response {
             Response::Handshake(r) => {
                 payload.push(RESP_HANDSHAKE);
                 payload.extend_from_slice(&r.server_eph_pub);
+            }
+            Response::Announce(bundle_bytes) => {
+                payload.push(RESP_ANNOUNCE);
+                payload.extend_from_slice(&(bundle_bytes.len() as u32).to_le_bytes());
+                payload.extend_from_slice(bundle_bytes);
             }
             Response::AdminAuthChallenge(c) => {
                 payload.push(RESP_ADMIN_AUTH_CHALLENGE);
@@ -984,6 +1031,22 @@ impl Response {
                 let mut server_eph_pub = [0u8; 32];
                 server_eph_pub.copy_from_slice(&data[1..33]);
                 Ok(Response::Handshake(HandshakeResult { server_eph_pub }))
+            }
+            RESP_ANNOUNCE => {
+                if data.len() < 1 + 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "announce response missing 4-byte bundle length",
+                    ));
+                }
+                let blen = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
+                if 5 + blen > data.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "announce response: bundle length exceeds buffer",
+                    ));
+                }
+                Ok(Response::Announce(data[5..5 + blen].to_vec()))
             }
             RESP_ADMIN_AUTH_CHALLENGE => {
                 if data.len() < 1 + 32 {
@@ -1894,5 +1957,111 @@ mod attest_wire_tests {
         let err = Response::decode(&payload).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(format!("{}", err).contains("ark_pem"), "got: {}", err);
+    }
+
+    // ─── Announce wire round-trips ──────────────────────────────────────
+
+    #[test]
+    fn announce_request_roundtrip() {
+        let encoded = Request::Announce.encode();
+        // [4B len LE][1B variant] = 5 bytes total.
+        assert_eq!(encoded.len(), 5);
+        assert_eq!(u32::from_le_bytes(encoded[..4].try_into().unwrap()), 1);
+        let decoded = Request::decode(&encoded[4..]).unwrap();
+        assert!(matches!(decoded, Request::Announce));
+    }
+
+    #[test]
+    fn announce_response_roundtrip_arbitrary_bundle() {
+        // The Response::Announce wraps the bundle bytes verbatim — it
+        // doesn't decode them. So this test uses an arbitrary blob to
+        // confirm the length-prefix framing is symmetric.
+        let bundle_bytes = (0u8..200u8).collect::<Vec<u8>>();
+        let encoded = Response::Announce(bundle_bytes.clone()).encode();
+        let decoded = Response::decode(&encoded[4..]).unwrap();
+        match decoded {
+            Response::Announce(bytes) => assert_eq!(bytes, bundle_bytes),
+            other => panic!("wrong variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn announce_response_truncated_bundle_length_fails() {
+        // [RESP_ANNOUNCE][len = 100][only 50 bytes of payload]
+        let mut payload = vec![RESP_ANNOUNCE];
+        payload.extend_from_slice(&100u32.to_le_bytes());
+        payload.extend_from_slice(&[0u8; 50]);
+        let err = Response::decode(&payload).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn announce_handler_returns_bundle_when_configured() {
+        use crate::handler::RequestHandler;
+        let bundle_bytes = vec![1u8, 2, 3, 4, 5];
+        let handler = RequestHandler::new(vec![])
+            .with_announcement_bundle(Some(bundle_bytes.clone()));
+        let resp = handler.handle_request(&Request::Announce);
+        match resp {
+            Response::Announce(bytes) => assert_eq!(bytes, bundle_bytes),
+            other => panic!("expected Announce, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn announce_handler_returns_error_when_unconfigured() {
+        use crate::handler::RequestHandler;
+        let handler = RequestHandler::new(vec![]); // announcement_bundle = None
+        let resp = handler.handle_request(&Request::Announce);
+        match resp {
+            Response::Error(msg) => assert!(msg.contains("announce not configured")),
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn announce_end_to_end_with_pir_identity() {
+        use crate::handler::RequestHandler;
+        use ed25519_dalek::SigningKey;
+        // Build a real bundle the SDK client will parse.
+        let op_sk = SigningKey::from_bytes(&[0x11u8; 32]);
+        let id_sk = SigningKey::from_bytes(&[0x22u8; 32]);
+        let cert = pir_identity::sign_identity_cert(
+            &op_sk,
+            "pir-test",
+            id_sk.verifying_key().to_bytes(),
+            0,
+            0,
+        );
+        let manifest = pir_identity::sign_channel_manifest(
+            &id_sk,
+            "pir-test",
+            [0xCCu8; 32],
+            [0xAAu8; 32],
+            "test-rev",
+            vec![],
+            1_700_000_000,
+        );
+        let bundle = pir_identity::AnnouncementBundle { cert, manifest };
+        let encoded_bundle = bundle.encode();
+        let handler = RequestHandler::new(vec![])
+            .with_announcement_bundle(Some(encoded_bundle.clone()));
+
+        // Server-side: produce the RESP_ANNOUNCE wire bytes.
+        let resp = handler.handle_request(&Request::Announce);
+        let wire = resp.encode();
+
+        // Client-side: decode the same wire. Bundle bytes round-trip.
+        let parsed = Response::decode(&wire[4..]).unwrap();
+        match parsed {
+            Response::Announce(b) => {
+                assert_eq!(b, encoded_bundle);
+                // And the bundle itself decodes + verify_chain passes.
+                let bundle2 = pir_identity::AnnouncementBundle::decode(&b).unwrap();
+                bundle2.verify_chain().unwrap();
+                assert_eq!(bundle2.cert.server_id, "pir-test");
+            }
+            other => panic!("expected Announce, got {:?}", other),
+        }
     }
 }

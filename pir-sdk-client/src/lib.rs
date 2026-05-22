@@ -58,6 +58,7 @@
 #[cfg(not(target_arch = "wasm32"))]
 mod connection;
 pub mod admin;
+pub mod announce;
 pub mod attest;
 pub mod channel;
 mod dpf;

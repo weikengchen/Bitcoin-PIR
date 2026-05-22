@@ -54,6 +54,22 @@ pub fn run(args: KeygenArgs) -> Result<(), String> {
 }
 
 #[cfg(unix)]
+pub(crate) fn write_secret_key_unix(
+    path: &std::path::Path,
+    seed: &[u8; 32],
+) -> Result<(), String> {
+    write_secret_key(path, seed)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn write_secret_key_unix(
+    path: &std::path::Path,
+    seed: &[u8; 32],
+) -> Result<(), String> {
+    write_secret_key(path, seed)
+}
+
+#[cfg(unix)]
 fn write_secret_key(path: &std::path::Path, seed: &[u8; 32]) -> Result<(), String> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = fs::OpenOptions::new()

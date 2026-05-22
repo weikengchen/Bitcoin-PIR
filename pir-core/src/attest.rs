@@ -61,6 +61,43 @@ pub const X25519_PUBKEY_LEN: usize = 32;
 /// preimage — see module docs for the migration story.
 pub const REPORT_DATA_DOMAIN_TAG: &[u8] = b"BPIR-ATTEST-V2";
 
+/// Domain-separation tag for the *attest nonce* derivation that binds
+/// the client's handshake ephemeral pubkey into the chip-signed
+/// REPORT_DATA. Distinct from [`REPORT_DATA_DOMAIN_TAG`] so a verifier
+/// cannot confuse a nonce preimage with a REPORT_DATA preimage.
+pub const ATTEST_NONCE_DOMAIN_TAG: &[u8] = b"BPIR-ATTEST-NONCE-V1";
+
+/// Derive the 32-byte attest nonce so the SEV-SNP report's REPORT_DATA
+/// commits to *this specific* client handshake ephemeral pubkey:
+///
+/// ```text
+/// attest_nonce = sha256(BPIR-ATTEST-NONCE-V1 || client_eph_pub || random_32)
+/// ```
+///
+/// The bound nonce is what gets passed to [`build_report_data`] as the
+/// `nonce` argument (and ultimately to the server's REQ_ATTEST). On the
+/// verifier side, the client recomputes this value from the same
+/// `client_eph_pub` (which it controls — it's the public half of the
+/// X25519 ephemeral the client will use in REQ_HANDSHAKE) plus the
+/// `random_32` it generated; if the chip-signed REPORT_DATA matches the
+/// reconstructed preimage, the attestation provably covers this
+/// handshake — not a stale or replayed one.
+///
+/// `random_32` MUST come from a CSPRNG. Production callers feed it
+/// from `OsRng` / `getrandom`. Tests can pass a fixed value for
+/// reproducibility.
+pub fn derive_attest_nonce(
+    client_eph_pub: [u8; X25519_PUBKEY_LEN],
+    random_32: [u8; 32],
+) -> [u8; 32] {
+    let mut preimage =
+        Vec::with_capacity(ATTEST_NONCE_DOMAIN_TAG.len() + X25519_PUBKEY_LEN + 32);
+    preimage.extend_from_slice(ATTEST_NONCE_DOMAIN_TAG);
+    preimage.extend_from_slice(&client_eph_pub);
+    preimage.extend_from_slice(&random_32);
+    sha256(&preimage)
+}
+
 /// Concatenate per-DB manifest roots and hash, producing the single
 /// "combined manifest root" that goes into REPORT_DATA. Empty input
 /// returns the all-zero hash so a server with no manifests still has
@@ -224,6 +261,51 @@ mod tests {
 
         let out = build_report_data(nonce, &[root], binary, server_pub, git);
         assert_eq!(&out[..32], &manual);
+    }
+
+    #[test]
+    fn derive_attest_nonce_changes_with_client_eph_pub() {
+        let n1 = derive_attest_nonce([0xAAu8; 32], [0x11u8; 32]);
+        let n2 = derive_attest_nonce([0xBBu8; 32], [0x11u8; 32]);
+        assert_ne!(n1, n2);
+    }
+
+    #[test]
+    fn derive_attest_nonce_changes_with_random_32() {
+        let n1 = derive_attest_nonce([0xAAu8; 32], [0x11u8; 32]);
+        let n2 = derive_attest_nonce([0xAAu8; 32], [0x22u8; 32]);
+        assert_ne!(n1, n2);
+    }
+
+    #[test]
+    fn derive_attest_nonce_is_deterministic() {
+        let eph = [0xCCu8; 32];
+        let rnd = [0xDDu8; 32];
+        assert_eq!(
+            derive_attest_nonce(eph, rnd),
+            derive_attest_nonce(eph, rnd)
+        );
+    }
+
+    #[test]
+    fn derive_attest_nonce_domain_tag_distinct_from_report_data_tag() {
+        // A nonce preimage and a REPORT_DATA preimage with the same
+        // trailing bytes must not collide — distinct domain tags
+        // prevent cross-protocol confusion.
+        assert_ne!(ATTEST_NONCE_DOMAIN_TAG, REPORT_DATA_DOMAIN_TAG);
+    }
+
+    #[test]
+    fn derive_attest_nonce_matches_manual_sha256() {
+        // Catch accidental field-order or domain-tag regressions.
+        let eph = [0x12u8; 32];
+        let rnd = [0x34u8; 32];
+        let mut p = Vec::new();
+        p.extend_from_slice(b"BPIR-ATTEST-NONCE-V1");
+        p.extend_from_slice(&eph);
+        p.extend_from_slice(&rnd);
+        let manual = sha256(&p);
+        assert_eq!(derive_attest_nonce(eph, rnd), manual);
     }
 
     #[test]

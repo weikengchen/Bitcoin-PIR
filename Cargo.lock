@@ -291,6 +291,7 @@ dependencies = [
  "hex",
  "pir-attest-verify",
  "pir-core",
+ "pir-identity",
  "pir-runtime-core",
  "pir-sdk",
  "pir-sdk-client",
@@ -1691,6 +1692,17 @@ dependencies = [
 [[package]]
 name = "pir-core"
 version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
+name = "pir-identity"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "sha2",
+]
 
 [[package]]
 name = "pir-runtime-core"
@@ -1706,6 +1718,7 @@ dependencies = [
  "memmap2",
  "pir-channel",
  "pir-core",
+ "pir-identity",
  "rand_core 0.6.4",
  "rayon",
  "serde",
@@ -1750,6 +1763,7 @@ dependencies = [
  "onionpir",
  "pir-channel",
  "pir-core",
+ "pir-identity",
  "pir-sdk",
  "rand 0.8.5",
  "rand_core 0.6.4",
@@ -1793,6 +1807,7 @@ dependencies = [
  "getrandom 0.2.17",
  "js-sys",
  "pir-attest-verify",
+ "pir-channel",
  "pir-core",
  "pir-runtime-core",
  "pir-sdk",

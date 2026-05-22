@@ -1742,6 +1742,33 @@ impl DpfClient {
         crate::attest::attest(conn.as_mut(), nonce).await
     }
 
+    /// Send REQ_ANNOUNCE to the chosen server and parse the
+    /// operator-signed identity bundle. See
+    /// [`crate::announce::announce`] for the verification semantics.
+    /// The returned [`AnnounceVerification`](crate::announce::AnnounceVerification)
+    /// carries the parsed bundle plus the in-bundle chain check
+    /// result; operator-pubkey pinning is a caller-driven step on top.
+    pub async fn announce(
+        &mut self,
+        server_index: u8,
+    ) -> PirResult<crate::announce::AnnounceVerification> {
+        let conn = match server_index {
+            0 => self.conn0.as_mut().ok_or_else(|| {
+                PirError::Protocol("announce: server0 not connected".into())
+            })?,
+            1 => self.conn1.as_mut().ok_or_else(|| {
+                PirError::Protocol("announce: server1 not connected".into())
+            })?,
+            _ => {
+                return Err(PirError::Protocol(format!(
+                    "announce: server_index must be 0 or 1, got {}",
+                    server_index
+                )))
+            }
+        };
+        crate::announce::announce(conn.as_mut()).await
+    }
+
     /// Replace both server connections with secure-channel-wrapped
     /// versions. Sends REQ_HANDSHAKE on each, derives the per-session
     /// AEAD key, and stores `SecureChannelTransport` wrappers in place
@@ -1759,10 +1786,63 @@ impl DpfClient {
     /// Errors if either connection is unestablished or if either
     /// handshake fails. On error the connections are restored to their
     /// pre-call state (cleartext) so the caller can retry.
+    ///
+    /// **Note:** this overload mints fresh ephemeral seeds internally, so
+    /// the handshake's `client_eph_pub` is *unbound* from any prior
+    /// REQ_ATTEST. For the binding flow (attest nonce committed to the
+    /// same eph_pub used in the handshake), call
+    /// [`Self::upgrade_to_secure_channel_with_seeds`] instead, threading
+    /// the same `eph_seed` you passed to
+    /// [`crate::attest::attest_with_eph_binding`].
     pub async fn upgrade_to_secure_channel(
         &mut self,
         server_static_pub_0: [u8; 32],
         server_static_pub_1: [u8; 32],
+    ) -> PirResult<()> {
+        // Mint fresh ephemeral seed + nonce per server.
+        let mut eph0 = [0u8; 32];
+        let mut nonce0 = [0u8; 32];
+        let mut eph1 = [0u8; 32];
+        let mut nonce1 = [0u8; 32];
+        getrandom::getrandom(&mut eph0)
+            .map_err(|e| PirError::Protocol(format!("getrandom: {}", e)))?;
+        getrandom::getrandom(&mut nonce0)
+            .map_err(|e| PirError::Protocol(format!("getrandom: {}", e)))?;
+        getrandom::getrandom(&mut eph1)
+            .map_err(|e| PirError::Protocol(format!("getrandom: {}", e)))?;
+        getrandom::getrandom(&mut nonce1)
+            .map_err(|e| PirError::Protocol(format!("getrandom: {}", e)))?;
+
+        self.upgrade_to_secure_channel_with_seeds(
+            server_static_pub_0,
+            eph0,
+            nonce0,
+            server_static_pub_1,
+            eph1,
+            nonce1,
+        )
+        .await
+    }
+
+    /// Same as [`Self::upgrade_to_secure_channel`] but lets the caller
+    /// supply the handshake ephemeral seeds + HKDF nonces. **Production
+    /// callers SHOULD use this overload** and pass the same `eph_seed`
+    /// they fed to [`crate::attest::attest_with_eph_binding`] for the
+    /// matching server — otherwise the attestation does not bind to the
+    /// handshake (a stale captured report could be replayed against a
+    /// fresh handshake undetected).
+    ///
+    /// `hs_nonce_0` / `hs_nonce_1` are HKDF salts for session-key
+    /// derivation (not the attest nonce). They MUST be CSPRNG-fresh per
+    /// call.
+    pub async fn upgrade_to_secure_channel_with_seeds(
+        &mut self,
+        server_static_pub_0: [u8; 32],
+        eph_seed_0: [u8; 32],
+        hs_nonce_0: [u8; 32],
+        server_static_pub_1: [u8; 32],
+        eph_seed_1: [u8; 32],
+        hs_nonce_1: [u8; 32],
     ) -> PirResult<()> {
         // Take out both transports up front. If either is missing we
         // re-store what we took before bailing.
@@ -1778,26 +1858,14 @@ impl DpfClient {
             }
         };
 
-        // Mint fresh ephemeral seed + nonce per server.
-        let mut eph0 = [0u8; 32];
-        let mut nonce0 = [0u8; 32];
-        let mut eph1 = [0u8; 32];
-        let mut nonce1 = [0u8; 32];
-        getrandom::getrandom(&mut eph0)
-            .map_err(|e| PirError::Protocol(format!("getrandom: {}", e)))?;
-        getrandom::getrandom(&mut nonce0)
-            .map_err(|e| PirError::Protocol(format!("getrandom: {}", e)))?;
-        getrandom::getrandom(&mut eph1)
-            .map_err(|e| PirError::Protocol(format!("getrandom: {}", e)))?;
-        getrandom::getrandom(&mut nonce1)
-            .map_err(|e| PirError::Protocol(format!("getrandom: {}", e)))?;
-
         // Run the two handshakes. If either fails, leave both connections
         // in self.conn0/conn1 as None — the caller knows from the error
         // that the connection state is now invalid (and should reconnect
         // before retrying).
-        let wrapped0 = crate::channel::establish(raw0, server_static_pub_0, eph0, nonce0).await?;
-        let wrapped1 = crate::channel::establish(raw1, server_static_pub_1, eph1, nonce1).await?;
+        let wrapped0 =
+            crate::channel::establish(raw0, server_static_pub_0, eph_seed_0, hs_nonce_0).await?;
+        let wrapped1 =
+            crate::channel::establish(raw1, server_static_pub_1, eph_seed_1, hs_nonce_1).await?;
 
         self.conn0 = Some(Box::new(wrapped0));
         self.conn1 = Some(Box::new(wrapped1));

@@ -1,0 +1,23 @@
+[package]
+name = "pir-identity"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+authors = ["Bitcoin PIR contributors"]
+description = "Operator-signed server identity primitives for Bitcoin PIR: two-tier Ed25519 cert chain (operator IdentityCert → server-side ChannelManifest) used by the REQ_ANNOUNCE opcode to authenticate `server_static_pub` on hosts that lack hardware attestation (pir1) and to layer defense-in-depth on hosts that do (pir2)."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Bitcoin-PIR/Bitcoin-PIR"
+homepage = "https://github.com/Bitcoin-PIR/Bitcoin-PIR"
+documentation = "https://docs.rs/pir-identity"
+readme = "README.md"
+keywords = ["pir", "privacy", "ed25519", "attestation", "identity"]
+categories = ["cryptography", "cryptography::cryptocurrencies"]
+
+[dependencies]
+# Ed25519 sign + verify. Same crate already pulled in by
+# pir-runtime-core / pir-sdk-client / bpir-admin so no new git dep.
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+# SHA-256 isn't strictly needed (Ed25519 handles its own hashing) but
+# we use it for canonical-encoding sanity tests + future test-only
+# fingerprinting. Default-features off so the dep stays light.
+sha2 = { version = "0.10", default-features = false }

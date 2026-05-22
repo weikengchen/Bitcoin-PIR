@@ -133,6 +133,23 @@ impl std::error::Error for ChannelError {}
 
 // ─── Handshake derivation ────────────────────────────────────────────
 
+/// Compute the X25519 public key corresponding to a 32-byte seed,
+/// without minting a [`ClientHandshake`]. Useful when the caller needs
+/// the pubkey ahead of time — e.g. to bind it into an attestation
+/// nonce via [`pir_core::attest::derive_attest_nonce`] BEFORE running
+/// REQ_ATTEST / REQ_HANDSHAKE.
+///
+/// The seed must remain stable between this call and the subsequent
+/// [`ClientHandshake::new`] call so the eph pubkey committed-to in
+/// REPORT_DATA matches the eph pubkey sent in REQ_HANDSHAKE. In
+/// practice: generate `eph_seed` once, derive `client_eph_pub` here,
+/// derive the attest nonce, run REQ_ATTEST, then pass the same
+/// `eph_seed` into [`ClientHandshake::new`].
+pub fn eph_pub_from_seed(seed: [u8; 32]) -> [u8; X25519_PUBKEY_LEN] {
+    let secret = StaticSecret::from(seed);
+    *PublicKey::from(&secret).as_bytes()
+}
+
 fn derive_from_dh(
     ecdh_static: &[u8; 32],
     ecdh_eph: &[u8; 32],
@@ -371,6 +388,24 @@ mod tests {
         let secret = StaticSecret::from(seed);
         let pub_bytes = *PublicKey::from(&secret).as_bytes();
         (secret, pub_bytes)
+    }
+
+    #[test]
+    fn eph_pub_from_seed_matches_client_handshake_pub() {
+        // The standalone helper and the ClientHandshake constructor
+        // must agree on the eph_pub for the same seed, so a caller
+        // can pre-compute the pubkey for nonce binding and trust that
+        // the subsequent handshake will send the same bytes.
+        let seed = random_seed();
+        let helper_pub = eph_pub_from_seed(seed);
+        let hs = ClientHandshake::new(seed, [0u8; 32]);
+        assert_eq!(helper_pub, hs.client_eph_pub());
+    }
+
+    #[test]
+    fn eph_pub_from_seed_is_deterministic() {
+        let seed = [0x42u8; 32];
+        assert_eq!(eph_pub_from_seed(seed), eph_pub_from_seed(seed));
     }
 
     #[test]
