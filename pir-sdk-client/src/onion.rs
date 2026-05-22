@@ -143,8 +143,8 @@ use pir_sdk::UtxoEntry;
 
 #[cfg(feature = "onion")]
 use crate::onion_merkle::{
-    parse_onionpir_merkle, verify_onion_merkle_batch, OnionMerkleInfo, OnionMerkleLeaf,
-    OnionTreeKind,
+    parse_onionpir_merkle, verify_onion_merkle_batch, MerkleShardConn, OnionMerkleInfo,
+    OnionMerkleLeaf, OnionTreeKind,
 };
 
 #[cfg(feature = "onion")]
@@ -372,8 +372,89 @@ struct FheState {
     /// Keys are long-lived; per-level clients just adjust `num_entries` for
     /// query generation and response decryption.
     level_clients: HashMap<(u8, u8), SendClient>,
-    /// Database IDs for which we've already registered keys on the server.
+    /// Database IDs for which we've already registered keys on EVERY shard.
+    /// (A db_id is "registered" only once its galois+GSW keys are acked by
+    /// all shards; on LRU eviction we drop it and re-register to all shards.)
     registered: HashSet<u8>,
+}
+
+// ─── Sharding ─────────────────────────────────────────────────────────────
+
+/// One OnionPIR shard — a server answering a contiguous range of INDEX and
+/// CHUNK PBC groups (and the matching per-group OnionPIR Merkle trees).
+///
+/// `N = 1` shard with full ranges (`0..K` / `0..K_CHUNK`) is exactly the
+/// classic single-server client; every existing call site and wire byte is
+/// unchanged in that case. With `N > 1`, the client builds the full padded
+/// per-group batch (K INDEX × 2 cuckoo positions, K_CHUNK CHUNK, per-group
+/// Merkle) exactly as before, then slices it by `index_range` / `chunk_range`
+/// and sends each shard only its slice, merging responses back by position.
+/// **Global K / K_CHUNK is never reduced** — only *which machine* answers a
+/// group is partitioned (privacy: an honest non-colluding shard sees only its
+/// already-padded slice; full collusion = the single-server view).
+struct OnionShard {
+    url: String,
+    conn: Option<Box<dyn PirTransport>>,
+    /// INDEX PBC groups this shard answers: `[start, end) ⊆ 0..K`. Also the
+    /// INDEX per-group Merkle tree range.
+    index_range: std::ops::Range<usize>,
+    /// CHUNK PBC groups this shard answers: `[start, end) ⊆ 0..K_CHUNK`. Also
+    /// the DATA per-group Merkle tree range.
+    chunk_range: std::ops::Range<usize>,
+}
+
+/// Operator-supplied shard descriptor for [`OnionClient::new_sharded`].
+///
+/// `index_range` / `chunk_range` are group ranges the shard serves; the union
+/// across all shards MUST be exactly `0..K` / `0..K_CHUNK` with no gaps or
+/// overlaps (validated at construction). `K` and `K_CHUNK` are the compile-time
+/// [`pir_core::params::K`] / [`pir_core::params::K_CHUNK`] constants.
+#[derive(Clone, Debug)]
+pub struct ShardConfig {
+    /// `ws://` / `wss://` URL of the shard server.
+    pub url: String,
+    /// INDEX PBC groups `[start, end) ⊆ 0..K` this shard serves.
+    pub index_range: std::ops::Range<usize>,
+    /// CHUNK PBC groups `[start, end) ⊆ 0..K_CHUNK` this shard serves.
+    pub chunk_range: std::ops::Range<usize>,
+}
+
+/// Validate that the per-shard ranges tile `0..total` exactly: non-empty,
+/// contiguous when sorted by start, no gaps or overlaps, full coverage. This
+/// is what lets the client slice a positional batch by range and concatenate
+/// the per-shard responses back into a complete `0..total` result.
+fn validate_shard_coverage(
+    shards: &[ShardConfig],
+    label: &str,
+    total: usize,
+    range_of: impl Fn(&ShardConfig) -> std::ops::Range<usize>,
+) -> PirResult<()> {
+    let mut ranges: Vec<std::ops::Range<usize>> = shards.iter().map(&range_of).collect();
+    ranges.sort_by_key(|r| r.start);
+    let mut cursor = 0usize;
+    for r in &ranges {
+        if r.start >= r.end {
+            return Err(PirError::InvalidState(format!(
+                "shard {} range {}..{} is empty",
+                label, r.start, r.end
+            )));
+        }
+        if r.start != cursor {
+            return Err(PirError::InvalidState(format!(
+                "shard {} ranges must tile 0..{} with no gaps/overlaps; \
+                 expected next range to start at {}, got {}..{}",
+                label, total, cursor, r.start, r.end
+            )));
+        }
+        cursor = r.end;
+    }
+    if cursor != total {
+        return Err(PirError::InvalidState(format!(
+            "shard {} ranges must cover 0..{} exactly; covered only 0..{}",
+            label, total, cursor
+        )));
+    }
+    Ok(())
 }
 
 // ─── OnionClient ────────────────────────────────────────────────────────────
@@ -432,8 +513,12 @@ struct FheState {
 ///
 /// [`PirError::SessionEvicted`]: pir_sdk::PirError::SessionEvicted
 pub struct OnionClient {
+    /// Primary shard URL — kept for logging / `fire_connect`. Equals
+    /// `shards[0].url`.
     server_url: String,
-    conn: Option<Box<dyn PirTransport>>,
+    /// One or more shards. `shards.len() == 1` with full group ranges is the
+    /// classic single-server client (backward-compatible, byte-identical).
+    shards: Vec<OnionShard>,
     catalog: Option<DatabaseCatalog>,
     /// Per-DB OnionPIR-specific parameters. Keyed by db_id.
     onion_params: std::collections::HashMap<u8, OnionDbParams>,
@@ -463,11 +548,60 @@ pub struct OnionClient {
 }
 
 impl OnionClient {
-    /// Create a new OnionPIR client.
+    /// Create a new single-server OnionPIR client (one shard serving all
+    /// `0..K` / `0..K_CHUNK` groups). Byte-identical to the pre-sharding
+    /// client.
     pub fn new(server_url: &str) -> Self {
+        Self::with_shards(
+            server_url.to_string(),
+            vec![OnionShard {
+                url: server_url.to_string(),
+                conn: None,
+                index_range: 0..pir_core::params::K,
+                chunk_range: 0..pir_core::params::K_CHUNK,
+            }],
+        )
+    }
+
+    /// Create a sharded OnionPIR client. Each [`ShardConfig`] names a server
+    /// and the contiguous INDEX / CHUNK group ranges it serves. The union of
+    /// the ranges MUST be exactly `0..K` / `0..K_CHUNK` with no gaps or
+    /// overlaps; otherwise this returns [`PirError::InvalidState`].
+    ///
+    /// The full padded per-group batch is built exactly as in the
+    /// single-server path, then sliced per shard — global `K` / `K_CHUNK` is
+    /// never reduced (privacy invariant; see [`OnionShard`]).
+    pub fn new_sharded(shards: Vec<ShardConfig>) -> PirResult<Self> {
+        if shards.is_empty() {
+            return Err(PirError::InvalidState(
+                "new_sharded: at least one shard required".into(),
+            ));
+        }
+        validate_shard_coverage(&shards, "index", pir_core::params::K, |s| {
+            s.index_range.clone()
+        })?;
+        validate_shard_coverage(&shards, "chunk", pir_core::params::K_CHUNK, |s| {
+            s.chunk_range.clone()
+        })?;
+        let primary_url = shards[0].url.clone();
+        let onion_shards = shards
+            .into_iter()
+            .map(|s| OnionShard {
+                url: s.url,
+                conn: None,
+                index_range: s.index_range,
+                chunk_range: s.chunk_range,
+            })
+            .collect();
+        Ok(Self::with_shards(primary_url, onion_shards))
+    }
+
+    /// Shared field initialiser for [`new`](Self::new) /
+    /// [`new_sharded`](Self::new_sharded).
+    fn with_shards(server_url: String, shards: Vec<OnionShard>) -> Self {
         Self {
-            server_url: server_url.to_string(),
-            conn: None,
+            server_url,
+            shards,
             catalog: None,
             onion_params: std::collections::HashMap::new(),
             #[cfg(feature = "onion")]
@@ -495,9 +629,22 @@ impl OnionClient {
     /// immediately. Pass `None` to uninstall.
     pub fn set_metrics_recorder(&mut self, recorder: Option<Arc<dyn PirMetrics>>) {
         self.metrics_recorder = recorder.clone();
-        if let Some(ref mut c) = self.conn {
-            c.set_metrics_recorder(recorder, "onion");
+        for shard in &mut self.shards {
+            if let Some(ref mut c) = shard.conn {
+                c.set_metrics_recorder(recorder.clone(), "onion");
+            }
         }
+    }
+
+    /// Mutable borrow of the primary shard's transport. Control-plane ops
+    /// (info / catalog fetch, attest, announce, secure-channel upgrade) talk
+    /// to the primary shard (`shards[0]`); per-shard attestation of the other
+    /// shards is a follow-up (each shard is an independently attested server).
+    fn primary_conn_mut(&mut self) -> PirResult<&mut Box<dyn PirTransport>> {
+        self.shards
+            .get_mut(0)
+            .and_then(|s| s.conn.as_mut())
+            .ok_or(PirError::NotConnected)
     }
 
     /// Fire `on_query_start` on the installed recorder, if any. Returns
@@ -578,8 +725,9 @@ impl OnionClient {
         nonce: [u8; 32],
     ) -> PirResult<crate::attest::AttestVerification> {
         let conn = self
-            .conn
-            .as_mut()
+            .shards
+            .get_mut(0)
+            .and_then(|s| s.conn.as_mut())
             .ok_or_else(|| PirError::Protocol("attest: server not connected".into()))?;
         crate::attest::attest(conn.as_mut(), nonce).await
     }
@@ -592,8 +740,9 @@ impl OnionClient {
         server_static_pub: [u8; 32],
     ) -> PirResult<()> {
         let raw = self
-            .conn
-            .take()
+            .shards
+            .get_mut(0)
+            .and_then(|s| s.conn.take())
             .ok_or_else(|| PirError::Protocol("upgrade: server not connected".into()))?;
         let mut eph = [0u8; 32];
         let mut nonce = [0u8; 32];
@@ -602,7 +751,7 @@ impl OnionClient {
         getrandom::getrandom(&mut nonce)
             .map_err(|e| PirError::Protocol(format!("getrandom: {}", e)))?;
         let wrapped = crate::channel::establish(raw, server_static_pub, eph, nonce).await?;
-        self.conn = Some(Box::new(wrapped));
+        self.shards[0].conn = Some(Box::new(wrapped));
         Ok(())
     }
 
@@ -612,12 +761,13 @@ impl OnionClient {
     /// `sync_with_plan`.
     #[tracing::instrument(level = "debug", skip_all, fields(backend = "onion"))]
     pub fn connect_with_transport(&mut self, conn: Box<dyn PirTransport>) {
-        self.conn = Some(conn);
+        // Single-shard injection (tests / N=1). Sharded setups must use
+        // `connect()`, which dials every shard's URL.
+        self.shards[0].conn = Some(conn);
         // Propagate any installed recorder so per-frame byte counts flow
-        // from this injected transport. OnionPIR only has one transport,
-        // so no cloning game like DPF/Harmony — just forward directly.
+        // from this injected transport.
         if let Some(rec) = self.metrics_recorder.clone() {
-            if let Some(ref mut c) = self.conn {
+            if let Some(ref mut c) = self.shards[0].conn {
                 c.set_metrics_recorder(Some(rec), "onion");
             }
         }
@@ -627,7 +777,7 @@ impl OnionClient {
     /// Fetch the JSON server info and (best-effort) the DPF-format catalog,
     /// merging into a unified [`DatabaseCatalog`] plus per-DB OnionPIR params.
     async fn fetch_server_info(&mut self) -> PirResult<()> {
-        let conn = self.conn.as_mut().ok_or(PirError::NotConnected)?;
+        let conn = self.primary_conn_mut()?;
 
         // Request JSON info.
         let req = encode_request(REQ_GET_INFO_JSON, &[]);
@@ -680,7 +830,7 @@ impl OnionClient {
     }
 
     async fn try_fetch_dpf_catalog(&mut self) -> PirResult<DatabaseCatalog> {
-        let conn = self.conn.as_mut().ok_or(PirError::NotConnected)?;
+        let conn = self.primary_conn_mut()?;
         let req = encode_request(REQ_GET_DB_CATALOG, &[]);
         let request_bytes = req.len() as u64;
         let response = conn.roundtrip(&req).await?;
@@ -935,9 +1085,24 @@ impl OnionClient {
             (fhe.client_id, fhe.secret_key.clone())
         };
         let leakage = self.leakage_recorder.clone();
-        let conn = self.conn.as_mut().ok_or(PirError::NotConnected)?;
+        // Per-shard transport view: each shard answers the merkle sibling
+        // queries for its INDEX / CHUNK group ranges; the tree-top blob is
+        // fetched from the first shard. (N=1: one shard with full ranges,
+        // byte-identical to the pre-sharding path.)
+        let mut merkle_shards: Vec<MerkleShardConn<'_>> =
+            Vec::with_capacity(self.shards.len());
+        for shard in self.shards.iter_mut() {
+            let index_range = shard.index_range.clone();
+            let chunk_range = shard.chunk_range.clone();
+            let conn = shard.conn.as_deref_mut().ok_or(PirError::NotConnected)?;
+            merkle_shards.push(MerkleShardConn {
+                conn,
+                index_range,
+                chunk_range,
+            });
+        }
         let verdicts = verify_onion_merkle_batch(
-            conn,
+            &mut merkle_shards,
             &info,
             &leaves,
             client_id,
@@ -1087,31 +1252,43 @@ impl OnionClient {
 
         let payload = encode_register_keys(&galois_keys, &gsw_keys, db_id);
         let request_bytes = payload.len() as u64;
-        let conn = self.conn.as_mut().ok_or(PirError::NotConnected)?;
-        let response = conn.roundtrip(&payload).await?;
-        self.record_round(RoundProfile {
-            kind: RoundKind::OnionKeyRegister,
-            server_id: 0,
-            db_id: Some(db_id),
-            request_bytes,
-            response_bytes: (response.len() as u64).saturating_add(4),
-            items: Vec::new(),
-        });
-
-        if response.is_empty() || response[0] != RESP_KEYS_ACK {
-            return Err(PirError::Protocol(
-                "expected RESP_KEYS_ACK (0x50)".into(),
-            ));
+        // Register the client's galois + GSW keys with EVERY shard — each
+        // shard is a separate server that must hold our keys to answer FHE
+        // queries for its group range. (N=1: a single roundtrip with
+        // server_id=0, byte-identical to the pre-sharding path.)
+        for shard_idx in 0..self.shards.len() {
+            let response = {
+                let conn = self.shards[shard_idx]
+                    .conn
+                    .as_mut()
+                    .ok_or(PirError::NotConnected)?;
+                conn.roundtrip(&payload).await?
+            };
+            self.record_round(RoundProfile {
+                kind: RoundKind::OnionKeyRegister,
+                server_id: shard_idx as u8,
+                db_id: Some(db_id),
+                request_bytes,
+                response_bytes: (response.len() as u64).saturating_add(4),
+                items: Vec::new(),
+            });
+            if response.is_empty() || response[0] != RESP_KEYS_ACK {
+                return Err(PirError::Protocol(
+                    "expected RESP_KEYS_ACK (0x50)".into(),
+                ));
+            }
         }
 
+        // Marked registered only after ALL shards acked.
         self.fhe
             .as_mut()
             .expect("fhe present")
             .registered
             .insert(db_id);
         log::info!(
-            "[PIR-AUDIT] OnionPIR registered keys for db_id={}",
-            db_id
+            "[PIR-AUDIT] OnionPIR registered keys for db_id={} across {} shard(s)",
+            db_id,
+            self.shards.len(),
         );
         Ok(())
     }
@@ -1158,6 +1335,7 @@ impl OnionClient {
     #[cfg(feature = "onion")]
     async fn onionpir_batch_rpc(
         &mut self,
+        shard_idx: usize,
         msg: &[u8],
         expected_variant: u8,
         db_id: u8,
@@ -1167,6 +1345,7 @@ impl OnionClient {
     ) -> PirResult<Vec<Vec<u8>>> {
         let batch = self
             .onionpir_batch_rpc_once(
+                shard_idx,
                 msg,
                 expected_variant,
                 variant_name,
@@ -1179,20 +1358,25 @@ impl OnionClient {
             return Ok(batch);
         }
         log::warn!(
-            "[PIR-AUDIT] OnionPIR: all-empty {} for db_id={} — assuming \
-             server LRU-evicted our keys. Re-registering and retrying once.",
+            "[PIR-AUDIT] OnionPIR: all-empty {} for db_id={} on shard {} — \
+             assuming server LRU-evicted our keys. Re-registering and \
+             retrying once.",
             variant_name,
             db_id,
+            shard_idx,
         );
         // Drop the "already registered" flag so `register_keys` will
         // actually re-register (otherwise a caller that calls
         // `ensure_keys_registered` before this would be a no-op).
+        // Re-registers to ALL shards (cheap; eviction is rare) — the
+        // `registered` set is all-or-nothing across shards.
         if let Some(fhe) = self.fhe.as_mut() {
             fhe.registered.remove(&db_id);
         }
         self.register_keys(db_id).await?;
         let batch = self
             .onionpir_batch_rpc_once(
+                shard_idx,
                 msg,
                 expected_variant,
                 variant_name,
@@ -1225,6 +1409,7 @@ impl OnionClient {
     #[cfg(feature = "onion")]
     async fn onionpir_batch_rpc_once(
         &mut self,
+        shard_idx: usize,
         msg: &[u8],
         expected_variant: u8,
         variant_name: &'static str,
@@ -1233,11 +1418,17 @@ impl OnionClient {
         db_id: u8,
     ) -> PirResult<Vec<Vec<u8>>> {
         let request_bytes = msg.len() as u64;
-        let conn = self.conn.as_mut().ok_or(PirError::NotConnected)?;
-        let response = conn.roundtrip(msg).await?;
+        let response = {
+            let conn = self
+                .shards
+                .get_mut(shard_idx)
+                .and_then(|s| s.conn.as_mut())
+                .ok_or(PirError::NotConnected)?;
+            conn.roundtrip(msg).await?
+        };
         self.record_round(RoundProfile {
             kind: round_kind,
-            server_id: 0,
+            server_id: shard_idx as u8,
             db_id: Some(db_id),
             request_bytes,
             response_bytes: (response.len() as u64).saturating_add(4),
@@ -1250,6 +1441,97 @@ impl OnionClient {
             )));
         }
         decode_onionpir_batch_result(&response[1..])
+    }
+
+    /// Dispatch a full positional per-group batch across all shards and merge
+    /// the per-shard responses back into one positional `Vec<Vec<u8>>` of
+    /// length `total_groups * stride`.
+    ///
+    /// `queries` is the full padded batch — built EXACTLY as in the
+    /// single-server path (real queries in cuckoo positions, random dummies
+    /// elsewhere), `total_groups * stride` entries, with group `g`'s queries
+    /// at positions `[g*stride, (g+1)*stride)`. Each shard receives only the
+    /// contiguous slice for its group range; mapping that positional
+    /// sub-batch back to the shard's global group ids is the shard server's
+    /// job (#3). `items_per_group` is the per-group leakage-profile item count
+    /// (`total_groups` entries), sliced by group range per shard so each
+    /// shard's `RoundProfile` is accurate.
+    ///
+    /// **Privacy:** the full batch (hence all padding) is built before this
+    /// split — global `K` / `K_CHUNK` is never reduced. N=1 with a full range
+    /// is a single roundtrip, byte-identical to the pre-sharding path.
+    ///
+    /// Dispatch is sequential (the per-shard LRU re-register retry in
+    /// [`onionpir_batch_rpc`](Self::onionpir_batch_rpc) needs `&mut self`);
+    /// concurrent dispatch across shards is a follow-up optimisation.
+    #[cfg(feature = "onion")]
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_sharded_batch(
+        &mut self,
+        variant: u8,
+        expected_variant: u8,
+        variant_name: &'static str,
+        round_kind: RoundKind,
+        round_id: u16,
+        queries: &[Vec<u8>],
+        items_per_group: &[u32],
+        stride: usize,
+        total_groups: usize,
+        chunk_level: bool,
+        db_id: u8,
+    ) -> PirResult<Vec<Vec<u8>>> {
+        debug_assert_eq!(queries.len(), total_groups * stride);
+        debug_assert_eq!(items_per_group.len(), total_groups);
+        let mut merged: Vec<Vec<u8>> = vec![Vec::new(); total_groups * stride];
+        for shard_idx in 0..self.shards.len() {
+            let range = if chunk_level {
+                self.shards[shard_idx].chunk_range.clone()
+            } else {
+                self.shards[shard_idx].index_range.clone()
+            };
+            if range.end > total_groups {
+                return Err(PirError::InvalidState(format!(
+                    "shard {} {} range {}..{} exceeds this DB's group count {} — \
+                     shard layout does not match the catalog K",
+                    shard_idx,
+                    if chunk_level { "chunk" } else { "index" },
+                    range.start,
+                    range.end,
+                    total_groups,
+                )));
+            }
+            let lo = range.start * stride;
+            let hi = range.end * stride;
+            let sub_queries: Vec<Vec<u8>> = queries[lo..hi].to_vec();
+            let sub_items: Vec<u32> = items_per_group[range.start..range.end].to_vec();
+            let msg = encode_onionpir_batch_query(variant, round_id, &sub_queries, db_id);
+            let shard_batch = self
+                .onionpir_batch_rpc(
+                    shard_idx,
+                    &msg,
+                    expected_variant,
+                    db_id,
+                    variant_name,
+                    round_kind,
+                    &sub_items,
+                )
+                .await?;
+            if shard_batch.len() != hi - lo {
+                return Err(PirError::Protocol(format!(
+                    "shard {} returned {} {} results, expected {} for group range {}..{}",
+                    shard_idx,
+                    shard_batch.len(),
+                    variant_name,
+                    hi - lo,
+                    range.start,
+                    range.end,
+                )));
+            }
+            for (j, r) in shard_batch.into_iter().enumerate() {
+                merged[lo + j] = r;
+            }
+        }
+        Ok(merged)
     }
 
     /// Get or create a per-level `onionpir::Client` for (db_id, level).
@@ -1362,15 +1644,13 @@ impl OnionClient {
                 queries.push(index_client.generate_query(bin));
             }
 
-            // Send and receive. `onionpir_batch_rpc` transparently
-            // re-registers keys + retries once if the server LRU-evicted
-            // us mid-session (the 100-client cap in SEAL's KeyStore).
-            let msg = encode_onionpir_batch_query(
-                REQ_ONIONPIR_INDEX_QUERY,
-                round_id as u16,
-                &queries,
-                db_info.db_id,
-            );
+            // Send and receive. `dispatch_sharded_batch` slices the full
+            // 2*K positional batch by each shard's INDEX group range and
+            // merges the responses back by position (N=1: one roundtrip,
+            // byte-identical). Per shard, `onionpir_batch_rpc` transparently
+            // re-registers keys + retries once on LRU eviction (the
+            // 100-client cap in SEAL's KeyStore).
+            //
             // Per-group item count: every group sends exactly
             // INDEX_CUCKOO_NUM_HASHES queries (the same Merkle INDEX
             // Item-Count Symmetry invariant DPF / Harmony preserve).
@@ -1378,13 +1658,18 @@ impl OnionClient {
                 .map(|_| INDEX_CUCKOO_NUM_HASHES as u32)
                 .collect();
             let batch = self
-                .onionpir_batch_rpc(
-                    &msg,
+                .dispatch_sharded_batch(
+                    REQ_ONIONPIR_INDEX_QUERY,
                     RESP_ONIONPIR_INDEX_RESULT,
-                    db_info.db_id,
                     "RESP_ONIONPIR_INDEX_RESULT",
                     RoundKind::Index,
+                    round_id as u16,
+                    &queries,
                     &items_per_group,
+                    INDEX_CUCKOO_NUM_HASHES, // stride: 2 queries per INDEX group
+                    k,                       // total INDEX groups
+                    false,                   // index level
+                    db_info.db_id,
                 )
                 .await?;
 
@@ -1619,26 +1904,28 @@ impl OnionClient {
                 queries.push(chunk_client.generate_query(bin));
             }
 
-            // Same eviction-retry path as the INDEX round — see
-            // `onionpir_batch_rpc` for the reasoning.
-            let msg = encode_onionpir_batch_query(
-                REQ_ONIONPIR_CHUNK_QUERY,
-                round_id as u16,
-                &queries,
-                db_info.db_id,
-            );
+            // Same per-shard split + eviction-retry path as the INDEX round
+            // — `dispatch_sharded_batch` slices the K_CHUNK positional batch
+            // by each shard's CHUNK group range and merges by position (N=1:
+            // one roundtrip, byte-identical).
+            //
             // OnionPIR CHUNK sends one query per group (different from
             // DPF / Harmony which send `CHUNK_CUCKOO_NUM_HASHES = 2`
             // per group); items[g] = 1 captures that wire shape.
             let items_per_group: Vec<u32> = (0..chunk_k).map(|_| 1u32).collect();
             let batch = self
-                .onionpir_batch_rpc(
-                    &msg,
+                .dispatch_sharded_batch(
+                    REQ_ONIONPIR_CHUNK_QUERY,
                     RESP_ONIONPIR_CHUNK_RESULT,
-                    db_info.db_id,
                     "RESP_ONIONPIR_CHUNK_RESULT",
                     RoundKind::Chunk,
+                    round_id as u16,
+                    &queries,
                     &items_per_group,
+                    1,        // stride: 1 query per CHUNK group
+                    chunk_k,  // total CHUNK groups
+                    true,     // chunk level
+                    db_info.db_id,
                 )
                 .await?;
 
@@ -1714,26 +2001,33 @@ impl PirClient for OnionClient {
 
     #[tracing::instrument(level = "info", skip_all, fields(backend = "onion", server = %self.server_url))]
     async fn connect(&mut self) -> PirResult<()> {
-        log::info!("Connecting to OnionPIR server: {}", self.server_url);
+        log::info!(
+            "Connecting to {} OnionPIR shard(s); primary: {}",
+            self.shards.len(),
+            self.server_url
+        );
 
-        // Native → tokio-tungstenite; WASM → web-sys WebSocket. OnionPIR
-        // has a single server so no try_join is needed.
-        #[cfg(not(target_arch = "wasm32"))]
-        let conn: Box<dyn PirTransport> = {
-            Box::new(WsConnection::connect(&self.server_url).await?)
-        };
-        #[cfg(target_arch = "wasm32")]
-        let conn: Box<dyn PirTransport> = {
-            use crate::wasm_transport::WasmWebSocketTransport;
-            Box::new(WasmWebSocketTransport::connect(&self.server_url).await?)
-        };
-
-        self.conn = Some(conn);
-        // Propagate any installed recorder to the fresh transport so
-        // per-frame byte counts start flowing immediately.
-        if let Some(rec) = self.metrics_recorder.clone() {
-            if let Some(ref mut c) = self.conn {
-                c.set_metrics_recorder(Some(rec), "onion");
+        // Dial each shard's URL. Native → tokio-tungstenite; WASM → web-sys
+        // WebSocket. (N=1: a single dial to the one shard URL == server_url,
+        // identical to the pre-sharding path.)
+        let recorder = self.metrics_recorder.clone();
+        for shard in &mut self.shards {
+            #[cfg(not(target_arch = "wasm32"))]
+            let conn: Box<dyn PirTransport> = {
+                Box::new(WsConnection::connect(&shard.url).await?)
+            };
+            #[cfg(target_arch = "wasm32")]
+            let conn: Box<dyn PirTransport> = {
+                use crate::wasm_transport::WasmWebSocketTransport;
+                Box::new(WasmWebSocketTransport::connect(&shard.url).await?)
+            };
+            shard.conn = Some(conn);
+            // Propagate any installed recorder to the fresh transport so
+            // per-frame byte counts start flowing immediately.
+            if let Some(rec) = recorder.clone() {
+                if let Some(ref mut c) = shard.conn {
+                    c.set_metrics_recorder(Some(rec), "onion");
+                }
             }
         }
         self.fire_connect(&self.server_url);
@@ -1747,10 +2041,12 @@ impl PirClient for OnionClient {
 
     #[tracing::instrument(level = "info", skip_all, fields(backend = "onion"))]
     async fn disconnect(&mut self) -> PirResult<()> {
-        if let Some(ref mut conn) = self.conn {
-            let _ = conn.close().await;
+        for shard in &mut self.shards {
+            if let Some(ref mut conn) = shard.conn {
+                let _ = conn.close().await;
+            }
+            shard.conn = None;
         }
-        self.conn = None;
         self.catalog = None;
         self.onion_params.clear();
         self.info_json = None;
@@ -1764,7 +2060,8 @@ impl PirClient for OnionClient {
     }
 
     fn is_connected(&self) -> bool {
-        self.conn.is_some()
+        // Connected iff every shard has a live transport.
+        !self.shards.is_empty() && self.shards.iter().all(|s| s.conn.is_some())
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(backend = "onion"))]
@@ -2725,6 +3022,153 @@ mod tests {
     use super::*;
 
     #[test]
+    fn new_sharded_validates_full_coverage() {
+        use pir_core::params::{K, K_CHUNK};
+
+        // OK: two shards tiling 0..K and 0..K_CHUNK exactly.
+        assert!(OnionClient::new_sharded(vec![
+            ShardConfig { url: "ws://a".into(), index_range: 0..30, chunk_range: 0..40 },
+            ShardConfig { url: "ws://b".into(), index_range: 30..K, chunk_range: 40..K_CHUNK },
+        ])
+        .is_ok());
+
+        // OK: single full shard == new().
+        assert!(OnionClient::new_sharded(vec![ShardConfig {
+            url: "ws://a".into(),
+            index_range: 0..K,
+            chunk_range: 0..K_CHUNK,
+        }])
+        .is_ok());
+
+        // Err: empty shard list.
+        assert!(OnionClient::new_sharded(vec![]).is_err());
+
+        // Err: INDEX gap at 29..30 (CHUNK is fine).
+        assert!(OnionClient::new_sharded(vec![
+            ShardConfig { url: "ws://a".into(), index_range: 0..29, chunk_range: 0..40 },
+            ShardConfig { url: "ws://b".into(), index_range: 30..K, chunk_range: 40..K_CHUNK },
+        ])
+        .is_err());
+
+        // Err: INDEX overlap at 30..40.
+        assert!(OnionClient::new_sharded(vec![
+            ShardConfig { url: "ws://a".into(), index_range: 0..40, chunk_range: 0..40 },
+            ShardConfig { url: "ws://b".into(), index_range: 30..K, chunk_range: 40..K_CHUNK },
+        ])
+        .is_err());
+
+        // Err: CHUNK range overshoots K_CHUNK.
+        assert!(OnionClient::new_sharded(vec![ShardConfig {
+            url: "ws://a".into(),
+            index_range: 0..K,
+            chunk_range: 0..(K_CHUNK + 1),
+        }])
+        .is_err());
+    }
+
+    /// Faithful split→dispatch→merge test using two mock shards: the full
+    /// positional batch is sliced by group range, each shard's canned
+    /// response is merged back, and every position must land where it
+    /// belongs. Exercises the offset arithmetic (the riskiest part) without
+    /// real FHE servers — the standalone-#2 stand-in for N>1 e2e.
+    #[cfg(feature = "onion")]
+    #[tokio::test]
+    async fn dispatch_sharded_batch_splits_and_merges_by_position() {
+        use crate::transport::mock::MockTransport;
+        use pir_core::params::{K, K_CHUNK};
+
+        // Build a RESP frame whose result[j] is the 4-byte LE encoding of the
+        // *global* position it should occupy after merge.
+        fn resp_frame(variant: u8, positions: std::ops::Range<usize>) -> Vec<u8> {
+            let mut payload = vec![variant, 0u8, 0u8, positions.len() as u8];
+            for p in positions {
+                payload.extend_from_slice(&4u32.to_le_bytes());
+                payload.extend_from_slice(&(p as u32).to_le_bytes());
+            }
+            let mut frame = (payload.len() as u32).to_le_bytes().to_vec();
+            frame.extend_from_slice(&payload);
+            frame
+        }
+
+        // INDEX (stride 2): uneven shards [0,30) and [30,K) → query positions
+        // [0,60) and [60, 2K).
+        let mut client = OnionClient::new_sharded(vec![
+            ShardConfig { url: "ws://s0".into(), index_range: 0..30, chunk_range: 0..40 },
+            ShardConfig { url: "ws://s1".into(), index_range: 30..K, chunk_range: 40..K_CHUNK },
+        ])
+        .unwrap();
+        let stride = INDEX_CUCKOO_NUM_HASHES; // 2
+        let mut m0 = MockTransport::new("ws://s0");
+        m0.enqueue_response(resp_frame(RESP_ONIONPIR_INDEX_RESULT, 0..(30 * stride)));
+        client.shards[0].conn = Some(Box::new(m0));
+        let mut m1 = MockTransport::new("ws://s1");
+        m1.enqueue_response(resp_frame(RESP_ONIONPIR_INDEX_RESULT, (30 * stride)..(K * stride)));
+        client.shards[1].conn = Some(Box::new(m1));
+
+        let queries: Vec<Vec<u8>> = (0..K * stride).map(|i| vec![(i & 0xff) as u8]).collect();
+        let items: Vec<u32> = vec![stride as u32; K];
+        let merged = client
+            .dispatch_sharded_batch(
+                REQ_ONIONPIR_INDEX_QUERY,
+                RESP_ONIONPIR_INDEX_RESULT,
+                "RESP_ONIONPIR_INDEX_RESULT",
+                RoundKind::Index,
+                0,
+                &queries,
+                &items,
+                stride,
+                K,
+                false,
+                0,
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(merged.len(), K * stride);
+        for (p, r) in merged.iter().enumerate() {
+            assert_eq!(
+                r.as_slice(),
+                &(p as u32).to_le_bytes()[..],
+                "INDEX merged position {} landed wrong",
+                p
+            );
+        }
+
+        // CHUNK (stride 1): single full shard → trivially the identity merge,
+        // confirming the N=1 path reconstructs the whole batch in order.
+        let mut client = OnionClient::new_sharded(vec![ShardConfig {
+            url: "ws://only".into(),
+            index_range: 0..K,
+            chunk_range: 0..K_CHUNK,
+        }])
+        .unwrap();
+        let mut m = MockTransport::new("ws://only");
+        m.enqueue_response(resp_frame(RESP_ONIONPIR_CHUNK_RESULT, 0..K_CHUNK));
+        client.shards[0].conn = Some(Box::new(m));
+        let queries: Vec<Vec<u8>> = (0..K_CHUNK).map(|i| vec![(i & 0xff) as u8]).collect();
+        let items: Vec<u32> = vec![1u32; K_CHUNK];
+        let merged = client
+            .dispatch_sharded_batch(
+                REQ_ONIONPIR_CHUNK_QUERY,
+                RESP_ONIONPIR_CHUNK_RESULT,
+                "RESP_ONIONPIR_CHUNK_RESULT",
+                RoundKind::Chunk,
+                0,
+                &queries,
+                &items,
+                1,
+                K_CHUNK,
+                true,
+                0,
+            )
+            .await
+            .expect("dispatch chunk");
+        assert_eq!(merged.len(), K_CHUNK);
+        for (p, r) in merged.iter().enumerate() {
+            assert_eq!(r.as_slice(), &(p as u32).to_le_bytes()[..], "CHUNK pos {}", p);
+        }
+    }
+
+    #[test]
     fn test_encode_request_simple() {
         let buf = encode_request(0x03, &[]);
         assert_eq!(buf, vec![1, 0, 0, 0, 0x03]);
@@ -3138,7 +3582,7 @@ mod tests {
         client.set_metrics_recorder(Some(recorder.clone()));
 
         // Drive one send through the transport directly.
-        client.conn.as_mut().unwrap().send(vec![1, 2, 3, 4, 5, 6, 7]).await.unwrap();
+        client.shards[0].conn.as_mut().unwrap().send(vec![1, 2, 3, 4, 5, 6, 7]).await.unwrap();
 
         let snap = recorder.snapshot();
         assert_eq!(snap.bytes_sent, 7);
@@ -3164,7 +3608,7 @@ mod tests {
         client.set_metrics_recorder(None);
         // Neither the client-level disconnect callback nor the
         // transport-level send callback should fire now.
-        client.conn.as_mut().unwrap().send(vec![9; 42]).await.unwrap();
+        client.shards[0].conn.as_mut().unwrap().send(vec![9; 42]).await.unwrap();
         client.disconnect().await.unwrap();
 
         let snap = recorder.snapshot();
