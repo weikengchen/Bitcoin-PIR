@@ -358,7 +358,7 @@ async fn test_wsconnection_reconnect_roundtrip() {
 #[cfg(feature = "onion")]
 mod onion_tests {
     use super::*;
-    use pir_sdk_client::OnionClient;
+    use pir_sdk_client::{OnionClient, ShardConfig};
 
     #[tokio::test]
     #[ignore = "requires running PIR servers"]
@@ -405,6 +405,59 @@ mod onion_tests {
         assert_eq!(results.len(), 1);
 
         println!("Query result: {:?}", results);
+
+        client.disconnect().await.unwrap();
+    }
+
+    /// N>1 sharded query: spread the K INDEX / K_CHUNK CHUNK groups across
+    /// several `--onion-*-group-range` shard servers and verify the merged
+    /// result matches a single-server query. Configure with `PIR_ONION_SHARDS`:
+    ///
+    /// ```text
+    /// PIR_ONION_SHARDS="ws://127.0.0.1:8099;0:25;0:27,\
+    ///                   ws://127.0.0.1:8100;25:50;27:54,\
+    ///                   ws://127.0.0.1:8101;50:75;54:80"
+    /// ```
+    ///
+    /// Each entry is `url;index_lo:index_hi;chunk_lo:chunk_hi`; the ranges must
+    /// tile `0..K` / `0..K_CHUNK`. Unset → the test no-ops (skips).
+    #[tokio::test]
+    #[ignore = "requires N sharded PIR servers (set PIR_ONION_SHARDS)"]
+    async fn test_onion_client_sharded_query_batch() {
+        let spec = match std::env::var("PIR_ONION_SHARDS") {
+            Ok(s) if !s.trim().is_empty() => s,
+            _ => {
+                eprintln!("PIR_ONION_SHARDS unset — skipping sharded test");
+                return;
+            }
+        };
+        fn parse_range(s: &str) -> std::ops::Range<usize> {
+            let (lo, hi) = s.trim().split_once(':').expect("range lo:hi");
+            lo.trim().parse::<usize>().unwrap()..hi.trim().parse::<usize>().unwrap()
+        }
+        let shards: Vec<ShardConfig> = spec
+            .split(',')
+            .map(|part| {
+                let mut f = part.trim().split(';');
+                let url = f.next().expect("shard url").trim().to_string();
+                let index_range = parse_range(f.next().expect("index range"));
+                let chunk_range = parse_range(f.next().expect("chunk range"));
+                ShardConfig { url, index_range, chunk_range }
+            })
+            .collect();
+        println!("Sharded over {} shards: {:?}", shards.len(), shards);
+
+        let mut client = OnionClient::new_sharded(shards).expect("valid shard layout");
+        client.connect().await.expect("connect all shards failed");
+        client.fetch_catalog().await.expect("fetch_catalog failed");
+
+        let script_hashes = vec![test_script_hash()];
+        let results = client.query_batch(&script_hashes, 0).await.expect("query_batch failed");
+
+        assert_eq!(results.len(), 1);
+        // All-zero scripthash → not found, merged across shards.
+        assert!(results[0].is_none(), "all-zero scripthash should be not-found; got {:?}", results[0]);
+        println!("Sharded query result: {:?}", results);
 
         client.disconnect().await.unwrap();
     }

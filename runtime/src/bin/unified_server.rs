@@ -135,6 +135,30 @@ struct CliArgs {
     /// `--serve-queries`. See `serve_hints` for the deployment
     /// topology rationale.
     serve_queries: bool,
+    /// OnionPIR INDEX group range `[lo, hi)` this server serves. A *shard*
+    /// serves a contiguous slice of the K INDEX PBC groups (and answers the
+    /// client's positional sub-batch against just those groups). `None` =
+    /// serve all `0..K` groups (classic full server). Set via
+    /// `--onion-index-group-range lo:hi`.
+    onion_index_group_range: Option<(usize, usize)>,
+    /// OnionPIR CHUNK group range `[lo, hi)` this server serves — the
+    /// contiguous slice of the K_CHUNK CHUNK PBC groups plus the matching
+    /// DATA Merkle sibling trees. `None` = serve all `0..K_CHUNK`. Set via
+    /// `--onion-chunk-group-range lo:hi`.
+    onion_chunk_group_range: Option<(usize, usize)>,
+}
+
+/// Parse a `lo:hi` group-range argument into `(lo, hi)`. Returns `None` if
+/// malformed or `lo >= hi`.
+fn parse_group_range(s: &str) -> Option<(usize, usize)> {
+    let (lo, hi) = s.split_once(':')?;
+    let lo: usize = lo.trim().parse().ok()?;
+    let hi: usize = hi.trim().parse().ok()?;
+    if lo < hi {
+        Some((lo, hi))
+    } else {
+        None
+    }
 }
 
 fn parse_args() -> CliArgs {
@@ -156,6 +180,8 @@ fn parse_args() -> CliArgs {
     let mut cashu_keysets: Vec<(String, String)> = Vec::new();
     let mut serve_hints = false;
     let mut serve_queries = false;
+    let mut onion_index_group_range: Option<(usize, usize)> = None;
+    let mut onion_chunk_group_range: Option<(usize, usize)> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -256,12 +282,28 @@ fn parse_args() -> CliArgs {
             "--serve-queries" => {
                 serve_queries = true;
             }
+            "--onion-index-group-range" => {
+                if let Some(v) = args.get(i + 1) {
+                    onion_index_group_range = Some(parse_group_range(v).unwrap_or_else(|| {
+                        panic!("invalid --onion-index-group-range {:?} (expected lo:hi, lo<hi)", v)
+                    }));
+                }
+                i += 1;
+            }
+            "--onion-chunk-group-range" => {
+                if let Some(v) = args.get(i + 1) {
+                    onion_chunk_group_range = Some(parse_group_range(v).unwrap_or_else(|| {
+                        panic!("invalid --onion-chunk-group-range {:?} (expected lo:hi, lo<hi)", v)
+                    }));
+                }
+                i += 1;
+            }
             _ => {}
         }
         i += 1;
     }
 
-    CliArgs { port, data_dir, role, warmup, config_path, checkpoints, deltas, admin_pubkey_hex, disable_onion, vcek_dir, pool_size, pool_dir, require_arc, require_cashu, cashu_keysets, serve_hints, serve_queries }
+    CliArgs { port, data_dir, role, warmup, config_path, checkpoints, deltas, admin_pubkey_hex, disable_onion, vcek_dir, pool_size, pool_dir, require_arc, require_cashu, cashu_keysets, serve_hints, serve_queries, onion_index_group_range, onion_chunk_group_range }
 }
 
 // ─── OnionPIR worker thread ─────────────────────────────────────────────────
@@ -1945,6 +1987,34 @@ async fn main() {
             let index_all_per_group_for_worker = index_all_per_group;
             let worker_label = db_label.clone();
 
+            // Sharding: this server may serve only a contiguous slice of the
+            // INDEX / CHUNK PBC groups (and the matching Merkle sibling
+            // trees). The client sends a positional sub-batch for exactly this
+            // range; loading only `[lo, hi)` into the per-group server Vecs (in
+            // order) makes the worker's positional `servers[i]` answer the
+            // client's `query[i]` with no offset logic. `None` = full range
+            // (classic full server). The catalog still reports the GLOBAL
+            // k_index / k_chunk (from the meta), so the client knows the total
+            // group count and which slice to ask this shard for.
+            let (idx_lo, idx_hi) = args.onion_index_group_range.unwrap_or((0, k_index));
+            let (chk_lo, chk_hi) = args.onion_chunk_group_range.unwrap_or((0, k_chunk));
+            assert!(
+                idx_lo < idx_hi && idx_hi <= k_index,
+                "[OnionPIR:{}] --onion-index-group-range {}:{} out of bounds (K={})",
+                db_label, idx_lo, idx_hi, k_index,
+            );
+            assert!(
+                chk_lo < chk_hi && chk_hi <= k_chunk,
+                "[OnionPIR:{}] --onion-chunk-group-range {}:{} out of bounds (K_CHUNK={})",
+                db_label, chk_lo, chk_hi, k_chunk,
+            );
+            if (idx_lo, idx_hi) != (0, k_index) || (chk_lo, chk_hi) != (0, k_chunk) {
+                println!(
+                    "  [OnionPIR:{}] SHARD: serving INDEX groups [{},{}) of {} + CHUNK groups [{},{}) of {}",
+                    db_label, idx_lo, idx_hi, k_index, chk_lo, chk_hi, k_chunk,
+                );
+            }
+
             let (tx, mut pir_rx) = mpsc::channel::<PirCommand>(64);
             onionpir_txs[*db_id as usize] = Some(Arc::new(tx));
 
@@ -1970,7 +2040,7 @@ async fn main() {
                 if chunk_dense {
                     let m = chunk_all_mmap_opt.as_ref()
                         .expect("dense chunk mmap present when chunk_dense");
-                    for g in 0..k_chunk {
+                    for g in chk_lo..chk_hi {
                         let off = ONION_CHUNK_ALL_HEADER_BYTES + g * chunk_all_per_group;
                         let slice = &m[off..off + chunk_all_per_group];
                         let mut server = PirServer::new(chunk_bins as u64);
@@ -1987,7 +2057,7 @@ async fn main() {
                     }
                     println!(
                         "  [OnionPIR:{}] {} chunk servers ready (dense, via onion_chunk_all.bin mmap)",
-                        worker_label, k_chunk,
+                        worker_label, chunk_servers.len(),
                     );
                 }
 
@@ -2039,8 +2109,8 @@ async fn main() {
                 let chunk_shared_num_entries =
                     (ntt_u64_slice.len() / coeff_val_cnt) as u64;
 
-                chunk_index_tables.reserve(k_chunk);
-                for g in 0..k_chunk {
+                chunk_index_tables.reserve(chk_hi - chk_lo);
+                for g in chk_lo..chk_hi {
                     let mut server = PirServer::new(chunk_bins as u64);
                     let mut index_table = vec![0u32; padded_chunk];
                     for bin in 0..chunk_bins {
@@ -2085,7 +2155,7 @@ async fn main() {
                     chunk_index_tables.push(index_table);
                     chunk_servers.push(server);
                 }
-                println!("  [OnionPIR:{}] {} chunk servers ready (shared NTT store)", worker_label, k_chunk);
+                println!("  [OnionPIR:{}] {} chunk servers ready (shared NTT store)", worker_label, chunk_servers.len());
                 } // end if !chunk_dense
 
                 // Set up index servers — each slices into the consolidated
@@ -2094,8 +2164,8 @@ async fn main() {
                 // it, which is satisfied by moving `index_all_mmap` into this
                 // worker thread closure — the mmap drops only when the
                 // thread exits, which happens on process shutdown.
-                let mut index_servers: Vec<PirServer> = Vec::with_capacity(k_index);
-                for b in 0..k_index {
+                let mut index_servers: Vec<PirServer> = Vec::with_capacity(idx_hi - idx_lo);
+                for b in idx_lo..idx_hi {
                     let off = ONION_INDEX_ALL_HEADER_BYTES + b * index_all_per_group_for_worker;
                     let end = off + index_all_per_group_for_worker;
                     let slice = &index_all_mmap[off..end];
@@ -2113,15 +2183,22 @@ async fn main() {
                     unsafe { server.set_key_store(Some(&key_store)); }
                     index_servers.push(server);
                 }
-                println!("  [OnionPIR:{}] {} index servers ready (via onion_index_all.bin mmap)", worker_label, k_index);
+                println!("  [OnionPIR:{}] {} index servers ready (via onion_index_all.bin mmap)", worker_label, index_servers.len());
 
                 // Set up per-group OnionPIR Merkle sibling servers — one
                 // PirServer per group, each zero-copy aliasing its
                 // 24-byte-header sub-slice of merkle_onion_sib_*.bin.
                 // Mirrors the index_servers block above.
-                let build_sib_servers = |sib: &OnionSibFile, kind: &str| -> Vec<PirServer> {
-                    let mut servers = Vec::with_capacity(sib.k);
-                    for g in 0..sib.k {
+                // `lo..hi` is the sibling-tree group range this shard serves
+                // (== the INDEX / CHUNK range for the index / data trees).
+                let build_sib_servers = |sib: &OnionSibFile, kind: &str, lo: usize, hi: usize| -> Vec<PirServer> {
+                    assert!(
+                        lo < hi && hi <= sib.k,
+                        "[OnionPIR:{}] {} sibling range {}..{} out of bounds (k={})",
+                        worker_label, kind, lo, hi, sib.k,
+                    );
+                    let mut servers = Vec::with_capacity(hi - lo);
+                    for g in lo..hi {
                         let off = 24 + g * sib.blob_len;
                         let slice = &sib.mmap[off..off + sib.blob_len];
                         let mut server = PirServer::new(sib.num_pt as u64);
@@ -2138,17 +2215,17 @@ async fn main() {
                         servers.push(server);
                     }
                     println!(
-                        "  [OnionPIR:{}] {} sibling servers ready ({} groups, num_pt={})",
-                        worker_label, kind, sib.k, sib.num_pt,
+                        "  [OnionPIR:{}] {} sibling servers ready ({} of {} groups [{},{}), num_pt={})",
+                        worker_label, kind, servers.len(), sib.k, lo, hi, sib.num_pt,
                     );
                     servers
                 };
                 let mut index_sib_servers: Vec<PirServer> = match &index_sib_file {
-                    Some(sib) => build_sib_servers(sib, "index"),
+                    Some(sib) => build_sib_servers(sib, "index", idx_lo, idx_hi),
                     None => Vec::new(),
                 };
                 let mut data_sib_servers: Vec<PirServer> = match &data_sib_file {
-                    Some(sib) => build_sib_servers(sib, "data"),
+                    Some(sib) => build_sib_servers(sib, "data", chk_lo, chk_hi),
                     None => Vec::new(),
                 };
 

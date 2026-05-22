@@ -80,7 +80,7 @@ pub use connection::{
 };
 pub use dpf::DpfClient;
 pub use harmony::{HarmonyClient, HintProgress, PRP_FASTPRP, PRP_HMR12};
-pub use onion::OnionClient;
+pub use onion::{OnionClient, ShardConfig};
 pub use transport::PirTransport;
 #[cfg(target_arch = "wasm32")]
 pub use wasm_transport::WasmWebSocketTransport;
