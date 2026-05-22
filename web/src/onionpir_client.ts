@@ -596,10 +596,71 @@ function walkTreeTopToRoot(
 
 // ─── Client config ────────────────────────────────────────────────────────
 
+/**
+ * One OnionPIR shard for a sharded ({@link OnionPirClientConfig.shards})
+ * deployment: a server answering a contiguous range of INDEX / CHUNK PBC
+ * groups (and the matching per-group Merkle trees). Mirrors the Rust
+ * `pir_sdk_client::ShardConfig`. `indexRange` / `chunkRange` are
+ * `[lo, hi)` group ranges; across all shards they MUST tile `0..K` /
+ * `0..K_CHUNK` with no gaps or overlaps. The client builds the full padded
+ * per-group batch and then slices it — global K / K_CHUNK is never reduced
+ * (privacy: an honest non-colluding shard sees only its already-padded
+ * slice).
+ */
+export interface OnionShardConfig {
+  url: string;
+  /** INDEX PBC groups `[lo, hi)` this shard serves. */
+  indexRange: [number, number];
+  /** CHUNK PBC groups `[lo, hi)` this shard serves. */
+  chunkRange: [number, number];
+}
+
 export interface OnionPirClientConfig {
+  /** Single-server URL. Used when {@link shards} is unset (the classic
+   *  single-server client). Also the primary shard's URL for logging. */
   serverUrl: string;
+  /** Optional explicit shard layout. When set (length ≥ 1), the client
+   *  shards queries across these servers; ranges must tile `0..K` /
+   *  `0..K_CHUNK`. When unset, a single full-range shard is used. */
+  shards?: OnionShardConfig[];
   onConnectionStateChange?: (state: ConnectionState, message?: string) => void;
   onLog?: (message: string, level: 'info' | 'success' | 'error') => void;
+}
+
+/**
+ * Internal per-shard connection state. `indexRange` / `chunkRange` are
+ * `null` for the implicit single full-range shard (resolved to
+ * `[0, indexK)` / `[0, chunkK)` at query time, once the server reports K).
+ */
+interface OnionShard {
+  url: string;
+  ws: ManagedWebSocket | null;
+  indexRange: [number, number] | null;
+  chunkRange: [number, number] | null;
+}
+
+/**
+ * Validate that `[lo, hi)` group ranges tile `0..total` exactly: non-empty,
+ * contiguous when sorted by start, no gaps or overlaps, full coverage. This
+ * is what lets the client slice a positional batch by range and concatenate
+ * the per-shard responses back into a complete `0..total` result. Mirrors the
+ * Rust `validate_shard_coverage`. Returns `null` if valid, else a reason
+ * string. Pure (no DOM / WASM) so it can be unit-tested in node.
+ */
+export function validateShardRangeCoverage(
+  ranges: ReadonlyArray<[number, number]>,
+  total: number,
+): string | null {
+  const sorted = [...ranges].sort((a, b) => a[0] - b[0]);
+  let cursor = 0;
+  for (const [lo, hi] of sorted) {
+    if (hi <= lo) return `empty range ${lo}:${hi}`;
+    if (lo !== cursor) return `gap/overlap: expected next range to start at ${cursor}, got ${lo}:${hi}`;
+    if (hi > total) return `range ${lo}:${hi} exceeds ${total}`;
+    cursor = hi;
+  }
+  if (cursor !== total) return `ranges cover only 0..${cursor}, need 0..${total}`;
+  return null;
 }
 
 // ─── CHUNK Round-Presence Symmetry: per-slot classifier ───────────────────
@@ -725,7 +786,9 @@ export function selectChunkUniqueFetches(
 // ─── Client class ─────────────────────────────────────────────────────────
 
 export class OnionPirWebClient {
-  private ws: ManagedWebSocket | null = null;
+  /** One or more shards. A single full-range shard (the default when
+   *  `config.shards` is unset) is the classic single-server client. */
+  private shards: OnionShard[] = [];
   private config: OnionPirClientConfig;
   private connectionState: ConnectionState = 'disconnected';
   private rng = new DummyRng();
@@ -785,6 +848,23 @@ export class OnionPirWebClient {
 
   constructor(config: OnionPirClientConfig) {
     this.config = config;
+    // Build the shard list. Explicit `shards` => one OnionShard each (ranges
+    // validated against the server's K at first query). Otherwise a single
+    // full-range shard (indexRange/chunkRange = null) == single-server.
+    this.shards =
+      config.shards && config.shards.length > 0
+        ? config.shards.map((s) => ({
+            url: s.url,
+            ws: null,
+            indexRange: s.indexRange,
+            chunkRange: s.chunkRange,
+          }))
+        : [{ url: config.serverUrl, ws: null, indexRange: null, chunkRange: null }];
+  }
+
+  /** Primary shard's transport (control plane: info / catalog / tree-tops). */
+  private primaryWs(): ManagedWebSocket | null {
+    return this.shards[0]?.ws ?? null;
   }
 
   /**
@@ -890,12 +970,21 @@ export class OnionPirWebClient {
   }
 
   getConnectionState(): ConnectionState { return this.connectionState; }
-  isConnected(): boolean { return this.ws?.isOpen() ?? false; }
+  /** Connected iff EVERY shard has an open transport. */
+  isConnected(): boolean {
+    return this.shards.length > 0 && this.shards.every((s) => s.ws?.isOpen() ?? false);
+  }
 
   /** Return all open WebSocket connections (for diagnostics like residency check). */
   getConnectedSockets(): { label: string; ws: ManagedWebSocket }[] {
-    if (this.ws?.isOpen()) return [{ label: 'OnionPIR Server', ws: this.ws }];
-    return [];
+    const multi = this.shards.length > 1;
+    return this.shards
+      .map((s, i) => ({ s, i }))
+      .filter(({ s }) => s.ws?.isOpen())
+      .map(({ s, i }) => ({
+        label: multi ? `OnionPIR Shard ${i}` : 'OnionPIR Server',
+        ws: s.ws!,
+      }));
   }
 
   // ─── Connection (delegates to shared ws.ts) ───────────────────────────
@@ -907,28 +996,37 @@ export class OnionPirWebClient {
     this.wasmModule = await loadWasmModule();
     this.log('WASM module loaded');
 
-    // Connect WebSocket
-    this.ws = new ManagedWebSocket({
-      url: this.config.serverUrl,
-      label: 'onionpir',
-      onLog: (msg, level) => this.log(msg, level),
-      onClose: () => {
-        this.ws = null;
-        this.setState('disconnected');
-      },
-    });
-    await this.ws.connect();
+    // Open every shard's WebSocket concurrently. (N=1: a single dial,
+    // identical to the pre-sharding path.)
+    const multi = this.shards.length > 1;
+    await Promise.all(
+      this.shards.map(async (shard, idx) => {
+        const ws = new ManagedWebSocket({
+          url: shard.url,
+          label: multi ? `onionpir-shard${idx}` : 'onionpir',
+          onLog: (msg, level) => this.log(msg, level),
+          onClose: () => {
+            shard.ws = null;
+            this.setState('disconnected');
+          },
+        });
+        await ws.connect();
+        shard.ws = ws;
+      }),
+    );
 
     this.setState('connected', 'Connected');
-    this.log('Connected to server', 'success');
+    this.log(multi ? `Connected to ${this.shards.length} shards` : 'Connected to server', 'success');
 
-    // Fetch server info
+    // Fetch server info (from the primary shard).
     await this.fetchServerInfo();
   }
 
   disconnect(): void {
-    this.ws?.disconnect();
-    this.ws = null;
+    for (const shard of this.shards) {
+      shard.ws?.disconnect();
+      shard.ws = null;
+    }
     // Reset per-connection FHE registration state — keys live only for the
     // server connection, so a new connection requires re-registration.
     this.registeredDbs.clear();
@@ -937,15 +1035,103 @@ export class OnionPirWebClient {
 
   // ─── Raw send/receive (delegates to shared ws.ts) ─────────────────────
 
+  /** Control-plane roundtrip to the primary shard (info / catalog / tree-tops). */
   private sendRaw(msg: Uint8Array): Promise<Uint8Array> {
-    if (!this.ws) throw new Error('Not connected');
-    return this.ws.sendRaw(msg);
+    const ws = this.primaryWs();
+    if (!ws) throw new Error('Not connected');
+    return ws.sendRaw(msg);
+  }
+
+  /** Roundtrip to a specific shard (per-shard query / sibling / key-reg). */
+  private sendRawToShard(shardIdx: number, msg: Uint8Array): Promise<Uint8Array> {
+    const ws = this.shards[shardIdx]?.ws;
+    if (!ws) throw new Error(`shard ${shardIdx} not connected`);
+    return ws.sendRaw(msg);
+  }
+
+  /** The group range a shard serves for a level (null => full `0..total`). */
+  private shardRange(shardIdx: number, chunkLevel: boolean, total: number): [number, number] {
+    const r = (chunkLevel ? this.shards[shardIdx].chunkRange : this.shards[shardIdx].indexRange) ?? [0, total];
+    return r;
+  }
+
+  /**
+   * Assert the explicit shard ranges tile `0..indexK` / `0..chunkK` exactly
+   * (no gaps/overlaps). No-op for the implicit single full-range shard.
+   * Called once per `queryBatch`, when K is known from the server.
+   */
+  private assertShardCoverage(): void {
+    if (this.shards.length === 1 && this.shards[0].indexRange === null) return;
+    const idxErr = validateShardRangeCoverage(
+      this.shards.map((_, i) => this.shardRange(i, false, this.indexK)),
+      this.indexK,
+    );
+    if (idxErr) throw new Error(`shard INDEX ranges invalid: ${idxErr}`);
+    const chkErr = validateShardRangeCoverage(
+      this.shards.map((_, i) => this.shardRange(i, true, this.chunkK)),
+      this.chunkK,
+    );
+    if (chkErr) throw new Error(`shard CHUNK ranges invalid: ${chkErr}`);
+  }
+
+  /**
+   * Split a full positional per-group batch across all shards, send each
+   * shard its slice CONCURRENTLY, and merge the per-shard responses back
+   * into one positional array of length `totalGroups * stride` (group g's
+   * results at `[g*stride, (g+1)*stride)`).
+   *
+   * `queries` is the full padded batch (built exactly as the single-server
+   * path); slicing happens AFTER padding, so global K / K_CHUNK is never
+   * reduced — an honest non-colluding shard sees only its already-padded
+   * slice. N=1 (single full-range shard) = a single roundtrip, byte-
+   * identical to the pre-sharding path.
+   */
+  private async dispatchShardedBatch(
+    variant: number,
+    expectedVariant: number,
+    roundId: number,
+    queries: Uint8Array[],
+    stride: number,
+    totalGroups: number,
+    chunkLevel: boolean,
+    dbId: number,
+    roundKind: RoundProfile['kind'],
+  ): Promise<Uint8Array[]> {
+    const merged: Uint8Array[] = new Array(totalGroups * stride);
+    await Promise.all(
+      this.shards.map(async (_shard, shardIdx) => {
+        const [glo, ghi] = this.shardRange(shardIdx, chunkLevel, totalGroups);
+        const lo = glo * stride;
+        const hi = ghi * stride;
+        const sub = queries.slice(lo, hi);
+        const batchMsg = encodeBatchQuery(variant, roundId, sub, dbId);
+        const respRaw = await this.sendRawToShard(shardIdx, batchMsg);
+        this.recordRound({
+          kind: roundKind,
+          server_id: shardIdx,
+          db_id: dbId,
+          request_bytes: batchMsg.length,
+          response_bytes: respRaw.length,
+          items: new Array(ghi - glo).fill(stride),
+        });
+        const respPayload = respRaw.slice(4);
+        if (respPayload[0] !== expectedVariant) {
+          throw new Error(`shard ${shardIdx}: unexpected response variant 0x${(respPayload[0] ?? 0).toString(16)}`);
+        }
+        const { results } = decodeBatchResult(respPayload, 1);
+        if (results.length !== hi - lo) {
+          throw new Error(`shard ${shardIdx} returned ${results.length} results, expected ${hi - lo}`);
+        }
+        for (let j = 0; j < results.length; j++) merged[lo + j] = results[j];
+      }),
+    );
+    return merged;
   }
 
   // ─── Server info (delegates to shared server-info.ts) ──────────────────
 
   private async fetchServerInfo(): Promise<void> {
-    const info = await fetchServerInfoJson(this.ws!, (req, resp) => {
+    const info = await fetchServerInfoJson(this.primaryWs()!, (req, resp) => {
       this.recordRound({
         kind: 'info',
         server_id: 0,
@@ -976,7 +1162,7 @@ export class OnionPirWebClient {
 
     // Fetch the database catalog so the UI can populate a selector.
     try {
-      this.catalog = await fetchDatabaseCatalog(this.ws!, (req, resp) => {
+      this.catalog = await fetchDatabaseCatalog(this.primaryWs()!, (req, resp) => {
         this.recordRound({
           kind: 'info',
           server_id: 0,
@@ -1077,6 +1263,10 @@ export class OnionPirWebClient {
     let chunkClient: WasmPirClient | null = null;
 
     try {
+      // Sharded layouts: validate the explicit shard ranges tile 0..K /
+      // 0..K_CHUNK exactly (no-op for the single full-range shard).
+      this.assertShardCoverage();
+
       // ── Register keys once per (connection, dbId) ───────────────────
       // Per-DB key registration: each DB has its own OnionPIR worker with
       // its own KeyStore, so keys must be registered separately per dbId.
@@ -1085,18 +1275,25 @@ export class OnionPirWebClient {
       if (!this.registeredDbs.has(dbId)) {
         progress('Setup', `Registering keys (dbId=${dbId})...`);
         const regMsg = encodeRegisterKeys(galoisKeys, gswKeys, dbId);
-        const ack = await this.sendRaw(regMsg);
-        this.recordRound({
-          kind: 'onion_key_register',
-          server_id: 0,
-          db_id: dbId,
-          request_bytes: regMsg.length,
-          response_bytes: ack.length,
-          items: [],
-        });
-        if (ack[4] !== RESP_KEYS_ACK) throw new Error('Key registration failed');
+        // Register with EVERY shard — each shard's KeyStore needs our keys to
+        // answer FHE queries for its group range. (N=1: one roundtrip,
+        // server_id=0, byte-identical.)
+        await Promise.all(
+          this.shards.map(async (_s, shardIdx) => {
+            const ack = await this.sendRawToShard(shardIdx, regMsg);
+            this.recordRound({
+              kind: 'onion_key_register',
+              server_id: shardIdx,
+              db_id: dbId,
+              request_bytes: regMsg.length,
+              response_bytes: ack.length,
+              items: [],
+            });
+            if (ack[4] !== RESP_KEYS_ACK) throw new Error(`Key registration failed (shard ${shardIdx})`);
+          }),
+        );
         this.registeredDbs.add(dbId);
-        this.log(`Keys registered for dbId=${dbId}`);
+        this.log(`Keys registered for dbId=${dbId}${this.shards.length > 1 ? ` across ${this.shards.length} shards` : ''}`);
       } else {
         this.log(`Keys already registered for dbId=${dbId} (reusing)`);
       }
@@ -1175,26 +1372,24 @@ export class OnionPirWebClient {
           }
         }
 
-        progress('Level 1', `Round ${roundNum}/${totalRounds}: querying server (${queries.length} FHE queries)...`);
-        const batchMsg = encodeBatchQuery(REQ_ONIONPIR_INDEX_QUERY, totalIndexRounds, queries, dbId);
-        const respRaw = await this.sendRaw(batchMsg);
-        // Per-group item count: every group sends INDEX_CUCKOO_NUM_HASHES
-        // FHE queries — matches the Rust shape (and DPF's INDEX shape).
-        // The Merkle INDEX item-count symmetry invariant lives in this
-        // uniform 2-per-group payload.
-        this.recordRound({
-          kind: 'index',
-          server_id: 0,
-          db_id: dbId,
-          request_bytes: batchMsg.length,
-          response_bytes: respRaw.length,
-          items: new Array(this.indexK).fill(INDEX_CUCKOO_NUM_HASHES),
-        });
+        progress('Level 1', `Round ${roundNum}/${totalRounds}: querying ${this.shards.length > 1 ? this.shards.length + ' shards' : 'server'} (${queries.length} FHE queries)...`);
+        // Split the full 2*K positional batch by each shard's INDEX group
+        // range, send concurrently, merge by position. (N=1: a single
+        // roundtrip, byte-identical.) Per-group item count is uniform
+        // INDEX_CUCKOO_NUM_HASHES (Merkle INDEX item-count symmetry); the
+        // per-shard RoundProfiles are recorded inside the helper.
+        const results = await this.dispatchShardedBatch(
+          REQ_ONIONPIR_INDEX_QUERY,
+          RESP_ONIONPIR_INDEX_RESULT,
+          totalIndexRounds,
+          queries,
+          INDEX_CUCKOO_NUM_HASHES,
+          this.indexK,
+          false,
+          dbId,
+          'index',
+        );
         totalIndexRounds++;
-
-        const respPayload = respRaw.slice(4);
-        if (respPayload[0] !== RESP_ONIONPIR_INDEX_RESULT) throw new Error('Unexpected index response');
-        const { results } = decodeBatchResult(respPayload, 1);
 
         // Decrypt all INDEX_CUCKOO_NUM_HASHES responses per address — even
         // after a match — so the Merkle item count is uniform across
@@ -1423,24 +1618,21 @@ export class OnionPirWebClient {
             }
           }
 
-          progress('Level 2', `Chunk round ${ri + 1}/${chunkRounds.length}: querying server...`);
-          const batchMsg = encodeBatchQuery(REQ_ONIONPIR_CHUNK_QUERY, ri, queries, dbId);
-          const respRaw = await this.sendRaw(batchMsg);
-          // OnionPIR CHUNK shape: 1 FHE query per group, K_CHUNK groups.
-          // Differs from DPF/Harmony CHUNK (which send 2 per group); the
-          // Rust `OnionClient::query_chunk_level` pin matches this.
-          this.recordRound({
-            kind: 'chunk',
-            server_id: 0,
-            db_id: dbId,
-            request_bytes: batchMsg.length,
-            response_bytes: respRaw.length,
-            items: new Array(this.chunkK).fill(1),
-          });
-
-          const respPayload = respRaw.slice(4);
-          if (respPayload[0] !== RESP_ONIONPIR_CHUNK_RESULT) throw new Error('Unexpected chunk response');
-          const { results } = decodeBatchResult(respPayload, 1);
+          progress('Level 2', `Chunk round ${ri + 1}/${chunkRounds.length}: querying ${this.shards.length > 1 ? this.shards.length + ' shards' : 'server'}...`);
+          // Split the K_CHUNK positional batch by each shard's CHUNK group
+          // range, send concurrently, merge by position. OnionPIR CHUNK shape:
+          // 1 FHE query per group (stride 1) — differs from DPF/Harmony's 2.
+          const results = await this.dispatchShardedBatch(
+            REQ_ONIONPIR_CHUNK_QUERY,
+            RESP_ONIONPIR_CHUNK_RESULT,
+            ri,
+            queries,
+            1,
+            this.chunkK,
+            true,
+            dbId,
+            'chunk',
+          );
 
           let chunkDecrypted = 0;
           // Post-port (commit 7): unpack the raw plaintext exactly as
@@ -1908,28 +2100,43 @@ export class OnionPirWebClient {
           if (g % 5 === 4) await yieldToMain();
         }
 
-        // round_id is vestigial under the per-group design — send 0.
-        const batchMsg = encodeBatchQuery(sibReq, 0, queries, this.dbId);
-        const respRaw = await this.sendRaw(batchMsg);
-        // One PIR sibling level ⇒ level is always 0. K FHE queries, one
-        // per PBC group — items[g] = 1 each. Matches the Rust
-        // `verify_sub_tree`'s `Index/ChunkMerkleSiblings { level: 0 }`.
-        this.recordRound({
-          kind: treeName === 'index' ? 'index_merkle_siblings' : 'chunk_merkle_siblings',
-          level: 0,
-          server_id: 0,
-          db_id: this.dbId,
-          request_bytes: batchMsg.length,
-          response_bytes: respRaw.length,
-          items: new Array(k).fill(1),
-        });
-        const respPayload = respRaw.slice(4);
-        if (respPayload[0] !== sibResp) {
-          throw new Error(
-            `Unexpected ${treeName} sibling response: 0x${respPayload[0].toString(16)}`,
-          );
-        }
-        const { results: batch } = decodeBatchResult(respPayload, 1);
+        // Split the K positional sibling queries by each shard's per-tree
+        // group range (index range for the INDEX tree, chunk range for the
+        // DATA tree), send concurrently, and merge by group position into a
+        // K-length `batch`. round_id is vestigial — send 0. One PIR sibling
+        // level ⇒ level 0; one FHE query per group ⇒ items[g] = 1. (N=1: a
+        // single roundtrip, byte-identical, matching the Rust
+        // `verify_sub_tree`'s `Index/ChunkMerkleSiblings { level: 0 }`.)
+        const sibChunkLevel = treeName !== 'index';
+        const batch: Uint8Array[] = new Array(k);
+        await Promise.all(
+          this.shards.map(async (_s, shardIdx) => {
+            const [glo, ghi] = this.shardRange(shardIdx, sibChunkLevel, k);
+            const sub = queries.slice(glo, ghi);
+            const batchMsg = encodeBatchQuery(sibReq, 0, sub, this.dbId);
+            const respRaw = await this.sendRawToShard(shardIdx, batchMsg);
+            this.recordRound({
+              kind: treeName === 'index' ? 'index_merkle_siblings' : 'chunk_merkle_siblings',
+              level: 0,
+              server_id: shardIdx,
+              db_id: this.dbId,
+              request_bytes: batchMsg.length,
+              response_bytes: respRaw.length,
+              items: new Array(ghi - glo).fill(1),
+            });
+            const respPayload = respRaw.slice(4);
+            if (respPayload[0] !== sibResp) {
+              throw new Error(
+                `shard ${shardIdx}: unexpected ${treeName} sibling response: 0x${(respPayload[0] ?? 0).toString(16)}`,
+              );
+            }
+            const { results } = decodeBatchResult(respPayload, 1);
+            if (results.length !== ghi - glo) {
+              throw new Error(`shard ${shardIdx} ${treeName} sibling returned ${results.length}, expected ${ghi - glo}`);
+            }
+            for (let j = 0; j < results.length; j++) batch[glo + j] = results[j];
+          }),
+        );
 
         // Fold each real group's decrypted sibling row into its leaf.
         for (const [g, item] of passGroupToItem) {
