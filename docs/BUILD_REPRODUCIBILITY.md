@@ -232,19 +232,39 @@ more entropy (e.g., future FHE-layer pre-randomization).
    attestation `REPORT_DATA`, or multi-operator quorum — many viable
    paths). The verifier code is trivial; the anchor-delivery channel is
    the remaining design choice.
-2. **Build-side anchor coverage gaps.** The consolidated
-   `onion_index_all.bin` master header (`0xBA7C_0010_0000_0003`) does
-   not yet carry the anchor (only the chunk-cuckoo + index-meta files
-   do), and the Merkle sibling tables use fixed-base seeds
-   (`0xBA7C_51B1_… + level`) rather than chain-derived ones. Decide:
-   extend for consistency, or document the Merkle tables as exempt
-   (they are content-addressed hashes, not adversarial-placement seeds).
-3. **CI cross-build check.** GitHub Actions workflow that runs
+2. **CI cross-build check.** GitHub Actions workflow that runs
    `./scripts/build_full.sh <snapshot> <height>` twice on clean
    checkouts at the same `<height>`, then `sha256sum`-compares the
    output cuckoo files. Deferred until first multi-operator deployment.
-4. **HarmonyPIR keys not affected** — query-time, client-derived;
+3. **HarmonyPIR keys not affected** — query-time, client-derived;
    no build-side seed.
+
+## Merkle tables — exempt from chain-derivation (resolved)
+
+The **active** Merkle schemes carry **no separate placement seed** to
+chain-derive:
+
+- **DPF / HarmonyPIR** use per-bucket bin Merkle
+  (`gen_4_build_merkle_bucket` → `merkle_bucket_builder.rs`). Its output
+  header writes `master_seed = 0`; it simply hashes the *already-placed*
+  cuckoo bins, so it transparently inherits the chain-derived INDEX/CHUNK
+  cuckoo seed. (`merkle_bucket_builder` was updated to read the v2
+  cuckoo headers so per-bucket Merkle builds on chain-anchored DBs.)
+- **OnionPIR** uses per-group Merkle (`gen_4_build_merkle_onion`),
+  likewise content-addressed.
+
+The only fixed Merkle seed (`0xBA7C_51B1_… + level`) lived in the
+**legacy N-ary tree Merkle** (`merkle_builder.rs` / `gen_4_build_merkle_dpf`
+/ `test_merkle_verify*`), which the active pipeline never built. Those
+builders were **removed** rather than chain-derived. The inert
+server/protocol/reference-client N-ary load+verify path (opcodes
+`0x31`/`0x32`, the `MappedDatabase.merkle_*` fields) is slated for
+removal in a focused follow-up; it is cleanly separated from the live
+per-bucket path (opcodes `0x33`/`0x34`).
+
+**Onion anchor coverage** is complete: `onion_index_meta.bin` +
+`onion_chunk_cuckoo.bin` + `onion_index_all.bin` all embed the anchor,
+and the server self-verifies the onion seeds against it on load.
 
 ## Wire format extension (Phase C)
 
