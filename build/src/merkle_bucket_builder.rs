@@ -14,7 +14,6 @@
 //! Group g's data starts at offset header + g × (num_rows × 256).
 
 use memmap2::Mmap;
-use pir_core::hash;
 use pir_core::merkle::{self, Hash256, ZERO_HASH};
 use pir_core::params::*;
 use rayon::prelude::*;
@@ -43,21 +42,23 @@ pub fn build_bucket_merkle(data_dir: &str) {
     println!("Arity: {}", ARITY);
     println!();
 
-    // Load INDEX cuckoo table
+    // Load INDEX cuckoo table. Accept legacy + v2 (chain-anchored) magic —
+    // the per-bucket Merkle only needs bins_per_table; the anchor/seed live
+    // in the cuckoo header but aren't used here.
     let index_path = Path::new(data_dir).join("batch_pir_cuckoo.bin");
     let index_mmap = mmap_file(&index_path);
-    let (index_bins, _tag_seed) = hash::read_cuckoo_header(
-        &index_mmap, INDEX_PARAMS.magic, INDEX_PARAMS.header_size, INDEX_PARAMS.has_tag_seed,
-    );
+    let index_bins = pir_core::cuckoo::read_cuckoo_header_with_anchor(&index_mmap, &INDEX_PARAMS)
+        .expect("INDEX cuckoo header parse")
+        .bins_per_table;
     let index_bin_size = INDEX_PARAMS.bin_size();
     println!("[INDEX] bins_per_table={}, bin_size={}B, K={}", index_bins, index_bin_size, INDEX_PARAMS.k);
 
     // Load CHUNK cuckoo table
     let chunk_path = Path::new(data_dir).join("chunk_pir_cuckoo.bin");
     let chunk_mmap = mmap_file(&chunk_path);
-    let (chunk_bins, _) = hash::read_cuckoo_header(
-        &chunk_mmap, CHUNK_PARAMS.magic, CHUNK_PARAMS.header_size, CHUNK_PARAMS.has_tag_seed,
-    );
+    let chunk_bins = pir_core::cuckoo::read_cuckoo_header_with_anchor(&chunk_mmap, &CHUNK_PARAMS)
+        .expect("CHUNK cuckoo header parse")
+        .bins_per_table;
     let chunk_bin_size = CHUNK_PARAMS.bin_size();
     println!("[CHUNK] bins_per_table={}, bin_size={}B, K={}", chunk_bins, chunk_bin_size, CHUNK_PARAMS.k);
     println!();
