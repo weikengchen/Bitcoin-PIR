@@ -397,7 +397,7 @@ async fn main() {
                                 dpf_sum / n as u32, fetch_sum / n as u32);
                             Response::ChunkBatch(batch)
                         }
-                        Request::MerkleSiblingBatch(_) | Request::BucketMerkleSibBatch(_) => {
+                        Request::BucketMerkleSibBatch(_) => {
                             Response::Error("merkle queries not supported by legacy server".into())
                         }
                         Request::HarmonyGetInfo => Response::HarmonyInfo(ServerInfo {

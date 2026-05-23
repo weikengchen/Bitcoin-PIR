@@ -17,9 +17,9 @@
 
 // ─── Wire protocol constants for OnionPIR messages ──────────────────────────
 
-// NOTE: 0x30-0x32 were the original OnionPIR codes but collide with
-// REQ_MERKLE_SIBLING_BATCH (0x31) and REQ_MERKLE_TREE_TOP (0x32).
-// Moved to 0x50-0x52 to avoid conflicts.
+// NOTE: 0x30-0x32 were the original OnionPIR codes but collided with the
+// legacy global N-ary tree Merkle opcodes 0x31/0x32 (since retired). Moved
+// to 0x50-0x52 to avoid that conflict; 0x31/0x32 remain reserved/unused.
 pub const REQ_REGISTER_KEYS: u8 = 0x50;
 pub const REQ_ONIONPIR_INDEX_QUERY: u8 = 0x51;
 pub const REQ_ONIONPIR_CHUNK_QUERY: u8 = 0x52;

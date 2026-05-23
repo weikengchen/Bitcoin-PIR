@@ -210,7 +210,7 @@ async fn main() {
                     index_bins = entry.index_bins_per_table as usize;
                     chunk_bins = entry.chunk_bins_per_table as usize;
                     tag_seed = entry.tag_seed;
-                    println!("  Catalog: db_id={} name=\"{}\" type={} base_height={} height={} has_merkle={}",
+                    println!("  Catalog: db_id={} name=\"{}\" type={} base_height={} height={} has_bucket_merkle={}",
                         entry.db_id, entry.name,
                         if entry.db_type == 0 { "full" } else { "delta" },
                         entry.base_height, entry.height, entry.has_bucket_merkle);

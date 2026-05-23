@@ -184,14 +184,6 @@ pub struct MappedDatabase {
     pub index: MappedSubTable,
     /// CHUNK-level cuckoo table.
     pub chunk: MappedSubTable,
-    /// Per-level sibling cuckoo tables (empty if Merkle not built).
-    pub merkle_siblings: Vec<MappedSubTable>,
-    /// Cached top of the Merkle tree (node hashes).
-    pub merkle_tree_top: Option<Vec<u8>>,
-    /// Merkle root hash (32 bytes).
-    pub merkle_root: Option<Vec<u8>>,
-    /// Merkle tree arity (e.g. 8 for DPF, 120 for OnionPIR). 0 if no Merkle.
-    pub merkle_arity: usize,
 
     // ── Per-bucket bin Merkle ────────────────────────────────────────────
     /// Flat sibling tables for INDEX-level per-bucket Merkle (L0, L1, ...).
@@ -283,63 +275,10 @@ impl MappedDatabase {
             );
         }
 
-        // Try to load Merkle sibling tables (DPF: _dpf suffix, then fallback to no suffix)
-        let mut merkle_siblings = Vec::new();
-        let mut merkle_arity = 0usize;
-
-        // Detect arity from tree-top cache header (byte 5-6 = arity LE u16)
-        let top_dpf = base_dir.join("merkle_tree_top_dpf.bin");
-        let top_plain = base_dir.join("merkle_tree_top.bin");
-        let (top_path, sib_prefix) = if top_dpf.exists() {
-            (top_dpf, "merkle_sibling_dpf")
-        } else if top_plain.exists() {
-            (top_plain, "merkle_sibling")
-        } else {
-            (top_plain, "") // no Merkle
-        };
-
-        let merkle_tree_top = std::fs::read(&top_path).ok();
-        if let Some(ref top_data) = merkle_tree_top {
-            if top_data.len() >= 8 {
-                merkle_arity = u16::from_le_bytes(top_data[5..7].try_into().unwrap()) as usize;
-            }
-        }
-
-        if merkle_arity > 0 && !sib_prefix.is_empty() {
-            let sib_slot_size = pir_core::merkle::merkle_sibling_slot_size(merkle_arity);
-            for level in 0.. {
-                let sib_path = base_dir.join(format!("{}_L{}.bin", sib_prefix, level));
-                if !sib_path.exists() { break; }
-                println!("  Loading {} L{} (arity={}, slot={}B)...", sib_prefix, level, merkle_arity, sib_slot_size);
-                let params = pir_core::params::TableParams {
-                    k: 75,
-                    num_hashes: 3,
-                    master_seed: 0xBA7C_51B1_0000_0000u64.wrapping_add(level as u64),
-                    slots_per_bin: 4,
-                    cuckoo_num_hashes: 2,
-                    slot_size: sib_slot_size,
-                    dpf_n: 0, // read from file header
-                    magic: 0xBA7C_51B1_0000_0000u64 | (level as u64),
-                    header_size: 32,
-                    has_tag_seed: false,
-                };
-                merkle_siblings.push(MappedSubTable::load(&sib_path, params));
-            }
-        }
-
-        // Load Merkle root
-        let root_dpf = base_dir.join("merkle_root_dpf.bin");
-        let root_plain = base_dir.join("merkle_root.bin");
-        let merkle_root = std::fs::read(&root_dpf).ok()
-            .or_else(|| std::fs::read(&root_plain).ok());
-
-        if !merkle_siblings.is_empty() {
-            println!("  Merkle: arity={}, {} sibling levels, tree-top={}, root={}",
-                merkle_arity, merkle_siblings.len(),
-                if merkle_tree_top.is_some() { "yes" } else { "no" },
-                if merkle_root.is_some() { "yes" } else { "no" },
-            );
-        }
+        // Legacy global N-ary tree Merkle (merkle_tree_top.bin / merkle_root.bin
+        // / merkle_sibling*_L*.bin, opcodes 0x31/0x32) was removed — superseded
+        // by the per-bucket bin Merkle loaded below. The N-ary builders no
+        // longer exist, so those files are never produced.
 
         // ── Load per-bucket bin Merkle files ──────────────────────────────
         let mut bucket_merkle_index_siblings = Vec::new();
@@ -402,16 +341,10 @@ impl MappedDatabase {
 
         MappedDatabase {
             descriptor, index, chunk,
-            merkle_siblings, merkle_tree_top, merkle_root, merkle_arity,
             bucket_merkle_index_siblings, bucket_merkle_chunk_siblings,
             bucket_merkle_tree_tops, bucket_merkle_roots, bucket_merkle_root,
             manifest, manifest_root,
         }
-    }
-
-    /// Whether this database has (legacy) global Merkle verification data.
-    pub fn has_merkle(&self) -> bool {
-        !self.merkle_siblings.is_empty()
     }
 
     /// Whether this database has per-bucket bin Merkle verification data.

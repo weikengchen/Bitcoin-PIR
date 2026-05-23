@@ -785,40 +785,9 @@ impl UnifiedServerData {
             Self::append_onionpir_merkle_json(&mut json, ",\"onionpir_merkle\":", om);
         }
 
-        if self.main_db().has_merkle() {
-            let arity = self.main_db().merkle_arity;
-            let num_levels = self.main_db().merkle_siblings.len();
-            json.push_str(&format!(
-                r#","merkle":{{"arity":{},"sibling_levels":{},"sibling_k":{},"sibling_bucket_size":{},"sibling_slot_size":{},"levels":["#,
-                arity, num_levels,
-                75, // K for sibling tables
-                4,  // slots_per_bin
-                pir_core::merkle::merkle_sibling_slot_size(arity),
-            ));
-            for (i, sib) in self.main_db().merkle_siblings.iter().enumerate() {
-                if i > 0 { json.push(','); }
-                json.push_str(&format!(
-                    r#"{{"dpf_n":{},"bins_per_table":{}}}"#,
-                    params::compute_dpf_n(sib.bins_per_table),
-                    sib.bins_per_table,
-                ));
-            }
-            json.push(']');
-            // Root hash as hex
-            if let Some(ref root) = self.main_db().merkle_root {
-                json.push_str(&format!(r#","root":"{}""#,
-                    root.iter().map(|b| format!("{:02x}", b)).collect::<String>()));
-            }
-            // Tree-top: send SHA256 hash of the cache blob (32 bytes hex) for compact verification.
-            // Client fetches the full cache separately if needed (or trusts the hash).
-            if let Some(ref top) = self.main_db().merkle_tree_top {
-                let top_hash = pir_core::merkle::sha256(top);
-                json.push_str(&format!(r#","tree_top_hash":"{}""#,
-                    top_hash.iter().map(|b| format!("{:02x}", b)).collect::<String>()));
-                json.push_str(&format!(r#","tree_top_size":{}"#, top.len()));
-            }
-            json.push('}');
-        }
+        // Legacy global N-ary tree Merkle ("merkle":{…}) removed — the
+        // per-bucket bin Merkle below ("merkle_bucket":{…}) is the active
+        // scheme. No DB carries N-ary Merkle data anymore.
 
         // Per-bucket bin Merkle info
         if self.main_db().has_bucket_merkle() {
@@ -1101,45 +1070,6 @@ impl UnifiedServerData {
             results.push(r);
         }
         (BatchResult { level: 1, round_id: query.round_id, results }, total_dpf, total_fetch)
-    }
-
-    fn process_merkle_sibling_batch(&self, query: &BatchQuery, db: &MappedDatabase) -> (BatchResult, std::time::Duration, std::time::Duration) {
-        // round_id encoding: `level * 100 + pbc_round_index`
-        // The server only cares about the sibling level (which table to query).
-        // The PBC round index is just echoed back for client-side correlation.
-        let level = (query.round_id as usize) / 100;
-        let sib_table = &db.merkle_siblings[level];
-        let k = sib_table.params.k;
-        let result_size = sib_table.params.bin_size(); // slots_per_bin × slot_size
-        let num_groups = query.keys.len().min(k);
-
-        let group_results: Vec<(Vec<Vec<u8>>, GroupTiming)> = (0..num_groups)
-            .into_par_iter()
-            .map(|b| {
-                let dpf_keys: Vec<DpfKey> = query.keys[b].iter()
-                    .map(|k| DpfKey::from_bytes(k).expect("bad dpf key"))
-                    .collect();
-                let key_refs: Vec<&DpfKey> = dpf_keys.iter().collect();
-                let table_bytes = sib_table.group_bytes(b);
-                let (r, timing) = eval::process_merkle_sibling_group(
-                    &key_refs,
-                    table_bytes,
-                    sib_table.bins_per_table,
-                    result_size,
-                );
-                (r, timing)
-            })
-            .collect();
-
-        let mut total_dpf = std::time::Duration::ZERO;
-        let mut total_fetch = std::time::Duration::ZERO;
-        let mut results = Vec::with_capacity(num_groups);
-        for (r, t) in group_results {
-            total_dpf += t.dpf_eval;
-            total_fetch += t.fetch_xor;
-            results.push(r);
-        }
-        (BatchResult { level: 2, round_id: query.round_id, results }, total_dpf, total_fetch)
     }
 
     /// Generic DPF batch evaluation against any MappedSubTable.
@@ -2529,7 +2459,7 @@ async fn main() {
         ServerRole::Primary => println!("  HarmonyPIR: query server"),
         ServerRole::Secondary => println!("  HarmonyPIR: hint server"),
     }
-    if server.main_db().has_merkle() { println!("  Merkle: available"); }
+    if server.main_db().has_bucket_merkle() { println!("  Merkle: available (per-bucket)"); }
     println!();
 
     let client_counter = std::sync::atomic::AtomicU64::new(1);
@@ -2689,8 +2619,6 @@ async fn main() {
                     match variant {
                         REQ_INDEX_BATCH
                         | REQ_CHUNK_BATCH
-                        | REQ_MERKLE_SIBLING_BATCH
-                        | REQ_MERKLE_TREE_TOP
                         | REQ_BUCKET_MERKLE_SIB_BATCH
                         | REQ_BUCKET_MERKLE_TREE_TOPS
                         | REQ_HARMONY_QUERY
@@ -2734,8 +2662,6 @@ async fn main() {
                     match variant {
                         REQ_INDEX_BATCH
                         | REQ_CHUNK_BATCH
-                        | REQ_MERKLE_SIBLING_BATCH
-                        | REQ_MERKLE_TREE_TOP
                         | REQ_BUCKET_MERKLE_SIB_BATCH
                         | REQ_BUCKET_MERKLE_TREE_TOPS
                         | REQ_HARMONY_QUERY
@@ -3081,50 +3007,9 @@ async fn main() {
                         }
                     }
 
-                    // ── Merkle sibling batch queries ──────────────────────
-                    REQ_MERKLE_SIBLING_BATCH => {
-                        if let Ok(Request::MerkleSiblingBatch(q)) = Request::decode(payload) {
-                            let s = Arc::clone(&server);
-                            let resp = tokio::task::spawn_blocking(move || {
-                                let db = match s.state.get_db(q.db_id) {
-                                    Some(db) if db.has_merkle() => db,
-                                    _ => return Response::Error(format!("db {} has no merkle siblings", q.db_id)),
-                                };
-                                let t = Instant::now();
-                                let n = q.keys.len();
-                                // round_id = level * 100 + pbc_round_index
-                                let level = q.round_id / 100;
-                                let pbc_round = q.round_id % 100;
-                                let (batch, dpf_sum, fetch_sum) = s.process_merkle_sibling_batch(&q, db);
-                                let wall = t.elapsed();
-                                println!("[merkle-sib] db={} L{} r{} {} groups {:.2?} | dpf {:.2?} fetch+xor {:.2?}",
-                                    q.db_id, level, pbc_round, n, wall, dpf_sum, fetch_sum);
-                                Response::MerkleSiblingBatch(batch)
-                            }).await.unwrap();
-                            let _ = send_resp(&mut sink, channel_session.as_mut(), resp.encode()).await;
-                        }
-                    }
-
-                    // ── Merkle tree-top cache fetch ──────────────────────
-                    REQ_MERKLE_TREE_TOP => {
-                        // Optional db_id byte: payload[1] if present, else 0.
-                        let db_id = if payload.len() > 1 { payload[1] } else { 0 };
-                        let db = server.state.get_db(db_id);
-                        let top = db.and_then(|d| d.merkle_tree_top.as_ref());
-                        if let Some(top) = top {
-                            // Send: [4B len][1B RESP_MERKLE_TREE_TOP][tree_top_bytes...]
-                            let payload_len = 1 + top.len();
-                            let mut msg = Vec::with_capacity(4 + payload_len);
-                            msg.extend_from_slice(&(payload_len as u32).to_le_bytes());
-                            msg.push(RESP_MERKLE_TREE_TOP);
-                            msg.extend_from_slice(top);
-                            let _ = send_resp(&mut sink, channel_session.as_mut(), msg).await;
-                            println!("[merkle-top] db={} sent {} bytes", db_id, top.len());
-                        } else {
-                            let err = Response::Error(format!("db {} has no merkle tree-top", db_id));
-                            let _ = send_resp(&mut sink, channel_session.as_mut(), err.encode()).await;
-                        }
-                    }
+                    // (0x31 REQ_MERKLE_SIBLING_BATCH / 0x32 REQ_MERKLE_TREE_TOP
+                    //  retired — legacy global N-ary tree Merkle. The per-bucket
+                    //  bin Merkle arms below are the active scheme.)
 
                     // ── Per-bucket bin Merkle sibling batch queries ──────
                     REQ_BUCKET_MERKLE_SIB_BATCH => {

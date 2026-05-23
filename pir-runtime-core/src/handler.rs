@@ -135,7 +135,6 @@ impl RequestHandler {
             Request::GetDbCatalog => Response::DbCatalog(self.build_catalog()),
             Request::IndexBatch(query) => self.handle_index_batch(query),
             Request::ChunkBatch(query) => self.handle_chunk_batch(query),
-            Request::MerkleSiblingBatch(query) => self.handle_merkle_sibling_batch(query),
             Request::BucketMerkleSibBatch(query) => self.handle_bucket_merkle_sib_batch(query),
             Request::HarmonyGetInfo => Response::HarmonyInfo(self.server_info()),
             Request::HarmonyHints(_) => {
@@ -246,20 +245,6 @@ impl RequestHandler {
     }
 
     /// Handle a Merkle sibling batch query.
-    fn handle_merkle_sibling_batch(&self, query: &BatchQuery) -> Response {
-        let db = match self.state.get_db(query.db_id) {
-            Some(d) => d,
-            None => return Response::Error(format!("unknown db_id {}", query.db_id)),
-        };
-
-        if !db.has_merkle() {
-            return Response::Error("database has no Merkle data".into());
-        }
-
-        let (result, _dpf_time, _fetch_time) = self.process_merkle_sibling_batch(query, db);
-        Response::MerkleSiblingBatch(result)
-    }
-
     /// Handle a bucket Merkle sibling batch query.
     fn handle_bucket_merkle_sib_batch(&self, query: &BatchQuery) -> Response {
         let db = match self.state.get_db(query.db_id) {
@@ -470,56 +455,6 @@ impl RequestHandler {
         (
             BatchResult {
                 level: 1,
-                round_id: query.round_id,
-                results,
-            },
-            total_dpf,
-            total_fetch,
-        )
-    }
-
-    fn process_merkle_sibling_batch(
-        &self,
-        query: &BatchQuery,
-        db: &MappedDatabase,
-    ) -> (BatchResult, Duration, Duration) {
-        let level = (query.round_id as usize) / 100;
-        let sib_table = &db.merkle_siblings[level];
-        let k = sib_table.params.k;
-        let result_size = sib_table.params.bin_size();
-        let num_groups = query.keys.len().min(k);
-
-        let group_results: Vec<(Vec<Vec<u8>>, GroupTiming)> = (0..num_groups)
-            .into_par_iter()
-            .map(|b| {
-                let dpf_keys: Vec<DpfKey> = query.keys[b]
-                    .iter()
-                    .map(|k| DpfKey::from_bytes(k).expect("bad dpf key"))
-                    .collect();
-                let key_refs: Vec<&DpfKey> = dpf_keys.iter().collect();
-                let table_bytes = sib_table.group_bytes(b);
-                let (r, timing) = eval::process_merkle_sibling_group(
-                    &key_refs,
-                    table_bytes,
-                    sib_table.bins_per_table,
-                    result_size,
-                );
-                (r, timing)
-            })
-            .collect();
-
-        let mut total_dpf = Duration::ZERO;
-        let mut total_fetch = Duration::ZERO;
-        let mut results = Vec::with_capacity(num_groups);
-        for (r, t) in group_results {
-            total_dpf += t.dpf_eval;
-            total_fetch += t.fetch_xor;
-            results.push(r);
-        }
-
-        (
-            BatchResult {
-                level: 2,
                 round_id: query.round_id,
                 results,
             },

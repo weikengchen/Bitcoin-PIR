@@ -13,8 +13,11 @@ pub const REQ_PING: u8 = 0x00;
 pub const REQ_GET_INFO: u8 = 0x01;
 pub const REQ_INDEX_BATCH: u8 = 0x11;
 pub const REQ_CHUNK_BATCH: u8 = 0x21;
-pub const REQ_MERKLE_SIBLING_BATCH: u8 = 0x31;
-pub const REQ_MERKLE_TREE_TOP: u8 = 0x32;
+// 0x31 (REQ_MERKLE_SIBLING_BATCH) and 0x32 (REQ_MERKLE_TREE_TOP) are
+// RETIRED. They served the legacy global N-ary tree Merkle, superseded by
+// the per-bucket bin Merkle (0x33/0x34). Do not reuse these opcode values:
+// pre-removal clients may still probe them, and the OnionPIR codes were
+// deliberately placed at 0x50+ to avoid this range (see runtime/onionpir.rs).
 pub const REQ_BUCKET_MERKLE_SIB_BATCH: u8 = 0x33;
 pub const REQ_BUCKET_MERKLE_TREE_TOPS: u8 = 0x34;
 
@@ -164,8 +167,7 @@ pub const RESP_ADMIN_DB_UPLOAD_FINALIZE: u8 = 0x84;
 pub const RESP_ADMIN_DB_ACTIVATE: u8 = 0x85;
 pub const RESP_INDEX_BATCH: u8 = 0x11;
 pub const RESP_CHUNK_BATCH: u8 = 0x21;
-pub const RESP_MERKLE_SIBLING_BATCH: u8 = 0x31;
-pub const RESP_MERKLE_TREE_TOP: u8 = 0x32;
+// 0x31 / 0x32 RETIRED (legacy N-ary tree Merkle) — see REQ section above.
 pub const RESP_BUCKET_MERKLE_SIB_BATCH: u8 = 0x33;
 pub const RESP_BUCKET_MERKLE_TREE_TOPS: u8 = 0x34;
 pub const RESP_RESIDENCY: u8 = 0x04;
@@ -382,7 +384,6 @@ pub enum Request {
     },
     IndexBatch(BatchQuery),
     ChunkBatch(BatchQuery),
-    MerkleSiblingBatch(BatchQuery),
     BucketMerkleSibBatch(BatchQuery),
     HarmonyGetInfo,
     HarmonyHints(HarmonyHintRequest),
@@ -584,7 +585,6 @@ pub enum Response {
     AdminDbActivate(AdminAck),
     IndexBatch(BatchResult),
     ChunkBatch(BatchResult),
-    MerkleSiblingBatch(BatchResult),
     BucketMerkleSibBatch(BatchResult),
     Error(String),
     HarmonyInfo(ServerInfo),
@@ -656,10 +656,6 @@ impl Request {
             }
             Request::ChunkBatch(q) => {
                 payload.push(REQ_CHUNK_BATCH);
-                encode_batch_query(&mut payload, q);
-            }
-            Request::MerkleSiblingBatch(q) => {
-                payload.push(REQ_MERKLE_SIBLING_BATCH);
                 encode_batch_query(&mut payload, q);
             }
             Request::BucketMerkleSibBatch(q) => {
@@ -820,10 +816,6 @@ impl Request {
                 let q = decode_batch_query(&data[1..])?;
                 Ok(Request::ChunkBatch(q))
             }
-            REQ_MERKLE_SIBLING_BATCH => {
-                let q = decode_batch_query(&data[1..])?;
-                Ok(Request::MerkleSiblingBatch(q))
-            }
             REQ_BUCKET_MERKLE_SIB_BATCH => {
                 let q = decode_batch_query(&data[1..])?;
                 Ok(Request::BucketMerkleSibBatch(q))
@@ -922,10 +914,6 @@ impl Response {
             }
             Response::ChunkBatch(r) => {
                 payload.push(RESP_CHUNK_BATCH);
-                encode_batch_result(&mut payload, r);
-            }
-            Response::MerkleSiblingBatch(r) => {
-                payload.push(RESP_MERKLE_SIBLING_BATCH);
                 encode_batch_result(&mut payload, r);
             }
             Response::BucketMerkleSibBatch(r) => {
@@ -1078,10 +1066,6 @@ impl Response {
             RESP_CHUNK_BATCH => {
                 let r = decode_batch_result(&data[1..])?;
                 Ok(Response::ChunkBatch(r))
-            }
-            RESP_MERKLE_SIBLING_BATCH => {
-                let r = decode_batch_result(&data[1..])?;
-                Ok(Response::MerkleSiblingBatch(r))
             }
             RESP_BUCKET_MERKLE_SIB_BATCH => {
                 let r = decode_batch_result(&data[1..])?;
