@@ -15,6 +15,13 @@ export interface OnionPirInfoJson {
   index_bins_per_table: number;
   chunk_bins_per_table: number;
   tag_seed: bigint;
+  /**
+   * INDEX/CHUNK cuckoo master seeds (chain-derived for v2 DBs). `0n`
+   * when the server doesn't emit them (pre-ext server) — the client
+   * then keeps its legacy-constant default.
+   */
+  index_master_seed: bigint;
+  chunk_master_seed: bigint;
   index_k: number;
   chunk_k: number;
   index_slots_per_bin: number;
@@ -181,6 +188,8 @@ export function parseServerInfoJson(jsonStr: string): ServerInfoJson {
       index_bins_per_table: raw.onionpir.index_bins_per_table,
       chunk_bins_per_table: raw.onionpir.chunk_bins_per_table,
       tag_seed: BigInt(raw.onionpir.tag_seed),
+      index_master_seed: raw.onionpir.index_master_seed != null ? BigInt(raw.onionpir.index_master_seed) : 0n,
+      chunk_master_seed: raw.onionpir.chunk_master_seed != null ? BigInt(raw.onionpir.chunk_master_seed) : 0n,
       index_k: raw.onionpir.index_k,
       chunk_k: raw.onionpir.chunk_k,
       index_slots_per_bin: raw.onionpir.index_slots_per_bin,
@@ -210,6 +219,8 @@ export function parseServerInfoJson(jsonStr: string): ServerInfoJson {
     index_bins_per_table: op.index_bins_per_table,
     chunk_bins_per_table: op.chunk_bins_per_table,
     tag_seed: BigInt(op.tag_seed),
+    index_master_seed: op.index_master_seed != null ? BigInt(op.index_master_seed) : 0n,
+    chunk_master_seed: op.chunk_master_seed != null ? BigInt(op.chunk_master_seed) : 0n,
     index_k: op.index_k,
     chunk_k: op.chunk_k,
     index_slots_per_bin: op.index_slots_per_bin,

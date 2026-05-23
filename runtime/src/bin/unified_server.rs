@@ -327,6 +327,9 @@ struct OnionChunkHeader {
     k_chunk: usize,
     bins_per_table: usize,
     num_packed_entries: usize,
+    /// CHUNK cuckoo master seed (chain-derived for v2 DBs). Layout:
+    /// magic(8) k_chunk(4) cuckoo_hashes(4) bins(4) master_seed(8) ...
+    master_seed: u64,
 }
 
 fn read_onion_chunk_header(data: &[u8]) -> OnionChunkHeader {
@@ -337,6 +340,7 @@ fn read_onion_chunk_header(data: &[u8]) -> OnionChunkHeader {
     OnionChunkHeader {
         k_chunk: u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize,
         bins_per_table: u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize,
+        master_seed: u64::from_le_bytes(data[20..28].try_into().unwrap()),
         num_packed_entries: u32::from_le_bytes(data[28..32].try_into().unwrap()) as usize,
     }
 }
@@ -347,6 +351,9 @@ struct OnionIndexMeta {
     slots_per_bin: usize,
     tag_seed: u64,
     slot_size: usize,
+    /// INDEX cuckoo master seed (chain-derived for v2 DBs). Layout:
+    /// magic(8) k(4) cuckoo_hashes(4) slots_per_bin(4) bins(4) master_seed(8) tag_seed(8) slot_size(4)
+    master_seed: u64,
 }
 
 fn read_onion_index_meta(data: &[u8]) -> OnionIndexMeta {
@@ -356,6 +363,7 @@ fn read_onion_index_meta(data: &[u8]) -> OnionIndexMeta {
         k: u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize,
         bins_per_table: u32::from_le_bytes(data[20..24].try_into().unwrap()) as usize,
         slots_per_bin: u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize,
+        master_seed: u64::from_le_bytes(data[24..32].try_into().unwrap()),
         tag_seed: u64::from_le_bytes(data[32..40].try_into().unwrap()),
         slot_size: u32::from_le_bytes(data[40..44].try_into().unwrap()) as usize,
     }
@@ -624,6 +632,11 @@ struct OnionPirInfo {
     tag_seed: u64,
     index_slots_per_bin: u16,
     index_slot_size: u8,
+    /// INDEX/CHUNK cuckoo master seeds (chain-derived for v2 DBs),
+    /// delivered to the standalone OnionPIR TS client so it computes
+    /// placements with the server's seed instead of a hardcoded const.
+    index_master_seed: u64,
+    chunk_master_seed: u64,
 }
 
 impl UnifiedServerData {
@@ -681,9 +694,10 @@ impl UnifiedServerData {
 
         if let Some(Some(ref opi)) = self.onionpir_infos.first() {
             json.push_str(&format!(
-                r#","onionpir":{{"total_packed_entries":{},"index_bins_per_table":{},"chunk_bins_per_table":{},"tag_seed":"0x{:016x}","index_k":{},"chunk_k":{},"index_slots_per_bin":{},"index_slot_size":{},"chunk_slots_per_bin":1,"chunk_slot_size":{}}}"#,
+                r#","onionpir":{{"total_packed_entries":{},"index_bins_per_table":{},"chunk_bins_per_table":{},"tag_seed":"0x{:016x}","index_master_seed":"0x{:016x}","chunk_master_seed":"0x{:016x}","index_k":{},"chunk_k":{},"index_slots_per_bin":{},"index_slot_size":{},"chunk_slots_per_bin":1,"chunk_slot_size":{}}}"#,
                 opi.total_packed_entries, opi.index_bins_per_table, opi.chunk_bins_per_table,
-                opi.tag_seed, opi.index_k, opi.chunk_k,
+                opi.tag_seed, opi.index_master_seed, opi.chunk_master_seed,
+                opi.index_k, opi.chunk_k,
                 opi.index_slots_per_bin, opi.index_slot_size,
                 3840, // PACKED_ENTRY_SIZE = 3.75KB fixed bin size for OnionPIR chunks
             ));
@@ -1757,6 +1771,8 @@ async fn main() {
                 tag_seed: im.tag_seed,
                 index_slots_per_bin: im.slots_per_bin as u16,
                 index_slot_size: im.slot_size as u8,
+                index_master_seed: im.master_seed,
+                chunk_master_seed: ch.master_seed,
             });
 
             // Parse chunk cuckoo tables

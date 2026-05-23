@@ -854,6 +854,10 @@ export class OnionPirWebClient {
     this.indexBins = opi.index_bins_per_table;
     this.chunkBins = opi.chunk_bins_per_table;
     this.tagSeed = opi.tag_seed;
+    // Chain-derived cuckoo seeds (0n from a pre-ext server → keep the
+    // legacy-constant defaults the fields were initialised with).
+    if (opi.index_master_seed) this.indexMasterSeed = opi.index_master_seed;
+    if (opi.chunk_master_seed) this.chunkMasterSeed = opi.chunk_master_seed;
     this.totalPacked = opi.total_packed_entries;
     this.indexSlotsPerBin = opi.index_slots_per_bin;
     this.indexSlotSize = opi.index_slot_size;
@@ -973,6 +977,9 @@ export class OnionPirWebClient {
       this.indexBins = info.index_bins_per_table;
       this.chunkBins = info.chunk_bins_per_table;
       this.tagSeed = info.tag_seed;
+      // No-OnionPIR fallback path: the main ServerInfoJson carries no
+      // onion master seeds, so the cuckoo-seed fields keep their legacy
+      // defaults (this path doesn't actually serve onion queries).
       this.totalPacked = 0;
       this.indexSlotsPerBin = info.index_slots_per_bin;
       this.indexSlotSize = info.index_slot_size;
