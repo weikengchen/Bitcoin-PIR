@@ -8,21 +8,30 @@ use crate::manifest::{hex_encode, DbManifest};
 use memmap2::Mmap;
 use pir_core::merkle::Hash256;
 use pir_core::params::{
-    TableParams, CHUNK_CUCKOO_FILE, CHUNK_SIZE, CHUNK_SLOTS_PER_BIN, CUCKOO_FILE, HEADER_SIZE,
-    INDEX_SLOTS_PER_BIN, INDEX_SLOT_SIZE, MAGIC,
+    TableParams, CHUNK_CUCKOO_FILE, CHUNK_PARAMS, CHUNK_SIZE, CHUNK_SLOTS_PER_BIN, CUCKOO_FILE,
+    INDEX_PARAMS, INDEX_SLOTS_PER_BIN, INDEX_SLOT_SIZE,
 };
 use std::fs::File;
 use std::path::Path;
 
 // Wrappers kept local (moved from the ex-`build::common`) so table.rs's
 // call sites stay readable — `read_cuckoo_header(bytes)` vs the full
-// pir-core signature with four arguments.
+// pir-core signature.
+//
+// Phase C: both accept legacy MAGIC (no anchor) AND v2 MAGIC (anchor
+// appended). The anchor itself is discarded by these signatures —
+// callers that need it should use
+// `pir_core::cuckoo::read_cuckoo_header_with_anchor` directly.
 fn read_cuckoo_header(data: &[u8]) -> (usize, u64) {
-    pir_core::hash::read_cuckoo_header(data, MAGIC, HEADER_SIZE, true)
+    let h = pir_core::cuckoo::read_cuckoo_header_with_anchor(data, &INDEX_PARAMS)
+        .expect("INDEX cuckoo header parse");
+    (h.bins_per_table, h.tag_seed)
 }
 
 fn read_chunk_cuckoo_header(data: &[u8]) -> usize {
-    pir_core::hash::read_chunk_cuckoo_header(data)
+    let h = pir_core::cuckoo::read_cuckoo_header_with_anchor(data, &CHUNK_PARAMS)
+        .expect("CHUNK cuckoo header parse");
+    h.bins_per_table
 }
 
 // ─── New generic types ─────────────────────────────────────────────────────
@@ -48,12 +57,13 @@ impl MappedSubTable {
         let f = File::open(path).unwrap_or_else(|e| panic!("open {}: {}", path.display(), e));
         let mmap = unsafe { Mmap::map(&f) }.unwrap_or_else(|e| panic!("mmap {}: {}", path.display(), e));
 
-        let (bins_per_table, tag_seed) = pir_core::hash::read_cuckoo_header(
-            &mmap,
-            params.magic,
-            params.header_size,
-            params.has_tag_seed,
-        );
+        // Phase C: accept legacy MAGIC and v2 MAGIC variants (snapshot/delta
+        // anchor appended). Caller already validates the file via the
+        // pir-core header parser; this only extracts bins_per_table + tag_seed.
+        let parsed = pir_core::cuckoo::read_cuckoo_header_with_anchor(&mmap, &params)
+            .unwrap_or_else(|e| panic!("cuckoo header parse {}: {}", path.display(), e));
+        let bins_per_table = parsed.bins_per_table;
+        let tag_seed = parsed.tag_seed;
         let table_byte_size = params.table_byte_size(bins_per_table);
 
         println!(
