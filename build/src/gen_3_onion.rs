@@ -52,6 +52,36 @@ const DEFAULT_INDEX_ALL_FILE: &str = "/Volumes/Bitcoin/data/onion_index_all.bin"
 const ONION_INDEX_ALL_MAGIC: u64 = 0xBA7C_0010_0000_0003;
 const ONION_INDEX_ALL_HEADER_BYTES: usize = 32; // 4 * u64
 
+/// Master-file magic for `onion_index_all.bin`, XOR'd with the v2
+/// snapshot/delta marker when a chain anchor is present (same scheme as
+/// every other BitcoinPIR file). The anchor itself is appended as a
+/// trailer AFTER the K per-group payloads (so per-group offsets are
+/// unchanged); see [`write_onion_index_all_anchor_trailer`].
+fn onion_index_all_magic(anchor: Option<&HeaderAnchor>) -> u64 {
+    match anchor {
+        None => ONION_INDEX_ALL_MAGIC,
+        Some(HeaderAnchor::Snapshot(_)) => ONION_INDEX_ALL_MAGIC ^ ANCHOR_MAGIC_SNAPSHOT_XOR,
+        Some(HeaderAnchor::Delta(_)) => ONION_INDEX_ALL_MAGIC ^ ANCHOR_MAGIC_DELTA_XOR,
+    }
+}
+
+/// Bytes the anchor trailer adds to `onion_index_all.bin` (0 / 36 / 72).
+fn onion_index_all_anchor_len(anchor: Option<&HeaderAnchor>) -> usize {
+    match anchor {
+        None => 0,
+        Some(HeaderAnchor::Snapshot(_)) => pir_core::seeds::CHAIN_ANCHOR_BYTES,
+        Some(HeaderAnchor::Delta(_)) => pir_core::seeds::DELTA_ANCHOR_BYTES,
+    }
+}
+
+fn write_onion_index_all_anchor_trailer<W: Write>(w: &mut W, anchor: Option<&HeaderAnchor>) {
+    match anchor {
+        None => {}
+        Some(HeaderAnchor::Snapshot(c)) => w.write_all(&c.to_bytes()).unwrap(),
+        Some(HeaderAnchor::Delta(d)) => w.write_all(&d.to_bytes()).unwrap(),
+    }
+}
+
 /// Paths resolved from optional `--data-dir <D>` argument.
 struct GenPaths {
     index_file: String,
@@ -530,7 +560,8 @@ fn consolidate_only_main(
         format_bytes(per_group_bytes as u64),
     );
 
-    let total_bytes = ONION_INDEX_ALL_HEADER_BYTES + k_found * per_group_bytes;
+    let total_bytes = ONION_INDEX_ALL_HEADER_BYTES + k_found * per_group_bytes
+        + onion_index_all_anchor_len(index_anchor());
     println!(
         "[consolidate-only] Total output: {} bytes ({})",
         total_bytes,
@@ -540,8 +571,8 @@ fn consolidate_only_main(
     let out = File::create(index_all_file).expect("create onion_index_all.bin");
     let mut w = BufWriter::with_capacity(16 * 1024 * 1024, out);
 
-    // Master header (32 bytes)
-    w.write_all(&ONION_INDEX_ALL_MAGIC.to_le_bytes()).unwrap();
+    // Master header (32 bytes); magic gains the v2 marker when anchored.
+    w.write_all(&onion_index_all_magic(index_anchor()).to_le_bytes()).unwrap();
     w.write_all(&(k_found as u64).to_le_bytes()).unwrap();
     w.write_all(&(per_group_bytes as u64).to_le_bytes()).unwrap();
     w.write_all(&0u64.to_le_bytes()).unwrap();
@@ -564,6 +595,7 @@ fn consolidate_only_main(
         }
     }
     eprintln!();
+    write_onion_index_all_anchor_trailer(&mut w, index_anchor());
     w.flush().unwrap();
     drop(w);
 
@@ -1004,14 +1036,15 @@ fn main() {
             .len() as usize;
         println!("  Per-group bytes: {} ({})", per_group_bytes, format_bytes(per_group_bytes as u64));
 
-        let total_bytes = ONION_INDEX_ALL_HEADER_BYTES + K * per_group_bytes;
+        let total_bytes = ONION_INDEX_ALL_HEADER_BYTES + K * per_group_bytes
+            + onion_index_all_anchor_len(index_anchor());
         println!("  Total output:    {} ({})", total_bytes, format_bytes(total_bytes as u64));
 
         let out = File::create(index_all_file).expect("create onion_index_all.bin");
         let mut w = BufWriter::with_capacity(16 * 1024 * 1024, out);
 
-        // Master header (32 bytes)
-        w.write_all(&ONION_INDEX_ALL_MAGIC.to_le_bytes()).unwrap();
+        // Master header (32 bytes); magic gains the v2 marker when anchored.
+        w.write_all(&onion_index_all_magic(index_anchor()).to_le_bytes()).unwrap();
         w.write_all(&(K as u64).to_le_bytes()).unwrap();
         w.write_all(&(per_group_bytes as u64).to_le_bytes()).unwrap();
         w.write_all(&0u64.to_le_bytes()).unwrap();
@@ -1036,6 +1069,7 @@ fn main() {
             }
         }
         eprintln!();
+        write_onion_index_all_anchor_trailer(&mut w, index_anchor());
         w.flush().unwrap();
         drop(w);
 

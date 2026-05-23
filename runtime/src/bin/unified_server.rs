@@ -323,6 +323,75 @@ fn check_onion_magic(magic: u64, legacy: u64, file_label: &str) -> u64 {
     }
 }
 
+/// Parse the chain anchor appended after an onion file's `header_size`-byte
+/// legacy header, when the magic indicates a v2 (snapshot/delta) layout.
+/// `None` for a legacy (pre-anchor) file.
+fn parse_onion_anchor(
+    data: &[u8],
+    legacy_magic: u64,
+    header_size: usize,
+) -> Option<pir_core::cuckoo::HeaderAnchor> {
+    use pir_core::seeds::{ChainAnchor, DeltaAnchor, CHAIN_ANCHOR_BYTES, DELTA_ANCHOR_BYTES};
+    let magic = u64::from_le_bytes(data[0..8].try_into().unwrap());
+    if magic == legacy_magic ^ ONION_MAGIC_SNAPSHOT_XOR {
+        let end = header_size + CHAIN_ANCHOR_BYTES;
+        ChainAnchor::from_bytes(data.get(header_size..end)?)
+            .ok()
+            .map(pir_core::cuckoo::HeaderAnchor::Snapshot)
+    } else if magic == legacy_magic ^ ONION_MAGIC_DELTA_XOR {
+        let end = header_size + DELTA_ANCHOR_BYTES;
+        DeltaAnchor::from_bytes(data.get(header_size..end)?)
+            .ok()
+            .map(pir_core::cuckoo::HeaderAnchor::Delta)
+    } else {
+        None
+    }
+}
+
+/// Self-verify that the onion INDEX/CHUNK seeds were honestly derived
+/// from the embedded chain anchor. Panics (refuse-to-serve) on mismatch;
+/// no-op for a legacy (anchor-less) onion DB. Mirrors the DPF/HarmonyPIR
+/// `MappedSubTable::verify_anchor_consistency` defense-in-depth check.
+fn verify_onion_anchor_seeds(
+    anchor: &pir_core::cuckoo::HeaderAnchor,
+    im_master: u64,
+    im_tag: u64,
+    ch_master: u64,
+    label: &str,
+) {
+    fn check<C: pir_core::seeds::SeedContext>(
+        a: &C,
+        im_master: u64,
+        im_tag: u64,
+        ch_master: u64,
+        label: &str,
+    ) {
+        use pir_core::seeds::{derive_seed_u64, domain};
+        let dm = derive_seed_u64(domain::INDEX_CUCKOO_MASTER, a);
+        assert_eq!(
+            dm, im_master,
+            "[anchor] {} onion INDEX master_seed mismatch: derived 0x{:016x} vs header 0x{:016x} — refusing to serve",
+            label, dm, im_master
+        );
+        let dt = derive_seed_u64(domain::INDEX_TAG_FINGERPRINT, a);
+        assert_eq!(
+            dt, im_tag,
+            "[anchor] {} onion INDEX tag_seed mismatch — refusing to serve",
+            label
+        );
+        let dc = derive_seed_u64(domain::CHUNK_CUCKOO_MASTER, a);
+        assert_eq!(
+            dc, ch_master,
+            "[anchor] {} onion CHUNK master_seed mismatch — refusing to serve",
+            label
+        );
+    }
+    match anchor {
+        pir_core::cuckoo::HeaderAnchor::Snapshot(a) => check(a, im_master, im_tag, ch_master, label),
+        pir_core::cuckoo::HeaderAnchor::Delta(a) => check(a, im_master, im_tag, ch_master, label),
+    }
+}
+
 struct OnionChunkHeader {
     k_chunk: usize,
     bins_per_table: usize,
@@ -354,7 +423,12 @@ struct OnionIndexMeta {
     /// INDEX cuckoo master seed (chain-derived for v2 DBs). Layout:
     /// magic(8) k(4) cuckoo_hashes(4) slots_per_bin(4) bins(4) master_seed(8) tag_seed(8) slot_size(4)
     master_seed: u64,
+    /// Chain anchor appended after the 44-byte legacy header in v2 files.
+    anchor: Option<pir_core::cuckoo::HeaderAnchor>,
 }
+
+/// Legacy (pre-anchor) byte size of the onion index meta header.
+const ONION_INDEX_META_HEADER_BYTES: usize = 44;
 
 fn read_onion_index_meta(data: &[u8]) -> OnionIndexMeta {
     let magic = u64::from_le_bytes(data[0..8].try_into().unwrap());
@@ -366,6 +440,7 @@ fn read_onion_index_meta(data: &[u8]) -> OnionIndexMeta {
         master_seed: u64::from_le_bytes(data[24..32].try_into().unwrap()),
         tag_seed: u64::from_le_bytes(data[32..40].try_into().unwrap()),
         slot_size: u32::from_le_bytes(data[40..44].try_into().unwrap()) as usize,
+        anchor: parse_onion_anchor(data, ONION_INDEX_META_MAGIC, ONION_INDEX_META_HEADER_BYTES),
     }
 }
 
@@ -1762,6 +1837,13 @@ async fn main() {
             println!("  Chunk: K={}, bins={}, packed={}", ch.k_chunk, ch.bins_per_table, ch.num_packed_entries);
             println!("  Index: K={}, bins={}, slots_per_bin={}", im.k, im.bins_per_table, im.slots_per_bin);
 
+            // Phase: self-verify onion seeds against the chain anchor embedded
+            // in onion_index_meta.bin (v2 header). No-op for legacy onion DBs.
+            if let Some(anchor) = im.anchor {
+                verify_onion_anchor_seeds(&anchor, im.master_seed, im.tag_seed, ch.master_seed, db_label);
+                println!("  anchor verified: onion INDEX/CHUNK seeds match chain-derived values");
+            }
+
             onionpir_infos[*db_id as usize] = Some(OnionPirInfo {
                 total_packed_entries: ch.num_packed_entries as u32,
                 index_bins_per_table: im.bins_per_table as u32,
@@ -1818,22 +1900,43 @@ async fn main() {
                 let magic = u64::from_le_bytes(index_all_mmap[0..8].try_into().unwrap());
                 let file_k = u64::from_le_bytes(index_all_mmap[8..16].try_into().unwrap()) as usize;
                 let file_per_group = u64::from_le_bytes(index_all_mmap[16..24].try_into().unwrap()) as usize;
-                assert_eq!(
-                    magic, ONION_INDEX_ALL_MAGIC,
-                    "{}: bad master magic (expected {:#x}, got {:#x})",
-                    index_all_path.display(), ONION_INDEX_ALL_MAGIC, magic,
-                );
+                // Accept legacy + v2 (anchor trailer) magic.
+                let _ = check_onion_magic(magic, ONION_INDEX_ALL_MAGIC, "onion index-all master");
                 assert_eq!(
                     file_k, im.k,
                     "{}: K mismatch (file says {}, meta says {})",
                     index_all_path.display(), file_k, im.k,
                 );
-                let expected_len = ONION_INDEX_ALL_HEADER_BYTES + file_k * file_per_group;
+                // The K per-group payloads occupy [HEADER .. HEADER + K*per_group);
+                // a v2 file then appends the chain anchor as a trailer.
+                let data_len = ONION_INDEX_ALL_HEADER_BYTES + file_k * file_per_group;
+                let all_anchor =
+                    parse_onion_anchor(&index_all_mmap, ONION_INDEX_ALL_MAGIC, data_len);
+                let expected_len = data_len
+                    + match all_anchor {
+                        None => 0,
+                        Some(pir_core::cuckoo::HeaderAnchor::Snapshot(_)) => {
+                            pir_core::seeds::CHAIN_ANCHOR_BYTES
+                        }
+                        Some(pir_core::cuckoo::HeaderAnchor::Delta(_)) => {
+                            pir_core::seeds::DELTA_ANCHOR_BYTES
+                        }
+                    };
                 assert_eq!(
                     index_all_mmap.len(), expected_len,
                     "{}: total size mismatch (expected {}, got {})",
                     index_all_path.display(), expected_len, index_all_mmap.len(),
                 );
+                // Cross-file consistency: onion_index_all's trailer anchor must
+                // match the one embedded in onion_index_meta.bin — catches a
+                // mixed build where the two files came from different anchors.
+                if let (Some(a), Some(m)) = (all_anchor, im.anchor) {
+                    assert_eq!(
+                        a, m,
+                        "{}: index-all anchor disagrees with index-meta anchor — mixed build, refusing to serve",
+                        index_all_path.display(),
+                    );
+                }
                 println!(
                     "  Index-all: K={}, per_group={:.2} MB, total={:.2} MB",
                     file_k,
