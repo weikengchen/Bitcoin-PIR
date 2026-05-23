@@ -1,0 +1,78 @@
+name: Build Reproducibility
+
+# Hermetic cross-build determinism gate for the chain-derived-seed
+# reproducibility guarantee (docs/BUILD_REPRODUCIBILITY.md).
+#
+# `pir-core/tests/cross_build_determinism.rs` builds a small synthetic
+# UTXO fixture through the real INDEX/CHUNK cuckoo primitives twice at a
+# fixed ChainAnchor and asserts the serialized bytes are identical, plus
+# that a different anchor reshuffles the body (the chain-derived seed
+# actually drives placement). A regression here means two honest
+# operators building from the same dumptxoutset at the same anchor would
+# diverge — i.e. a third party could no longer mirror/verify the database
+# byte-for-byte.
+#
+# This job is intentionally separate from pir-sdk-integration.yml: that
+# workflow hits live production servers (needs network + secrets), whereas
+# this one is fully hermetic and must stay fast — it only compiles the
+# lightweight `pir-core` crate (no SEAL/onionpir), so a determinism break
+# surfaces as its own isolated red check within seconds.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'pir-core/**'
+      - '.github/workflows/build-determinism.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'pir-core/**'
+      - '.github/workflows/build-determinism.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-determinism:
+    name: pir-core cross-build determinism
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo registry + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-pir-core-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-pir-core-
+
+      # Headline gate: the fixture cross-build determinism + anchor-
+      # sensitivity suite. Run it explicitly first so a reproducibility
+      # regression is the obvious failure, not buried in the full suite.
+      - name: Cross-build determinism fixture
+        run: cargo test -p pir-core --test cross_build_determinism -- --nocapture
+
+      # Full pir-core unit suite (seeds, cuckoo, hash, merkle, codec) —
+      # all hermetic, gives pir-core its own coverage gate on PRs that
+      # touch it.
+      - name: pir-core unit tests
+        run: cargo test -p pir-core
+
+      - name: Clippy (pir-core, incl. tests)
+        run: cargo clippy -p pir-core --tests -- -D warnings
