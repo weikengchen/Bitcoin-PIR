@@ -48,6 +48,13 @@ pub struct MappedSubTable {
     pub table_byte_size: usize,
     /// Tag seed from header (0 if the table has no tag seed).
     pub tag_seed: u64,
+    /// Master cuckoo seed as read from the file header (the real on-disk
+    /// value — `params.master_seed` is only a sentinel post-Phase-B).
+    pub master_seed: u64,
+    /// Chain anchor embedded in a Phase-C v2 header, if present. `None`
+    /// for legacy (pre-anchor) databases. Surfaced so the load path can
+    /// self-verify the seeds against it (see `verify_anchor_consistency`).
+    pub anchor: Option<pir_core::cuckoo::HeaderAnchor>,
 }
 
 impl MappedSubTable {
@@ -64,6 +71,8 @@ impl MappedSubTable {
             .unwrap_or_else(|e| panic!("cuckoo header parse {}: {}", path.display(), e));
         let bins_per_table = parsed.bins_per_table;
         let tag_seed = parsed.tag_seed;
+        let master_seed = parsed.master_seed;
+        let anchor = parsed.anchor;
         let table_byte_size = params.table_byte_size(bins_per_table);
 
         println!(
@@ -85,13 +94,60 @@ impl MappedSubTable {
             }
         }
 
-        MappedSubTable { mmap, params, bins_per_table, table_byte_size, tag_seed }
+        MappedSubTable { mmap, params, bins_per_table, table_byte_size, tag_seed, master_seed, anchor }
     }
 
     /// Get the byte slice for a specific group's sub-table.
     pub fn group_bytes(&self, group_id: usize) -> &[u8] {
         let offset = self.params.header_size + group_id * self.table_byte_size;
         &self.mmap[offset..offset + self.table_byte_size]
+    }
+
+    /// Self-verify that this table's header seeds were honestly derived
+    /// from its embedded chain anchor (Phase C).
+    ///
+    /// When the file carries a v2 anchor, recompute the expected master
+    /// (and, for INDEX, tag) seed from `(block_hash, height)` and assert
+    /// they equal the on-disk seeds. A mismatch means the database was
+    /// not built at the anchor it claims — a build bug, corruption, or
+    /// tampering — so we **panic and refuse to serve**. A no-op for
+    /// legacy (anchor-less) databases.
+    ///
+    /// Note: this proves internal consistency only. Defeating a *malicious*
+    /// operator (who could fabricate a matching anchor+seed pair) still
+    /// requires the client to check the anchor against an independent view
+    /// of the Bitcoin chain — see docs/BUILD_REPRODUCIBILITY.md.
+    pub fn verify_anchor_consistency(
+        &self,
+        label: &str,
+        master_domain: &str,
+        tag_domain: Option<&str>,
+    ) {
+        let Some(anchor) = self.anchor else { return };
+        let header = pir_core::cuckoo::CuckooHeader {
+            bins_per_table: self.bins_per_table,
+            master_seed: self.master_seed,
+            tag_seed: self.tag_seed,
+            anchor: Some(anchor),
+            header_size: 0, // unused by verify_anchor_seeds
+        };
+        match pir_core::cuckoo::verify_anchor_seeds(&header, master_domain, tag_domain) {
+            Ok(()) => {
+                let (kind, height) = match anchor {
+                    pir_core::cuckoo::HeaderAnchor::Snapshot(a) => ("snapshot", a.block_height),
+                    pir_core::cuckoo::HeaderAnchor::Delta(d) => ("delta→", d.to.block_height),
+                };
+                println!(
+                    "    {} anchor verified ({} height {}): on-disk seeds match chain-derived values",
+                    label, kind, height
+                );
+            }
+            Err(e) => panic!(
+                "[anchor] {} seed verification FAILED: {}. Database was not honestly \
+                 built at its embedded chain anchor — refusing to serve.",
+                label, e
+            ),
+        }
     }
 }
 
@@ -201,6 +257,31 @@ impl MappedDatabase {
             &base_dir.join("chunk_pir_cuckoo.bin"),
             descriptor.chunk_params.clone(),
         );
+
+        // Phase C: if the cuckoo files carry a v2 chain anchor, verify their
+        // header seeds were honestly derived from it before serving.
+        // Panics (refuses to serve) on mismatch; no-op for legacy DBs.
+        index.verify_anchor_consistency(
+            "INDEX",
+            pir_core::seeds::domain::INDEX_CUCKOO_MASTER,
+            Some(pir_core::seeds::domain::INDEX_TAG_FINGERPRINT),
+        );
+        chunk.verify_anchor_consistency(
+            "CHUNK",
+            pir_core::seeds::domain::CHUNK_CUCKOO_MASTER,
+            None,
+        );
+        // INDEX and CHUNK are built from the same chain anchor; a mismatch
+        // means a mixed/inconsistent build. Guard against it when both
+        // tables carry anchors.
+        if let (Some(ia), Some(ca)) = (index.anchor, chunk.anchor) {
+            assert_eq!(
+                ia, ca,
+                "[anchor] INDEX and CHUNK cuckoo files were built at different chain anchors \
+                 ({:?} vs {:?}) — refusing to serve a mixed database.",
+                ia, ca
+            );
+        }
 
         // Try to load Merkle sibling tables (DPF: _dpf suffix, then fallback to no suffix)
         let mut merkle_siblings = Vec::new();

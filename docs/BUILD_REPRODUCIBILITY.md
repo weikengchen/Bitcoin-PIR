@@ -187,42 +187,63 @@ more entropy (e.g., future FHE-layer pre-randomization).
 - [x] **`doc/DEPLOYMENT.md` updated** with the operator workflow
       ("Reproducible database builds (Phase B / C)" section).
 
-### Phase C — deferred / followups
+### Phase C2 — landed
 
-1. **OnionPIR custom file headers** ([build/src/gen_2_onion.rs](../build/src/gen_2_onion.rs)
-   line 534, [build/src/gen_3_onion.rs](../build/src/gen_3_onion.rs)
-   line 714) embed the master seed in *bespoke* file layouts
-   (`magic 0xBA7C_0010_0000_0001 / _0002 / _0003`), not via
-   `cuckoo::write_header`. Extending these to also carry the chain
-   anchor is analogous (XOR the magic with the same snapshot/delta
-   marker, append 36/72 bytes) but requires updating the matching
-   readers in [runtime/src/bin/unified_server.rs](../runtime/src/bin/unified_server.rs)
-   (`read_onion_chunk_header`, `read_onion_index_meta`). Tracked as
-   Phase C2.
-2. **Migrate legacy build/common.rs seed wrappers**
-   (`derive_cuckoo_key` / `derive_chunk_cuckoo_key`) and zero out
-   `INDEX_PARAMS.master_seed` / `CHUNK_PARAMS.master_seed` in
-   `params.rs`. ~8 diagnostic binaries
-   (`test_batch_pir`, `verify`, `verify_chunk_cuckoo`, `assign_queries`,
-   `assign_chunk_queries`, `test_chunk_pir`, `test_chunk_pir_batched`,
-   `cuckoo4_experiment`) currently compute cuckoo placements without
-   reading the file header. Each needs to switch to reading
-   `header.master_seed` instead of the const.
+- **OnionPIR custom file headers carry the anchor.**
+  [build/src/gen_2_onion.rs](../build/src/gen_2_onion.rs) (chunk cuckoo,
+  `0xBA7C_0010_0000_0001`) and [build/src/gen_3_onion.rs](../build/src/gen_3_onion.rs)
+  (index meta, `0xBA7C_0010_0000_0002`) XOR the same snapshot/delta
+  marker into their bespoke magics and append the 36/72-byte anchor.
+  [runtime/src/bin/unified_server.rs](../runtime/src/bin/unified_server.rs)
+  `read_onion_chunk_header` / `read_onion_index_meta` accept legacy + v2
+  via a shared `check_onion_magic` helper.
+- **Diagnostic binaries migrated off const seeds.** `build/common.rs`
+  legacy `derive_cuckoo_key` / `derive_chunk_cuckoo_key` wrappers
+  deleted; the ~7 diagnostic binaries read `header.master_seed` via the
+  new `read_cuckoo_header_full` / `read_chunk_cuckoo_header_full`.
+  `INDEX_PARAMS.master_seed` / `CHUNK_PARAMS.master_seed` zeroed to a
+  sentinel in `params.rs`.
+
+### Phase C3 — landed
+
+- **Server-side self-verification on load.**
+  [pir-runtime-core/src/table.rs](../pir-runtime-core/src/table.rs)
+  `MappedSubTable` now surfaces the header's `master_seed` + `anchor`;
+  `MappedDatabase::load` calls `verify_anchor_consistency` on the INDEX
+  and CHUNK tables — recomputing the seeds from the embedded anchor and
+  **panicking (refusing to serve)** on mismatch — plus an INDEX/CHUNK
+  anchor-equality guard. No-op for legacy (anchor-less) databases.
+  This proves *internal consistency* (catches build bugs / corruption /
+  tampering); it does **not** by itself defeat a malicious operator who
+  fabricates a matching anchor+seed pair — that needs the client check
+  below.
+
+### Remaining
+
+1. **Client-side verification wiring.** Clients (`pir-sdk-client`,
+   `pir-sdk-wasm`, the standalone TS OnionPIR client) still trust the
+   header seed. They should read the anchor from the v2 header (or the
+   attest response) and `verify_anchor_seeds(&header, domain, tag_domain)`,
+   refusing to query on mismatch. **Trust model (per project owner):**
+   the seed is a deterministic function of the anchor block-header hash,
+   so a client that can *see the block hash used* can recompute the seed
+   and confirm it matches; how the client independently confirms that
+   block hash is left open (Bitcoin light client, baked-in pin,
+   attestation `REPORT_DATA`, or multi-operator quorum — many viable
+   paths). The verifier code is trivial; the anchor-delivery channel is
+   the remaining design choice.
+2. **Build-side anchor coverage gaps.** The consolidated
+   `onion_index_all.bin` master header (`0xBA7C_0010_0000_0003`) does
+   not yet carry the anchor (only the chunk-cuckoo + index-meta files
+   do), and the Merkle sibling tables use fixed-base seeds
+   (`0xBA7C_51B1_… + level`) rather than chain-derived ones. Decide:
+   extend for consistency, or document the Merkle tables as exempt
+   (they are content-addressed hashes, not adversarial-placement seeds).
 3. **CI cross-build check.** GitHub Actions workflow that runs
    `./scripts/build_full.sh <snapshot> <height>` twice on clean
-   checkouts at the same `<height>`, then `sha256sum` -compares the
-   output cuckoo files. Currently no CI infrastructure pinned for
-   this; deferred until first multi-operator deployment.
-4. **Client-side verification wiring.** Clients (`pir-sdk-client`,
-   `pir-sdk-wasm`, the standalone TS OnionPIR client) currently
-   trust the cuckoo header's seed. Phase C3: read the anchor from
-   the v2 header, call `verify_anchor_seeds(&header, domain, tag_domain)`
-   on connect, refuse to query on mismatch. Requires the client to
-   independently obtain the expected chain anchor (from a Bitcoin
-   light client, a baked-in pin, or a multi-operator quorum) before
-   verification is meaningful — that piece is the bigger design
-   question, not the verifier code.
-5. **HarmonyPIR keys not affected** — query-time, client-derived;
+   checkouts at the same `<height>`, then `sha256sum`-compares the
+   output cuckoo files. Deferred until first multi-operator deployment.
+4. **HarmonyPIR keys not affected** — query-time, client-derived;
    no build-side seed.
 
 ## Wire format extension (Phase C)
