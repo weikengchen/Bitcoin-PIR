@@ -169,6 +169,11 @@ async fn handle_connection(stream: TcpStream, handler: Arc<RequestHandler>) -> P
 /// Builder for creating a PIR server.
 pub struct PirServerBuilder {
     config: ServerConfig,
+    /// Pre-encoded `pir_identity::AnnouncementBundle` bytes that
+    /// REQ_ANNOUNCE returns verbatim. `None` (the default) leaves the
+    /// server in "unannounced" mode (REQ_ANNOUNCE → RESP_ERROR). Build
+    /// the bytes with `pir_runtime_core::identity::build_announcement_bundle`.
+    announcement_bundle: Option<Vec<u8>>,
 }
 
 impl PirServerBuilder {
@@ -176,7 +181,18 @@ impl PirServerBuilder {
     pub fn new() -> Self {
         Self {
             config: ServerConfig::new(),
+            announcement_bundle: None,
         }
+    }
+
+    /// Supply the operator-signed announcement bundle served by
+    /// REQ_ANNOUNCE. Pass the pre-encoded
+    /// `pir_identity::AnnouncementBundle` bytes (build them with
+    /// `pir_runtime_core::identity::build_announcement_bundle`). `None`
+    /// keeps the server in unannounced mode.
+    pub fn with_announcement_bundle(mut self, bundle: Option<Vec<u8>>) -> Self {
+        self.announcement_bundle = bundle;
+        self
     }
 
     /// Load configuration from a TOML file.
@@ -264,7 +280,10 @@ impl PirServerBuilder {
 
         // Create request handler
         let catalog = loader.catalog().clone();
-        let handler = Arc::new(RequestHandler::new(loader.into_databases()));
+        let handler = Arc::new(
+            RequestHandler::new(loader.into_databases())
+                .with_announcement_bundle(self.announcement_bundle),
+        );
 
         // Bind listener
         let addr = format!("0.0.0.0:{}", self.config.port);

@@ -23,7 +23,7 @@
 //!   cargo run --release -p runtime --bin unified_server -- --port 8091 &
 //!   cargo run --release -p runtime --bin unified_server -- --port 8092 &
 
-use pir_sdk_client::{DpfClient, HarmonyClient, PirClient, ScriptHash};
+use pir_sdk_client::{DpfClient, HarmonyClient, PirClient, PirError, ScriptHash, WsConnection};
 
 /// Default to the public deployment so CI — and contributors who haven't
 /// stood up a fixture server — can exercise the full stack against
@@ -533,4 +533,86 @@ fn test_sync_plan_stale_height() {
 
     assert!(plan.is_fresh_sync);
     assert_eq!(plan.target_height, 920000);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// REQ_ANNOUNCE — operator-signed identity, end-to-end through unified_server.
+//
+// This is the only test that drives the *production* dispatch arm for
+// REQ_ANNOUNCE (the binary re-implements dispatch inline rather than going
+// through pir-runtime-core's stateless RequestHandler). It connects, sends
+// REQ_ANNOUNCE, parses the bundle, runs the in-bundle chain check, then
+// operator-pubkey pinning (accept the right key, reject a wrong one).
+//
+// Unlike the other integration tests it does NOT default to the public
+// deployment — pir1/pir2 run without --identity-* flags and answer
+// "announce not configured". Point it at a locally-booted server:
+//
+//   # operator workflow (once):
+//   bpir-admin generate-identity --purpose server   --out /tmp/s.key   # -> SERVER_PUB (stdout)
+//   bpir-admin generate-identity --purpose operator --out /tmp/op.key  # -> OPERATOR_PUB (stdout)
+//   bpir-admin sign-identity --operator-key-path /tmp/op.key --server-id pir-test \
+//       --identity-pubkey-hex <SERVER_PUB> --valid-until <unix-ts> --out /tmp/s.cert
+//   # boot (any local checkpoint works — announce is independent of the DB):
+//   unified_server --port 8097 --data-dir <ckpt> --serve-queries \
+//       --identity-key-path /tmp/s.key --identity-cert-path /tmp/s.cert \
+//       --identity-server-id pir-test
+//   # run:
+//   PIR_ANNOUNCE_URL=ws://127.0.0.1:8097 \
+//   PIR_ANNOUNCE_OPERATOR_PUB=<OPERATOR_PUB hex> \
+//     cargo test -p pir-sdk-client --test integration_test \
+//       test_announce_operator_identity_end_to_end -- --ignored --nocapture
+#[tokio::test]
+#[ignore = "requires a unified_server booted with --identity-* flags; see PIR_ANNOUNCE_* env vars"]
+async fn test_announce_operator_identity_end_to_end() {
+    use pir_sdk_client::announce::{announce, announce_with_pinned_operator};
+
+    let url = std::env::var("PIR_ANNOUNCE_URL")
+        .expect("set PIR_ANNOUNCE_URL to a unified_server booted with --identity-* flags");
+    let operator_pub = parse_pubkey_hex(
+        &std::env::var("PIR_ANNOUNCE_OPERATOR_PUB")
+            .expect("set PIR_ANNOUNCE_OPERATOR_PUB to the operator pubkey hex (64 chars)"),
+    );
+
+    // 1. Plain announce: the bundle decodes and the in-bundle chain check
+    //    (manifest signature + cert/manifest cross-references) passes.
+    let mut conn = WsConnection::connect(&url).await.expect("connect");
+    let v = announce(&mut conn).await.expect("announce roundtrip");
+    assert!(v.chain_verified, "chain check failed: {:?}", v.chain_error);
+    assert_eq!(v.bundle.cert.server_id, "pir-test");
+    assert_eq!(
+        v.bundle.cert.operator_pubkey, operator_pub,
+        "cert's operator_pubkey should match the pinned operator"
+    );
+
+    // 2. Pinned to the correct operator pubkey → accepted (cert signature
+    //    verifies under the pinned key and the chain check holds).
+    let v2 = announce_with_pinned_operator(&mut conn, &operator_pub, 0)
+        .await
+        .expect("pinned announce with the correct operator must succeed");
+    assert!(v2.chain_verified);
+
+    // 3. Pinned to a wrong operator pubkey → rejected before trusting anything.
+    let wrong = [0u8; 32];
+    let err = announce_with_pinned_operator(&mut conn, &wrong, 0)
+        .await
+        .expect_err("pinned announce with a wrong operator must fail");
+    match err {
+        PirError::Protocol(m) => assert!(
+            m.contains("does not match pinned operator"),
+            "unexpected error: {m}"
+        ),
+        other => panic!("expected Protocol(does not match pinned operator), got {other:?}"),
+    }
+}
+
+/// Parse a 64-char hex Ed25519 pubkey into 32 bytes (test helper).
+fn parse_pubkey_hex(s: &str) -> [u8; 32] {
+    let s = s.trim();
+    assert_eq!(s.len(), 64, "operator pubkey hex must be 64 chars, got {}", s.len());
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("invalid hex in operator pubkey");
+    }
+    out
 }

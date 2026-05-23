@@ -1312,6 +1312,24 @@ fn split_cert_chain_ask_then_ark(bytes: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     Some((first_block, second_block))
 }
 
+// ─── REQ_ANNOUNCE response builder ──────────────────────────────────────────
+//
+// Maps the startup-built `ServerState.announcement_bundle` to the wire
+// reply: `Some` → `RESP_ANNOUNCE` carrying the operator-signed bundle
+// verbatim; `None` → `RESP_ERROR` (the server was started without a
+// consistent identity key + operator cert). Extracted so the REQ_ANNOUNCE
+// dispatch arm and its unit test share one implementation — booting the
+// full binary needs a multi-GB checkpoint, so this is the closest seam
+// the production code path can be exercised at in-process.
+fn build_announce_response(announcement_bundle: &Option<Vec<u8>>) -> Response {
+    match announcement_bundle {
+        Some(bytes) => Response::Announce(bytes.clone()),
+        None => Response::Error(
+            "announce not configured: server lacks identity key or operator cert".into(),
+        ),
+    }
+}
+
 // ─── Encrypted-channel send helper ─────────────────────────────────────────
 //
 // Wraps the raw `sink.send(Message::Binary(...))` pattern so that, if a
@@ -3075,6 +3093,14 @@ async fn main() {
                             let _ = send_resp(&mut sink, channel_session.as_mut(), resp.encode()).await;
                         }
                     }
+                    REQ_ANNOUNCE => {
+                        // Operator-signed identity bundle, built at startup
+                        // into `ServerState.announcement_bundle` when the
+                        // --identity-* flags are set. `None` means the server
+                        // lacks an identity key / operator cert.
+                        let resp = build_announce_response(&server.state.announcement_bundle);
+                        let _ = send_resp(&mut sink, channel_session.as_mut(), resp.encode()).await;
+                    }
                     REQ_HANDSHAKE => {
                         // Encrypted-channel handshake. The reply MUST go out
                         // in cleartext — the client doesn't have the session
@@ -3851,5 +3877,57 @@ async fn main() {
 
             println!("[{}] Disconnected (id={})", peer, client_id);
         });
+    }
+}
+
+#[cfg(test)]
+mod announce_dispatch_tests {
+    //! Tests for the REQ_ANNOUNCE response builder used by the
+    //! production dispatch loop. The full per-connection match lives
+    //! inline in `main` and needs a multi-GB checkpoint to boot, so we
+    //! exercise the shared `build_announce_response` seam directly.
+    //! Routing (opcode 0x07 reaching this arm rather than the catch-all
+    //! "unsupported request" arm) is verified live by the operator-
+    //! identity end-to-end check, since it can only be observed against
+    //! a running binary.
+    use super::*;
+
+    #[test]
+    fn announce_response_configured_returns_bundle_verbatim() {
+        let bundle = vec![0xDEu8, 0xAD, 0xBE, 0xEF, 0x07];
+        match build_announce_response(&Some(bundle.clone())) {
+            Response::Announce(b) => assert_eq!(b, bundle),
+            other => panic!("expected Announce, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn announce_response_configured_wire_roundtrips_to_same_bundle() {
+        // The arm sends `resp.encode()` on the wire; a client decodes it
+        // back to identical bundle bytes — proving the dispatch arm emits
+        // a well-formed RESP_ANNOUNCE frame the SDK `announce()` parses.
+        let bundle = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        let wire = build_announce_response(&Some(bundle.clone())).encode();
+        // Wire layout: [u32 LE outer len][RESP_ANNOUNCE][u32 LE blen][bundle];
+        // `Response::decode` consumes everything after the outer length.
+        match Response::decode(&wire[4..]).expect("decode RESP_ANNOUNCE") {
+            Response::Announce(b) => assert_eq!(b, bundle),
+            other => panic!("expected Announce after round-trip, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn announce_response_unconfigured_returns_error() {
+        // None (server started without --identity-* flags, or with an
+        // inconsistent key/cert pair) must surface as RESP_ERROR carrying
+        // the documented "announce not configured" message — the client's
+        // `announce()` maps this to PirError::ServerError.
+        match build_announce_response(&None) {
+            Response::Error(msg) => assert!(
+                msg.contains("announce not configured"),
+                "unexpected error message: {msg}"
+            ),
+            other => panic!("expected Error, got {:?}", other),
+        }
     }
 }
