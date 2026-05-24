@@ -197,6 +197,8 @@ export const PIR1_PIN: ServerAttestPin = {
  *   3. replace the hex below + record provenance like the pins above.
  * Until then, callers should treat a passing operator-pin check as
  * dev-only and gate any "verified operator" UI on a real pin landing.
+ *
+ * Full operator runbook + client trust model: docs/OPERATOR_IDENTITY.md.
  */
 export const PIR_OPERATOR_PUBKEY_HEX =
   '47d98cb6483b2b027e4b08e516e26ce414ebb719421a591f66272f9c97bad562';
