@@ -818,6 +818,30 @@ impl WasmAnnounceVerification {
         hex_encode(&self.inner.bundle.manifest.channel_pub)
     }
 
+    /// Verify the bundle against a pinned operator pubkey: operator
+    /// pubkey match + the cert's operator **signature** (`cert.verify()`)
+    /// + validity window (skipped when `nowUnixSeconds == 0`) + the
+    /// in-bundle chain check. Throws on any failure or a non-32-byte
+    /// argument. A bare `operatorPubkeyHex` string-compare would miss
+    /// the signature check, so use this. Mirrors the Rust
+    /// `AnnounceVerification::check_pinned_operator`.
+    #[wasm_bindgen(js_name = checkPinnedOperator)]
+    pub fn check_pinned_operator(
+        &self,
+        pinned_operator_pubkey: &[u8],
+        now_unix_seconds: i64,
+    ) -> Result<(), JsError> {
+        let arr: [u8; 32] = pinned_operator_pubkey.try_into().map_err(|_| {
+            JsError::new(&format!(
+                "checkPinnedOperator: expected a 32-byte operator pubkey, got {} bytes",
+                pinned_operator_pubkey.len()
+            ))
+        })?;
+        self.inner
+            .check_pinned_operator(&arr, now_unix_seconds)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
     /// Bind the bundle to the encrypted session: verify that the
     /// manifest's `channelPub` equals the X25519 key the channel
     /// actually handshook against. Pass the *attested* key — i.e.

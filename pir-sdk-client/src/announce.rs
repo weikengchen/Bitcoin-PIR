@@ -66,6 +66,55 @@ pub struct AnnounceVerification {
 }
 
 impl AnnounceVerification {
+    /// Verify the already-fetched bundle is fully trustworthy under a
+    /// pinned operator pubkey. This is the synchronous core of
+    /// [`announce_with_pinned_operator`] (which is just `announce()` +
+    /// this), exposed so callers that already hold an
+    /// `AnnounceVerification` — e.g. the WASM client after
+    /// `WasmDpfClient.announce()` — can run the same check without a
+    /// second round-trip. Fails unless ALL hold:
+    /// - `cert.operator_pubkey == pinned_operator_pubkey`,
+    /// - the cert's operator signature verifies (`cert.verify()`) —
+    ///   note neither [`Self::chain_verified`] nor
+    ///   [`Self::check_channel_binding`] covers this, so a bare
+    ///   pubkey-equality compare would miss a forged cert signature,
+    /// - the cert is inside its validity window (skipped when
+    ///   `now_unix_seconds == 0`),
+    /// - the in-bundle chain check passed.
+    pub fn check_pinned_operator(
+        &self,
+        pinned_operator_pubkey: &[u8; 32],
+        now_unix_seconds: i64,
+    ) -> PirResult<()> {
+        if &self.bundle.cert.operator_pubkey != pinned_operator_pubkey {
+            return Err(PirError::Protocol(format!(
+                "announce: cert.operator_pubkey ({}) does not match pinned operator ({})",
+                short_hex(&self.bundle.cert.operator_pubkey),
+                short_hex(pinned_operator_pubkey),
+            )));
+        }
+        self.bundle
+            .cert
+            .verify()
+            .map_err(|e| PirError::Protocol(format!("announce: cert.verify failed: {}", e)))?;
+        if now_unix_seconds != 0 {
+            self.bundle
+                .cert
+                .check_validity(now_unix_seconds)
+                .map_err(|e| PirError::Protocol(format!("announce: cert outside validity: {}", e)))?;
+        }
+        if !self.chain_verified {
+            return Err(PirError::Protocol(format!(
+                "announce: chain check failed: {}",
+                self.chain_error
+                    .as_ref()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "unknown".into())
+            )));
+        }
+        Ok(())
+    }
+
     /// Bind the bundle to the encrypted session: check that the
     /// operator-signed `manifest.channel_pub` equals the X25519 public
     /// key the channel actually handshook against.
@@ -196,32 +245,7 @@ pub async fn announce_with_pinned_operator<T: PirTransport + ?Sized>(
     now_unix_seconds: i64,
 ) -> PirResult<AnnounceVerification> {
     let v = announce(transport).await?;
-    if &v.bundle.cert.operator_pubkey != pinned_operator_pubkey {
-        return Err(PirError::Protocol(format!(
-            "announce: cert.operator_pubkey ({}) does not match pinned operator ({})",
-            short_hex(&v.bundle.cert.operator_pubkey),
-            short_hex(pinned_operator_pubkey),
-        )));
-    }
-    v.bundle
-        .cert
-        .verify()
-        .map_err(|e| PirError::Protocol(format!("announce: cert.verify failed: {}", e)))?;
-    if now_unix_seconds != 0 {
-        v.bundle
-            .cert
-            .check_validity(now_unix_seconds)
-            .map_err(|e| PirError::Protocol(format!("announce: cert outside validity: {}", e)))?;
-    }
-    if !v.chain_verified {
-        return Err(PirError::Protocol(format!(
-            "announce: chain check failed: {}",
-            v.chain_error
-                .as_ref()
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "unknown".into())
-        )));
-    }
+    v.check_pinned_operator(pinned_operator_pubkey, now_unix_seconds)?;
     Ok(v)
 }
 
@@ -535,6 +559,41 @@ mod tests {
         match err {
             PirError::Protocol(m) => assert!(m.contains("does not match the handshake key")),
             other => panic!("expected Protocol(channel mismatch), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn check_pinned_operator_accepts_correct_and_rejects_wrong() {
+        let bundle = build_bundle();
+        let pinned = bundle.cert.operator_pubkey;
+        let v = AnnounceVerification {
+            bundle,
+            chain_verified: true,
+            chain_error: None,
+        };
+        v.check_pinned_operator(&pinned, 0)
+            .expect("correct operator pin must pass");
+        let err = v.check_pinned_operator(&[0u8; 32], 0).unwrap_err();
+        match err {
+            PirError::Protocol(m) => assert!(m.contains("does not match pinned operator")),
+            other => panic!("expected Protocol(operator mismatch), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn check_pinned_operator_requires_chain_verified() {
+        // Right operator pin, but the in-bundle chain check failed → reject.
+        let bundle = build_bundle();
+        let pinned = bundle.cert.operator_pubkey;
+        let v = AnnounceVerification {
+            bundle,
+            chain_verified: false,
+            chain_error: None,
+        };
+        let err = v.check_pinned_operator(&pinned, 0).unwrap_err();
+        match err {
+            PirError::Protocol(m) => assert!(m.contains("chain check failed")),
+            other => panic!("expected Protocol(chain check failed), got {:?}", other),
         }
     }
 

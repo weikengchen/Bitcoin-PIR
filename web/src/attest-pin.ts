@@ -169,3 +169,51 @@ export const PIR1_PIN: ServerAttestPin = {
     '71a041ae1931b81563f460c6e028c96706ea1c2f66545ee700479c0e5c5a93b6',
   description: 'weikeng1.bitcoinpir.org (Hetzner i7-8700, no SEV)',
 };
+
+/**
+ * Operator identity pin (Tier-1) for the REQ_ANNOUNCE operator-signed
+ * identity flow.
+ *
+ * The operator's long-term Ed25519 key (generated OFFLINE via
+ * `bpir-admin generate-identity --purpose operator`, secret never on a
+ * server) signs each server's `IdentityCert`. A client pins the
+ * operator's *public* key here and rejects any announce bundle whose
+ * cert isn't signed by it. One operator key signs the whole fleet; the
+ * per-server `IdentityCert.server_id` (pir1 / pir2) distinguishes them,
+ * so this single pin covers both.
+ *
+ * Pass the decoded bytes to `WasmAnnounceVerification.checkPinnedOperator`
+ * (operator pubkey match + cert signature + validity + chain check) —
+ * NOT a bare `operatorPubkeyHex` string-compare, which would miss the
+ * cert's operator signature.
+ *
+ * ⚠️ DEV STAND-IN — NOT FOR PRODUCTION. The value below is the
+ * throwaway keypair used by the announce end-to-end test
+ * (`test_announce_operator_identity_end_to_end`), pinned so the path is
+ * exercisable in dev. Before any deployment relies on operator identity:
+ *   1. generate the real operator key offline,
+ *   2. publish its pubkey out-of-band (build-time pin here is the MVP;
+ *      DNSSEC/Nostr can layer on later), and
+ *   3. replace the hex below + record provenance like the pins above.
+ * Until then, callers should treat a passing operator-pin check as
+ * dev-only and gate any "verified operator" UI on a real pin landing.
+ */
+export const PIR_OPERATOR_PUBKEY_HEX =
+  '47d98cb6483b2b027e4b08e516e26ce414ebb719421a591f66272f9c97bad562';
+
+/** Decoded 32-byte operator pubkey for
+ *  `WasmAnnounceVerification.checkPinnedOperator`. See the loud
+ *  DEV-STAND-IN warning on [`PIR_OPERATOR_PUBKEY_HEX`]. */
+export const PIR_OPERATOR_PUBKEY: Uint8Array = (() => {
+  const hex = PIR_OPERATOR_PUBKEY_HEX;
+  if (hex.length !== 64) {
+    throw new Error(
+      `attest-pin: PIR_OPERATOR_PUBKEY_HEX must be 64 hex chars, got ${hex.length}`,
+    );
+  }
+  const out = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) {
+    out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+})();
