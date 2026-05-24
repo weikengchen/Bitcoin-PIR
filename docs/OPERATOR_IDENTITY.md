@@ -229,6 +229,23 @@ v.checkChannelBinding(attestVerification.serverStaticPub);    // throws on misma
 // getters for display: v.serverId, v.operatorPubkeyHex, v.gitRev, v.validUntil, v.chainVerified
 ```
 
+Or let `BatchPirClientAdapter` do it during `connect()` and read the
+gated snapshot (this is what a badge should consume):
+
+```ts
+const adapter = new BatchPirClientAdapter({
+  server0Url, server1Url,
+  useSecureChannel: true,        // required — binds against the attested key
+  verifyOperatorIdentity: true,  // default false (prod not configured + DEV pin)
+  // pinnedOperatorPubkey defaults to PIR_OPERATOR_PUBKEY
+  onOperatorIdentity: (i, info) => renderBadge(i, info),
+});
+await adapter.connect();
+// adapter.operatorIdentity.server0.state ∈
+//   'verified' | 'unconfigured' | 'unverified' | 'error' | 'not-checked'
+// Gate the "verified operator" badge on === 'verified' ONLY.
+```
+
 ---
 
 ## Current status
@@ -242,15 +259,20 @@ v.checkChannelBinding(attestVerification.serverStaticPub);    // throws on misma
 - ⏳ **Pin value is a DEV stand-in** — replace with a real published key.
 - ⏳ **Not deployed** on pir1/pir2 (`--identity-*` flags unset → announce
   returns "not configured").
-- ⏳ Web UI indicator not wired; `issued_at` freshness policy not enforced;
-  standalone TS `OnionPirWebClient` has no `announce()`.
+- ✅ `BatchPirClientAdapter` exposes a gated `operatorIdentity` snapshot
+  (opt-in via `verifyOperatorIdentity`); `gateOperatorIdentity` unit-tested.
+- ⏳ Playground still needs to render the badge from the snapshot;
+  `issued_at` freshness policy not enforced; standalone TS
+  `OnionPirWebClient` has no `announce()`.
 
 ### Remaining work
 
 - **C** — generate the real operator key + deploy `--identity-*` to
-  pir1/pir2 (replaces the DEV stand-in pin).
-- **D** — surface a web "operator identity" indicator (gate it on
-  `checkPinnedOperator` + `checkChannelBinding` + `chainVerified`, never on
-  `chainVerified` alone).
+  pir1/pir2 (replaces the DEV stand-in pin; flips `verifyOperatorIdentity`
+  default to on once live).
+- **D (playground)** — render the badge from
+  `adapter.operatorIdentity.serverN.state` / `onOperatorIdentity`. The
+  gating already lives in the adapter; the badge is the only remaining
+  piece, in the playground repo.
 - **E** — add `announce()` to the standalone TS `OnionPirWebClient`.
 - **F** — enforce `valid_until` / `issued_at` freshness policy in clients.

@@ -47,11 +47,12 @@ import {
 } from './server-info.js';
 import {
   requireSdkWasm,
+  type WasmAnnounceVerification,
   type WasmAttestVerification,
   type WasmDpfClient,
   type WasmQueryResult,
 } from './sdk-bridge.js';
-import { getAmdTurinArkFingerprint } from './attest-pin.js';
+import { getAmdTurinArkFingerprint, PIR_OPERATOR_PUBKEY } from './attest-pin.js';
 import type { ConnectionState, QueryResult, UtxoEntry } from './types.js';
 import { ManagedWebSocket } from './ws.js';
 
@@ -121,6 +122,81 @@ export interface ServerAttestation {
   pinError?: string;
 }
 
+/**
+ * Per-server operator-signed-identity snapshot, exposed via
+ * `BatchPirClientAdapter.operatorIdentity` when
+ * `config.verifyOperatorIdentity` is enabled. The UI gates a "verified
+ * operator" badge on `state === 'verified'` ONLY — never on the bundle's
+ * `chainVerified` alone (that proves consistency, not authenticity).
+ *
+ * States:
+ *   - `'not-checked'`: verification disabled, or not yet run.
+ *   - `'unconfigured'`: server has no operator identity (started without
+ *     `--identity-*`). Expected for servers that haven't opted in — show
+ *     nothing, not an error.
+ *   - `'verified'`: REQ_ANNOUNCE returned a bundle AND operator-pin
+ *     (`checkPinnedOperator`: pubkey + cert signature + validity + chain)
+ *     AND channel-binding (`checkChannelBinding` vs the attested
+ *     `serverStaticPub`) both passed.
+ *   - `'unverified'`: a bundle came back but a check failed (wrong
+ *     operator, bad signature, expired, chain mismatch, or channel
+ *     mismatch). `error` carries the diagnostic — treat as a strong
+ *     negative signal.
+ *   - `'error'`: couldn't complete the check (no attestation to bind
+ *     against, transport/protocol error). `error` carries the reason.
+ */
+export interface OperatorIdentity {
+  state: 'not-checked' | 'unconfigured' | 'verified' | 'unverified' | 'error';
+  /** `server_id` the cert is endorsed for (e.g. "pir1"). */
+  serverId?: string;
+  /** Hex operator (Tier-1) pubkey the cert claims. Trustworthy only
+   *  when `state === 'verified'`. */
+  operatorPubkeyHex?: string;
+  /** Hex identity (Tier-2) pubkey the operator endorsed. */
+  identityPubkeyHex?: string;
+  /** Git rev the manifest self-reports. */
+  gitRev?: string;
+  /** Cert validity upper bound (unix-seconds; 0 = indefinite). */
+  validUntil?: number;
+  /** Diagnostic for `'unverified'` / `'error'`. */
+  error?: string;
+}
+
+/**
+ * Pure gating step: given a fetched `WasmAnnounceVerification`, the
+ * pinned operator pubkey, the attested channel key, and a wall clock,
+ * run operator-pin + channel-binding and classify. Never throws —
+ * folds a failed check into `state: 'unverified'`. Extracted (and
+ * exported) so it's unit-testable without a live server.
+ */
+export function gateOperatorIdentity(
+  v: WasmAnnounceVerification,
+  pinnedOperatorPubkey: Uint8Array,
+  expectedChannelPub: Uint8Array,
+  nowUnixSeconds: bigint,
+): OperatorIdentity {
+  try {
+    // checkPinnedOperator already requires chainVerified internally.
+    v.checkPinnedOperator(pinnedOperatorPubkey, nowUnixSeconds);
+    v.checkChannelBinding(expectedChannelPub);
+    return {
+      state: 'verified',
+      serverId: v.serverId,
+      operatorPubkeyHex: v.operatorPubkeyHex,
+      identityPubkeyHex: v.identityPubkeyHex,
+      gitRev: v.gitRev,
+      validUntil: Number(v.validUntil),
+    };
+  } catch (e) {
+    return {
+      state: 'unverified',
+      serverId: v.serverId,
+      operatorPubkeyHex: v.operatorPubkeyHex,
+      error: (e as Error)?.message ?? String(e),
+    };
+  }
+}
+
 export interface BatchPirClientConfig {
   server0Url: string;
   server1Url: string;
@@ -179,6 +255,26 @@ export interface BatchPirClientConfig {
    */
   expectedServer0Pin?: import('./attest-pin.js').ServerAttestPin;
   expectedServer1Pin?: import('./attest-pin.js').ServerAttestPin;
+  /**
+   * If `true`, after attesting each server the adapter also fetches its
+   * operator-signed identity (REQ_ANNOUNCE) and verifies it against
+   * `pinnedOperatorPubkey` + the attested channel key, populating
+   * `operatorIdentity.serverN`. Default `false`: production servers
+   * don't yet run with `--identity-*` (they'd report `'unconfigured'`)
+   * and the default pin is a DEV stand-in — see `PIR_OPERATOR_PUBKEY`.
+   * Requires `useSecureChannel` (needs the attested channel key to bind).
+   */
+  verifyOperatorIdentity?: boolean;
+  /**
+   * Operator (Tier-1) pubkey to pin announce bundles against. Defaults
+   * to `PIR_OPERATOR_PUBKEY` from `./attest-pin.ts` (currently a DEV
+   * stand-in). Pass a real published key here, or update the constant.
+   */
+  pinnedOperatorPubkey?: Uint8Array;
+  /** Fires once per server after `connect()` resolves the per-server
+   *  operator-identity check (only when `verifyOperatorIdentity`). Use to
+   *  surface a "verified operator" badge — gate it on `state === 'verified'`. */
+  onOperatorIdentity?: (serverIndex: 0 | 1, info: OperatorIdentity) => void;
 }
 
 // ─── Adapter ─────────────────────────────────────────────────────────────────
@@ -215,6 +311,18 @@ export class BatchPirClientAdapter {
   attestation: { server0: ServerAttestation; server1: ServerAttestation } = {
     server0: { state: 'unattested' },
     server1: { state: 'unattested' },
+  };
+
+  /**
+   * Per-server operator-signed-identity snapshot. Populated by
+   * `connect()` only when `config.verifyOperatorIdentity` is set; stays
+   * `'not-checked'` otherwise. Read after `connect()` or via the
+   * `onOperatorIdentity` callback. Gate any "verified operator" badge on
+   * `state === 'verified'`.
+   */
+  operatorIdentity: { server0: OperatorIdentity; server1: OperatorIdentity } = {
+    server0: { state: 'not-checked' },
+    server1: { state: 'not-checked' },
   };
 
   constructor(config: BatchPirClientConfig) {
@@ -708,10 +816,69 @@ export class BatchPirClientAdapter {
         'info',
       );
     }
+
+    // Operator-signed identity (REQ_ANNOUNCE), opt-in. Runs after the
+    // channel decision so announce() rides the encrypted channel when it
+    // came up; binds against the attested serverStaticPub from `att*`.
+    if (this.config.verifyOperatorIdentity) {
+      const pin = this.config.pinnedOperatorPubkey ?? PIR_OPERATOR_PUBKEY;
+      const oid0 = await this.verifyOperatorIdentityOne(0, att0, pin);
+      const oid1 = await this.verifyOperatorIdentityOne(1, att1, pin);
+      this.operatorIdentity.server0 = oid0;
+      this.operatorIdentity.server1 = oid1;
+      this.config.onOperatorIdentity?.(0, oid0);
+      this.config.onOperatorIdentity?.(1, oid1);
+    }
+
     // Free the WasmAttestVerification handles to release the WASM-side
     // copies. We've already extracted the JS-side fields we need.
     att0?.free();
     att1?.free();
+  }
+
+  /**
+   * Fetch + verify one server's operator-signed identity. Never throws;
+   * returns an `OperatorIdentity` snapshot. `att` supplies the attested
+   * `serverStaticPub` the bundle's `channel_pub` is bound against, so a
+   * `null` att (attest failed) yields `state: 'error'`.
+   */
+  private async verifyOperatorIdentityOne(
+    idx: 0 | 1,
+    att: WasmAttestVerification | null,
+    pin: Uint8Array,
+  ): Promise<OperatorIdentity> {
+    if (!this.wasmClient) {
+      return { state: 'error', error: 'wasm client not initialised' };
+    }
+    if (!att) {
+      return { state: 'error', error: 'attestation unavailable; cannot bind channel key' };
+    }
+    let v: WasmAnnounceVerification;
+    try {
+      v = await this.wasmClient.announce(idx);
+    } catch (e) {
+      const msg = (e as Error)?.message ?? String(e);
+      // A server started without --identity-* answers RESP_ERROR
+      // "announce not configured" — an expected, benign state.
+      if (/not configured/i.test(msg)) {
+        this.log(`server${idx}: operator identity not configured`, 'info');
+        return { state: 'unconfigured' };
+      }
+      this.log(`announce(server${idx}) failed: ${msg}`, 'error');
+      return { state: 'error', error: msg };
+    }
+    try {
+      const nowSecs = BigInt(Math.floor(Date.now() / 1000));
+      const result = gateOperatorIdentity(v, pin, att.serverStaticPub, nowSecs);
+      if (result.state === 'verified') {
+        this.log(`server${idx}: operator identity verified (${result.serverId})`, 'success');
+      } else {
+        this.log(`server${idx}: operator identity UNVERIFIED — ${result.error}`, 'error');
+      }
+      return result;
+    } finally {
+      v.free();
+    }
   }
 }
 

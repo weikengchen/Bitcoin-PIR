@@ -28,6 +28,8 @@ if (typeof window !== 'undefined') {
 export {
   BatchPirClientAdapter,
   type BatchPirClientConfig,
+  type OperatorIdentity,
+  gateOperatorIdentity,
 } from './dpf-adapter.js';
 
 export type {

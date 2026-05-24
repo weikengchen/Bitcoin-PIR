@@ -295,6 +295,39 @@ export interface WasmPolicyRequirements {
   setExpectedImageId(bytes: Uint8Array): void;
 }
 
+/**
+ * JS-visible result of a `WasmDpfClient.announce()` call. Mirrors
+ * `pir_sdk_wasm::WasmAnnounceVerification`. Carries the parsed
+ * operator-signed bundle; the caller layers verification:
+ *   - `checkPinnedOperator(pin, now)` — operator pubkey match + cert
+ *     signature + validity + in-bundle chain check (do NOT settle for a
+ *     bare `operatorPubkeyHex` string-compare — it misses the signature),
+ *   - `checkChannelBinding(expected)` — `channelPub` equals the attested
+ *     `serverStaticPub` the channel handshook against.
+ * Both throw on failure. `i64` fields surface as `bigint` (wasm-bindgen).
+ */
+export interface WasmAnnounceVerification {
+  readonly serverId: string;
+  readonly operatorPubkeyHex: string;
+  readonly identityPubkeyHex: string;
+  readonly channelPub: Uint8Array;
+  readonly channelPubHex: string;
+  readonly binarySha256Hex: string;
+  readonly gitRev: string;
+  readonly validFrom: bigint;
+  readonly validUntil: bigint;
+  readonly issuedAt: bigint;
+  readonly chainVerified: boolean;
+  readonly chainError: string;
+  /** Operator pubkey match + `cert.verify()` signature + validity
+   *  (skipped when `nowUnixSeconds === 0n`) + chain check. Throws on
+   *  failure. */
+  checkPinnedOperator(pinnedOperatorPubkey: Uint8Array, nowUnixSeconds: bigint): void;
+  /** `channelPub === expectedChannelPub` (32 bytes). Throws on mismatch. */
+  checkChannelBinding(expectedChannelPub: Uint8Array): void;
+  free(): void;
+}
+
 interface WasmDpfClient {
   free(): void;
   readonly isConnected: boolean;
@@ -306,6 +339,12 @@ interface WasmDpfClient {
    *  returned `serverStaticPub` (32 bytes) as input to
    *  `upgradeToSecureChannel`. */
   attest(serverIndex: number): Promise<WasmAttestVerification>;
+  /** Send REQ_ANNOUNCE to one of the connected servers (`serverIndex`
+   *  ∈ {0, 1}) and return the parsed operator-signed identity bundle.
+   *  Rejects with "announce not configured" when the server was started
+   *  without `--identity-*` flags. See `WasmAnnounceVerification` for the
+   *  verification methods to run on the result. */
+  announce(serverIndex: number): Promise<WasmAnnounceVerification>;
   /** Wrap both server connections with the encrypted-channel transport.
    *  Caller MUST first verify `pub0`/`pub1` came from a trustworthy
    *  source (call `attest` first; ideally also check the SEV-SNP report's
