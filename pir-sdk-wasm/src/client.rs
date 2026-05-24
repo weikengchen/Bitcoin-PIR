@@ -818,6 +818,28 @@ impl WasmAnnounceVerification {
         hex_encode(&self.inner.bundle.manifest.channel_pub)
     }
 
+    /// Bind the bundle to the encrypted session: verify that the
+    /// manifest's `channelPub` equals the X25519 key the channel
+    /// actually handshook against. Pass the *attested* key — i.e.
+    /// `attestVerification.serverStaticPub`, which the SEV-SNP report /
+    /// VCEK chain already vouches for. Throws on mismatch (the bundle
+    /// describes a different channel than the live session) or on a
+    /// non-32-byte argument. Mirrors the Rust
+    /// `AnnounceVerification::check_channel_binding` so web and native
+    /// share one implementation and error message.
+    #[wasm_bindgen(js_name = checkChannelBinding)]
+    pub fn check_channel_binding(&self, expected_channel_pub: &[u8]) -> Result<(), JsError> {
+        let arr: [u8; 32] = expected_channel_pub.try_into().map_err(|_| {
+            JsError::new(&format!(
+                "checkChannelBinding: expected a 32-byte channel pubkey, got {} bytes",
+                expected_channel_pub.len()
+            ))
+        })?;
+        self.inner
+            .check_channel_binding(&arr)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
     /// Hex-encoded binary SHA-256 the manifest claims (self-reported,
     /// trustworthy iff the chain check passed).
     #[wasm_bindgen(getter, js_name = binarySha256Hex)]

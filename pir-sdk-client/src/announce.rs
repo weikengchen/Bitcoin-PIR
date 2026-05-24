@@ -21,12 +21,14 @@
 //!   authentication should pass an `operator_pubkey` to
 //!   [`announce_with_pinned_operator`] once the publishing path is in
 //!   place — that variant runs the missing check.
-//! - **Cross-check `channel_pub` against the value the encrypted
-//!   channel handshake used.** The caller is responsible for taking
-//!   `bundle.manifest.channel_pub` and comparing it against
-//!   `AttestVerification::response.server_static_pub` (or whatever
-//!   key path it actually handshook against). This crate doesn't
-//!   know about the handshake state.
+//! - **Know the expected channel key on its own.** This crate doesn't
+//!   track handshake state, so the caller must supply the X25519 key
+//!   the channel actually handshook against (the attested
+//!   `AttestVerification::response.server_static_pub`). Given that key,
+//!   [`AnnounceVerification::check_channel_binding`] performs the
+//!   cross-check against `bundle.manifest.channel_pub`, and the
+//!   all-in-one [`announce_bound`] folds it together with operator
+//!   pinning + validity in one call.
 //! - **Validate `cert.valid_from` / `cert.valid_until`.** That's a
 //!   caller wall-clock policy. See
 //!   [`IdentityCert::check_validity`](pir_identity::IdentityCert::check_validity).
@@ -61,6 +63,37 @@ pub struct AnnounceVerification {
     pub chain_verified: bool,
     /// `Some(e)` if `chain_verified` is `false`, for diagnostics.
     pub chain_error: Option<IdentityError>,
+}
+
+impl AnnounceVerification {
+    /// Bind the bundle to the encrypted session: check that the
+    /// operator-signed `manifest.channel_pub` equals the X25519 public
+    /// key the channel actually handshook against.
+    ///
+    /// Pass the *attested* `server_static_pub` — i.e. the value the
+    /// client verified via the SEV-SNP report / VCEK chain (V2 layout
+    /// commits the channel key to `REPORT_DATA`) and then ran
+    /// `REQ_HANDSHAKE` against. Equality closes the loop: the chip
+    /// vouches for the channel key, the operator vouches for the same
+    /// key, and the client confirms they agree. A mismatch means the
+    /// bundle describes a *different* channel than the one in use —
+    /// either a deploy bug or a relay splicing one server's bundle onto
+    /// another server's session — so trust nothing in the bundle.
+    ///
+    /// This is orthogonal to operator-pubkey pinning ([`announce_with_pinned_operator`])
+    /// and the in-bundle chain check ([`AnnounceVerification::chain_verified`]);
+    /// the full-trust path wants all three, which [`announce_bound`] runs
+    /// in one call.
+    pub fn check_channel_binding(&self, expected_channel_pub: &[u8; 32]) -> PirResult<()> {
+        if &self.bundle.manifest.channel_pub != expected_channel_pub {
+            return Err(PirError::Protocol(format!(
+                "announce: bundle channel_pub ({}) does not match the handshake key ({})",
+                short_hex(&self.bundle.manifest.channel_pub),
+                short_hex(expected_channel_pub),
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Send REQ_ANNOUNCE and parse the response.
@@ -189,6 +222,34 @@ pub async fn announce_with_pinned_operator<T: PirTransport + ?Sized>(
                 .unwrap_or_else(|| "unknown".into())
         )));
     }
+    Ok(v)
+}
+
+/// Full-trust announce: [`announce_with_pinned_operator`] **plus** the
+/// channel-binding cross-check ([`AnnounceVerification::check_channel_binding`]).
+///
+/// This is the call a production client should use once it has both a
+/// pinned operator pubkey and the attested channel key in hand. It
+/// fails unless ALL of the following hold:
+/// - the cert is signed by `pinned_operator_pubkey` and (if
+///   `now_unix_seconds != 0`) is inside its validity window,
+/// - the in-bundle chain check passes (manifest signed by the cert's
+///   identity key, server_id / identity_pubkey cross-refs match),
+/// - `bundle.manifest.channel_pub == expected_channel_pub` (the
+///   attested `server_static_pub` the channel handshook against).
+///
+/// `expected_channel_pub` is the X25519 key the caller verified through
+/// attestation and ran `REQ_HANDSHAKE` against. `now_unix_seconds` is
+/// the wall clock for the validity check; pass `0` to skip it.
+pub async fn announce_bound<T: PirTransport + ?Sized>(
+    transport: &mut T,
+    pinned_operator_pubkey: &[u8; 32],
+    expected_channel_pub: &[u8; 32],
+    now_unix_seconds: i64,
+) -> PirResult<AnnounceVerification> {
+    let v =
+        announce_with_pinned_operator(transport, pinned_operator_pubkey, now_unix_seconds).await?;
+    v.check_channel_binding(expected_channel_pub)?;
     Ok(v)
 }
 
@@ -415,6 +476,83 @@ mod tests {
         match err {
             Err(PirError::Protocol(m)) => assert!(m.contains("outside validity")),
             other => panic!("expected Protocol(outside validity), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn check_channel_binding_accepts_matching_key() {
+        // build_bundle()'s manifest commits channel_pub = [0xCC; 32].
+        let v = AnnounceVerification {
+            bundle: build_bundle(),
+            chain_verified: true,
+            chain_error: None,
+        };
+        v.check_channel_binding(&[0xCCu8; 32])
+            .expect("matching channel_pub must pass");
+    }
+
+    #[test]
+    fn check_channel_binding_rejects_mismatched_key() {
+        let v = AnnounceVerification {
+            bundle: build_bundle(),
+            chain_verified: true,
+            chain_error: None,
+        };
+        let err = v.check_channel_binding(&[0u8; 32]).unwrap_err();
+        match err {
+            PirError::Protocol(m) => assert!(m.contains("does not match the handshake key")),
+            other => panic!("expected Protocol(channel mismatch), got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn announce_bound_happy_path() {
+        let bundle = build_bundle();
+        let pinned = bundle.cert.operator_pubkey;
+        let mut mock = MockTransport {
+            reply: build_resp_announce(&bundle),
+            last_request: Mutex::new(Vec::new()),
+        };
+        let v = announce_bound(&mut mock, &pinned, &[0xCCu8; 32], 0)
+            .await
+            .expect("correct operator + channel key must pass");
+        assert!(v.chain_verified);
+    }
+
+    #[tokio::test]
+    async fn announce_bound_rejects_wrong_channel_pub() {
+        // Operator pin is correct, but the bundle's channel_pub does not
+        // match the key the channel handshook against → reject.
+        let bundle = build_bundle();
+        let pinned = bundle.cert.operator_pubkey;
+        let mut mock = MockTransport {
+            reply: build_resp_announce(&bundle),
+            last_request: Mutex::new(Vec::new()),
+        };
+        let err = announce_bound(&mut mock, &pinned, &[0x99u8; 32], 0)
+            .await
+            .unwrap_err();
+        match err {
+            PirError::Protocol(m) => assert!(m.contains("does not match the handshake key")),
+            other => panic!("expected Protocol(channel mismatch), got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn announce_bound_rejects_wrong_operator_even_with_right_channel() {
+        // A wrong operator pin must fail before the channel key is even
+        // considered (operator pinning is checked first).
+        let bundle = build_bundle();
+        let mut mock = MockTransport {
+            reply: build_resp_announce(&bundle),
+            last_request: Mutex::new(Vec::new()),
+        };
+        let err = announce_bound(&mut mock, &[0u8; 32], &[0xCCu8; 32], 0)
+            .await
+            .unwrap_err();
+        match err {
+            PirError::Protocol(m) => assert!(m.contains("does not match pinned operator")),
+            other => panic!("expected Protocol(operator mismatch), got {:?}", other),
         }
     }
 }
