@@ -142,6 +142,8 @@ impl HintPool {
             chunk_bins: db.chunk.bins_per_table,
             index_entry_size: db.index.params.bin_size(),
             chunk_entry_size: db.chunk.params.bin_size(),
+            index_data_offset: db.index.data_offset,
+            chunk_data_offset: db.chunk.data_offset,
         };
         let index_mmap_ptr = db.index.mmap.as_ptr() as usize;
         let index_mmap_len = db.index.mmap.len();
@@ -218,6 +220,14 @@ struct DbParams {
     chunk_bins: usize,
     index_entry_size: usize,
     chunk_entry_size: usize,
+    /// Anchor-aware byte offset to the per-group tables (legacy header +
+    /// chain-anchor length). MUST be used instead of `*_params.header_size`,
+    /// which is legacy-only and reads v2 (anchored) DBs `anchor_len` bytes
+    /// too early — see `MappedSubTable::data_offset`. Hints computed at the
+    /// wrong offset disagree with the anchor-correct eval path and corrupt
+    /// HarmonyPIR reconstruction.
+    index_data_offset: usize,
+    chunk_data_offset: usize,
 }
 
 fn generation_loop(
@@ -327,7 +337,7 @@ fn generate_pool_entry(
                 g,
                 0, // k_offset for INDEX groups
                 index_mmap,
-                db_params.index_params.header_size,
+                db_params.index_data_offset,
                 db_params.index_bins,
                 db_params.index_entry_size,
             )
@@ -345,7 +355,7 @@ fn generate_pool_entry(
                 g,
                 index_k, // k_offset for CHUNK groups
                 chunk_mmap,
-                db_params.chunk_params.header_size,
+                db_params.chunk_data_offset,
                 db_params.chunk_bins,
                 db_params.chunk_entry_size,
             )
