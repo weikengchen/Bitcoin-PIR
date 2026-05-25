@@ -276,12 +276,13 @@ await adapter.connect();
 
 ## Deployment status (2026-05-25)
 
-Operator-identity provisioning is **done**, but announce is **not yet
-functional in production** — the deployed reproducible binary
-(`binarySha256Hex 71a041ae…`, main @ ea4ee8c8) predates the REQ_ANNOUNCE
-**dispatch arm**. It builds + logs the bundle ("Identity announce:
-enabled") yet still answers `unsupported request 0x07`. Verified live:
-`announce()` against `wss://weikeng1.bitcoinpir.org` returns that error.
+The dispatch arm is **merged to main** (PR #9) and the new binary is
+**built + reproducible**, but it is **not yet deployed** — the running
+servers still execute the old reproducible binary
+(`binarySha256Hex 71a041ae…`), which predates the dispatch arm, so
+`announce()` against `wss://weikeng1.bitcoinpir.org` still returns
+`unsupported request 0x07`. The remaining work is the coordinated binary
+deploy + re-pin below.
 
 Done:
 - Operator key + pir1/pir2 `IdentityCert`s signed (valid to 2029).
@@ -291,18 +292,64 @@ Done:
   Both restarted + verified `Identity announce: enabled (server_id=pir1)`.
 - Operator pubkey pinned in `attest-pin.ts`.
 
-To make it live (a coordinated **binary release**, not a flag flip):
-1. Merge the announce dispatch work (the `fb11a0ef` arm) to main.
-2. `nix build .#unified-server` (reproducible) from that commit → new
-   `binary_sha256`.
-3. Deploy the new binary to pir1; rebuild the pir2 Tier-3 UKI with it +
-   the pir2 identity key/cert + `--identity-server-id pir2` baked in.
-4. Re-pin `PIR1_PIN.binarySha256Hex` + `PIR2_TIER3_PIN.binarySha256Hex`
-   (new hash) and `PIR2_TIER3_PIN.measurementHex` (new UKI), capture via
-   `bpir-admin attest`.
-5. pir2 deploy needs the **VPSBG portal** (upload UKI → Save & Reboot;
-   pir2 is unreachable over SSH in Tier 3).
-6. Then flip the web `verifyOperatorIdentity` on / wire the playground badge.
+**Steps 1–2 are DONE** (PR #9, merged to main `fda3eb47`):
+- The dispatch arm is on main. `nix build .#unified-server` at `fda3eb47`
+  reproduces (verified twice) to
+  **`f7df82d04fb4a02fa51f6d595f04ea302fefece7da15b33bd30c7102f9729101`**
+  (old deployed: `71a041ae…`). This is the binary to deploy + re-pin.
+- The pir2 Tier-3 run script (`scripts/dracut/97bpir-tier3-init/unified-server-run.sh`)
+  now carries `--identity-{key-path,cert-path,server-id pir2}` (key/cert
+  read from the bind-mounted rootfs `/home/pir/data`, not baked/measured).
+
+> **Shared-pin constraint:** `PIR1_PIN` and `PIR2_TIER3_PIN` share
+> `binarySha256Hex`. The new binary must be live on **both** pir1 and
+> pir2 *before* the pin flips, or clients reject whichever still runs the
+> old one. Do the binary swap on both, then update the pin in one commit.
+
+Remaining (operator-executed) — steps 3–5:
+
+**3a. pir1 binary swap** (SSH; ~3 min cold-load each service):
+```bash
+ssh pir-hetzner
+sudo -u pir bash -c 'cd /home/pir/BitcoinPIR && git fetch origin main && git checkout fda3eb47 && nix build .#unified-server && sha256sum result/bin/unified_server'
+# expect f7df82d0…; then swap the binary the services exec:
+cp -f /home/pir/BitcoinPIR/result/bin/unified_server /home/pir/BitcoinPIR/target/release/unified_server
+systemctl restart pir-primary pir-secondary
+journalctl -u pir-primary -n40 | grep -E 'Identity announce|Listening'   # expect "enabled (server_id=pir1)"
+```
+(pir1 identity key/cert + `--identity-*` are already staged from this session.)
+
+**3b. pir2 Tier-3 UKI rebuild + provision** (Hetzner build host + VPSBG portal):
+```bash
+# provision the pir2 identity files into pir2's rootfs (Slice 2 first):
+#   VPSBG portal → Measured Boot → UKI: None → Save & Reboot (boots Slice 2 w/ sshd)
+scp ~/.config/bpir-admin/pir2-identity.key ~/.config/bpir-admin/pir2.cert vpsbg-pir:/home/pir/data/
+ssh vpsbg-pir 'chmod 600 /home/pir/data/pir2-identity.key'
+# build the new UKI (embeds f7df82d0 binary + the updated run script):
+ssh pir-hetzner 'cd /home/pir/BitcoinPIR && git checkout fda3eb47 && nix build --impure .#tier3-uki'
+scp pir-hetzner:.../bpir-tier3.efi deploy/uki/bpir-tier3-vNN.efi
+#   VPSBG portal → upload UKI → Save & Reboot (back into Tier 3)
+```
+
+**4. Capture pins + re-pin** (after BOTH servers run f7df82d0):
+```bash
+./target/release/bpir-admin attest wss://weikeng2.bitcoinpir.org   # new measurement + binary_sha256
+```
+In `web/src/attest-pin.ts`: set `PIR1_PIN.binarySha256Hex` and
+`PIR2_TIER3_PIN.binarySha256Hex` to `f7df82d0…`, and
+`PIR2_TIER3_PIN.measurementHex` to the captured value. Commit.
+
+**5. Verify announce live:**
+```bash
+PIR_ANNOUNCE_URL=wss://weikeng1.bitcoinpir.org \
+PIR_ANNOUNCE_OPERATOR_PUB=256fb106c039f8009d3caa431a9634ff3fe5db3b9e4d9ae7282bbde66772c97a \
+PIR_ANNOUNCE_SERVER_ID=pir1 \
+  cargo test -p pir-sdk-client --test integration_test \
+    test_announce_operator_identity_end_to_end -- --ignored --nocapture
+# repeat for weikeng2 with PIR_ANNOUNCE_SERVER_ID=pir2
+```
+
+**6.** Flip web `verifyOperatorIdentity` on / wire the playground badge.
 
 ### Remaining work
 

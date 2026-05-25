@@ -46,4 +46,14 @@ exec /usr/local/bin/unified_server \
     --config /home/pir/data/databases.toml \
     --admin-pubkey-hex 87d454db85266e10e55ed8b68417de9d79ceb1d5d944bae831a7877627efdad3 \
     --vcek-dir /home/pir/data/vcek \
+    --identity-key-path /home/pir/data/pir2-identity.key \
+    --identity-cert-path /home/pir/data/pir2.cert \
+    --identity-server-id pir2 \
     2>&1
+# --identity-* (operator-signed identity / REQ_ANNOUNCE): key + cert live
+# in the bind-mounted rootfs /home/pir/data — NOT baked into the measured
+# initramfs (only this run script + the binary are measured). Missing or
+# inconsistent files are non-fatal (unified_server logs "Identity
+# announce: DISABLED" and serves everything else), so this is safe to ship
+# ahead of provisioning the files. server_id MUST be "pir2" to match the
+# operator-signed cert.
