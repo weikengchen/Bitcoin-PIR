@@ -567,12 +567,21 @@ fn test_sync_plan_stale_height() {
 async fn test_announce_operator_identity_end_to_end() {
     use pir_sdk_client::announce::{announce, announce_with_pinned_operator};
 
-    let url = std::env::var("PIR_ANNOUNCE_URL")
-        .expect("set PIR_ANNOUNCE_URL to a unified_server booted with --identity-* flags");
-    let operator_pub = parse_pubkey_hex(
-        &std::env::var("PIR_ANNOUNCE_OPERATOR_PUB")
-            .expect("set PIR_ANNOUNCE_OPERATOR_PUB to the operator pubkey hex (64 chars)"),
-    );
+    // Skip gracefully when unconfigured: unlike the other --ignored tests
+    // there is no sensible public default (the public servers don't serve
+    // announce), so CI runs this as a no-op unless both env vars are set.
+    let (url, operator_pub_hex) =
+        match (std::env::var("PIR_ANNOUNCE_URL"), std::env::var("PIR_ANNOUNCE_OPERATOR_PUB")) {
+            (Ok(u), Ok(p)) => (u, p),
+            _ => {
+                eprintln!(
+                    "skipping test_announce_operator_identity_end_to_end: set PIR_ANNOUNCE_URL \
+                     + PIR_ANNOUNCE_OPERATOR_PUB (and optionally PIR_ANNOUNCE_SERVER_ID) to run"
+                );
+                return;
+            }
+        };
+    let operator_pub = parse_pubkey_hex(&operator_pub_hex);
 
     // 1. Plain announce: the bundle decodes and the in-bundle chain check
     //    (manifest signature + cert/manifest cross-references) passes.
