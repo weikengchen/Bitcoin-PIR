@@ -132,20 +132,20 @@ export interface ServerAttestPin {
  * binary, embedded via the full Nix closure.
  */
 export const PIR2_TIER3_PIN: ServerAttestPin = {
-  // Tier 3 UKI v22 — 2026-05-25. Rebuilt from main @ fda3eb47 (PR #9 —
-  // operator-signed identity / REQ_ANNOUNCE dispatch arm). New reproducible
-  // Nix `unified_server` (`f7df82d0…`); pir1 runs the SAME binary so
-  // PIR1_PIN and PIR2_TIER3_PIN share `binarySha256Hex`. pir2 runs
+  // Tier 3 UKI v23 — 2026-05-26. Rebuilt from fix/dpf-harmony-anchor-offset
+  // @ c72020ba (DPF/HarmonyPIR v2 chain-anchor table-offset fix). New
+  // reproducible Nix `unified_server` (`57ac525b…`); pir1 runs the SAME
+  // binary so PIR1_PIN and PIR2_TIER3_PIN share `binarySha256Hex`. pir2 runs
   // `--serve-queries` (no hint pool, no OnionPIR) plus `--identity-*`
   // (operator-signed identity, server_id=pir2). MEASUREMENT captured from
-  // the v22 deploy via `bpir-admin attest wss://weikeng2.bitcoinpir.org`
-  // (SEV-SNP Status: ReportDataMatch — verified on real hardware).
-  // NOTE: v21 was a mis-deploy (a stale `result-tier3-uki` symlink holding
-  // an old pre-v2 binary `3925cc4d…`) that crash-looped; v22 is correct.
+  // the v23 deploy via `bpir-admin attest wss://weikeng2.bitcoinpir.org`
+  // (SEV-SNP REPORT_DATA binding verified on real hardware).
+  // (v22 = `f7df82d0…` announce-enabled binary; v23 = v22 + the anchor-offset
+  // fix, so both servers' Merkle was also regenerated to match the fix.)
   measurementHex:
-    '41461a8856cc2ca9e2157c7e71fb75c618c03e4d28f5dac4346cefe528229f906568ed8effc934e31ada9c6afaee786e',
+    '4fb0ad57b28b7c33e6b2977f911fd6bf407ccf28bbab3ef9d24dceec579464a5961e10f5297a294c7dde24839eca4c6e',
   binarySha256Hex:
-    'f7df82d04fb4a02fa51f6d595f04ea302fefece7da15b33bd30c7102f9729101',
+    '57ac525b1d92656a0ae39d6def562d6fc2889a8c6337b8b34f71a59d6ac44d59',
   description: 'weikeng2.bitcoinpir.org (VPSBG, SEV-SNP, Tier 3 UKI v22)',
 };
 
@@ -158,13 +158,13 @@ export const PIR2_TIER3_PIN: ServerAttestPin = {
  */
 export const PIR1_PIN: ServerAttestPin = {
   // No measurementHex — Hetzner has no SEV.
-  // Bumped 2026-05-25 (v22): pir1 redeployed from main @ fda3eb47 (PR #9 —
-  // operator-signed identity / REQ_ANNOUNCE). Binary is the reproducible
-  // `nix build .#unified-server` output (`f7df82d0…`) — the same Nix binary
-  // embedded in the v22 Tier-3 UKI for pir2, so PIR1_PIN and PIR2_TIER3_PIN
-  // share `binarySha256Hex` (shared-binary invariant preserved).
+  // Bumped 2026-05-26 (v23): pir1 redeployed from fix/dpf-harmony-anchor-offset
+  // @ c72020ba (DPF/HarmonyPIR v2 chain-anchor table-offset fix). Binary is the
+  // reproducible `nix build .#unified-server` output (`57ac525b…`) — the same
+  // Nix binary embedded in the v23 Tier-3 UKI for pir2, so PIR1_PIN and
+  // PIR2_TIER3_PIN share `binarySha256Hex` (shared-binary invariant preserved).
   binarySha256Hex:
-    'f7df82d04fb4a02fa51f6d595f04ea302fefece7da15b33bd30c7102f9729101',
+    '57ac525b1d92656a0ae39d6def562d6fc2889a8c6337b8b34f71a59d6ac44d59',
   description: 'weikeng1.bitcoinpir.org (Hetzner i7-8700, no SEV)',
 };
 

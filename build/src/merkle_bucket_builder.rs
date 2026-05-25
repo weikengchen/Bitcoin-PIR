@@ -47,18 +47,25 @@ pub fn build_bucket_merkle(data_dir: &str) {
     // in the cuckoo header but aren't used here.
     let index_path = Path::new(data_dir).join("batch_pir_cuckoo.bin");
     let index_mmap = mmap_file(&index_path);
-    let index_bins = pir_core::cuckoo::read_cuckoo_header_with_anchor(&index_mmap, &INDEX_PARAMS)
-        .expect("INDEX cuckoo header parse")
-        .bins_per_table;
+    let index_header = pir_core::cuckoo::read_cuckoo_header_with_anchor(&index_mmap, &INDEX_PARAMS)
+        .expect("INDEX cuckoo header parse");
+    let index_bins = index_header.bins_per_table;
+    // Anchor-aware offset to the per-group tables (legacy header + anchor
+    // length). Building leaves at the legacy params.header_size on a v2
+    // (chain-anchored) cuckoo file hashes misaligned bins, so the roots
+    // disagree with the anchor-correct served bins and client Merkle
+    // verification fails. Mirrors MappedSubTable::data_offset.
+    let index_data_offset = index_header.header_size;
     let index_bin_size = INDEX_PARAMS.bin_size();
     println!("[INDEX] bins_per_table={}, bin_size={}B, K={}", index_bins, index_bin_size, INDEX_PARAMS.k);
 
     // Load CHUNK cuckoo table
     let chunk_path = Path::new(data_dir).join("chunk_pir_cuckoo.bin");
     let chunk_mmap = mmap_file(&chunk_path);
-    let chunk_bins = pir_core::cuckoo::read_cuckoo_header_with_anchor(&chunk_mmap, &CHUNK_PARAMS)
-        .expect("CHUNK cuckoo header parse")
-        .bins_per_table;
+    let chunk_header = pir_core::cuckoo::read_cuckoo_header_with_anchor(&chunk_mmap, &CHUNK_PARAMS)
+        .expect("CHUNK cuckoo header parse");
+    let chunk_bins = chunk_header.bins_per_table;
+    let chunk_data_offset = chunk_header.header_size;
     let chunk_bin_size = CHUNK_PARAMS.bin_size();
     println!("[CHUNK] bins_per_table={}, bin_size={}B, K={}", chunk_bins, chunk_bin_size, CHUNK_PARAMS.k);
     println!();
@@ -71,7 +78,7 @@ pub fn build_bucket_merkle(data_dir: &str) {
         .map(|g| {
             build_group_tree(
                 &index_mmap,
-                INDEX_PARAMS.header_size,
+                index_data_offset,
                 g,
                 index_bins,
                 index_bin_size,
@@ -88,7 +95,7 @@ pub fn build_bucket_merkle(data_dir: &str) {
         .map(|g| {
             build_group_tree(
                 &chunk_mmap,
-                CHUNK_PARAMS.header_size,
+                chunk_data_offset,
                 g,
                 chunk_bins,
                 chunk_bin_size,
@@ -193,13 +200,13 @@ struct PerGroupTree {
 /// tree-top caches (e.g. 565K bins padded to 2.1M would waste 30× space).
 fn build_group_tree(
     mmap: &[u8],
-    header_size: usize,
+    data_offset: usize,
     group_id: usize,
     bins_per_table: usize,
     bin_size: usize,
 ) -> PerGroupTree {
     let table_byte_size = bins_per_table * bin_size;
-    let group_offset = header_size + group_id * table_byte_size;
+    let group_offset = data_offset + group_id * table_byte_size;
     let group_data = &mmap[group_offset..group_offset + table_byte_size];
 
     // Compute leaf hashes: leaf[i] = SHA256(i_u32_LE || bin_content)

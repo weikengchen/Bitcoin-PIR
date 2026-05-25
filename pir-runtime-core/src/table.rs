@@ -46,6 +46,14 @@ pub struct MappedSubTable {
     pub bins_per_table: usize,
     /// Byte size of one group's sub-table (bins × slots_per_bin × slot_size).
     pub table_byte_size: usize,
+    /// Byte offset where the per-group tables begin = legacy header size +
+    /// chain-anchor length (0 legacy / 36 snapshot / 72 delta). On a v2
+    /// database the anchor is written BETWEEN the header and the tables, so
+    /// `group_bytes` MUST use this — not the hardcoded `params.header_size`,
+    /// which would read every group's bins `anchor_len` bytes too early and
+    /// silently serve misaligned data. Mirrors the OnionPIR
+    /// `OnionChunkHeader.data_offset` fix (commit ea4ee8c8).
+    pub data_offset: usize,
     /// Tag seed from header (0 if the table has no tag seed).
     pub tag_seed: u64,
     /// Master cuckoo seed as read from the file header (the real on-disk
@@ -74,6 +82,32 @@ impl MappedSubTable {
         let master_seed = parsed.master_seed;
         let anchor = parsed.anchor;
         let table_byte_size = params.table_byte_size(bins_per_table);
+        // Anchor-aware: legacy header size + anchor payload length. The v2
+        // anchor sits between the header and the tables, so the per-group
+        // table data starts here, not at `params.header_size`.
+        let data_offset = parsed.header_size;
+
+        // Fail loudly if a v2 (chain-anchored) table's on-disk size is
+        // inconsistent with the anchor-aware layout, instead of silently
+        // serving misaligned bins. Anchored tables are only ever the
+        // INDEX/CHUNK cuckoo files, written as [header][anchor][k ×
+        // table_byte_size]; non-anchored tables (legacy cuckoo + Merkle
+        // siblings) have other layouts, so the check is scoped to anchored.
+        if anchor.is_some() {
+            let expected = data_offset + params.k * table_byte_size;
+            assert_eq!(
+                mmap.len(),
+                expected,
+                "cuckoo table {} size {} != expected {} (data_offset {} + k {} × table_byte_size {}) \
+                 — anchor-aware offset mismatch, refusing to serve",
+                path.display(),
+                mmap.len(),
+                expected,
+                data_offset,
+                params.k,
+                table_byte_size,
+            );
+        }
 
         println!(
             "    bins_per_table={}, slot={}B, table={:.1}MB, file={:.2}GB",
@@ -94,12 +128,12 @@ impl MappedSubTable {
             }
         }
 
-        MappedSubTable { mmap, params, bins_per_table, table_byte_size, tag_seed, master_seed, anchor }
+        MappedSubTable { mmap, params, bins_per_table, table_byte_size, data_offset, tag_seed, master_seed, anchor }
     }
 
     /// Get the byte slice for a specific group's sub-table.
     pub fn group_bytes(&self, group_id: usize) -> &[u8] {
-        let offset = self.params.header_size + group_id * self.table_byte_size;
+        let offset = self.data_offset + group_id * self.table_byte_size;
         &self.mmap[offset..offset + self.table_byte_size]
     }
 
@@ -498,5 +532,94 @@ impl CuckooTablePair {
             chunk_bins_per_table,
             chunk_table_byte_size,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pir_core::cuckoo::{write_header_with_anchor, HeaderAnchor};
+    use pir_core::seeds::{ChainAnchor, CHAIN_ANCHOR_BYTES};
+    use std::io::Write as _;
+
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "mst_{}_{}_{}.bin",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        p
+    }
+
+    /// Regression: on a v2 (chain-anchored) INDEX cuckoo file the per-group
+    /// tables begin AFTER the 36-byte snapshot anchor. `group_bytes` must use
+    /// the anchor-aware `data_offset` (40 + 36 = 76) — not `params.header_size`
+    /// (40), which read every group 36 bytes too early and silently served
+    /// misaligned bins (the DPF/HarmonyPIR 0-UTXO regression).
+    #[test]
+    fn group_bytes_skips_v2_snapshot_anchor() {
+        let params = INDEX_PARAMS;
+        let bins_per_table = 1usize;
+        let table_byte_size = params.table_byte_size(bins_per_table);
+
+        let anchor = ChainAnchor { block_hash: [0xAB; 32], block_height: 948_454 };
+        let header = write_header_with_anchor(
+            &params,
+            bins_per_table,
+            0xdead_beef_cafe_babe, // tag_seed (load does not verify it)
+            Some(&HeaderAnchor::Snapshot(anchor)),
+        );
+        let expected_offset = params.header_size + CHAIN_ANCHOR_BYTES;
+        assert_eq!(header.len(), expected_offset, "anchored header = legacy + 36");
+
+        // Marker at the first byte of group 0's real table. The anchor bytes
+        // are never 0x5A, so reading it back proves we skipped the anchor.
+        let mut tables = vec![0u8; params.k * table_byte_size];
+        tables[0] = 0x5A;
+        let mut bytes = header;
+        bytes.extend_from_slice(&tables);
+
+        let path = temp_path("snap");
+        std::fs::File::create(&path).unwrap().write_all(&bytes).unwrap();
+        let st = MappedSubTable::load(&path, params);
+
+        assert_eq!(st.data_offset, expected_offset, "data_offset must skip the v2 anchor");
+        let g0 = st.group_bytes(0);
+        assert_eq!(g0.len(), table_byte_size);
+        assert_eq!(g0[0], 0x5A, "group_bytes(0) must start at real table data, past the anchor");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A legacy (anchor-less) file is unchanged: data_offset == header_size,
+    /// so the fix is a no-op for pre-Phase-C databases.
+    #[test]
+    fn group_bytes_legacy_no_anchor_unchanged() {
+        let params = INDEX_PARAMS;
+        let bins_per_table = 1usize;
+        let table_byte_size = params.table_byte_size(bins_per_table);
+
+        let header_size = params.header_size; // capture before `params` is moved into load()
+        let header = write_header_with_anchor(&params, bins_per_table, 0, None);
+        assert_eq!(header.len(), header_size, "legacy header carries no anchor");
+
+        let mut tables = vec![0u8; table_byte_size];
+        tables[0] = 0x5A;
+        let mut bytes = header;
+        bytes.extend_from_slice(&tables);
+
+        let path = temp_path("legacy");
+        std::fs::File::create(&path).unwrap().write_all(&bytes).unwrap();
+        let st = MappedSubTable::load(&path, params);
+
+        assert_eq!(st.data_offset, header_size);
+        assert_eq!(st.group_bytes(0)[0], 0x5A);
+
+        std::fs::remove_file(&path).ok();
     }
 }
