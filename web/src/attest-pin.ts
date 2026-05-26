@@ -125,7 +125,7 @@ export interface ServerAttestPin {
 }
 
 /**
- * weikeng2.bitcoinpir.org — VPSBG Tier 3 UKI v22, pinned 2026-05-25.
+ * weikeng2.bitcoinpir.org — VPSBG Tier 3 UKI v23, pinned 2026-05-26.
  * Built by the `packages.tier3-uki` flake derivation
  * (`nix build --impure .#tier3-uki`) on the Hetzner build host: VPSBG
  * kernel 7.0.0-15 + the reproducible `nix build .#unified-server`
@@ -146,7 +146,7 @@ export const PIR2_TIER3_PIN: ServerAttestPin = {
     '4fb0ad57b28b7c33e6b2977f911fd6bf407ccf28bbab3ef9d24dceec579464a5961e10f5297a294c7dde24839eca4c6e',
   binarySha256Hex:
     '57ac525b1d92656a0ae39d6def562d6fc2889a8c6337b8b34f71a59d6ac44d59',
-  description: 'weikeng2.bitcoinpir.org (VPSBG, SEV-SNP, Tier 3 UKI v22)',
+  description: 'weikeng2.bitcoinpir.org (VPSBG, SEV-SNP, Tier 3 UKI v23)',
 };
 
 /**
