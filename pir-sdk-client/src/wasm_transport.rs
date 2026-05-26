@@ -172,6 +172,21 @@ fn take_record_from_buf(buf: &mut Vec<u8>) -> PirResult<Option<Vec<u8>>> {
     Ok(Some(record))
 }
 
+/// Clear every JS-side event handler from `ws`.
+///
+/// Called on teardown (`close()` and `Drop`) *before* the owning
+/// `Closure`s are freed, so a late `close` / `error` / `message` event
+/// can't invoke a dropped closure — the wasm-bindgen runtime would
+/// otherwise throw "closure invoked recursively or after being dropped".
+/// Idempotent: setting an already-cleared handler to `None` is a no-op,
+/// so calling this from `close()` and again from `Drop` is fine.
+fn detach_ws_handlers(ws: &WebSocket) {
+    ws.set_onopen(None);
+    ws.set_onmessage(None);
+    ws.set_onerror(None);
+    ws.set_onclose(None);
+}
+
 /// Owning handles for the four JS-side callbacks.
 ///
 /// `Closure<dyn FnMut(...)>` is the idiomatic `wasm-bindgen` shape for a
@@ -524,12 +539,22 @@ impl PirTransport for WasmWebSocketTransport {
         // the socket closed for any concurrent code path that might
         // still be holding a reference.
         self.closed.set(true);
+        // Detach the JS event handlers BEFORE the owning `Closure`s drop
+        // below. `ws.close()` only *initiates* the close handshake — the
+        // browser fires the `close` event on a later tick. If the socket
+        // still held `set_onclose(&closure)` at that point, the late event
+        // would invoke a closure we already freed and wasm-bindgen would
+        // throw "closure invoked recursively or after being dropped".
+        // Clearing the handlers here also breaks the Browser → Closure →
+        // Channel cycle, so dropping the closures afterwards is purely
+        // freeing memory.
+        detach_ws_handlers(&self.ws);
         if self.ws.ready_state() != WebSocket::CLOSED {
             let _ = self.ws.close();
         }
-        // Drop the callbacks to break the cycle Browser → Closure →
-        // Channel. The `Rc<RefCell<_>>` lets us do it without needing
-        // `&mut self` over the full teardown.
+        // Now safe to drop the callbacks — no live handler references them.
+        // The `Rc<RefCell<_>>` lets us do it without needing `&mut self`
+        // over the full teardown.
         let mut cb = self.callbacks.borrow_mut();
         cb.on_open.take();
         cb.on_message.take();
@@ -549,5 +574,22 @@ impl PirTransport for WasmWebSocketTransport {
     ) {
         self.metrics_recorder = recorder;
         self.metrics_backend = backend;
+    }
+}
+
+impl Drop for WasmWebSocketTransport {
+    /// Detach the JS event handlers before the struct's fields drop.
+    ///
+    /// `Drop::drop` runs before any field is dropped, so `self.ws` is
+    /// still live here while `callbacks` (which owns the `Closure`s) has
+    /// not been freed yet. Detaching now covers the teardown paths that
+    /// don't go through `close()` — e.g. the WASM client being `free()`d
+    /// or dropped — which would otherwise leave the socket holding
+    /// handlers pointing at closures about to be freed, so a late event
+    /// would throw "closure invoked recursively or after being dropped".
+    /// Redundant after an explicit `close()` (handlers already cleared)
+    /// and harmless thanks to `detach_ws_handlers`' idempotence.
+    fn drop(&mut self) {
+        detach_ws_handlers(&self.ws);
     }
 }
