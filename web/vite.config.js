@@ -25,6 +25,9 @@ export default defineConfig({
         // to verify the SEV-SNP MEASUREMENT pin against the chip-signed
         // value via sev-snp-measure + bpir-admin attest.
         reproduce: 'reproduce.html',
+        // Anonymous rate-limiting demo (ARC + Cashu) — self-contained,
+        // talks only to the dev-issuer (free issuance + co-located gate).
+        'ratelimit-demo': 'ratelimit-demo.html',
       },
     },
   },

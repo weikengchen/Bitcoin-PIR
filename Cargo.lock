@@ -835,6 +835,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dev-issuer"
+version = "0.1.0"
+dependencies = [
+ "arc",
+ "hex",
+ "k256",
+ "rand_core 0.6.4",
+ "sha2",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1805,7 +1816,9 @@ dependencies = [
  "arc",
  "console_error_panic_hook",
  "getrandom 0.2.17",
+ "hex",
  "js-sys",
+ "k256",
  "pir-attest-verify",
  "pir-channel",
  "pir-core",
@@ -1817,6 +1830,7 @@ dependencies = [
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
+ "sha2",
  "tracing-wasm",
  "wasm-bindgen",
  "wasm-bindgen-futures",

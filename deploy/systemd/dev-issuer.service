@@ -1,0 +1,43 @@
+[Unit]
+Description=BitcoinPIR dev-issuer (ARC + Cashu rate-limiting demo: free issuance + verify gate)
+Documentation=https://github.com/Bitcoin-PIR/Bitcoin-PIR
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pir
+Group=pir
+WorkingDirectory=/home/pir/dev-issuer
+# DEV-ONLY: free credential issuance (no payment) + a co-located verify gate
+# for the public rate-limiting demo at sdk.bitcoinpir.org/rate-limiting.
+# Binds 127.0.0.1:5601; the Cloudflare tunnel fronts it as
+# issuer.bitcoinpir.org. Does NOT touch the PIR servers (pir-primary/secondary)
+# or their query path. The "rate limit" is a mechanism demo — issuance is free.
+ExecStart=/home/pir/dev-issuer/dev-issuer --arc-key /home/pir/dev-issuer/arc_key.bin --cashu-key /home/pir/dev-issuer/cashu_key.bin --port 5601
+Restart=on-failure
+RestartSec=5
+
+# Security hardening. Key dir /home/pir/dev-issuer must be owned by pir:pir
+# (the binary writes arc_key.bin / cashu_key.bin there on first run).
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/pir/dev-issuer
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dev-issuer
+
+[Install]
+WantedBy=multi-user.target

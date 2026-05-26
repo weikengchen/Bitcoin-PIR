@@ -54,6 +54,11 @@ pub use merkle_verify::{
 /// unlinkable rate-limited credential presentations.
 pub mod arc;
 
+/// Cashu Blind Auth (NUT-22) client-side BDHKE. Exposes `WasmCashuBlind`
+/// for the browser to blind a secret, send it to the mint, and unblind the
+/// returned signature into a single-use BAT.
+pub mod cashu;
+
 /// Async PIR clients (`WasmDpfClient` / `WasmHarmonyClient`) wrapping the
 /// native `pir-sdk-client` structs. On wasm32 they use
 /// `WasmWebSocketTransport` under the hood; on native (for unit tests)
@@ -1104,6 +1109,12 @@ mod tests {
             dpf_n_index: 13,
             dpf_n_chunk: 14,
             has_bucket_merkle,
+            // Chain-anchored fields added to DatabaseInfo after this helper
+            // was written; default to legacy (no seeds / no anchor).
+            index_master_seed: 0,
+            chunk_master_seed: 0,
+            anchor_kind: 0,
+            anchor_bytes: Vec::new(),
         }
     }
 

@@ -1,0 +1,25 @@
+[package]
+name = "dev-issuer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "DEV-ONLY free credential issuer for the ARC/Cashu rate-limiting demo. No payment, no Lightning. Do not deploy to production."
+
+[[bin]]
+name = "dev-issuer"
+path = "src/main.rs"
+
+[dependencies]
+# arc is already vendored at this rev (see .cargo/config.toml); reusing it
+# means the issuer and the server-side ArcVerifier share byte-exact key
+# serialization. No new vendored crates are introduced by this binary — it
+# hand-rolls its HTTP/1.1 handling over std so the offline `vendor/` tree is
+# untouched.
+arc = { git = "https://github.com/Bitcoin-PIR/arc.git", rev = "de6c1709eee0faa32985d5a452be11904ee95de4" }
+rand_core = { version = "0.6", features = ["getrandom"] }
+# Cashu BDHKE blind-signing (mint side). k256/hex are already vendored
+# (pir-runtime-core's CashuVerifier uses the same versions).
+k256 = { version = "0.13", features = ["arithmetic"] }
+hex = "0.4"
+# Cashu hash_to_curve (verify gate) + the round-trip test's client side.
+sha2 = "0.10"

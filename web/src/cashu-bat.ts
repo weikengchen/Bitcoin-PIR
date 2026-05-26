@@ -21,6 +21,13 @@
  */
 
 import { REQ_CASHU_BAT_PRESENT } from './constants';
+import { bytesToHex } from './hash.js';
+import { initSdkWasm, requireSdkWasm } from './sdk-bridge.js';
+import {
+  getCashuKeyset,
+  mintCashuBats,
+  CASHU_POINT_BYTES,
+} from './payment-client.js';
 
 /**
  * A single unspent Blind Auth Token.
@@ -98,4 +105,56 @@ export class CashuBatPool {
     frame.set(payload, 4);
     return frame;
   }
+}
+
+/**
+ * Mint a pool of `count` single-use BATs from a Cashu mint (the "obtain" leg).
+ *
+ * Runs the full BDHKE flow: for each BAT, blind a fresh secret in WASM
+ * (`WasmCashuBlind`), batch the blinded messages to the mint, then unblind
+ * each returned signature into a `Bat`. The blinding factors never leave
+ * WASM.
+ *
+ * Requires the SDK WASM module (initialised here, idempotently). In the demo
+ * `issuerUrl` is the `dev-issuer`; in production it would be the
+ * Lightning-backed mint after a paid invoice.
+ *
+ * @throws if `count` is not a positive integer, the mint is unreachable, or
+ *   the response is malformed (errors surface from `payment-client`).
+ */
+export async function mintBatPool(
+  issuerUrl: string,
+  count: number,
+): Promise<CashuBatPool> {
+  if (!Number.isInteger(count) || count <= 0) {
+    throw new Error(`mintBatPool: count must be a positive integer, got ${count}`);
+  }
+
+  await initSdkWasm();
+  const sdk = requireSdkWasm();
+
+  const keyset = await getCashuKeyset(issuerUrl);
+
+  // One blind per BAT; concatenate the 33-byte blinded messages.
+  const blinds = Array.from({ length: count }, () => new sdk.WasmCashuBlind());
+  const blinded = new Uint8Array(count * CASHU_POINT_BYTES);
+  blinds.forEach((b, i) => blinded.set(b.blinded_message(), i * CASHU_POINT_BYTES));
+
+  // Mint → N blind signatures C', in the same order.
+  const sigs = await mintCashuBats(issuerUrl, blinded);
+
+  // Unblind each into a BAT, then release the WASM handle.
+  const bats: Bat[] = blinds.map((b, i) => {
+    const sig = sigs.slice(i * CASHU_POINT_BYTES, (i + 1) * CASHU_POINT_BYTES);
+    const c = b.unblind(keyset.pubkey, sig);
+    const bat: Bat = {
+      keysetId: keyset.id,
+      secret: b.secret_string(),
+      signature: bytesToHex(c),
+    };
+    b.free();
+    return bat;
+  });
+
+  return new CashuBatPool(bats);
 }

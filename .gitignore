@@ -66,3 +66,6 @@ deploy/
 # rules above (target/, build/, .DS_Store, .claude/, Cargo.lock) don't
 # bite vendored crates.
 !vendor/**
+# dev-issuer demo key files (never commit)
+arc_key.bin
+cashu_key.bin

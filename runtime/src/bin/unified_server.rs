@@ -116,6 +116,11 @@ struct CliArgs {
     pool_dir: Option<PathBuf>,
     /// Require ARC credential presentation before serving PIR queries.
     require_arc: bool,
+    /// Path to the 128-byte ARC private key (`arc_key.bin`) shared with the
+    /// issuer. When set with `--require-arc`, the verifier loads this key so
+    /// externally-issued credentials verify. Without it, a random key is
+    /// generated (no external credential can verify — dev/test only).
+    arc_key_path: Option<PathBuf>,
     require_cashu: bool,
     cashu_keysets: Vec<(String, String)>,
     /// Whether this server accepts HarmonyPIR hint requests
@@ -167,6 +172,7 @@ fn parse_args() -> CliArgs {
     let mut pool_size: usize = 0; // 0 = pool disabled
     let mut pool_dir: Option<PathBuf> = None;
     let mut require_arc = false;
+    let mut arc_key_path: Option<PathBuf> = None;
     let mut require_cashu = false;
     let mut cashu_keysets: Vec<(String, String)> = Vec::new();
     let mut serve_hints = false;
@@ -255,6 +261,12 @@ fn parse_args() -> CliArgs {
             "--require-arc" => {
                 require_arc = true;
             }
+            "--arc-key" => {
+                if let Some(p) = args.get(i + 1) {
+                    arc_key_path = Some(PathBuf::from(p));
+                }
+                i += 1;
+            }
             "--require-cashu" => {
                 require_cashu = true;
             }
@@ -297,7 +309,7 @@ fn parse_args() -> CliArgs {
         i += 1;
     }
 
-    CliArgs { port, data_dir, role, warmup, config_path, checkpoints, deltas, admin_pubkey_hex, disable_onion, vcek_dir, pool_size, pool_dir, require_arc, require_cashu, cashu_keysets, serve_hints, serve_queries, identity_key_path, identity_cert_path, identity_server_id }
+    CliArgs { port, data_dir, role, warmup, config_path, checkpoints, deltas, admin_pubkey_hex, disable_onion, vcek_dir, pool_size, pool_dir, require_arc, arc_key_path, require_cashu, cashu_keysets, serve_hints, serve_queries, identity_key_path, identity_cert_path, identity_server_id }
 }
 
 // ─── OnionPIR worker thread ─────────────────────────────────────────────────
@@ -2491,8 +2503,26 @@ async fn main() {
 
     // ── Initialize HarmonyPIR V2 hint pool (if enabled) ──────────────────
     let (arc_verifier, require_arc) = if args.require_arc {
-        let verifier = pir_runtime_core::arc_verifier::ArcVerifier::generate();
-        println!("  ARC: enabled — credential verification required");
+        let verifier = match &args.arc_key_path {
+            Some(path) => {
+                let v = pir_runtime_core::arc_verifier::ArcVerifier::from_secret_key_file(path)
+                    .unwrap_or_else(|e| panic!("failed to load ARC key from {}: {e}", path.display()));
+                println!(
+                    "  ARC: enabled — verification required (shared key loaded from {})",
+                    path.display()
+                );
+                v
+            }
+            None => {
+                let v = pir_runtime_core::arc_verifier::ArcVerifier::generate();
+                eprintln!(
+                    "  ARC: WARNING — --require-arc set without --arc-key; generated a random \
+                     key. No externally-issued credential will verify. Pass --arc-key <arc_key.bin> \
+                     to share the issuer's key."
+                );
+                v
+            }
+        };
         (Some(std::sync::Mutex::new(verifier)), true)
     } else {
         println!("  ARC: disabled (use --require-arc to enable)");

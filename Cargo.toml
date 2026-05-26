@@ -15,6 +15,7 @@ members = [
     "runtime",
     "harmonypir-wasm",
     "block_reader",
+    "dev-issuer",
 ]
 exclude = ["electrum_plugin/harmonypir-python"]
 

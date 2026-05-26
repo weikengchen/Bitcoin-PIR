@@ -99,6 +99,19 @@ interface PirSdkWasm {
     ): WasmArcPresentationState;
     deserialize(bytes: Uint8Array): WasmArcPresentationState;
   };
+  // ARC "obtain" leg — `WasmArcCredentialRequest`. `request_bytes()` is the
+  // 226-byte CredentialRequest POSTed to the issuer; `finalize()` combines
+  // the issuer's 99-byte pubkey + 454-byte response into the 131-byte
+  // credential consumed by `WasmArcPresentationState`.
+  WasmArcCredentialRequest: {
+    new(requestContext: Uint8Array): WasmArcCredentialRequest;
+  };
+  // Cashu Blind Auth (NUT-22) "obtain" leg — `WasmCashuBlind`. One per BAT:
+  // `blinded_message()` is POSTed to the mint, `unblind()` combines the
+  // returned 33-byte blind signature into the unblinded BAT signature.
+  WasmCashuBlind: {
+    new(): WasmCashuBlind;
+  };
   PRP_HMR12: () => number;
   PRP_FASTPRP: () => number;
   /**
@@ -584,6 +597,39 @@ interface WasmArcPresentationState {
   nonce(): bigint;
   /** Serialise full state (credential + presCtx + nonce + limit) for persistence. */
   serialize(): Uint8Array;
+}
+
+/**
+ * Opaque WASM handle for the ARC issuance "obtain" leg (pir-sdk-wasm
+ * `arc.rs`). Holds the per-request `ClientSecrets` inside WASM so the
+ * blinding factors never reach JS.
+ */
+interface WasmArcCredentialRequest {
+  free(): void;
+  /** 226-byte `CredentialRequest` to POST to the issuer (`/dev/arc/issue`). */
+  request_bytes(): Uint8Array;
+  /**
+   * Combine the issuer's 99-byte pubkey + 454-byte `CredentialResponse`
+   * into the 131-byte credential blob for `WasmArcPresentationState`.
+   */
+  finalize(pubkeyBytes: Uint8Array, responseBytes: Uint8Array): Uint8Array;
+}
+
+/**
+ * Opaque WASM handle for one Cashu blind/unblind (pir-sdk-wasm `cashu.rs`).
+ * Holds the blinding scalar + secret inside WASM. Create one per BAT.
+ */
+interface WasmCashuBlind {
+  free(): void;
+  /** The Cashu "secret" string (64-char hex) for the authA token. */
+  secret_string(): string;
+  /** 33-byte blinded message `B'` to POST to the mint (`/dev/cashu/mint`). */
+  blinded_message(): Uint8Array;
+  /**
+   * Unblind the mint's 33-byte `C'` with the 33-byte keyset pubkey `K`:
+   * `C = C' − r·K`. Returns the 33-byte unblinded signature.
+   */
+  unblind(keysetPubkey: Uint8Array, signature: Uint8Array): Uint8Array;
 }
 
 interface WasmAtomicMetrics {

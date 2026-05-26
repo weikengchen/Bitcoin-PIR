@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bitcoin PIR — Anonymous Rate-Limiting Demo (ARC + Cashu)</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+        max-width: 960px; margin: 0 auto; padding: 24px; line-height: 1.5;
+      }
+      h1 { font-size: 1.5rem; margin-bottom: 4px; }
+      .sub { color: #666; margin-top: 0; }
+      .note {
+        background: #fff7e6; border: 1px solid #f0d28a; border-radius: 8px;
+        padding: 12px 16px; font-size: 0.9rem; margin: 16px 0;
+      }
+      .note code { background: #00000010; padding: 1px 5px; border-radius: 4px; }
+      .config { margin: 16px 0; }
+      .config label { font-weight: 600; margin-right: 8px; }
+      .config input { padding: 6px 8px; border: 1px solid #ccc; border-radius: 6px; }
+      .banner {
+        margin: 10px 0; padding: 8px 12px; border-radius: 6px; font-size: 0.85rem;
+        font-family: ui-monospace, monospace;
+      }
+      .banner.ok { background: #e6f7ec; border: 1px solid #8ad6a4; color: #0a5; }
+      .banner.err { background: #fdecec; border: 1px solid #f0a0a0; color: #c33; }
+      .banner.checking { background: #eef; border: 1px solid #aac; color: #559; }
+      .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+      @media (max-width: 720px) { .cols { grid-template-columns: 1fr; } }
+      .card { border: 1px solid #ddd; border-radius: 10px; padding: 16px; }
+      .card h2 { font-size: 1.15rem; margin: 0 0 4px; }
+      .card .tag { font-size: 0.8rem; color: #666; margin-bottom: 12px; }
+      .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+      .row input[type="number"] { width: 64px; padding: 4px 6px; }
+      button {
+        padding: 7px 12px; border: 1px solid #0a5; background: #0a5; color: #fff;
+        border-radius: 6px; cursor: pointer; font-size: 0.9rem;
+      }
+      button.secondary { background: #fff; color: #0a5; }
+      button:disabled { opacity: 0.45; cursor: not-allowed; }
+      .status { font-weight: 600; margin: 10px 0 6px; }
+      .meter { display: flex; gap: 3px; flex-wrap: wrap; margin-bottom: 10px; min-height: 16px; }
+      .meter .cell { width: 14px; height: 14px; border-radius: 3px; }
+      .meter .full { background: #0a5; }
+      .meter .spent { background: #ddd; }
+      .log {
+        background: #1118; color: #cde; font-family: ui-monospace, monospace;
+        font-size: 0.78rem; border-radius: 6px; padding: 8px; height: 180px;
+        overflow-y: auto; white-space: pre-wrap;
+      }
+      .log .line.ok { color: #8f8; }
+      .log .line.err { color: #f99; }
+      .log .line.info { color: #bcd; }
+    </style>
+  </head>
+  <body>
+    <h1>Anonymous Rate-Limiting Demo</h1>
+    <p class="sub">
+      ARC (multi-show credential) vs Cashu Blind Auth (single-show tokens),
+      end-to-end: <strong>mint → obtain → present → verify</strong>.
+    </p>
+
+    <div class="note">
+      This demo is self-contained — it talks only to the <strong>dev-issuer</strong>
+      (free issuance, no Lightning, no PIR database). Start it first:
+      <br /><code>cargo run -p dev-issuer</code>
+      &nbsp;then&nbsp;<code>cd web &amp;&amp; npm run dev</code>.
+      <br />The dev-issuer co-locates the <em>verify</em> gate (identical crypto to
+      the PIR server's <code>unified_server</code> gate), so no PIR server is needed.
+      In production the same present frames go over WebSocket to the PIR server.
+    </div>
+
+    <div class="config">
+      <label for="issuer">Issuer URL</label>
+      <input id="issuer" type="text" size="32" value="http://127.0.0.1:5601" />
+      <button id="issuer-check" class="secondary">Check</button>
+    </div>
+    <div class="banner checking" id="issuer-banner">Checking issuer…</div>
+
+    <div class="cols">
+      <!-- ARC -->
+      <div class="card">
+        <h2>ARC</h2>
+        <div class="tag">Multi-show: one credential → N unlinkable presentations.</div>
+        <div class="row">
+          <label for="arc-limit">limit</label>
+          <input id="arc-limit" type="number" min="1" max="64" value="8" />
+          <button id="arc-mint">Mint credential</button>
+          <button id="arc-run" class="secondary">Run to exhaustion</button>
+        </div>
+        <div class="row">
+          <button id="arc-present" class="secondary" disabled>Present once</button>
+          <button id="arc-replay" class="secondary" disabled>Replay last (rejected)</button>
+        </div>
+        <div class="status" id="arc-status">No credential yet.</div>
+        <div class="meter" id="arc-meter"></div>
+        <div class="log" id="arc-log"></div>
+      </div>
+
+      <!-- Cashu -->
+      <div class="card">
+        <h2>Cashu Blind Auth</h2>
+        <div class="tag">Single-show: a pool of one-time BATs, each spent once.</div>
+        <div class="row">
+          <label for="cashu-count">count</label>
+          <input id="cashu-count" type="number" min="1" max="64" value="5" />
+          <button id="cashu-mint">Mint BAT pool</button>
+          <button id="cashu-run" class="secondary">Mint + spend all</button>
+        </div>
+        <div class="row">
+          <button id="cashu-present" class="secondary" disabled>Spend one</button>
+          <button id="cashu-replay" class="secondary" disabled>Replay last (double-spend)</button>
+        </div>
+        <div class="status" id="cashu-status">No pool yet.</div>
+        <div class="meter" id="cashu-meter"></div>
+        <div class="log" id="cashu-log"></div>
+      </div>
+    </div>
+
+    <script type="module" src="/src/ratelimit-demo.ts"></script>
+  </body>
+</html>
