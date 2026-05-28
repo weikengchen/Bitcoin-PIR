@@ -5,12 +5,13 @@ exactly what a client learns when it verifies one. This covers the
 end-to-end **operator runbook** (generate → sign → deploy) and the
 **client trust model** (what each check proves, and what it does not).
 
-> **Status (2026-05-24).** The full path is wired and live-verified
-> end-to-end (`bpir-admin` → `unified_server --identity-*` → client
-> `announce()`), but **not yet deployed on pir1/pir2** and the pinned
-> operator pubkey in `web/src/attest-pin.ts` is currently a **DEV
-> stand-in** (the e2e test key), not a real published key. See
-> [Current status](#current-status).
+> **Status (2026-05-28).** **LIVE.** Deployed and live-verified end-to-end
+> on both production servers: pir1 + pir2 serve REQ_ANNOUNCE on the
+> announce-enabled binary (v22 `f7df82d0…` → current v23 `57ac525b…`). The
+> pinned operator pubkey in `web/src/attest-pin.ts` is the **real**
+> published key (`256fb106…`), and the "verified operator" badge is wired
+> into the www client (DPF + HarmonyPIR cards) and the playground, gated on
+> `state === 'verified'`. See [Current status](#current-status).
 
 ---
 
@@ -259,30 +260,35 @@ await adapter.connect();
   dispatch arm, `PirServerBuilder::with_announcement_bundle`, admin CLI,
   client `announce` / `announce_with_pinned_operator` / `announce_bound`
   / `check_pinned_operator` / `check_channel_binding`, WASM bindings.
-- ✅ Live-verified e2e (`test_announce_operator_identity_end_to_end`).
+- ✅ Live-verified e2e (`test_announce_operator_identity_end_to_end`) — ok
+  against pir1 (weikeng1) AND pir2 (weikeng2).
 - ✅ Real operator key minted (2026-05-25) + pinned in `attest-pin.ts`
   (`PIR_OPERATOR_PUBKEY_HEX = 256fb106…`; secret offline at
   `~/.config/bpir-admin/operator.key`).
-- 🟡 pir1 **staged** with `--identity-*` (server_id=pir1, cert valid to
-  2029) — see Deployment status below. pir2 not yet staged.
-- ✅ `BatchPirClientAdapter` exposes a gated `operatorIdentity` snapshot
-  (opt-in via `verifyOperatorIdentity`); `gateOperatorIdentity` unit-tested.
+- ✅ **Deployed (2026-05-28):** pir1 + pir2 both run the announce-enabled
+  binary (v22 `f7df82d0…` → v23 `57ac525b…`); both answer REQ_ANNOUNCE and
+  verify under the pinned operator key.
+- ✅ `BatchPirClientAdapter` (DPF) and `HarmonyPirClientAdapter` expose a
+  gated `operatorIdentity` snapshot (opt-in via `verifyOperatorIdentity`);
+  `gateOperatorIdentity` unit-tested.
 - ✅ Standalone TS `OnionPirWebClient.announce()` — reuses the Rust
   parser/chain check via the WASM `verifyAnnounceResponse` binding
   (operator-pin + chain; channel-binding N/A — no attest/channel there).
-- ⏳ Playground still needs to render the badge from the snapshot;
-  `check_freshness(now, maxAge)` available (Rust + WASM + adapter
-  `maxAnnounceAgeSeconds`); validity enforced via real `now`.
+- ✅ **"Verified operator" badge wired** into the www client (DPF +
+  HarmonyPIR cards, `web/index.html`) and the playground
+  (`OperatorIdentityBadge.tsx`), gated on `state === 'verified'`. OnionPIR
+  excluded (single-server, no secure channel → channel binding N/A).
 
-## Deployment status (2026-05-25)
+## Deployment status — RESOLVED (2026-05-28)
 
-The dispatch arm is **merged to main** (PR #9) and the new binary is
-**built + reproducible**, but it is **not yet deployed** — the running
-servers still execute the old reproducible binary
-(`binarySha256Hex 71a041ae…`), which predates the dispatch arm, so
-`announce()` against `wss://weikeng1.bitcoinpir.org` still returns
-`unsupported request 0x07`. The remaining work is the coordinated binary
-deploy + re-pin below.
+**Done.** The announce-enabled binary was deployed to **both** servers
+(v22 `f7df82d0…`, then current v23 `57ac525b…` = v22 + the DPF/Harmony
+anchor-offset fix) and the shared `binarySha256Hex` + pir2 `measurementHex`
+re-pinned in `attest-pin.ts`. `announce()` against both
+`wss://weikeng1.bitcoinpir.org` and `wss://weikeng2.bitcoinpir.org` returns
+an operator-endorsed bundle that verifies under the pinned operator key
+(`256fb106…`). The original coordinated-deploy checklist is retained below
+as a historical record.
 
 Done:
 - Operator key + pir1/pir2 `IdentityCert`s signed (valid to 2029).
@@ -353,10 +359,11 @@ PIR_ANNOUNCE_SERVER_ID=pir1 \
 
 ### Remaining work
 
-- **C (binary release)** — the 6 steps above; needs a merge + reproducible
-  build + the VPSBG portal for pir2. pir1 identity is staged and will
-  activate the instant the dispatch-arm binary lands.
-- **D (playground)** — render the badge from
-  `adapter.operatorIdentity.serverN.state` / `onOperatorIdentity`. The
-  gating already lives in the adapter; the badge is the only remaining
-  piece, in the playground repo.
+- ✅ **C (binary release) — DONE (2026-05-28).** Announce-enabled binary
+  (v23 `57ac525b…`) live on pir1 + pir2; pins updated.
+- ✅ **D (UI badge) — DONE (2026-05-28).** "Verified operator" badge wired
+  into the www client (DPF + HarmonyPIR cards) and the playground
+  (`OperatorIdentityBadge.tsx` ← `BatchPirClientAdapter.operatorIdentity` /
+  the `attestAndUpgrade` operator-identity verdict), gated on
+  `state === 'verified'`. OnionPIR excluded (no secure channel).
+- _Nothing outstanding._
