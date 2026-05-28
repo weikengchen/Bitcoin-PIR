@@ -787,6 +787,11 @@
         .attest-badge-mismatch      { border-left-color: var(--err); background: #fef2f2; }
         .attest-badge-plaintext     { border-left-color: var(--ink-mute); background: var(--bg); }
         .attest-badge-unattested    { border-left-color: var(--ink-mute); background: var(--bg); color: var(--ink-mute); }
+        /* Operator-signed identity badge (REQ_ANNOUNCE). Green once the
+           operator-pinned cert + channel binding verify; red on a failed
+           check. Hidden for unconfigured / error / not-checked. */
+        .attest-badge-op-verified   { border-left-color: #2e7d32; background: #f0fdf4; }
+        .attest-badge-op-unverified { border-left-color: var(--err); background: #fef2f2; }
     </style>
     <!-- OnionPIR WASM (post-port ES module) loaded dynamically via
          `await import('/wasm/onionpir_client.mjs')` in
@@ -1024,12 +1029,14 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                             <input type="text" id="server0Url" class="input" value="wss://weikeng1.bitcoinpir.org" spellcheck="false">
                         </div>
                         <div id="attestBadge0" class="attest-badge attest-badge-unattested" data-server="0" style="display: none;"></div>
+                        <div id="operatorBadge0" class="attest-badge attest-badge-op-verified" data-server="0" style="display: none;"></div>
 
                         <div class="status-row">
                             <label for="server1Url">Server 1</label>
                             <input type="text" id="server1Url" class="input" value="wss://weikeng2.bitcoinpir.org" spellcheck="false">
                         </div>
                         <div id="attestBadge1" class="attest-badge attest-badge-unattested" data-server="1" style="display: none;"></div>
+                        <div id="operatorBadge1" class="attest-badge attest-badge-op-verified" data-server="1" style="display: none;"></div>
 
                         <div id="syncStateRow" style="display: none; margin-top: 14px;">
                             <span>Sync state:</span>
@@ -1355,12 +1362,14 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                             <input type="text" id="hp-hintServerUrl" class="input" value="wss://weikeng1.bitcoinpir.org" spellcheck="false">
                         </div>
                         <div id="hp-attestBadgeHint" class="attest-badge attest-badge-unattested" style="display: none;"></div>
+                        <div id="hp-operatorBadgeHint" class="attest-badge attest-badge-op-verified" style="display: none;"></div>
 
                         <div class="status-row">
                             <label for="hp-queryServerUrl">Query server</label>
                             <input type="text" id="hp-queryServerUrl" class="input" value="wss://weikeng2.bitcoinpir.org" spellcheck="false">
                         </div>
                         <div id="hp-attestBadgeQuery" class="attest-badge attest-badge-unattested" style="display: none;"></div>
+                        <div id="hp-operatorBadgeQuery" class="attest-badge attest-badge-op-verified" style="display: none;"></div>
                         <div class="status-row">
                             <label for="hp-prpSelect">PRP backend</label>
                             <div style="display: flex; align-items: center; gap: 10px;">
@@ -1564,6 +1573,42 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
             }
             if (info.sevStatus) {
                 rows.push(`<div class="ab-row"><span class="ab-label">sev status</span><span class="ab-val">${info.sevStatus}</span></div>`);
+            }
+            el.innerHTML = rows.join('');
+        }
+
+        // Operator-signed identity badge, populated from the adapter's
+        // onOperatorIdentity callback. Only a definitive verdict is shown:
+        // 'verified' (green) or 'unverified' (red). 'unconfigured' (server
+        // opted out), 'error' (transient/no attestation) and 'not-checked'
+        // stay hidden — they are not security-relevant to surface.
+        function renderOperatorBadge(idElem, serverTag, oid) {
+            const el = typeof idElem === 'string' ? document.getElementById(idElem) : idElem;
+            if (!el) return;
+            if (oid.state !== 'verified' && oid.state !== 'unverified') {
+                el.style.display = 'none';
+                return;
+            }
+            const truncate = (hex, n = 16) =>
+                hex && hex.length > n ? `${hex.slice(0, n)}…` : (hex || '—');
+            el.className = `attest-badge attest-badge-op-${oid.state}`;
+            el.style.display = 'block';
+
+            const rows = [];
+            if (oid.state === 'verified') {
+                rows.push(`<span class="ab-state">🔏 Operator-endorsed — ${oid.serverId || 'identity'} verified</span>`);
+                if (oid.operatorPubkeyHex) {
+                    rows.push(`<div class="ab-row"><span class="ab-label">operator</span><span class="ab-val" title="${oid.operatorPubkeyHex}">${truncate(oid.operatorPubkeyHex, 24)}</span></div>`);
+                }
+                if (oid.identityPubkeyHex) {
+                    rows.push(`<div class="ab-row"><span class="ab-label">identity</span><span class="ab-val" title="${oid.identityPubkeyHex}">${truncate(oid.identityPubkeyHex, 24)}</span></div>`);
+                }
+                if (oid.gitRev) {
+                    rows.push(`<div class="ab-row"><span class="ab-label">git rev</span><span class="ab-val" title="${oid.gitRev}">${truncate(oid.gitRev, 12)}</span></div>`);
+                }
+            } else {
+                rows.push(`<span class="ab-state">⚠ Operator identity UNVERIFIED</span>`);
+                rows.push(`<div class="ab-row"><span class="ab-label">reason</span><span class="ab-val" title="${oid.error || ''}">${oid.error || 'check failed'}</span></div>`);
             }
             el.innerHTML = rows.join('');
         }
@@ -2069,6 +2114,20 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                         // Slice 3: persistent badge under the server URL input
                         // surfacing binary sha + MEASUREMENT + channel pk + git rev.
                         renderAttestBadge(`attestBadge${idx}`, tag, info);
+                    },
+                    // Operator-signed identity (REQ_ANNOUNCE). The adapter
+                    // fetches each server's bundle after attest, checks it
+                    // against the pinned operator key + the attested channel
+                    // key, and reports the verdict here. Gated on 'verified'.
+                    verifyOperatorIdentity: true,
+                    onOperatorIdentity: (idx, info) => {
+                        const tag = `server${idx}`;
+                        if (info.state === 'verified') {
+                            log(`🔏 ${tag}: operator-endorsed identity verified (${info.serverId})`, 'success');
+                        } else if (info.state === 'unverified') {
+                            log(`⚠ ${tag}: operator identity UNVERIFIED — ${info.error}`, 'error');
+                        }
+                        renderOperatorBadge(`operatorBadge${idx}`, tag, info);
                     },
                     onConnectionStateChange: (state, message) => {
                         log(`Connection: ${state}${message ? ' - ' + message : ''}`,
@@ -3546,6 +3605,20 @@ bc1q2292d7mz8txc7462hjy4prs2gtx727ut8mcanr</textarea>
                         // Slice 3: persistent badge under each server URL.
                         const badgeId = idx === 0 ? 'hp-attestBadgeHint' : 'hp-attestBadgeQuery';
                         renderAttestBadge(badgeId, `HarmonyPIR ${tag}`, info);
+                    },
+                    // Operator-signed identity (REQ_ANNOUNCE) — same opt-in as
+                    // the DPF card. Verifies each server's bundle against the
+                    // pinned operator key + the attested channel key.
+                    verifyOperatorIdentity: true,
+                    onOperatorIdentity: (idx, info) => {
+                        const tag = idx === 0 ? 'hint' : 'query';
+                        if (info.state === 'verified') {
+                            log(`🔏 HarmonyPIR ${tag}: operator-endorsed identity verified (${info.serverId})`, 'success');
+                        } else if (info.state === 'unverified') {
+                            log(`⚠ HarmonyPIR ${tag}: operator identity UNVERIFIED — ${info.error}`, 'error');
+                        }
+                        const badgeId = idx === 0 ? 'hp-operatorBadgeHint' : 'hp-operatorBadgeQuery';
+                        renderOperatorBadge(badgeId, `HarmonyPIR ${tag}`, info);
                     },
                     onProgress: (msg) => {
                         log(`HarmonyPIR: ${msg}`);

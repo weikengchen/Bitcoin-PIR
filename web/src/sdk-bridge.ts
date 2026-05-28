@@ -444,6 +444,10 @@ interface WasmHarmonyClient {
   /** Same as `WasmDpfClient.attest`. `serverIndex` 0 = hint server,
    *  1 = query server (matches `serverUrls()` order). */
   attest(serverIndex: number): Promise<WasmAttestVerification>;
+  /** Same as `WasmDpfClient.announce`. `serverIndex` 0 = hint server,
+   *  1 = query server. Rejects with "announce not configured" when the
+   *  server was started without `--identity-*` flags. */
+  announce(serverIndex: number): Promise<WasmAnnounceVerification>;
   /** Same as `WasmDpfClient.upgradeToSecureChannel`. Argument order
    *  matches `serverUrls()` — `(hintServerStaticPub, queryServerStaticPub)`. */
   upgradeToSecureChannel(hintServerStaticPub: Uint8Array, queryServerStaticPub: Uint8Array): Promise<void>;

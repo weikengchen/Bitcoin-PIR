@@ -67,12 +67,13 @@ import {
 } from './server-info.js';
 import {
   requireSdkWasm,
+  type WasmAnnounceVerification,
   type WasmAttestVerification,
   type WasmHarmonyClient,
   type WasmQueryResult,
 } from './sdk-bridge.js';
-import { getAmdTurinArkFingerprint } from './attest-pin.js';
-import type { ServerAttestation } from './dpf-adapter.js';
+import { getAmdTurinArkFingerprint, PIR_OPERATOR_PUBKEY } from './attest-pin.js';
+import { gateOperatorIdentity, type OperatorIdentity, type ServerAttestation } from './dpf-adapter.js';
 import type {
   HarmonyQueryResult,
   HarmonyUtxoEntry,
@@ -129,6 +130,25 @@ export interface HarmonyPirClientConfig {
    */
   expectedServer0Pin?: import('./attest-pin.js').ServerAttestPin;
   expectedServer1Pin?: import('./attest-pin.js').ServerAttestPin;
+  /**
+   * Opt-in operator-signed identity (REQ_ANNOUNCE) verification, mirroring
+   * `BatchPirClientConfig`. When `true`, after attesting both servers the
+   * adapter fetches each server's announce bundle and verifies it against
+   * `pinnedOperatorPubkey` + the attested channel key, populating
+   * `operatorIdentity`. Default `false`.
+   */
+  verifyOperatorIdentity?: boolean;
+  /** Operator (Tier-1) pubkey to pin announce bundles against. Defaults to
+   *  `PIR_OPERATOR_PUBKEY` from `./attest-pin.ts`. */
+  pinnedOperatorPubkey?: Uint8Array;
+  /** Replay/staleness cap (seconds) on the bundle's `issued_at`. Default
+   *  `0` = no cap (issued_at is the server's boot time, so a staleness cap
+   *  would wrongly reject long-uptime servers). */
+  maxAnnounceAgeSeconds?: number;
+  /** Fires once per server after attest resolves the operator-identity
+   *  check (only when `verifyOperatorIdentity`). Index 0 = hint, 1 = query.
+   *  Gate any "verified operator" badge on `state === 'verified'`. */
+  onOperatorIdentity?: (serverIndex: 0 | 1, info: OperatorIdentity) => void;
 }
 
 // ─── Adapter ─────────────────────────────────────────────────────────────────
@@ -159,6 +179,17 @@ export class HarmonyPirClientAdapter {
   attestation: { hint: ServerAttestation; query: ServerAttestation } = {
     hint: { state: 'unattested' },
     query: { state: 'unattested' },
+  };
+  /**
+   * Per-server operator-signed-identity snapshot, mirroring
+   * `BatchPirClientAdapter.operatorIdentity`. Populated by
+   * `attestAndUpgrade()` only when `verifyOperatorIdentity` is set; stays
+   * `'not-checked'` otherwise. Index 0 = hint, 1 = query. Gate any
+   * "verified operator" badge on `state === 'verified'`.
+   */
+  operatorIdentity: { hint: OperatorIdentity; query: OperatorIdentity } = {
+    hint: { state: 'not-checked' },
+    query: { state: 'not-checked' },
   };
   /**
    * Inspector data populated by the most recent `queryBatch`. The native
@@ -344,8 +375,69 @@ export class HarmonyPirClientAdapter {
         + ` query=${this.attestation.query.state})`,
       );
     }
+
+    // Operator-signed identity (REQ_ANNOUNCE), opt-in. After the channel
+    // decision so announce() rides the encrypted channel when it came up;
+    // binds against the attested serverStaticPub from hintAtt/queryAtt
+    // (still alive here — freed just below). Mirrors the DPF adapter.
+    if (this.config.verifyOperatorIdentity) {
+      const pin = this.config.pinnedOperatorPubkey ?? PIR_OPERATOR_PUBKEY;
+      this.operatorIdentity.hint = await this.verifyOperatorIdentityOne(0, hintAtt, pin);
+      this.operatorIdentity.query = await this.verifyOperatorIdentityOne(1, queryAtt, pin);
+      this.config.onOperatorIdentity?.(0, this.operatorIdentity.hint);
+      this.config.onOperatorIdentity?.(1, this.operatorIdentity.query);
+    }
+
     hintAtt?.free();
     queryAtt?.free();
+  }
+
+  /**
+   * Fetch + verify one server's operator-signed identity. Never throws;
+   * returns an `OperatorIdentity` snapshot. `att` supplies the attested
+   * `serverStaticPub` the bundle's `channel_pub` is bound against, so a
+   * `null` att (attest failed) yields `state: 'error'`. Mirrors
+   * `dpf-adapter.ts::verifyOperatorIdentityOne`.
+   */
+  private async verifyOperatorIdentityOne(
+    idx: 0 | 1,
+    att: WasmAttestVerification | null,
+    pin: Uint8Array,
+  ): Promise<OperatorIdentity> {
+    const which = idx === 0 ? 'hint' : 'query';
+    if (!this.wasmClient) {
+      return { state: 'error', error: 'wasm client not initialised' };
+    }
+    if (!att) {
+      return { state: 'error', error: 'attestation unavailable; cannot bind channel key' };
+    }
+    let v: WasmAnnounceVerification;
+    try {
+      v = await this.wasmClient.announce(idx);
+    } catch (e) {
+      const msg = (e as Error)?.message ?? String(e);
+      // A server started without --identity-* answers RESP_ERROR
+      // "announce not configured" — an expected, benign state.
+      if (/not configured/i.test(msg)) {
+        this.log(`HarmonyPIR ${which}: operator identity not configured`);
+        return { state: 'unconfigured' };
+      }
+      this.log(`HarmonyPIR announce(${which}) failed: ${msg}`);
+      return { state: 'error', error: msg };
+    }
+    try {
+      const nowSecs = BigInt(Math.floor(Date.now() / 1000));
+      const maxAge = BigInt(this.config.maxAnnounceAgeSeconds ?? 0);
+      const result = gateOperatorIdentity(v, pin, att.serverStaticPub, nowSecs, maxAge);
+      if (result.state === 'verified') {
+        this.log(`HarmonyPIR ${which}: operator identity verified (${result.serverId})`);
+      } else {
+        this.log(`HarmonyPIR ${which}: operator identity UNVERIFIED — ${result.error}`);
+      }
+      return result;
+    } finally {
+      v.free();
+    }
   }
 
   // ══ Setup / WASM loading ════════════════════════════════════════════════

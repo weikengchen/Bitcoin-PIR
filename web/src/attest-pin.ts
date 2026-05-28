@@ -191,15 +191,14 @@ export const PIR1_PIN: ServerAttestPin = {
  * backed up out-of-band) and signs the pir1 / pir2 `IdentityCert`s
  * (`bpir-admin sign-identity`, valid_until 2029-05).
  *
- * ⚠️ NOT YET LIVE END-TO-END. pir1/pir2 are *staged* with `--identity-*`
- * (the bundle is built + logged "Identity announce: enabled"), but the
- * deployed reproducible binary predates the REQ_ANNOUNCE *dispatch* arm,
- * so the servers still answer "unsupported request 0x07". Announce goes
- * live only once a binary carrying the dispatch arm is reproducibly
- * rebuilt + deployed to pir1 AND baked into the pir2 Tier-3 UKI, with
- * `binarySha256Hex` (both pins) + pir2 `measurementHex` re-pinned. Keep
- * any "verified operator" UI gated until then. See
- * docs/OPERATOR_IDENTITY.md §"Deployment status".
+ * LIVE END-TO-END (verified 2026-05-28). pir1 + pir2 both serve
+ * REQ_ANNOUNCE on the announce-enabled binary (v22 `f7df82d0…` → current
+ * v23 `57ac525b…`); `announce()` against either returns an
+ * operator-endorsed bundle that verifies under this pinned key
+ * (operator-pin + cert signature + validity + chain + channel binding).
+ * The "verified operator" badge is wired into the DPF + HarmonyPIR cards
+ * (web/index.html) and the playground, gated on `state === 'verified'`.
+ * See docs/OPERATOR_IDENTITY.md.
  */
 export const PIR_OPERATOR_PUBKEY_HEX =
   '256fb106c039f8009d3caa431a9634ff3fe5db3b9e4d9ae7282bbde66772c97a';
