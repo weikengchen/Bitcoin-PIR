@@ -53,6 +53,8 @@ PLAN_*.md
 
 # Claude Code
 .claude/
+# dream audit-skill working dir (regenerable scratch)
+.dream/
 
 # Deployment artifacts (local configs, secrets, notes, SSH known_hosts)
 deploy/
